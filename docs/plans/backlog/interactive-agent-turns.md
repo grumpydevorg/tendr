@@ -102,16 +102,21 @@ Use an absolute path to `tendr` if the hook environment's `PATH` may differ.
 `--best-effort` keeps a Tendr failure from failing the agent's hook.
 
 ```bash
+# Follow first, before the session exists, so hook.session_start cannot be
+# missed. A follower on a not-yet-created session becomes ready and catches
+# its first event (checked 2026-10-08).
+rm -f ./ready
+tendr events --session agents/cc --kind hook. --follow --from-now \
+  --ready-file ./ready > ./events.ndjson &
+until [ -f ./ready ]; do sleep 0.1; done
+
 CLAUDE=$(readlink -f "$(command -v claude)")
 tendr start cc --namespace agents --pty --stdin --cwd "$PWD" \
   --env CLAUDE_CODE_ARTIFACT_AUTO_OPEN=0 \
   -- "$CLAUDE" --settings ./tendr-hooks.json
 
-# Follow before sending, so the turn's events cannot be missed.
-tendr events --session agents/cc --kind hook. --follow --from-now \
-  --ready-file ./ready > ./events.ndjson &
-
-# Wait for hook.session_start, then:
+# Wait for hook.session_start in events.ndjson, give the input box a moment
+# to draw (the probe used 3 s), then:
 printf '/design a settings screen' | tendr push cc --namespace agents
 sleep 0.5
 printf '\r' | tendr push cc --namespace agents
