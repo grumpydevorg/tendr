@@ -33,6 +33,7 @@ the live distinction is keep-ready vs deferred-until-a-consumer.
 | ID | File | Lane / status |
 |----|------|---------------|
 | agent-hook-routing | `agent-hook-routing.md` | Lane B/D — small docs/glue; ready (replaces the cut skill-agent + hermes cards) |
+| interactive-agent-turns | `interactive-agent-turns.md` | Lane A/D — measured 2026-10-08: drive one turn of an interactive agent under a Tendr PTY, with hook events for submit/blocked/stopped; ready. Guide recipe plus one generic "wait for the first matching event" addition; where it sits beside herdr. |
 | capture-stop-drain | `capture-stop-drain.md` | Lane A — small sidecar fix; ready |
 | boo-integration | `boo-integration.md` | Lane D — optional composition, live validation open; path-5 decision revised by cloud-pty-control |
 | content-addressable-storage | `content-addressable-storage.md` | Lane C — deferred; blob primitive already absorbed into event-protocol, rest is consumer-gated |
