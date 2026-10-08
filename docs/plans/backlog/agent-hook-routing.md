@@ -60,8 +60,8 @@ protocol names/schema only:
 
    A measured Claude Code recipe (hooks → `tendr emit --data-stdin`, with
    submit/blocked/stop events and their correlation by `prompt_id`) is in
-   [interactive-agent-turns](interactive-agent-turns.md). Use it alongside, or
-   instead of, the Hermes example.
+   [interactive-agent-turns](interactive-agent-turns.md). Publish it alongside
+   the Hermes example.
 
 3. **Consumer note.** State plainly that Boo / Ghostty / a future egui view /
    `tendr query` analytics are **consumers** of `hook.*` events, not core
