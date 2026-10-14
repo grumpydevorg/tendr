@@ -1,0 +1,28 @@
+# Git hooks, run by prek: `prek install --allow-missing-config` once per
+# workspace (the flag keeps commits working in a checkout of a branch that
+# predates this file). The same commands as CI's lint job, on the toolchain
+# rust-toolchain.toml pins: fmt at commit, clippy at push. CI stays the gate.
+default_install_hook_types: [pre-commit, pre-push]
+repos:
+  - repo: builtin
+    hooks:
+      - id: check-added-large-files
+        stages: [pre-commit]
+      - id: check-merge-conflict
+        stages: [pre-commit]
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        language: system
+        entry: cargo fmt --all --check
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: cargo-clippy
+        name: cargo clippy
+        language: system
+        entry: cargo clippy --all-targets --locked -- -D warnings
+        types_or: [rust, toml]
+        pass_filenames: false
+        stages: [pre-push]
