@@ -41,11 +41,13 @@ impl SupervisedChild {
 }
 
 /// Lightweight kill handle for Unix. Carries the ProcessIdentity
-/// needed for identity-verified group kill. Send + Clone so it can
-/// be moved to a timeout thread.
+/// needed for identity-verified group kill, and whether the child leads a
+/// PTY session, whose graceful stop starts with a hangup. Send + Clone so it
+/// can be moved to a timeout thread.
 #[derive(Clone)]
 pub struct ChildKillHandle {
     identity: ProcessIdentity,
+    is_pty: bool,
 }
 
 impl Platform for UnixPlatform {
@@ -310,15 +312,18 @@ impl Platform for UnixPlatform {
     fn child_kill_handle(child: &SupervisedChild) -> ChildKillHandle {
         ChildKillHandle {
             identity: child.identity,
+            is_pty: child.is_pty,
         }
     }
 
     fn kill_child(handle: &ChildKillHandle, force: bool) -> io::Result<()> {
-        kill_process(&handle.identity, force)
+        kill_process(&handle.identity, force, handle.is_pty)
     }
 
     fn kill_orphan(id: &ProcessIdentity, force: bool) -> io::Result<()> {
-        kill_process(id, force)
+        // Without its sidecar an orphan's terminal is already closed, so the
+        // kernel has delivered whatever hangup it was going to.
+        kill_process(id, force, false)
     }
 
     fn self_identity() -> io::Result<ProcessIdentity> {
@@ -666,11 +671,19 @@ fn process_status(id: &ProcessIdentity) -> ProcessStatus {
     }
 }
 
-/// Kill a process. Sends SIGTERM first, waits briefly, then SIGKILL.
+/// How long a PTY child gets to act on its hangup before SIGTERM. A shell
+/// passes the hangup on to its jobs as it exits; a SIGTERM that ended it first
+/// would leave them running.
+const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Kill a process. Sends SIGTERM first, waits briefly, then SIGKILL. A PTY
+/// session leader (`hang_up_first`) gets SIGHUP before that, as when its
+/// terminal window closes, so an interactive shell hangs up its jobs, which
+/// sit in their own process groups outside the group kill.
 /// Tries process group kill first (kill(-pgid)), falls back to direct kill.
 /// Verifies process identity before signaling to prevent killing recycled PIDs.
 /// Returns Ok(()) if the process is already dead (idempotent).
-fn kill_process(id: &ProcessIdentity, force: bool) -> io::Result<()> {
+fn kill_process(id: &ProcessIdentity, force: bool, hang_up_first: bool) -> io::Result<()> {
     match process_status(id) {
         ProcessStatus::Missing => return Ok(()),
         ProcessStatus::IdentityMismatch => {
@@ -691,34 +704,50 @@ fn kill_process(id: &ProcessIdentity, force: bool) -> io::Result<()> {
     }
 
     let pid = id.pid.get() as i32;
-    let signal = if force {
-        rustix::process::Signal::KILL
-    } else {
-        rustix::process::Signal::TERM
-    };
-
     // Try process group first (kills descendants), fall back to direct
-    send_signal_group(pid, signal).or_else(|_| send_signal_direct(pid, signal))?;
+    let signal_tree =
+        |signal| send_signal_group(pid, signal).or_else(|_| send_signal_direct(pid, signal));
 
     if force {
+        return signal_tree(rustix::process::Signal::KILL);
+    }
+
+    if hang_up_first {
+        signal_tree(rustix::process::Signal::HUP)?;
+        if wait_for_exit(id, HANGUP_GRACE) {
+            // The group outlives its leader while members remain, and one
+            // that ignores the hangup must still be stopped. Only the group:
+            // the leader's own PID may already belong to another process.
+            return send_signal_group(pid, rustix::process::Signal::TERM);
+        }
+    }
+
+    signal_tree(rustix::process::Signal::TERM)?;
+
+    // Wait up to 5 seconds for graceful exit
+    if wait_for_exit(id, std::time::Duration::from_secs(5)) {
         return Ok(());
     }
 
-    // Wait up to 5 seconds for graceful exit
-    for _ in 0..50 {
+    // Still alive -- escalate to SIGKILL
+    signal_tree(rustix::process::Signal::KILL)
+}
+
+/// Poll until `id` has exited or `within` passes; true if it exited.
+fn wait_for_exit(id: &ProcessIdentity, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
         match process_status(id) {
-            ProcessStatus::Missing => return Ok(()),
-            ProcessStatus::IdentityMismatch => return Ok(()), // recycled = original is dead
+            // A recycled PID means the original is dead.
+            ProcessStatus::Missing | ProcessStatus::IdentityMismatch => return true,
             _ => {}
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100).min(deadline - now));
     }
-
-    // Still alive -- escalate to SIGKILL
-    send_signal_group(pid, rustix::process::Signal::KILL)
-        .or_else(|_| send_signal_direct(pid, rustix::process::Signal::KILL))?;
-
-    Ok(())
 }
 
 /// Send a signal to a process group (kill(-pgid, sig)).

@@ -226,6 +226,68 @@ fn push_to_pty_session_delivers_input() {
     }
 }
 
+/// Killing a PTY session hangs up its terminal first, as closing a terminal
+/// window does, so an interactive shell's background jobs end with it. Those
+/// jobs sit in their own process groups, outside the group kill, and a shell
+/// that is SIGKILLed cannot pass a hangup on to them.
+#[test]
+fn kill_pty_shell_ends_its_background_jobs() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let pid_file = root.path().join("job.pid");
+
+    tendr(&root)
+        .args([
+            "start",
+            "pty-jobs",
+            "--pty",
+            "--stdin",
+            "--",
+            "bash",
+            "--norc",
+            "--noprofile",
+            "-i",
+        ])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-jobs");
+    harness::wait_running(&root, "pty-jobs");
+
+    tendr(&root)
+        .args(["push", "pty-jobs"])
+        .write_stdin(format!("sleep 600 & echo $! > {}\n", pid_file.display()))
+        .assert()
+        .success();
+    let job: libc::pid_t =
+        harness::poll_until(Duration::from_secs(10), Duration::from_millis(20), || {
+            match std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                Some(pid) => harness::Observation::Ready(pid),
+                None => harness::Observation::Pending(format!("no pid in {}", pid_file.display())),
+            }
+        })
+        .expect("the shell never reported its background job");
+
+    tendr(&root).args(["kill", "pty-jobs"]).assert().success();
+
+    // SAFETY: signal 0 only probes whether `job` exists.
+    let alive = || unsafe { libc::kill(job, 0) } == 0;
+    let gone = harness::poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        if alive() {
+            harness::Observation::Pending(format!("job {job} still alive"))
+        } else {
+            harness::Observation::Ready(())
+        }
+    });
+    if gone.is_err() {
+        // SAFETY: `job` is the test's own background sleep.
+        unsafe { libc::kill(job, libc::SIGKILL) };
+        panic!("background job {job} outlived `tendr kill` of its PTY shell");
+    }
+}
+
 /// Python REPL exec works on PTY sessions.
 #[test]
 fn exec_python_pty() {
