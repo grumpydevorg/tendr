@@ -41,7 +41,8 @@ Current PTY rules:
   that channel writes every effect already decided before the terminal record;
   the thread then stops, and anything sent later is dropped, so nothing
   reaches the session paths after the run releases its lock
-- `push` connects to the attach socket in push mode (`Mode::Push`), claims control
+- `push` needs no `--stdin` on a PTY session (that flag only adds the FIFO PTY
+  `exec` uses). It connects to the attach socket in push mode (`Mode::Push`), claims control
   as an agent (refused if anyone holds it, so concurrent pushes never
   interleave), streams frames written one at a time, and ends with
   `MSG_INPUT_DONE {written | revoked | closed, accepted, received}`; the CLI

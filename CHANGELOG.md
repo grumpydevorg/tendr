@@ -28,6 +28,10 @@
 - **`tendr push` to a PTY session is acknowledged.** It exits non-zero, with
   byte counts, when it is refused or its bytes are not all written; a second
   concurrent push is refused instead of interleaving. Pipe sessions are unchanged.
+- **`tendr push` to a PTY session no longer needs `--stdin`.** The push goes
+  over the session's attach socket, which every PTY session has; it used to be
+  refused with exit 1 for want of the stdin pipe it does not use. `--stdin` on a
+  PTY session now only adds the pipe PTY `exec` needs.
 - **`tendr attach` and `tendr push` to a PTY session exit 80–85 instead of 1
   when refused or cut off.** 80: the session speaks another attach protocol
   version. 81: another client holds the terminal, or took it over, or the

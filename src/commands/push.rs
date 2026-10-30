@@ -15,8 +15,10 @@ pub fn cmd_push(name: &str, namespace: &Namespace) -> anyhow::Result<()> {
 
     let meta = session::read_meta(&session)?;
 
-    // First what can never succeed, whatever the session is doing.
-    if meta.launch_spec().stdin_mode != StdinMode::Pipe {
+    // First what can never succeed, whatever the session is doing. A pipe
+    // session's push needs the stdin FIFO; a PTY push goes over the attach
+    // socket, which every PTY session has.
+    if meta.pty().is_none() && meta.launch_spec().stdin_mode != StdinMode::Pipe {
         anyhow::bail!("session was not started with --stdin");
     }
 
