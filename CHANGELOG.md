@@ -52,6 +52,12 @@
 
 ### Fixed
 
+- **Killing a PTY session ends an interactive shell's background jobs.** A job
+  started with `&` sits in its own process group, outside the group kill, and
+  an interactive shell ignores SIGTERM, so it was SIGKILLed without passing a
+  hangup on and its jobs kept running. `kill` now sends a PTY session SIGHUP
+  first and gives it up to a second, as when a terminal window closes.
+  `kill --force` and `--timeout`, which send SIGKILL at once, are unchanged.
 - **`tendr attach` detaches when the session's program changes the keyboard
   encoding.** A child that enables the kitty keyboard protocol (as Claude Code
   can in Ghostty, kitty, WezTerm and foot) or xterm's `modifyOtherKeys` makes the

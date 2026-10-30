@@ -41,11 +41,13 @@ impl SupervisedChild {
 }
 
 /// Lightweight kill handle for Unix. Carries the ProcessIdentity
-/// needed for identity-verified group kill. Send + Clone so it can
-/// be moved to a timeout thread.
+/// needed for identity-verified group kill, and whether the child leads a
+/// PTY session, whose graceful stop starts with a hangup. Send + Clone so it
+/// can be moved to a timeout thread.
 #[derive(Clone)]
 pub struct ChildKillHandle {
     identity: ProcessIdentity,
+    is_pty: bool,
 }
 
 impl Platform for UnixPlatform {
@@ -310,15 +312,18 @@ impl Platform for UnixPlatform {
     fn child_kill_handle(child: &SupervisedChild) -> ChildKillHandle {
         ChildKillHandle {
             identity: child.identity,
+            is_pty: child.is_pty,
         }
     }
 
     fn kill_child(handle: &ChildKillHandle, force: bool) -> io::Result<()> {
-        kill_process(&handle.identity, force)
+        kill_process(&handle.identity, force, handle.is_pty)
     }
 
     fn kill_orphan(id: &ProcessIdentity, force: bool) -> io::Result<()> {
-        kill_process(id, force)
+        // Without its sidecar an orphan's terminal is usually already closed,
+        // so the kernel has delivered whatever hangup it was going to.
+        kill_process(id, force, false)
     }
 
     fn self_identity() -> io::Result<ProcessIdentity> {
@@ -666,11 +671,19 @@ fn process_status(id: &ProcessIdentity) -> ProcessStatus {
     }
 }
 
-/// Kill a process. Sends SIGTERM first, waits briefly, then SIGKILL.
+/// How long a PTY child gets to act on its hangup before SIGTERM. A shell
+/// passes the hangup on to its jobs as it exits; a SIGTERM that ended it first
+/// would leave them running.
+const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Kill a process. Sends SIGTERM first, waits briefly, then SIGKILL. A PTY
+/// session leader (`hang_up_first`) gets SIGHUP before that, as when its
+/// terminal window closes, so an interactive shell hangs up its jobs, which
+/// sit in their own process groups outside the group kill.
 /// Tries process group kill first (kill(-pgid)), falls back to direct kill.
 /// Verifies process identity before signaling to prevent killing recycled PIDs.
 /// Returns Ok(()) if the process is already dead (idempotent).
-fn kill_process(id: &ProcessIdentity, force: bool) -> io::Result<()> {
+fn kill_process(id: &ProcessIdentity, force: bool, hang_up_first: bool) -> io::Result<()> {
     match process_status(id) {
         ProcessStatus::Missing => return Ok(()),
         ProcessStatus::IdentityMismatch => {
@@ -691,34 +704,63 @@ fn kill_process(id: &ProcessIdentity, force: bool) -> io::Result<()> {
     }
 
     let pid = id.pid.get() as i32;
-    let signal = if force {
-        rustix::process::Signal::KILL
-    } else {
-        rustix::process::Signal::TERM
-    };
-
     // Try process group first (kills descendants), fall back to direct
-    send_signal_group(pid, signal).or_else(|_| send_signal_direct(pid, signal))?;
+    let signal_tree =
+        |signal| send_signal_group(pid, signal).or_else(|_| send_signal_direct(pid, signal));
 
     if force {
+        return signal_tree(rustix::process::Signal::KILL);
+    }
+
+    if hang_up_first {
+        signal_tree(rustix::process::Signal::HUP)?;
+        match wait_for_exit(id, HANGUP_GRACE) {
+            Some(ProcessStatus::Missing) => {
+                // The group outlives its leader while members remain, and one
+                // that ignores the hangup must still be stopped. Only the
+                // group: the leader's own PID may already belong to another
+                // process. The result is ignored: with the leader gone,
+                // ESRCH means the group is empty, and EPERM that its members
+                // are all unreaped zombies (macOS refuses such a group,
+                // including the leader until its parent reaps it).
+                let _ = send_signal_group(pid, rustix::process::Signal::TERM);
+                return Ok(());
+            }
+            // The leader's PID belongs to another process, so its group,
+            // which held that number, has no members left.
+            Some(_) => return Ok(()),
+            None => {}
+        }
+    }
+
+    signal_tree(rustix::process::Signal::TERM)?;
+
+    // Wait up to 5 seconds for graceful exit
+    if wait_for_exit(id, std::time::Duration::from_secs(5)).is_some() {
         return Ok(());
     }
 
-    // Wait up to 5 seconds for graceful exit
-    for _ in 0..50 {
-        match process_status(id) {
-            ProcessStatus::Missing => return Ok(()),
-            ProcessStatus::IdentityMismatch => return Ok(()), // recycled = original is dead
-            _ => {}
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
     // Still alive -- escalate to SIGKILL
-    send_signal_group(pid, rustix::process::Signal::KILL)
-        .or_else(|_| send_signal_direct(pid, rustix::process::Signal::KILL))?;
+    signal_tree(rustix::process::Signal::KILL)
+}
 
-    Ok(())
+/// Poll until `id` has exited or `within` passes. Returns how it ended:
+/// `Missing`, or `IdentityMismatch` (its PID recycled, so the original is
+/// dead); `None` if it is still alive.
+fn wait_for_exit(id: &ProcessIdentity, within: std::time::Duration) -> Option<ProcessStatus> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let status @ (ProcessStatus::Missing | ProcessStatus::IdentityMismatch) =
+            process_status(id)
+        {
+            return Some(status);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100).min(deadline - now));
+    }
 }
 
 /// Send a signal to a process group (kill(-pgid, sig)).
@@ -1095,5 +1137,41 @@ mod tests {
         // Clean up
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// A PTY leader that exits on its hangup stays a zombie until its parent
+    /// reaps it, and macOS refuses a signal to a group of zombies with EPERM.
+    /// The kill still succeeds: there is nothing left in the group to stop.
+    /// macOS only: elsewhere a zombie still reads as alive, so the kill takes
+    /// the SIGTERM/SIGKILL path and never reaches the zombie group.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hang_up_kill_of_a_leader_left_unreaped_succeeds() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: pre_exec runs after fork() in the child, before exec().
+        // setsid is async-signal-safe. No shared mutable state is accessed.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let identity = capture_spawned_identity(child.id()).unwrap();
+
+        // `sleep` dies on SIGHUP; nothing reaps it until the end of the test.
+        let result = kill_process(&identity, false, true);
+        let _ = child.kill();
+        let _ = child.wait();
+        result.expect("killing a leader that exited on its hangup");
     }
 }
