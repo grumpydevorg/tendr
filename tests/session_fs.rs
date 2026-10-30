@@ -8,6 +8,18 @@ use tendr::model::spec::LaunchSpec;
 use tendr::session::LockGuard;
 use tendr::session::{self, SessionError, SessionRoot};
 
+/// Held by the test that spawns a process and by the tests that release a
+/// lock and expect it free at once. A child being spawned holds a copy of
+/// every descriptor the test process has open until it execs, so a lock
+/// released on another test thread meanwhile stays held for that moment.
+/// Tendr itself always polls for a release; only these tests assume an
+/// instant one.
+static SPAWN_VS_RELEASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_VS_RELEASE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn tmp_root() -> (TempDir, SessionRoot) {
     let dir = TempDir::new().unwrap();
     let root = SessionRoot::new(dir.path().to_path_buf());
@@ -241,6 +253,7 @@ fn lock_exclusivity_across_try_acquire() {
 #[cfg(unix)]
 #[test]
 fn lock_released_on_drop() {
+    let _serial = serial();
     let (_dir, root) = tmp_root();
     let name = SessionName::new("upload").unwrap();
     let session = session::create(&root, &default_ns(), &name).unwrap();
@@ -257,6 +270,7 @@ fn lock_released_on_drop() {
 fn lock_exclusivity_across_processes() {
     use std::process::Command;
 
+    let _serial = serial();
     let (_dir, root) = tmp_root();
     let name = SessionName::new("upload").unwrap();
     let session = session::create(&root, &default_ns(), &name).unwrap();
@@ -305,6 +319,7 @@ fn lock_exclusivity_across_processes() {
 /// once it is released (#91).
 #[test]
 fn wait_unlocked_waits_for_the_lock_to_be_released() {
+    let _serial = serial();
     let (_dir, root) = tmp_root();
     let name = SessionName::new("unlock").unwrap();
     let session = session::create(&root, &default_ns(), &name).unwrap();

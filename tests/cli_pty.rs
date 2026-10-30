@@ -1804,10 +1804,18 @@ fn takeover_retires_the_previous_human_and_rejects_its_later_input() {
     let log = wait_log_contains(&root, "pty-takeover", "new-owns-now");
     assert!(!log.contains("old-after-rt"), "log: {log}");
 
-    let takeover_event = harness::read_events(&root, "pty-takeover")
-        .into_iter()
-        .find(|e| e["kind"] == "pty.control_changed" && e["data"]["trigger"] == "takeover");
-    assert!(takeover_event.is_some(), "takeover is recorded as a fact");
+    // Control changes reach events.jsonl through the run's effects thread,
+    // not the output path, so the new owner's output can be logged first.
+    harness::poll_until(Duration::from_secs(10), Duration::from_millis(10), || {
+        let takeover = harness::read_events(&root, "pty-takeover")
+            .into_iter()
+            .find(|e| e["kind"] == "pty.control_changed" && e["data"]["trigger"] == "takeover");
+        match takeover {
+            Some(event) => harness::Observation::Ready(event),
+            None => harness::Observation::Pending("no takeover control_changed event yet".into()),
+        }
+    })
+    .expect("takeover is recorded as a fact");
 
     drop(new);
 }
