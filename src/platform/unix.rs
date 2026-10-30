@@ -718,7 +718,14 @@ fn kill_process(id: &ProcessIdentity, force: bool, hang_up_first: bool) -> io::R
             // The group outlives its leader while members remain, and one
             // that ignores the hangup must still be stopped. Only the group:
             // the leader's own PID may already belong to another process.
-            return send_signal_group(pid, rustix::process::Signal::TERM);
+            // macOS refuses a group whose members are all unreaped zombies
+            // (the leader itself, until its parent reaps it) with EPERM, and
+            // a group id reused by another user's processes is EPERM too:
+            // either way there is nothing left here to stop.
+            return match send_signal_group(pid, rustix::process::Signal::TERM) {
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => Ok(()),
+                other => other,
+            };
         }
     }
 
@@ -1124,5 +1131,38 @@ mod tests {
         // Clean up
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// A PTY leader that exits on its hangup stays a zombie until its parent
+    /// reaps it, and macOS refuses a signal to a group of zombies with EPERM.
+    /// The kill still succeeds: there is nothing left in the group to stop.
+    #[test]
+    fn hang_up_kill_of_a_leader_left_unreaped_succeeds() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: pre_exec runs after fork() in the child, before exec().
+        // setsid is async-signal-safe. No shared mutable state is accessed.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let identity = capture_spawned_identity(child.id()).unwrap();
+
+        // `sleep` dies on SIGHUP; nothing reaps it until the end of the test.
+        let result = kill_process(&identity, false, true);
+        let _ = child.kill();
+        let _ = child.wait();
+        result.expect("killing a leader that exited on its hangup");
     }
 }
