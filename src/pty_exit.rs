@@ -7,8 +7,10 @@
 //! `exec`, `events`, …) are unchanged. The command-scoped table is in
 //! `docs/guide.md` ("Exit codes").
 //!
-//! 82 (deadline exceeded) and 83 (missing or incompatible screen extension) are
-//! reserved in the same range and not used yet.
+//! 82 (deadline exceeded) is used outside this module by the `--host` connect
+//! deadline (`ssh::SshError::ConnectDeadline`); a remote command's own 82
+//! passes through `--host` unchanged, so the stderr message tells them apart.
+//! 83 (missing or incompatible screen extension) is reserved and not used yet.
 
 use std::io;
 

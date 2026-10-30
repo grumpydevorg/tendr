@@ -299,6 +299,21 @@ This is the workflow behind "leave long-running work on a remote box and come
 back to it": start it under `--host`, disconnect, and reconnect later to `log`,
 `status`, `wait`, or `exec` against the same live session.
 
+Every `--host` call except `attach` has a **connect deadline**: if `ssh` has not
+authenticated and started the remote `tendr` within 30 s, it is stopped and the
+call exits `82`, naming the host. That turns a silent stall (a lapsed Tailscale
+SSH check-mode approval waits about 30 minutes with no prompt) into an error an
+agent can act on: stop, get the approval, retry. Once the remote `tendr` has
+started, the call runs as long as it needs, so `wait --timeout 3600` and
+`log -f` are unaffected. Change the limit with `TENDR_SSH_CONNECT_TIMEOUT`
+(seconds; `0` turns it off). The deadline needs the remote `tendr` to be this
+version or newer: an older one rejects the `--hello` the call carries, and the
+error says to upgrade it. With `TENDR_SSH_CONNECT_TIMEOUT=0` the call sends no
+`--hello` and reaches an older remote as before. Time spent answering an `ssh`
+prompt (passphrase, unknown host key) counts against the deadline. If the stop
+lands while `ssh` is still authenticating, a `ProxyCommand` that ignores its
+input can be left running.
+
 On Windows hosts, the default ssh shell only matters when you write your own
 `ssh host 'tendr ...'` wrapper. `tendr --host ... exec ...` uses a constant
 remote argv (`tendr exec --frame-from-stdin`) and sends the payload over stdin,
@@ -491,6 +506,7 @@ command exits 0 on success and 1 on an error without a code of its own below
 | any | 2 | Usage error from argument parsing |
 | any, with `--host` | 2 | Invalid destination, or a local-only command (printed with an `ssh` fallback) |
 | any, with `--host` | the remote's | The remote `tendr`'s exit code; 255 is `ssh` failing to connect |
+| any, with `--host` except `attach` | 82 | `ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s) |
 | `start` | 2, 5 | The child failed to spawn; the sidecar failed |
 | `run` | the child's | The child's own code, or 2 spawn failed, 3 sidecar lost, 4 dependency failed, 5 sidecar failed, 124 timed out, 137 killed |
 | `wait` | 1 | `--timeout` passed before the sessions ended |

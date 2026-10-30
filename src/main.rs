@@ -66,6 +66,12 @@ struct Cli {
     #[arg(long, global = true, allow_hyphen_values = true)]
     host: Option<String>,
 
+    /// Write `tendr::ssh::HELLO_LINE` to stderr before anything else. A local
+    /// `--host` call passes it to the remote tendr: its arrival proves ssh got
+    /// through authentication, which ends the connect deadline.
+    #[arg(long, global = true, hide = true)]
+    hello: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -916,6 +922,9 @@ fn parse_optional_namespace(namespace: Option<String>) -> anyhow::Result<Option<
 
 fn main() {
     let cli = Cli::parse();
+    if cli.hello {
+        eprintln!("{}", tendr::ssh::HELLO_LINE);
+    }
 
     // If --host is set, dispatch to SSH transport.
     if let Some(ref host) = cli.host {
@@ -951,11 +960,11 @@ fn main() {
                 }
                 .to_json()
             });
-            match tendr::ssh::exec_ssh_frame(host, frame.as_deref()) {
+            match tendr::ssh::exec_ssh_frame(host, frame) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("{e}");
-                    std::process::exit(1);
+                    std::process::exit(e.exit_code());
                 }
             }
         }
@@ -992,7 +1001,7 @@ fn main() {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("{e}");
-                std::process::exit(1);
+                std::process::exit(e.exit_code());
             }
         }
     }

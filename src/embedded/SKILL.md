@@ -11,6 +11,7 @@ Before first use:
 - `tendr exec` takes argv, not a shell string. Use `-- bash -c '...'` for multi-step shell logic.
 - Check `exit_code` / process status, not just stdout text.
 - Use one in-flight `exec` per session.
+- A `--host` call that exits 82 with "did not reach the remote tendr" most likely never ran remotely (SSH auth stalled, e.g. a lapsed Tailscale SSH approval). Stop and get a human to approve or fix SSH; do not retry in a loop, and check `status` before re-running a `start`.
 
 For current, version-matched usage, run:
 

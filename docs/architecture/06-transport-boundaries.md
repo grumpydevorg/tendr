@@ -52,6 +52,20 @@ Boundary inventory:
 - SSH transport:
   - forwards only an allowlisted subset of commands today
   - does not invent a separate event model or remote session store
+  - connect deadline (`src/ssh.rs`): every call except `attach` runs the remote
+    as `tendr --hello …`, whose first stderr line is `ssh::HELLO_LINE`. The
+    local end reads stderr, drops the hello, and passes the rest through. ssh's
+    `ConnectTimeout` ends at key exchange; authentication can then stall (a
+    lapsed Tailscale SSH check-mode approval waits about 30 minutes, silently),
+    so if the hello has not arrived within `TENDR_SSH_CONNECT_TIMEOUT` seconds
+    (default 30) ssh gets SIGTERM, then SIGKILL a second later, and the call
+    exits 82. After the hello there is no deadline, so `wait` and `log -f` run
+    as long as they need. The marker comes from the remote tendr, not from
+    ssh's log, which ControlMaster reuse and OpenSSH versions make unreliable.
+    `attach` gets none: its stderr shares the terminal. `0` sends no `--hello`
+    and leaves stderr inherited, which is how an older remote is reached.
+    Stdout stays inherited while a thread relays stderr, so the order between
+    the two streams is not exact; each stream's own order is kept
 
 What stays in-process:
 

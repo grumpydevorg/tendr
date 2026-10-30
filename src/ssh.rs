@@ -9,6 +9,12 @@
 
 use std::io;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// The first stderr line of a remote `tendr --hello …`: proof that ssh got
+/// through authentication and started the remote tendr.
+pub const HELLO_LINE: &str = "tendr-hello 1";
 
 /// Errors from the SSH transport layer.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +37,27 @@ pub enum SshError {
     /// local command execution. Rejected before ssh is ever spawned.
     #[error("invalid --host destination {0:?}: must not be empty or begin with '-'")]
     InvalidDestination(String),
+
+    /// ssh did not get through authentication and start the remote tendr
+    /// (no [`HELLO_LINE`]) within the connect deadline, and was killed.
+    #[error(
+        "ssh to {host} did not reach the remote tendr within {seconds} s and was \
+         stopped: authentication stalled (a Tailscale SSH check-mode approval may \
+         have lapsed: approve it in the browser, then retry) or the host is slow \
+         to start tendr. Set TENDR_SSH_CONNECT_TIMEOUT to change the limit (0 for none)."
+    )]
+    ConnectDeadline { host: String, seconds: f64 },
+}
+
+impl SshError {
+    /// The CLI exit code: 82 (operation deadline exceeded, as for PTY
+    /// operations) for a missed connect deadline, 1 otherwise.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::ConnectDeadline { .. } => 82,
+            _ => 1,
+        }
+    }
 }
 
 /// Commands whose argv is forwarded verbatim over SSH transport.
@@ -79,11 +106,14 @@ pub fn validate_destination(host: &str) -> Result<(), SshError> {
 /// The resulting local argv is:
 ///
 /// ```text
-/// ssh -T -o ConnectTimeout=10 <host> tendr 'arg1' 'arg2' ...
+/// ssh -T -o ConnectTimeout=10 <host> tendr --hello 'arg1' 'arg2' ...
 /// ```
 ///
 /// SSH concatenates "tendr", "'arg1'", "'arg2'" with spaces and sends
 /// the result to the remote login shell, which re-splits it into argv.
+/// `--hello` asks the remote tendr to announce itself on stderr first
+/// ([`HELLO_LINE`]), which ends the connect deadline. An `attach` (with a
+/// TTY, `allocate_tty`) has no hello: its stderr shares the terminal.
 ///
 /// No `--` separator is used between the host and the remote command.
 /// SSH does not treat `--` as an option terminator — it would be sent
@@ -109,14 +139,30 @@ pub fn build_ssh_command(
     // quoted for the remote shell. SSH concatenates all args after the
     // host with spaces to form the remote command string.
     cmd.arg("tendr");
+    let hello = sends_hello(allocate_tty);
+    if hello {
+        cmd.arg("--hello");
+    }
     for arg in tendr_args {
         cmd.arg(shell_words::quote(arg).into_owned());
     }
 
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(if hello {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
     Ok(cmd)
+}
+
+/// Whether a call carries `--hello` and so runs under the connect deadline:
+/// not for `attach` (its stderr shares the TTY), and not with the deadline
+/// off (`TENDR_SSH_CONNECT_TIMEOUT=0`), which is how an older remote tendr
+/// that does not know `--hello` is still reached.
+fn sends_hello(allocate_tty: bool) -> bool {
+    !allocate_tty && connect_deadline().is_some()
 }
 
 /// Execute a remote tendr command via SSH, streaming stdout/stderr
@@ -124,19 +170,18 @@ pub fn build_ssh_command(
 ///
 /// Returns the remote tendr exit code on success.
 /// Returns `SshError::TransportFailed` for SSH connection failures (exit 255),
+/// `SshError::ConnectDeadline` if the remote tendr never said hello in time,
 /// or `SshError::InvalidDestination` for an option-shaped/empty host.
 pub fn exec_ssh(host: &str, tendr_args: &[String], allocate_tty: bool) -> Result<i32, SshError> {
     let mut child = build_ssh_command(host, tendr_args, allocate_tty)?
         .spawn()
         .map_err(SshError::SpawnFailed)?;
 
-    let status = child.wait().map_err(SshError::SpawnFailed)?;
-
-    match status.code() {
-        Some(255) => Err(SshError::TransportFailed),
-        Some(code) => Ok(code),
-        None => Err(SshError::Abnormal),
-    }
+    let status = match connect_deadline().filter(|_| sends_hello(allocate_tty)) {
+        Some(deadline) => wait_after_hello(host, &mut child, deadline)?,
+        None => child.wait().map_err(SshError::SpawnFailed)?,
+    };
+    exit_code(status)
 }
 
 /// The remote argv for frame-transport exec — constant by construction:
@@ -145,23 +190,24 @@ pub fn exec_ssh(host: &str, tendr_args: &[String], allocate_tty: bool) -> Result
 /// itself travels on the SSH stdin channel as opaque bytes.
 fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Command, SshError> {
     validate_destination(host)?;
+    let hello = sends_hello(false);
     let mut cmd = Command::new("ssh");
-    cmd.args([
-        "-T",
-        "-o",
-        "ConnectTimeout=10",
-        host,
-        "tendr",
-        "exec",
-        "--frame-from-stdin",
-    ]);
+    cmd.args(["-T", "-o", "ConnectTimeout=10", host, "tendr"]);
+    if hello {
+        cmd.arg("--hello");
+    }
+    cmd.args(["exec", "--frame-from-stdin"]);
     cmd.stdin(if inherit_stdin {
         Stdio::inherit()
     } else {
         Stdio::piped()
     })
     .stdout(Stdio::inherit())
-    .stderr(Stdio::inherit());
+    .stderr(if hello {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    });
     Ok(cmd)
 }
 
@@ -177,30 +223,224 @@ fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Comma
 /// # Errors
 /// `SshError::TransportFailed` on ssh exit 255 (which shadows a remote
 /// command genuinely exiting 255 — an inherent ssh limitation),
-/// `SshError::SpawnFailed`/`Abnormal` as for `exec_ssh`.
-pub fn exec_ssh_frame(host: &str, frame: Option<&[u8]>) -> Result<i32, SshError> {
+/// `SshError::ConnectDeadline`, `SshError::SpawnFailed`/`Abnormal` as for
+/// `exec_ssh`.
+pub fn exec_ssh_frame(host: &str, frame: Option<Vec<u8>>) -> Result<i32, SshError> {
     let mut child = build_ssh_exec_frame_command(host, frame.is_none())?
         .spawn()
         .map_err(SshError::SpawnFailed)?;
 
-    // Nested rather than a let-chain: let-chains are stable from 1.88, and the
-    // crate advertises rust-version 1.85. Published releases carry that promise
-    // and `cargo install tendr` is a documented path, so the syntax gives
-    // way, not the contract.
-    if let Some(bytes) = frame {
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(bytes);
-            // Dropping stdin closes the channel — the remote sees EOF.
-        }
-    }
+    // The frame is written on its own thread: a remote that is still
+    // authenticating does not read it, and a large frame would block the
+    // write, and with it the connect deadline, on a full pipe. Once ssh is
+    // gone the write fails with EPIPE, so the join never hangs.
+    let writer = frame.and_then(|bytes| {
+        child.stdin.take().map(|mut stdin| {
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = stdin.write_all(&bytes);
+                // Dropping stdin closes the channel — the remote sees EOF.
+            })
+        })
+    });
 
-    let status = child.wait().map_err(SshError::SpawnFailed)?;
+    let status = match connect_deadline().filter(|_| sends_hello(false)) {
+        Some(deadline) => wait_after_hello(host, &mut child, deadline)?,
+        None => child.wait().map_err(SshError::SpawnFailed)?,
+    };
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    exit_code(status)
+}
+
+fn exit_code(status: std::process::ExitStatus) -> Result<i32, SshError> {
     match status.code() {
         Some(255) => Err(SshError::TransportFailed),
         Some(code) => Ok(code),
         None => Err(SshError::Abnormal),
     }
+}
+
+/// The default time for ssh to get through authentication and start the
+/// remote tendr.
+const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The connect deadline: `TENDR_SSH_CONNECT_TIMEOUT` seconds, `0` (or less)
+/// for none, otherwise [`DEFAULT_CONNECT_DEADLINE`]. A value that does not
+/// parse, or is too large to represent, is the default.
+fn connect_deadline() -> Option<Duration> {
+    match std::env::var("TENDR_SSH_CONNECT_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(secs) if secs <= 0.0 => None,
+        Some(secs) => Some(Duration::try_from_secs_f64(secs).unwrap_or(DEFAULT_CONNECT_DEADLINE)),
+        None => Some(DEFAULT_CONNECT_DEADLINE),
+    }
+}
+
+/// Wait for `child` (an ssh to a remote `tendr --hello …`) to exit, stopping
+/// it if the remote tendr has not said hello within `deadline`.
+///
+/// ssh's own `ConnectTimeout` ends at key exchange; authentication can then
+/// stall indefinitely (a lapsed Tailscale SSH check-mode approval waits about
+/// 30 minutes, silently). The hello is the remote tendr's first stderr line,
+/// so it arrives only once ssh is through. After it, the call may run as long
+/// as it needs (`wait`, `log -f`). Everything on stderr except the hello is
+/// passed through in order; stdout stays inherited, so the order *between*
+/// the two streams is no longer exact.
+///
+/// Time a human spends at an ssh prompt (passphrase, host key) counts against
+/// the deadline: those prompts use the terminal, not stderr.
+fn wait_after_hello(
+    host: &str,
+    child: &mut std::process::Child,
+    deadline: Duration,
+) -> Result<std::process::ExitStatus, SshError> {
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr is piped for a --hello call");
+    let (events_tx, events) = mpsc::channel();
+    std::thread::spawn(move || relay_stderr(stderr, events_tx));
+
+    let started = Instant::now();
+    let mut hello = false;
+    let mut old_tendr = None;
+    loop {
+        // Only the hello proves ssh got through. An end of stream before it
+        // proves nothing: a process can close its stderr and keep running.
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Relay::Hello => hello = true,
+                Relay::Done { old_tendr: seen } => old_tendr = Some(seen),
+            }
+        }
+        if let Some(status) = child.try_wait().map_err(SshError::SpawnFailed)? {
+            // The relay reads stderr to its end, so it waits for every holder
+            // of it, not just ssh. After the hello that is the command's own
+            // output, kept as long as it lasts (a ProxyCommand that ignores
+            // ssh's SIGHUP holds the call open, as it held the terminal
+            // before). Without a hello, a leftover holder must not hold the
+            // call open: wait briefly for the rest, then report the status.
+            if old_tendr.is_none() {
+                old_tendr = if hello {
+                    wait_relay(&events, None)
+                } else {
+                    wait_relay(&events, Some(Duration::from_secs(1)))
+                };
+            }
+            if old_tendr == Some(true) {
+                eprintln!(
+                    "tendr on {host} does not know --hello, so it predates the \
+                     connect deadline: upgrade tendr on {host}, or set \
+                     TENDR_SSH_CONNECT_TIMEOUT=0 to reach it without one"
+                );
+            }
+            return Ok(status);
+        }
+        if !hello && started.elapsed() >= deadline {
+            stop(child);
+            // The relay is not waited for: a lingering ProxyCommand may hold
+            // stderr open, and only an unfinished pre-hello line is lost.
+            return Err(SshError::ConnectDeadline {
+                host: host.to_owned(),
+                seconds: deadline.as_secs_f64(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What the stderr relay reports.
+enum Relay {
+    /// The remote tendr's hello arrived.
+    Hello,
+    /// Stderr ended; whether the remote rejected `--hello` (a tendr too old
+    /// to know it).
+    Done { old_tendr: bool },
+}
+
+/// Wait for the relay to finish, at most `limit` (forever with `None`).
+/// Returns its verdict on an old remote tendr, or `None` if it did not finish.
+fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option<bool> {
+    let until = limit.map(|limit| Instant::now() + limit);
+    loop {
+        let event = match until {
+            None => events.recv().ok()?,
+            Some(until) => events
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .ok()?,
+        };
+        if let Relay::Done { old_tendr } = event {
+            return Some(old_tendr);
+        }
+    }
+}
+
+/// Stop an ssh that missed the connect deadline: SIGTERM first, so ssh can
+/// restore a terminal it left mid-prompt and hang up its ProxyCommand, then
+/// SIGKILL if it is still there after a second.
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // SAFETY: `pid` is our own unreaped child, so it cannot have been
+            // reused; SIGTERM has no memory-safety implications.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let until = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < until {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Copy a `--hello` call's stderr to ours, dropping the hello and reporting
+/// it. The hello ends a line but need not start one: anything a login shell's
+/// rc file wrote without a newline just before tendr ran is glued in front,
+/// and is passed through. Reports [`Relay::Done`] when stderr ends.
+fn relay_stderr(stderr: std::process::ChildStderr, events: mpsc::Sender<Relay>) {
+    use std::io::{BufRead, Write};
+
+    let mut reader = io::BufReader::new(stderr);
+    let mut out = io::stderr();
+    let mut old_tendr = false;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => {
+                let _ = events.send(Relay::Done { old_tendr });
+                return;
+            }
+            Ok(_) => {}
+        }
+        let body = line.trim_ascii_end();
+        if body.ends_with(HELLO_LINE.as_bytes()) {
+            let prefix = &body[..body.len() - HELLO_LINE.len()];
+            if !prefix.is_empty() {
+                let _ = out.write_all(prefix);
+                let _ = out.write_all(b"\n");
+            }
+            let _ = events.send(Relay::Hello);
+            break;
+        }
+        old_tendr |= String::from_utf8_lossy(&line).contains("'--hello'");
+        let _ = out.write_all(&line);
+    }
+    // After the hello the stream is the command's own: copy it as it comes.
+    {
+        let mut out = out.lock();
+        let _ = io::copy(&mut reader, &mut out);
+    }
+    let _ = events.send(Relay::Done { old_tendr });
 }
 
 #[cfg(test)]
@@ -223,6 +463,7 @@ mod tests {
                 "ConnectTimeout=10",
                 "user@box",
                 "tendr",
+                "--hello",
                 "exec",
                 "--frame-from-stdin"
             ]
@@ -296,8 +537,9 @@ mod tests {
         assert_eq!(args[2], "ConnectTimeout=10");
         assert_eq!(args[3], "user@box");
         assert_eq!(args[4], "tendr");
-        assert_eq!(args[5], "status");
-        assert_eq!(args[6], "my-session");
+        assert_eq!(args[5], "--hello");
+        assert_eq!(args[6], "status");
+        assert_eq!(args[7], "my-session");
         assert!(
             !args.contains(&"--".to_string()),
             "no -- in ssh argv: {args:?}"
@@ -323,7 +565,15 @@ mod tests {
         let parsed = shell_words::split(&remote_cmd).unwrap();
         assert_eq!(
             parsed,
-            vec!["tendr", "start", "job", "--", "echo", "hello world"]
+            vec![
+                "tendr",
+                "--hello",
+                "start",
+                "job",
+                "--",
+                "echo",
+                "hello world"
+            ]
         );
     }
 
@@ -345,7 +595,7 @@ mod tests {
         let remote_args = &argv[4..];
         let remote_cmd = remote_args.join(" ");
         let parsed = shell_words::split(&remote_cmd).unwrap();
-        assert_eq!(parsed[6], "echo $HOME && ls");
+        assert_eq!(parsed[7], "echo $HOME && ls");
     }
 
     #[test]
