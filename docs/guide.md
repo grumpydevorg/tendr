@@ -173,7 +173,8 @@ knowing:
 ## Answer prompts and attach
 
 - **`tendr push <name>`** feeds stdin to a session waiting on an interactive
-  prompt: `printf 'y\n' | tendr push dev`.
+  prompt: `printf 'y\n' | tendr push dev`. A pipe session needs `--stdin` for
+  this; a `--pty` session takes pushes without it.
 - **`tendr attach <name>`** connects your terminal to the live session for
   hands-on interaction. Press **`Ctrl-\` then `d`** to detach; the session keeps
   running. `Ctrl-\` twice sends one `Ctrl-\`, and `Ctrl-\` followed by any other
