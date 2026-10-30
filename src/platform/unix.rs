@@ -321,8 +321,8 @@ impl Platform for UnixPlatform {
     }
 
     fn kill_orphan(id: &ProcessIdentity, force: bool) -> io::Result<()> {
-        // Without its sidecar an orphan's terminal is already closed, so the
-        // kernel has delivered whatever hangup it was going to.
+        // Without its sidecar an orphan's terminal is usually already closed,
+        // so the kernel has delivered whatever hangup it was going to.
         kill_process(id, force, false)
     }
 
@@ -714,25 +714,29 @@ fn kill_process(id: &ProcessIdentity, force: bool, hang_up_first: bool) -> io::R
 
     if hang_up_first {
         signal_tree(rustix::process::Signal::HUP)?;
-        if wait_for_exit(id, HANGUP_GRACE) {
-            // The group outlives its leader while members remain, and one
-            // that ignores the hangup must still be stopped. Only the group:
-            // the leader's own PID may already belong to another process.
-            // macOS refuses a group whose members are all unreaped zombies
-            // (the leader itself, until its parent reaps it) with EPERM, and
-            // a group id reused by another user's processes is EPERM too:
-            // either way there is nothing left here to stop.
-            return match send_signal_group(pid, rustix::process::Signal::TERM) {
-                Err(e) if e.raw_os_error() == Some(libc::EPERM) => Ok(()),
-                other => other,
-            };
+        match wait_for_exit(id, HANGUP_GRACE) {
+            Some(ProcessStatus::Missing) => {
+                // The group outlives its leader while members remain, and one
+                // that ignores the hangup must still be stopped. Only the
+                // group: the leader's own PID may already belong to another
+                // process. The result is ignored: with the leader gone,
+                // ESRCH means the group is empty, and EPERM that its members
+                // are all unreaped zombies (macOS refuses such a group,
+                // including the leader until its parent reaps it).
+                let _ = send_signal_group(pid, rustix::process::Signal::TERM);
+                return Ok(());
+            }
+            // The leader's PID belongs to another process, so its group,
+            // which held that number, has no members left.
+            Some(_) => return Ok(()),
+            None => {}
         }
     }
 
     signal_tree(rustix::process::Signal::TERM)?;
 
     // Wait up to 5 seconds for graceful exit
-    if wait_for_exit(id, std::time::Duration::from_secs(5)) {
+    if wait_for_exit(id, std::time::Duration::from_secs(5)).is_some() {
         return Ok(());
     }
 
@@ -740,18 +744,20 @@ fn kill_process(id: &ProcessIdentity, force: bool, hang_up_first: bool) -> io::R
     signal_tree(rustix::process::Signal::KILL)
 }
 
-/// Poll until `id` has exited or `within` passes; true if it exited.
-fn wait_for_exit(id: &ProcessIdentity, within: std::time::Duration) -> bool {
+/// Poll until `id` has exited or `within` passes. Returns how it ended:
+/// `Missing`, or `IdentityMismatch` (its PID recycled, so the original is
+/// dead); `None` if it is still alive.
+fn wait_for_exit(id: &ProcessIdentity, within: std::time::Duration) -> Option<ProcessStatus> {
     let deadline = std::time::Instant::now() + within;
     loop {
-        match process_status(id) {
-            // A recycled PID means the original is dead.
-            ProcessStatus::Missing | ProcessStatus::IdentityMismatch => return true,
-            _ => {}
+        if let status @ (ProcessStatus::Missing | ProcessStatus::IdentityMismatch) =
+            process_status(id)
+        {
+            return Some(status);
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            return false;
+            return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(100).min(deadline - now));
     }
@@ -1136,6 +1142,9 @@ mod tests {
     /// A PTY leader that exits on its hangup stays a zombie until its parent
     /// reaps it, and macOS refuses a signal to a group of zombies with EPERM.
     /// The kill still succeeds: there is nothing left in the group to stop.
+    /// macOS only: elsewhere a zombie still reads as alive, so the kill takes
+    /// the SIGTERM/SIGKILL path and never reaches the zombie group.
+    #[cfg(target_os = "macos")]
     #[test]
     fn hang_up_kill_of_a_leader_left_unreaped_succeeds() {
         use std::os::unix::process::CommandExt;
