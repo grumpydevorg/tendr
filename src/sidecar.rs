@@ -2452,14 +2452,14 @@ impl PtyRecordingRun {
 fn start_pty_recording(
     session_dir: &Path,
     run_id: RunId,
-    child_env: &std::collections::BTreeMap<String, String>,
+    launch_env: &std::collections::BTreeMap<String, String>,
     limits: crate::recorder::RecorderLimits,
     effects: std::sync::mpsc::Sender<RunEffect>,
 ) -> PtyRecordingRun {
     use crate::recording::{Geometry, SegmentHeader, Sequence, TermName};
 
     let dir = format!("recording/{run_id}");
-    let term = TermName::new(pty_term(child_env))
+    let term = TermName::new(pty_term(launch_env))
         .unwrap_or_else(|_| TermName::new("").expect("an empty TERM is recordable"));
     let origin_unix_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

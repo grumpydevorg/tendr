@@ -92,7 +92,13 @@ fn pty_child_term(
     harness::wait_terminal(root, session);
     let log = wait_output_contains(root, session, "TERM=[");
     let start = log.find("TERM=[").unwrap() + "TERM=[".len();
-    log[start..].split(']').next().unwrap().to_owned()
+    let term = log[start..].split(']').next().unwrap().to_owned();
+    assert_eq!(
+        decode_session_recording(root, session).header.term.as_str(),
+        term,
+        "{session}: the recording names the TERM the child ran under"
+    );
+    term
 }
 
 /// A PTY is a real terminal, so a caller's `TERM=dumb` (an agent's tool
