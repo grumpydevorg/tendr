@@ -43,6 +43,13 @@
   `Ctrl-\ Ctrl-\` sends one. `--escape none` turns it off.
 - **PTY children start at 24×80** instead of 0×0, and a resize with a zero
   dimension is ignored.
+- **A PTY child gets `TERM=xterm-256color` when started without a usable
+  `TERM`.** `tendr start --pty` from an agent's tool shell (`TERM=dumb`) or over
+  `ssh -T` (no `TERM`) told the child its real terminal could not draw: no
+  colour, no cursor addressing. An unset, empty or `dumb` `TERM` is now replaced
+  for PTY sessions, and recorded as such; a real `TERM` is passed through and
+  `--env TERM=…` always wins. Pipe sessions and every other variable are
+  unchanged.
 - **`prune` removes orphaned attach sockets** left by a sidecar that was killed
   outright, and its summary gains `sockets_removed`.
 

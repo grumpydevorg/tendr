@@ -136,7 +136,9 @@ Current PTY rules:
   offers output to the attached viewer's bounded queue (8 MiB), drained by that
   viewer's own sender thread, so a viewer that stops reading is disconnected
   (releasing its control) instead of stalling capture and the child
-- the child starts at 24×80. Each run is recorded exactly
+- the child starts at 24×80, under `TERM=xterm-256color` when the launching
+  environment had none, an empty one or `dumb` (an explicit `--env TERM` wins;
+  `sidecar::pty_term`). Each run is recorded exactly
   ([format](../plans/specs/pty-recording-format.md)) under
   `<session>/recording/<run_id>/` (`0700` directories, `0600` segments): capture
   offers every output chunk, and the input writer applies each resize while

@@ -206,6 +206,12 @@ knowing:
   the session keeps running: status shows `Stopped` with the last recorded
   sequence, a `recording.stopped` event is logged, and the run ends with a
   warning that later output was not recorded.
+- A PTY session's child gets `TERM=xterm-256color` when the `tendr start` that
+  launched it had `TERM` unset, empty or `dumb`, as an agent's tool shell or
+  `ssh -T` does; a real `TERM` is passed through, and `--env TERM=…` always
+  wins. Other variables are inherited unchanged: an agent shell's `CI=true` or
+  `NO_COLOR=1` reaches the child unless you unset them, e.g.
+  `-- env -u CI -u NO_COLOR claude`.
 
 ## Observe long-running work
 

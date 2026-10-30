@@ -261,6 +261,25 @@ fn setup_stdin_forwarding(
     Ok(())
 }
 
+/// The terminal type assumed when a PTY child would otherwise inherit none.
+const DEFAULT_PTY_TERM: &str = "xterm-256color";
+
+/// The `TERM` a PTY child runs under, given its launch `--env` overrides.
+///
+/// An explicit `--env TERM=…` wins. Otherwise the inherited `TERM` is kept
+/// unless it is unset, empty or `dumb`: those come from callers that are not
+/// terminals (an agent's tool shell, `ssh -T`), and would tell a child that
+/// has a real terminal that it cannot draw.
+fn pty_term(launch_env: &std::collections::BTreeMap<String, String>) -> String {
+    if let Some(term) = launch_env.get("TERM") {
+        return term.clone();
+    }
+    match std::env::var("TERM") {
+        Ok(term) if !term.is_empty() && term != "dumb" => term,
+        _ => DEFAULT_PTY_TERM.to_owned(),
+    }
+}
+
 /// Spawn a timeout thread that kills the child after `timeout_s` seconds.
 /// Returns the `timed_out` flag. The caller passes a `cancel` flag to prevent the kill
 /// after the child exits naturally.
@@ -1109,6 +1128,11 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
         "TENDR_SESSION_DIR".to_owned(),
         session_dir.to_str().unwrap_or("").to_owned(),
     );
+    // A PTY is a real terminal: don't hand its child a `TERM` that says it
+    // cannot draw.
+    if meta.launch_spec().io_mode == IoMode::Pty {
+        effective_env.insert("TERM".to_owned(), pty_term(&meta.launch_spec().env));
+    }
 
     // --- Wait for --after dependencies ---
     let has_deps = !meta.launch_spec().after.is_empty();
@@ -2420,8 +2444,8 @@ impl PtyRecordingRun {
 }
 
 /// Start recording a PTY run: output and applied geometry, not input. The child
-/// starts at the platform's initial PTY size, under its `TERM` (recorded empty if
-/// unset or not recordable). A stop is queued on the run's effects channel,
+/// starts at the platform's initial PTY size, under its `TERM` ([`pty_term`];
+/// recorded empty if not recordable). A stop is queued on the run's effects channel,
 /// which appends it as a `recording.stopped` event and writes it to
 /// `meta.json`; the recorder never touches the session paths itself.
 #[cfg(unix)]
@@ -2435,12 +2459,8 @@ fn start_pty_recording(
     use crate::recording::{Geometry, SegmentHeader, Sequence, TermName};
 
     let dir = format!("recording/{run_id}");
-    let term = child_env
-        .get("TERM")
-        .cloned()
-        .or_else(|| std::env::var("TERM").ok())
-        .and_then(|term| TermName::new(term).ok())
-        .unwrap_or_else(|| TermName::new("").expect("an empty TERM is recordable"));
+    let term = TermName::new(pty_term(child_env))
+        .unwrap_or_else(|_| TermName::new("").expect("an empty TERM is recordable"));
     let origin_unix_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
