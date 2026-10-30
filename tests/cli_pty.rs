@@ -248,25 +248,25 @@ fn attach_socket_exists_for_pty_session() {
     );
 }
 
+/// A PTY push travels over the attach socket, which every PTY session has, so
+/// it needs no `--stdin` (that flag adds the FIFO `exec` uses).
 #[test]
-fn push_to_pty_session_delivers_input() {
+fn push_to_pty_session_delivers_input_without_stdin_flag() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    // Start a PTY cat session with stdin
     tendr(&root)
-        .args(["start", "pty-push", "--pty", "--stdin", "--", "cat"])
+        .args(["start", "pty-push", "--pty", "--", "cat"])
         .output()
         .unwrap();
     let _session = harness::SessionGuard::new(&root, "pty-push");
     harness::wait_running(&root, "pty-push");
 
-    // Push some input
     tendr(&root)
         .args(["push", "pty-push"])
         .write_stdin(b"hello-from-push\n")
-        .output()
-        .unwrap();
+        .assert()
+        .success();
 
     // Poll the log until the pushed input echoes through the PTY (no fixed sleep).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -284,6 +284,111 @@ fn push_to_pty_session_delivers_input() {
             "push input never appeared in PTY log: {stdout}"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A PTY session still waiting on `--after` has no `pty` record yet, but it
+/// will take pushes once it runs: a push now is refused as not running, not
+/// for a missing `--stdin`.
+#[test]
+fn push_to_a_starting_pty_session_without_stdin_reports_not_running() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .args(["start", "pty-dep", "--", "sleep", "120"])
+        .assert()
+        .success();
+    let _dep = harness::SessionGuard::new(&root, "pty-dep");
+    tendr(&root)
+        .args([
+            "start",
+            "pty-after",
+            "--pty",
+            "--after",
+            "pty-dep",
+            "--",
+            "cat",
+        ])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-after");
+
+    let output = tendr(&root)
+        .args(["push", "pty-after"])
+        .write_stdin(b"early\n")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a push before the run starts fails"
+    );
+    assert!(
+        stderr.contains("not running"),
+        "the refusal says the session is not running: {stderr}"
+    );
+}
+
+/// Killing a PTY session hangs up its terminal first, as closing a terminal
+/// window does, so an interactive shell's background jobs end with it. Those
+/// jobs sit in their own process groups, outside the group kill, and a shell
+/// that is SIGKILLed cannot pass a hangup on to them.
+#[test]
+fn kill_pty_shell_ends_its_background_jobs() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let pid_file = root.path().join("job.pid");
+
+    tendr(&root)
+        .args([
+            "start",
+            "pty-jobs",
+            "--pty",
+            "--stdin",
+            "--",
+            "bash",
+            "--norc",
+            "--noprofile",
+            "-i",
+        ])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-jobs");
+    harness::wait_running(&root, "pty-jobs");
+
+    tendr(&root)
+        .args(["push", "pty-jobs"])
+        .write_stdin(format!("sleep 600 & echo $! > {}\n", pid_file.display()))
+        .assert()
+        .success();
+    let job: libc::pid_t =
+        harness::poll_until(Duration::from_secs(10), Duration::from_millis(20), || {
+            match std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                Some(pid) => harness::Observation::Ready(pid),
+                None => harness::Observation::Pending(format!("no pid in {}", pid_file.display())),
+            }
+        })
+        .expect("the shell never reported its background job");
+
+    tendr(&root).args(["kill", "pty-jobs"]).assert().success();
+
+    // SAFETY: signal 0 only probes whether `job` exists.
+    let alive = || unsafe { libc::kill(job, 0) } == 0;
+    let gone = harness::poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        if alive() {
+            harness::Observation::Pending(format!("job {job} still alive"))
+        } else {
+            harness::Observation::Ready(())
+        }
+    });
+    if gone.is_err() {
+        // SAFETY: `job` is the test's own background sleep.
+        unsafe { libc::kill(job, libc::SIGKILL) };
+        panic!("background job {job} outlived `tendr kill` of its PTY shell");
     }
 }
 
@@ -3397,28 +3502,4 @@ fn cli_push_to_a_finished_session_exits_81_for_a_pty_and_1_for_a_pipe() {
     assert_exit(&output, 81, "push to a finished PTY session");
     let output = push_output(&root, "pipe-push-ended", b"too late\n");
     assert_exit(&output, 1, "push to a finished pipe session");
-}
-
-/// A push to a session started without `--stdin` can never succeed, so that
-/// is what it reports, even while a human holds the terminal.
-#[test]
-fn cli_push_without_stdin_exits_1_even_while_a_human_holds_the_terminal() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = harness::SessionGuard::new(&root, "pty-x1-nostdin");
-    tendr(&root)
-        .args(["start", "pty-x1-nostdin", "--pty", "--", "cat"])
-        .output()
-        .unwrap();
-    harness::wait_running(&root, "pty-x1-nostdin");
-    let sock_path = wait_for_attach_socket(&root, "pty-x1-nostdin");
-    let _human = attach_as_human(&sock_path);
-    wait_for_pty_control(&root, "pty-x1-nostdin", "HumanControl");
-
-    let output = push_output(&root, "pty-x1-nostdin", b"nowhere\n");
-    assert_exit(&output, 1, "push to a session without --stdin");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("not started with --stdin"),
-        "the refusal names the missing --stdin"
-    );
 }
