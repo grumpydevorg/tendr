@@ -236,6 +236,12 @@ tendr run --detach ./job.sh      # one-shot convenience over `start` for scripts
 `start --replace` straight after them find the session free. If the sidecar still
 holds it after 2 s, they return anyway with a warning on stderr.
 
+`kill` stops the session's process group with SIGTERM, then SIGKILL after 5 s.
+A PTY session first gets SIGHUP and up to a second to act on it, as when a
+terminal window closes, so an interactive shell hangs up its background jobs
+too. `kill --force` and `--timeout` send SIGKILL at once, which a shell cannot
+pass on: its background jobs keep running.
+
 Useful `start` / `run` flags for batch work:
 
 - `--detach` — return immediately, leave it running.

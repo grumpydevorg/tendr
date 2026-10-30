@@ -95,8 +95,9 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
     let sidecar_alive = session::is_locked(&session).unwrap_or(false);
 
     if sidecar_alive {
-        // 8s total: 5s grace for graceful stop + 3s buffer for terminal state write.
-        if let Some(m) = signal_kill_request(&session, &meta, force, 80)? {
+        // 9s total: up to 1s for a PTY child's hangup, 5s grace for graceful
+        // stop, and 3s buffer for terminal state write.
+        if let Some(m) = signal_kill_request(&session, &meta, force, 90)? {
             let json = serde_json::to_string_pretty(&m)?;
             println!("{json}");
             return Ok(());
