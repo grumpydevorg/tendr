@@ -166,7 +166,8 @@ pub trait Platform {
     /// Contract (what implementations must provide):
     /// - `force = false`: request graceful stop (SIGTERM on Unix,
     ///   best-effort CTRL_BREAK on Windows); waits up to 5s then
-    ///   escalates to force termination.
+    ///   escalates to force termination. A Unix PTY child gets SIGHUP and
+    ///   up to 1s to act on it first, as when its terminal closes.
     /// - `force = true`: immediate termination (SIGKILL / TerminateJobObject).
     ///
     /// Does not reap the child. Callers must still call `child_wait`

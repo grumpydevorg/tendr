@@ -173,7 +173,8 @@ knowing:
 ## Answer prompts and attach
 
 - **`tendr push <name>`** feeds stdin to a session waiting on an interactive
-  prompt: `printf 'y\n' | tendr push dev`.
+  prompt: `printf 'y\n' | tendr push dev`. A pipe session needs `--stdin` for
+  this; a `--pty` session takes pushes without it.
 - **`tendr attach <name>`** connects your terminal to the live session for
   hands-on interaction. Press **`Ctrl-\` then `d`** to detach; the session keeps
   running. `Ctrl-\` twice sends one `Ctrl-\`, and `Ctrl-\` followed by any other
@@ -235,6 +236,12 @@ tendr run --detach ./job.sh      # one-shot convenience over `start` for scripts
 `wait` and `kill` return once the session's sidecar has released it, so `prune` or
 `start --replace` straight after them find the session free. If the sidecar still
 holds it after 2 s, they return anyway with a warning on stderr.
+
+`kill` stops the session's process group with SIGTERM, then SIGKILL after 5 s.
+A PTY session first gets SIGHUP and up to a second to act on it, as when a
+terminal window closes, so an interactive shell hangs up its background jobs
+too. `kill --force` and `--timeout` send SIGKILL at once, which a shell cannot
+pass on: its background jobs keep running.
 
 Useful `start` / `run` flags for batch work:
 

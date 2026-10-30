@@ -79,7 +79,7 @@ enum Commands {
         /// Namespace for session grouping
         #[arg(long)]
         namespace: Option<String>,
-        /// Enable stdin pipe for push command
+        /// Enable stdin pipe for exec and push (a --pty session takes push without it)
         #[arg(long)]
         stdin: bool,
         /// Interactive pseudo-terminal mode

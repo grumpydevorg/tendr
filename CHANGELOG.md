@@ -28,6 +28,10 @@
 - **`tendr push` to a PTY session is acknowledged.** It exits non-zero, with
   byte counts, when it is refused or its bytes are not all written; a second
   concurrent push is refused instead of interleaving. Pipe sessions are unchanged.
+- **`tendr push` to a PTY session no longer needs `--stdin`.** The push goes
+  over the session's attach socket, which every PTY session has; it used to be
+  refused with exit 1 for want of the stdin pipe it does not use. `--stdin` on a
+  PTY session now only adds the pipe PTY `exec` needs.
 - **`tendr attach` and `tendr push` to a PTY session exit 80–85 instead of 1
   when refused or cut off.** 80: the session speaks another attach protocol
   version. 81: another client holds the terminal, or took it over, or the
@@ -48,6 +52,12 @@
 
 ### Fixed
 
+- **Killing a PTY session ends an interactive shell's background jobs.** A job
+  started with `&` sits in its own process group, outside the group kill, and
+  an interactive shell ignores SIGTERM, so it was SIGKILLed without passing a
+  hangup on and its jobs kept running. `kill` now sends a PTY session SIGHUP
+  first and gives it up to a second, as when a terminal window closes.
+  `kill --force` and `--timeout`, which send SIGKILL at once, are unchanged.
 - **`tendr attach` detaches when the session's program changes the keyboard
   encoding.** A child that enables the kitty keyboard protocol (as Claude Code
   can in Ghostty, kitty, WezTerm and foot) or xterm's `modifyOtherKeys` makes the
