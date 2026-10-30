@@ -12,8 +12,9 @@ use tendr::session::{self, SessionError, SessionRoot};
 /// lock and expect it free at once. A child being spawned holds a copy of
 /// every descriptor the test process has open until it execs, so a lock
 /// released on another test thread meanwhile stays held for that moment.
-/// Tendr itself always polls for a release; only these tests assume an
-/// instant one.
+/// Tendr's commands that wait for a release poll for it (`wait_unlocked`);
+/// its one-shot lock probes can only err toward "locked". Only these tests
+/// assume an instant release.
 static SPAWN_VS_RELEASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
