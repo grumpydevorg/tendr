@@ -302,27 +302,36 @@ fn wait_after_hello(
         .stderr
         .take()
         .expect("stderr is piped for a --hello call");
-    let (hello_tx, hello_rx) = mpsc::channel();
-    let relay = std::thread::spawn(move || relay_stderr(stderr, hello_tx));
+    let (events_tx, events) = mpsc::channel();
+    std::thread::spawn(move || relay_stderr(stderr, events_tx));
 
     let started = Instant::now();
     let mut hello = false;
+    let mut old_tendr = None;
     loop {
-        if !hello {
-            match hello_rx.try_recv() {
-                Ok(()) => hello = true,
-                // The relay ended without a hello: stderr closed, so ssh is
-                // exiting; its status says why.
-                Err(mpsc::TryRecvError::Disconnected) => hello = true,
-                Err(mpsc::TryRecvError::Empty) => {}
+        // Only the hello proves ssh got through. An end of stream before it
+        // proves nothing: a process can close its stderr and keep running.
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Relay::Hello => hello = true,
+                Relay::Done { old_tendr: seen } => old_tendr = Some(seen),
             }
         }
         if let Some(status) = child.try_wait().map_err(SshError::SpawnFailed)? {
-            // Reads stderr to its end, so it waits for every holder of it,
-            // not just ssh: a ProxyCommand that ignores ssh's SIGHUP keeps
-            // the call open until it exits, as it kept the terminal before.
-            let saw_old_tendr = relay.join().unwrap_or(false);
-            if saw_old_tendr {
+            // The relay reads stderr to its end, so it waits for every holder
+            // of it, not just ssh. After the hello that is the command's own
+            // output, kept as long as it lasts (a ProxyCommand that ignores
+            // ssh's SIGHUP holds the call open, as it held the terminal
+            // before). Without a hello, a leftover holder must not hold the
+            // call open: wait briefly for the rest, then report the status.
+            if old_tendr.is_none() {
+                old_tendr = if hello {
+                    wait_relay(&events, None)
+                } else {
+                    wait_relay(&events, Some(Duration::from_secs(1)))
+                };
+            }
+            if old_tendr == Some(true) {
                 eprintln!(
                     "tendr on {host} does not know --hello, so it predates the \
                      connect deadline: upgrade tendr on {host}, or set \
@@ -333,7 +342,7 @@ fn wait_after_hello(
         }
         if !hello && started.elapsed() >= deadline {
             stop(child);
-            // The relay is not joined: a lingering ProxyCommand may hold
+            // The relay is not waited for: a lingering ProxyCommand may hold
             // stderr open, and only an unfinished pre-hello line is lost.
             return Err(SshError::ConnectDeadline {
                 host: host.to_owned(),
@@ -341,6 +350,32 @@ fn wait_after_hello(
             });
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What the stderr relay reports.
+enum Relay {
+    /// The remote tendr's hello arrived.
+    Hello,
+    /// Stderr ended; whether the remote rejected `--hello` (a tendr too old
+    /// to know it).
+    Done { old_tendr: bool },
+}
+
+/// Wait for the relay to finish, at most `limit` (forever with `None`).
+/// Returns its verdict on an old remote tendr, or `None` if it did not finish.
+fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option<bool> {
+    let until = limit.map(|limit| Instant::now() + limit);
+    loop {
+        let event = match until {
+            None => events.recv().ok()?,
+            Some(until) => events
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .ok()?,
+        };
+        if let Relay::Done { old_tendr } = event {
+            return Some(old_tendr);
+        }
     }
 }
 
@@ -367,12 +402,11 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Copy a `--hello` call's stderr to ours, dropping the hello and signalling
+/// Copy a `--hello` call's stderr to ours, dropping the hello and reporting
 /// it. The hello ends a line but need not start one: anything a login shell's
 /// rc file wrote without a newline just before tendr ran is glued in front,
-/// and is passed through. Returns whether the remote rejected `--hello` (a
-/// tendr too old to know it).
-fn relay_stderr(stderr: std::process::ChildStderr, hello: mpsc::Sender<()>) -> bool {
+/// and is passed through. Reports [`Relay::Done`] when stderr ends.
+fn relay_stderr(stderr: std::process::ChildStderr, events: mpsc::Sender<Relay>) {
     use std::io::{BufRead, Write};
 
     let mut reader = io::BufReader::new(stderr);
@@ -382,7 +416,10 @@ fn relay_stderr(stderr: std::process::ChildStderr, hello: mpsc::Sender<()>) -> b
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => return old_tendr,
+            Ok(0) | Err(_) => {
+                let _ = events.send(Relay::Done { old_tendr });
+                return;
+            }
             Ok(_) => {}
         }
         let body = line.trim_ascii_end();
@@ -392,16 +429,18 @@ fn relay_stderr(stderr: std::process::ChildStderr, hello: mpsc::Sender<()>) -> b
                 let _ = out.write_all(prefix);
                 let _ = out.write_all(b"\n");
             }
-            let _ = hello.send(());
+            let _ = events.send(Relay::Hello);
             break;
         }
         old_tendr |= String::from_utf8_lossy(&line).contains("'--hello'");
         let _ = out.write_all(&line);
     }
     // After the hello the stream is the command's own: copy it as it comes.
-    let mut out = out.lock();
-    let _ = io::copy(&mut reader, &mut out);
-    old_tendr
+    {
+        let mut out = out.lock();
+        let _ = io::copy(&mut reader, &mut out);
+    }
+    let _ = events.send(Relay::Done { old_tendr });
 }
 
 #[cfg(test)]

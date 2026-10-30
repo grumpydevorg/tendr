@@ -144,8 +144,14 @@ fn host_call(tmp: &TempDir, deadline: &str, args: &[&str]) -> (std::process::Out
 fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    for args in [&["status", "job"][..], &["exec", "shell", "--", "true"][..]] {
-        let tmp = fake_ssh("echo $$ > \"$PIDF\"\nexec /bin/sleep 30");
+    // The last stall closes its stderr first: end of stream before a hello
+    // proves nothing about authentication.
+    for (args, stall) in [
+        (&["status", "job"][..], "exec /bin/sleep 30"),
+        (&["exec", "shell", "--", "true"][..], "exec /bin/sleep 30"),
+        (&["status", "job"][..], "exec 2>&-\nexec /bin/sleep 30"),
+    ] {
+        let tmp = fake_ssh(&format!("echo $$ > \"$PIDF\"\n{stall}"));
         let (output, took) = host_call(&tmp, "1", args);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -164,6 +170,27 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "{args:?}: the stalled ssh was killed");
     }
+}
+
+/// An ssh that exits without a hello while something it started still holds
+/// its stderr (a ProxyCommand that ignores the hangup) does not keep the call
+/// open past the deadline: the exit status is reported.
+#[test]
+fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // The leftover holds only ssh's stderr, as a ProxyCommand does (its stdout
+    // is the ssh connection, not ours).
+    let tmp = fake_ssh(
+        "/bin/sleep 30 </dev/null >/dev/null &\necho 'ssh: connection closed' >&2\nexit 255",
+    );
+    let (output, took) = host_call(&tmp, "1", &["status", "job"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(took < Duration::from_secs(10), "took {took:?}: {stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("ssh: connection closed"), "{stderr}");
+    assert!(stderr.contains("exit 255"), "{stderr}");
 }
 
 /// Once the remote tendr has said hello the deadline no longer applies: a
