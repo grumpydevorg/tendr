@@ -9,6 +9,12 @@
 
 use std::io;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// The first stderr line of a remote `tendr --hello …`: proof that ssh got
+/// through authentication and started the remote tendr.
+pub const HELLO_LINE: &str = "tendr-hello 1";
 
 /// Errors from the SSH transport layer.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +37,27 @@ pub enum SshError {
     /// local command execution. Rejected before ssh is ever spawned.
     #[error("invalid --host destination {0:?}: must not be empty or begin with '-'")]
     InvalidDestination(String),
+
+    /// ssh did not get through authentication and start the remote tendr
+    /// (no [`HELLO_LINE`]) within the connect deadline, and was killed.
+    #[error(
+        "ssh to {host} did not reach the remote tendr within {seconds} s and was \
+         stopped: authentication stalled (a Tailscale SSH check-mode approval may \
+         have lapsed: approve it in the browser, then retry) or the host is slow \
+         to start tendr. Set TENDR_SSH_CONNECT_TIMEOUT to change the limit (0 for none)."
+    )]
+    ConnectDeadline { host: String, seconds: f64 },
+}
+
+impl SshError {
+    /// The CLI exit code: 82 (operation deadline exceeded, as for PTY
+    /// operations) for a missed connect deadline, 1 otherwise.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::ConnectDeadline { .. } => 82,
+            _ => 1,
+        }
+    }
 }
 
 /// Commands whose argv is forwarded verbatim over SSH transport.
@@ -79,11 +106,14 @@ pub fn validate_destination(host: &str) -> Result<(), SshError> {
 /// The resulting local argv is:
 ///
 /// ```text
-/// ssh -T -o ConnectTimeout=10 <host> tendr 'arg1' 'arg2' ...
+/// ssh -T -o ConnectTimeout=10 <host> tendr --hello 'arg1' 'arg2' ...
 /// ```
 ///
 /// SSH concatenates "tendr", "'arg1'", "'arg2'" with spaces and sends
 /// the result to the remote login shell, which re-splits it into argv.
+/// `--hello` asks the remote tendr to announce itself on stderr first
+/// ([`HELLO_LINE`]), which ends the connect deadline. An `attach` (with a
+/// TTY, `allocate_tty`) has no hello: its stderr shares the terminal.
 ///
 /// No `--` separator is used between the host and the remote command.
 /// SSH does not treat `--` as an option terminator — it would be sent
@@ -109,13 +139,20 @@ pub fn build_ssh_command(
     // quoted for the remote shell. SSH concatenates all args after the
     // host with spaces to form the remote command string.
     cmd.arg("tendr");
+    if !allocate_tty {
+        cmd.arg("--hello");
+    }
     for arg in tendr_args {
         cmd.arg(shell_words::quote(arg).into_owned());
     }
 
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(if allocate_tty {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        });
     Ok(cmd)
 }
 
@@ -124,19 +161,19 @@ pub fn build_ssh_command(
 ///
 /// Returns the remote tendr exit code on success.
 /// Returns `SshError::TransportFailed` for SSH connection failures (exit 255),
+/// `SshError::ConnectDeadline` if the remote tendr never said hello in time,
 /// or `SshError::InvalidDestination` for an option-shaped/empty host.
 pub fn exec_ssh(host: &str, tendr_args: &[String], allocate_tty: bool) -> Result<i32, SshError> {
     let mut child = build_ssh_command(host, tendr_args, allocate_tty)?
         .spawn()
         .map_err(SshError::SpawnFailed)?;
 
-    let status = child.wait().map_err(SshError::SpawnFailed)?;
-
-    match status.code() {
-        Some(255) => Err(SshError::TransportFailed),
-        Some(code) => Ok(code),
-        None => Err(SshError::Abnormal),
-    }
+    let status = if allocate_tty {
+        child.wait().map_err(SshError::SpawnFailed)?
+    } else {
+        wait_after_hello(host, &mut child, connect_deadline())?
+    };
+    exit_code(status)
 }
 
 /// The remote argv for frame-transport exec — constant by construction:
@@ -152,6 +189,7 @@ fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Comma
         "ConnectTimeout=10",
         host,
         "tendr",
+        "--hello",
         "exec",
         "--frame-from-stdin",
     ]);
@@ -161,7 +199,7 @@ fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Comma
         Stdio::piped()
     })
     .stdout(Stdio::inherit())
-    .stderr(Stdio::inherit());
+    .stderr(Stdio::piped());
     Ok(cmd)
 }
 
@@ -177,30 +215,144 @@ fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Comma
 /// # Errors
 /// `SshError::TransportFailed` on ssh exit 255 (which shadows a remote
 /// command genuinely exiting 255 — an inherent ssh limitation),
-/// `SshError::SpawnFailed`/`Abnormal` as for `exec_ssh`.
+/// `SshError::ConnectDeadline`, `SshError::SpawnFailed`/`Abnormal` as for
+/// `exec_ssh`.
 pub fn exec_ssh_frame(host: &str, frame: Option<&[u8]>) -> Result<i32, SshError> {
     let mut child = build_ssh_exec_frame_command(host, frame.is_none())?
         .spawn()
         .map_err(SshError::SpawnFailed)?;
 
-    // Nested rather than a let-chain: let-chains are stable from 1.88, and the
-    // crate advertises rust-version 1.85. Published releases carry that promise
-    // and `cargo install tendr` is a documented path, so the syntax gives
-    // way, not the contract.
-    if let Some(bytes) = frame {
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(bytes);
-            // Dropping stdin closes the channel — the remote sees EOF.
-        }
-    }
+    // The frame is written on its own thread: a remote that is still
+    // authenticating does not read it, and a large frame would block the
+    // write, and with it the connect deadline, on a full pipe.
+    let writer = frame.and_then(|bytes| {
+        let bytes = bytes.to_vec();
+        child.stdin.take().map(|mut stdin| {
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = stdin.write_all(&bytes);
+                // Dropping stdin closes the channel — the remote sees EOF.
+            })
+        })
+    });
 
-    let status = child.wait().map_err(SshError::SpawnFailed)?;
+    let status = wait_after_hello(host, &mut child, connect_deadline())?;
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    exit_code(status)
+}
+
+fn exit_code(status: std::process::ExitStatus) -> Result<i32, SshError> {
     match status.code() {
         Some(255) => Err(SshError::TransportFailed),
         Some(code) => Ok(code),
         None => Err(SshError::Abnormal),
     }
+}
+
+/// The default time for ssh to get through authentication and start the
+/// remote tendr.
+const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The connect deadline: `TENDR_SSH_CONNECT_TIMEOUT` seconds, `0` for none,
+/// otherwise [`DEFAULT_CONNECT_DEADLINE`]. An unparseable value is the default.
+fn connect_deadline() -> Option<Duration> {
+    match std::env::var("TENDR_SSH_CONNECT_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(secs) if secs <= 0.0 => None,
+        Some(secs) if secs.is_finite() => Some(Duration::from_secs_f64(secs)),
+        _ => Some(DEFAULT_CONNECT_DEADLINE),
+    }
+}
+
+/// Wait for `child` (an ssh to a remote `tendr --hello …`) to exit, killing it
+/// if the remote tendr has not said hello within `deadline`.
+///
+/// ssh's own `ConnectTimeout` ends at key exchange; authentication can then
+/// stall indefinitely (a lapsed Tailscale SSH check-mode approval waits about
+/// 30 minutes, silently). The hello is the remote tendr's first stderr line,
+/// so it arrives only once ssh is through. After it, the call may run as long
+/// as it needs (`wait`, `log -f`). Everything on stderr except the hello is
+/// passed through in order.
+fn wait_after_hello(
+    host: &str,
+    child: &mut std::process::Child,
+    deadline: Option<Duration>,
+) -> Result<std::process::ExitStatus, SshError> {
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr is piped for a --hello call");
+    let (hello_tx, hello_rx) = mpsc::channel();
+    let relay = std::thread::spawn(move || relay_stderr(stderr, hello_tx));
+
+    let started = Instant::now();
+    let mut hello = false;
+    loop {
+        if !hello {
+            match hello_rx.try_recv() {
+                Ok(()) => hello = true,
+                // The relay ended without a hello: stderr closed, so ssh is
+                // exiting; its status says why.
+                Err(mpsc::TryRecvError::Disconnected) => hello = true,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(status) = child.try_wait().map_err(SshError::SpawnFailed)? {
+            let saw_old_tendr = relay.join().unwrap_or(false);
+            if saw_old_tendr {
+                eprintln!(
+                    "tendr on {host} does not know --hello, so it predates the \
+                     connect deadline: upgrade tendr on {host}"
+                );
+            }
+            return Ok(status);
+        }
+        if let (false, Some(limit)) = (hello, deadline) {
+            if started.elapsed() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SshError::ConnectDeadline {
+                    host: host.to_owned(),
+                    seconds: limit.as_secs_f64(),
+                });
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Copy a `--hello` call's stderr to ours, dropping the hello line and
+/// signalling it. Returns whether the remote rejected `--hello` (a tendr too
+/// old to know it).
+fn relay_stderr(stderr: std::process::ChildStderr, hello: mpsc::Sender<()>) -> bool {
+    use std::io::{BufRead, Write};
+
+    let mut reader = io::BufReader::new(stderr);
+    let mut out = io::stderr();
+    let mut old_tendr = false;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return old_tendr,
+            Ok(_) => {}
+        }
+        let text = String::from_utf8_lossy(&line);
+        if text.trim_end() == HELLO_LINE {
+            let _ = hello.send(());
+            break;
+        }
+        old_tendr |= text.contains("'--hello'");
+        let _ = out.write_all(&line);
+    }
+    // After the hello the stream is the command's own: copy it as it comes.
+    let mut out = out.lock();
+    let _ = io::copy(&mut reader, &mut out);
+    old_tendr
 }
 
 #[cfg(test)]
@@ -223,6 +375,7 @@ mod tests {
                 "ConnectTimeout=10",
                 "user@box",
                 "tendr",
+                "--hello",
                 "exec",
                 "--frame-from-stdin"
             ]
@@ -296,8 +449,9 @@ mod tests {
         assert_eq!(args[2], "ConnectTimeout=10");
         assert_eq!(args[3], "user@box");
         assert_eq!(args[4], "tendr");
-        assert_eq!(args[5], "status");
-        assert_eq!(args[6], "my-session");
+        assert_eq!(args[5], "--hello");
+        assert_eq!(args[6], "status");
+        assert_eq!(args[7], "my-session");
         assert!(
             !args.contains(&"--".to_string()),
             "no -- in ssh argv: {args:?}"
@@ -323,7 +477,15 @@ mod tests {
         let parsed = shell_words::split(&remote_cmd).unwrap();
         assert_eq!(
             parsed,
-            vec!["tendr", "start", "job", "--", "echo", "hello world"]
+            vec![
+                "tendr",
+                "--hello",
+                "start",
+                "job",
+                "--",
+                "echo",
+                "hello world"
+            ]
         );
     }
 
@@ -345,7 +507,7 @@ mod tests {
         let remote_args = &argv[4..];
         let remote_cmd = remote_args.join(" ");
         let parsed = shell_words::split(&remote_cmd).unwrap();
-        assert_eq!(parsed[6], "echo $HOME && ls");
+        assert_eq!(parsed[7], "echo $HOME && ls");
     }
 
     #[test]

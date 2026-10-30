@@ -6,6 +6,7 @@ mod harness;
 
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -71,9 +72,17 @@ fn host_flag_invokes_ssh_with_correct_remote_command() {
         .lines()
         .filter_map(|l| l.strip_prefix("ARG:"))
         .collect();
-    // Should see: -T, -o, ConnectTimeout=10, user@box, tendr, list
-    assert!(args.contains(&"tendr"), "should contain tendr: {args:?}");
-    assert!(args.contains(&"list"), "should contain list: {args:?}");
+    // Should see: -T, -o, ConnectTimeout=10, user@box, tendr, --hello, list
+    let remote: Vec<&str> = args
+        .iter()
+        .skip_while(|a| **a != "tendr")
+        .copied()
+        .collect();
+    assert_eq!(
+        remote,
+        ["tendr", "--hello", "list"],
+        "the remote tendr is asked to announce itself first: {args:?}"
+    );
     // No "--" should be passed to ssh
     assert!(
         !args.contains(&"--"),
@@ -99,6 +108,130 @@ fn parse_remote_argv(stdout: &str) -> Vec<String> {
     let remote_parts = &args[4..];
     let remote_cmd = remote_parts.join(" ");
     shell_words::split(&remote_cmd).expect("remote command should be valid POSIX shell syntax")
+}
+
+// -- Connect deadline: a --host call that never reaches the remote tendr --
+
+/// A fake ssh running `script` (a POSIX `sh` body), on a PATH holding only it.
+fn fake_ssh(script: &str) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let fake_ssh = tmp.path().join("ssh");
+    std::fs::write(&fake_ssh, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
+    tmp
+}
+
+/// Run `tendr --host box <args>` against `tmp`'s fake ssh with a connect
+/// deadline of `deadline` (the `TENDR_SSH_CONNECT_TIMEOUT` value).
+fn host_call(tmp: &TempDir, deadline: &str, args: &[&str]) -> (std::process::Output, Duration) {
+    let started = Instant::now();
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        .args(["--host", "box"])
+        .args(args)
+        .env("PATH", tmp.path())
+        .env("TENDR_SSH_CONNECT_TIMEOUT", deadline)
+        .env("PIDF", tmp.path().join("ssh.pid"))
+        .output()
+        .unwrap();
+    (output, started.elapsed())
+}
+
+/// An ssh that never reaches the remote tendr (a Tailscale SSH check-mode
+/// approval that lapsed stalls like this for about 30 minutes) is killed at
+/// the deadline with exit 82 and a message naming the host, for ordinary
+/// commands and for exec's frame transport alike.
+#[test]
+fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    for args in [&["status", "job"][..], &["exec", "shell", "--", "true"][..]] {
+        let tmp = fake_ssh("echo $$ > \"$PIDF\"\nexec /bin/sleep 30");
+        let (output, took) = host_call(&tmp, "1", args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(82), "{args:?}: {stderr}");
+        assert!(took < Duration::from_secs(10), "{args:?} took {took:?}");
+        assert!(
+            stderr.contains("box") && stderr.contains("did not reach"),
+            "{args:?}: the error names the host: {stderr}"
+        );
+        let pid: i32 = std::fs::read_to_string(tmp.path().join("ssh.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes whether the fake ssh still exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "{args:?}: the stalled ssh was killed");
+    }
+}
+
+/// Once the remote tendr has said hello the deadline no longer applies: a
+/// call that runs on long after it (`wait`, `log -f`) is left alone. The hello
+/// itself is not shown; everything else on stderr is, in order.
+#[test]
+fn host_call_runs_past_the_deadline_once_the_remote_tendr_says_hello() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = fake_ssh(&format!(
+        "echo 'ssh: before hello' >&2\n\
+         echo '{}' >&2\n\
+         /bin/sleep 2\n\
+         echo 'remote result'\n\
+         echo 'remote: after hello' >&2\n\
+         exit 0",
+        tendr::ssh::HELLO_LINE
+    ));
+    let (output, _) = host_call(&tmp, "1", &["wait", "job"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "remote result\n");
+    assert_eq!(stderr, "ssh: before hello\nremote: after hello\n");
+}
+
+/// `TENDR_SSH_CONNECT_TIMEOUT=0` turns the deadline off.
+#[test]
+fn host_connect_deadline_of_zero_waits_as_long_as_ssh_takes() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = fake_ssh("/bin/sleep 2\necho 'slow but fine'\nexit 0");
+    let (output, _) = host_call(&tmp, "0", &["list"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "slow but fine\n");
+}
+
+/// A remote tendr too old to know `--hello` fails fast with clap's parse
+/// error (exit 2); the caller is told why and what to do.
+#[test]
+fn host_call_to_a_tendr_without_hello_says_to_upgrade_it() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = fake_ssh("echo \"error: unexpected argument '--hello' found\" >&2\nexit 2");
+    let (output, _) = host_call(&tmp, "5", &["list"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("unexpected argument '--hello'"), "{stderr}");
+    assert!(stderr.contains("upgrade tendr on box"), "{stderr}");
+}
+
+/// What the remote end does: `tendr --hello …` writes the hello as its very
+/// first stderr line, before the command's own output.
+#[test]
+fn hello_flag_writes_the_hello_line_first() {
+    let root = TempDir::new().unwrap();
+    let output = harness::tendr(&root)
+        .args(["--hello", "status", "missing"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.lines().next(),
+        Some(tendr::ssh::HELLO_LINE),
+        "{stderr}"
+    );
 }
 
 // -- Task 4: Transport error classification --
@@ -956,7 +1089,7 @@ fn host_exec_remote_argv_carries_no_payload() {
     let args = parse_remote_argv(&stdout);
     assert_eq!(
         args,
-        vec!["tendr", "exec", "--frame-from-stdin"],
+        vec!["tendr", "--hello", "exec", "--frame-from-stdin"],
         "remote argv is constant — nothing user-controlled"
     );
     assert!(
