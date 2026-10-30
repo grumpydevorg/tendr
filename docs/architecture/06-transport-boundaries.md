@@ -31,7 +31,7 @@ Boundary inventory:
 
 - `stdin.pipe`:
   - created when `--stdin` is enabled
-  - shared input transport for `push`
+  - input transport for `push` to a pipe session (a PTY `push` uses the attach socket)
   - also used by `exec` to inject framed commands into running shell-like sessions
 
 - `kill_request` file:

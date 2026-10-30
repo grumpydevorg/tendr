@@ -1,6 +1,6 @@
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::model::pty::PtyControl;
-use tendr::model::spec::StdinMode;
+use tendr::model::spec::{IoMode, StdinMode};
 use tendr::model::state::RunStatus;
 use tendr::platform::{Current, Platform};
 use tendr::pty_exit::PtyExitCode;
@@ -17,8 +17,10 @@ pub fn cmd_push(name: &str, namespace: &Namespace) -> anyhow::Result<()> {
 
     // First what can never succeed, whatever the session is doing. A pipe
     // session's push needs the stdin FIFO; a PTY push goes over the attach
-    // socket, which every PTY session has.
-    if meta.pty().is_none() && meta.launch_spec().stdin_mode != StdinMode::Pipe {
+    // socket, which every PTY session has. Keyed on the launch spec: a PTY
+    // session still waiting on `--after` has no `pty` record yet.
+    if meta.launch_spec().io_mode != IoMode::Pty && meta.launch_spec().stdin_mode != StdinMode::Pipe
+    {
         anyhow::bail!("session was not started with --stdin");
     }
 

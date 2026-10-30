@@ -226,6 +226,49 @@ fn push_to_pty_session_delivers_input_without_stdin_flag() {
     }
 }
 
+/// A PTY session still waiting on `--after` has no `pty` record yet, but it
+/// will take pushes once it runs: a push now is refused as not running, not
+/// for a missing `--stdin`.
+#[test]
+fn push_to_a_starting_pty_session_without_stdin_reports_not_running() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .args(["start", "pty-dep", "--", "sleep", "120"])
+        .assert()
+        .success();
+    let _dep = harness::SessionGuard::new(&root, "pty-dep");
+    tendr(&root)
+        .args([
+            "start",
+            "pty-after",
+            "--pty",
+            "--after",
+            "pty-dep",
+            "--",
+            "cat",
+        ])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-after");
+
+    let output = tendr(&root)
+        .args(["push", "pty-after"])
+        .write_stdin(b"early\n")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a push before the run starts fails"
+    );
+    assert!(
+        stderr.contains("not running"),
+        "the refusal says the session is not running: {stderr}"
+    );
+}
+
 /// Python REPL exec works on PTY sessions.
 #[test]
 fn exec_python_pty() {
