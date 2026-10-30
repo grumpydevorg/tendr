@@ -168,38 +168,68 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
 
 /// Once the remote tendr has said hello the deadline no longer applies: a
 /// call that runs on long after it (`wait`, `log -f`) is left alone. The hello
-/// itself is not shown; everything else on stderr is, in order.
+/// itself is not shown; everything else on stderr is, in order, including a
+/// fragment without a newline that a login shell's rc file wrote just before
+/// tendr started, which the hello is glued onto.
 #[test]
 fn host_call_runs_past_the_deadline_once_the_remote_tendr_says_hello() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let tmp = fake_ssh(&format!(
         "echo 'ssh: before hello' >&2\n\
+         printf 'rc says hi ' >&2\n\
          echo '{}' >&2\n\
-         /bin/sleep 2\n\
+         /bin/sleep 3\n\
          echo 'remote result'\n\
          echo 'remote: after hello' >&2\n\
          exit 0",
         tendr::ssh::HELLO_LINE
     ));
-    let (output, _) = host_call(&tmp, "1", &["wait", "job"]);
+    let (output, _) = host_call(&tmp, "2", &["wait", "job"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(0), "{stderr}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "remote result\n");
-    assert_eq!(stderr, "ssh: before hello\nremote: after hello\n");
+    assert_eq!(
+        stderr,
+        "ssh: before hello\nrc says hi \nremote: after hello\n"
+    );
 }
 
-/// `TENDR_SSH_CONNECT_TIMEOUT=0` turns the deadline off.
+/// `TENDR_SSH_CONNECT_TIMEOUT=0` turns the deadline off and with it the
+/// `--hello` flag, so an older remote tendr that does not know it still works.
 #[test]
-fn host_connect_deadline_of_zero_waits_as_long_as_ssh_takes() {
+fn host_connect_deadline_of_zero_waits_and_works_with_an_older_remote() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = fake_ssh("/bin/sleep 2\necho 'slow but fine'\nexit 0");
-    let (output, _) = host_call(&tmp, "0", &["list"]);
+    let tmp = fake_ssh(
+        "for a in \"$@\"; do [ \"$a\" = --hello ] && { echo \"error: unexpected argument '--hello' found\" >&2; exit 2; }; done\n\
+         /bin/sleep 2\necho 'slow but fine'\nexit 0",
+    );
+    for args in [&["list"][..], &["exec", "shell", "--", "true"][..]] {
+        let (output, _) = host_call(&tmp, "0", args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "slow but fine\n");
+    }
+}
 
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "slow but fine\n");
+/// A deadline too large to represent is the default, not a panic.
+#[test]
+fn host_connect_deadline_that_cannot_be_represented_falls_back() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = fake_ssh(&format!(
+        "echo '{}' >&2\necho ok\nexit 0",
+        tendr::ssh::HELLO_LINE
+    ));
+    let (output, _) = host_call(&tmp, "1e30", &["list"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// A remote tendr too old to know `--hello` fails fast with clap's parse

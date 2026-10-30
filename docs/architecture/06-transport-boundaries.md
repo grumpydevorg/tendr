@@ -58,11 +58,14 @@ Boundary inventory:
     `ConnectTimeout` ends at key exchange; authentication can then stall (a
     lapsed Tailscale SSH check-mode approval waits about 30 minutes, silently),
     so if the hello has not arrived within `TENDR_SSH_CONNECT_TIMEOUT` seconds
-    (default 30, `0` for none) ssh is killed and the call exits 82. After the
-    hello there is no deadline, so `wait` and `log -f` run as long as they
-    need. The marker comes from the remote tendr, not from ssh's log, which
-    ControlMaster reuse and OpenSSH versions make unreliable. `attach` gets
-    none: its stderr shares the terminal
+    (default 30) ssh gets SIGTERM, then SIGKILL a second later, and the call
+    exits 82. After the hello there is no deadline, so `wait` and `log -f` run
+    as long as they need. The marker comes from the remote tendr, not from
+    ssh's log, which ControlMaster reuse and OpenSSH versions make unreliable.
+    `attach` gets none: its stderr shares the terminal. `0` sends no `--hello`
+    and leaves stderr inherited, which is how an older remote is reached.
+    Stdout stays inherited while a thread relays stderr, so the order between
+    the two streams is not exact; each stream's own order is kept
 
 What stays in-process:
 

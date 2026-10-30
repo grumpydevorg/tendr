@@ -306,9 +306,13 @@ SSH check-mode approval waits about 30 minutes with no prompt) into an error an
 agent can act on: stop, get the approval, retry. Once the remote `tendr` has
 started, the call runs as long as it needs, so `wait --timeout 3600` and
 `log -f` are unaffected. Change the limit with `TENDR_SSH_CONNECT_TIMEOUT`
-(seconds; `0` turns it off). The remote `tendr` must be this version or newer:
-an older one rejects the `--hello` the call carries, and the error says to
-upgrade it.
+(seconds; `0` turns it off). The deadline needs the remote `tendr` to be this
+version or newer: an older one rejects the `--hello` the call carries, and the
+error says to upgrade it. With `TENDR_SSH_CONNECT_TIMEOUT=0` the call sends no
+`--hello` and reaches an older remote as before. Time spent answering an `ssh`
+prompt (passphrase, unknown host key) counts against the deadline. If the stop
+lands while `ssh` is still authenticating, a `ProxyCommand` that ignores its
+input can be left running.
 
 On Windows hosts, the default ssh shell only matters when you write your own
 `ssh host 'tendr ...'` wrapper. `tendr --host ... exec ...` uses a constant

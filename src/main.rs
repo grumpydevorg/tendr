@@ -960,7 +960,7 @@ fn main() {
                 }
                 .to_json()
             });
-            match tendr::ssh::exec_ssh_frame(host, frame.as_deref()) {
+            match tendr::ssh::exec_ssh_frame(host, frame) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("{e}");

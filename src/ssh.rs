@@ -139,7 +139,8 @@ pub fn build_ssh_command(
     // quoted for the remote shell. SSH concatenates all args after the
     // host with spaces to form the remote command string.
     cmd.arg("tendr");
-    if !allocate_tty {
+    let hello = sends_hello(allocate_tty);
+    if hello {
         cmd.arg("--hello");
     }
     for arg in tendr_args {
@@ -148,12 +149,20 @@ pub fn build_ssh_command(
 
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(if allocate_tty {
-            Stdio::inherit()
-        } else {
+        .stderr(if hello {
             Stdio::piped()
+        } else {
+            Stdio::inherit()
         });
     Ok(cmd)
+}
+
+/// Whether a call carries `--hello` and so runs under the connect deadline:
+/// not for `attach` (its stderr shares the TTY), and not with the deadline
+/// off (`TENDR_SSH_CONNECT_TIMEOUT=0`), which is how an older remote tendr
+/// that does not know `--hello` is still reached.
+fn sends_hello(allocate_tty: bool) -> bool {
+    !allocate_tty && connect_deadline().is_some()
 }
 
 /// Execute a remote tendr command via SSH, streaming stdout/stderr
@@ -168,10 +177,9 @@ pub fn exec_ssh(host: &str, tendr_args: &[String], allocate_tty: bool) -> Result
         .spawn()
         .map_err(SshError::SpawnFailed)?;
 
-    let status = if allocate_tty {
-        child.wait().map_err(SshError::SpawnFailed)?
-    } else {
-        wait_after_hello(host, &mut child, connect_deadline())?
+    let status = match connect_deadline().filter(|_| sends_hello(allocate_tty)) {
+        Some(deadline) => wait_after_hello(host, &mut child, deadline)?,
+        None => child.wait().map_err(SshError::SpawnFailed)?,
     };
     exit_code(status)
 }
@@ -182,24 +190,24 @@ pub fn exec_ssh(host: &str, tendr_args: &[String], allocate_tty: bool) -> Result
 /// itself travels on the SSH stdin channel as opaque bytes.
 fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Command, SshError> {
     validate_destination(host)?;
+    let hello = sends_hello(false);
     let mut cmd = Command::new("ssh");
-    cmd.args([
-        "-T",
-        "-o",
-        "ConnectTimeout=10",
-        host,
-        "tendr",
-        "--hello",
-        "exec",
-        "--frame-from-stdin",
-    ]);
+    cmd.args(["-T", "-o", "ConnectTimeout=10", host, "tendr"]);
+    if hello {
+        cmd.arg("--hello");
+    }
+    cmd.args(["exec", "--frame-from-stdin"]);
     cmd.stdin(if inherit_stdin {
         Stdio::inherit()
     } else {
         Stdio::piped()
     })
     .stdout(Stdio::inherit())
-    .stderr(Stdio::piped());
+    .stderr(if hello {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    });
     Ok(cmd)
 }
 
@@ -217,16 +225,16 @@ fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Comma
 /// command genuinely exiting 255 — an inherent ssh limitation),
 /// `SshError::ConnectDeadline`, `SshError::SpawnFailed`/`Abnormal` as for
 /// `exec_ssh`.
-pub fn exec_ssh_frame(host: &str, frame: Option<&[u8]>) -> Result<i32, SshError> {
+pub fn exec_ssh_frame(host: &str, frame: Option<Vec<u8>>) -> Result<i32, SshError> {
     let mut child = build_ssh_exec_frame_command(host, frame.is_none())?
         .spawn()
         .map_err(SshError::SpawnFailed)?;
 
     // The frame is written on its own thread: a remote that is still
     // authenticating does not read it, and a large frame would block the
-    // write, and with it the connect deadline, on a full pipe.
+    // write, and with it the connect deadline, on a full pipe. Once ssh is
+    // gone the write fails with EPIPE, so the join never hangs.
     let writer = frame.and_then(|bytes| {
-        let bytes = bytes.to_vec();
         child.stdin.take().map(|mut stdin| {
             std::thread::spawn(move || {
                 use std::io::Write;
@@ -236,7 +244,10 @@ pub fn exec_ssh_frame(host: &str, frame: Option<&[u8]>) -> Result<i32, SshError>
         })
     });
 
-    let status = wait_after_hello(host, &mut child, connect_deadline())?;
+    let status = match connect_deadline().filter(|_| sends_hello(false)) {
+        Some(deadline) => wait_after_hello(host, &mut child, deadline)?,
+        None => child.wait().map_err(SshError::SpawnFailed)?,
+    };
     if let Some(writer) = writer {
         let _ = writer.join();
     }
@@ -255,32 +266,37 @@ fn exit_code(status: std::process::ExitStatus) -> Result<i32, SshError> {
 /// remote tendr.
 const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The connect deadline: `TENDR_SSH_CONNECT_TIMEOUT` seconds, `0` for none,
-/// otherwise [`DEFAULT_CONNECT_DEADLINE`]. An unparseable value is the default.
+/// The connect deadline: `TENDR_SSH_CONNECT_TIMEOUT` seconds, `0` (or less)
+/// for none, otherwise [`DEFAULT_CONNECT_DEADLINE`]. A value that does not
+/// parse, or is too large to represent, is the default.
 fn connect_deadline() -> Option<Duration> {
     match std::env::var("TENDR_SSH_CONNECT_TIMEOUT")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
     {
         Some(secs) if secs <= 0.0 => None,
-        Some(secs) if secs.is_finite() => Some(Duration::from_secs_f64(secs)),
-        _ => Some(DEFAULT_CONNECT_DEADLINE),
+        Some(secs) => Some(Duration::try_from_secs_f64(secs).unwrap_or(DEFAULT_CONNECT_DEADLINE)),
+        None => Some(DEFAULT_CONNECT_DEADLINE),
     }
 }
 
-/// Wait for `child` (an ssh to a remote `tendr --hello …`) to exit, killing it
-/// if the remote tendr has not said hello within `deadline`.
+/// Wait for `child` (an ssh to a remote `tendr --hello …`) to exit, stopping
+/// it if the remote tendr has not said hello within `deadline`.
 ///
 /// ssh's own `ConnectTimeout` ends at key exchange; authentication can then
 /// stall indefinitely (a lapsed Tailscale SSH check-mode approval waits about
 /// 30 minutes, silently). The hello is the remote tendr's first stderr line,
 /// so it arrives only once ssh is through. After it, the call may run as long
 /// as it needs (`wait`, `log -f`). Everything on stderr except the hello is
-/// passed through in order.
+/// passed through in order; stdout stays inherited, so the order *between*
+/// the two streams is no longer exact.
+///
+/// Time a human spends at an ssh prompt (passphrase, host key) counts against
+/// the deadline: those prompts use the terminal, not stderr.
 fn wait_after_hello(
     host: &str,
     child: &mut std::process::Child,
-    deadline: Option<Duration>,
+    deadline: Duration,
 ) -> Result<std::process::ExitStatus, SshError> {
     let stderr = child
         .stderr
@@ -302,32 +318,60 @@ fn wait_after_hello(
             }
         }
         if let Some(status) = child.try_wait().map_err(SshError::SpawnFailed)? {
+            // Reads stderr to its end, so it waits for every holder of it,
+            // not just ssh: a ProxyCommand that ignores ssh's SIGHUP keeps
+            // the call open until it exits, as it kept the terminal before.
             let saw_old_tendr = relay.join().unwrap_or(false);
             if saw_old_tendr {
                 eprintln!(
                     "tendr on {host} does not know --hello, so it predates the \
-                     connect deadline: upgrade tendr on {host}"
+                     connect deadline: upgrade tendr on {host}, or set \
+                     TENDR_SSH_CONNECT_TIMEOUT=0 to reach it without one"
                 );
             }
             return Ok(status);
         }
-        if let (false, Some(limit)) = (hello, deadline) {
-            if started.elapsed() >= limit {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(SshError::ConnectDeadline {
-                    host: host.to_owned(),
-                    seconds: limit.as_secs_f64(),
-                });
-            }
+        if !hello && started.elapsed() >= deadline {
+            stop(child);
+            // The relay is not joined: a lingering ProxyCommand may hold
+            // stderr open, and only an unfinished pre-hello line is lost.
+            return Err(SshError::ConnectDeadline {
+                host: host.to_owned(),
+                seconds: deadline.as_secs_f64(),
+            });
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// Copy a `--hello` call's stderr to ours, dropping the hello line and
-/// signalling it. Returns whether the remote rejected `--hello` (a tendr too
-/// old to know it).
+/// Stop an ssh that missed the connect deadline: SIGTERM first, so ssh can
+/// restore a terminal it left mid-prompt and hang up its ProxyCommand, then
+/// SIGKILL if it is still there after a second.
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // SAFETY: `pid` is our own unreaped child, so it cannot have been
+            // reused; SIGTERM has no memory-safety implications.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let until = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < until {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Copy a `--hello` call's stderr to ours, dropping the hello and signalling
+/// it. The hello ends a line but need not start one: anything a login shell's
+/// rc file wrote without a newline just before tendr ran is glued in front,
+/// and is passed through. Returns whether the remote rejected `--hello` (a
+/// tendr too old to know it).
 fn relay_stderr(stderr: std::process::ChildStderr, hello: mpsc::Sender<()>) -> bool {
     use std::io::{BufRead, Write};
 
@@ -341,12 +385,17 @@ fn relay_stderr(stderr: std::process::ChildStderr, hello: mpsc::Sender<()>) -> b
             Ok(0) | Err(_) => return old_tendr,
             Ok(_) => {}
         }
-        let text = String::from_utf8_lossy(&line);
-        if text.trim_end() == HELLO_LINE {
+        let body = line.trim_ascii_end();
+        if body.ends_with(HELLO_LINE.as_bytes()) {
+            let prefix = &body[..body.len() - HELLO_LINE.len()];
+            if !prefix.is_empty() {
+                let _ = out.write_all(prefix);
+                let _ = out.write_all(b"\n");
+            }
             let _ = hello.send(());
             break;
         }
-        old_tendr |= text.contains("'--hello'");
+        old_tendr |= String::from_utf8_lossy(&line).contains("'--hello'");
         let _ = out.write_all(&line);
     }
     // After the hello the stream is the command's own: copy it as it comes.

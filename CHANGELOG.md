@@ -4,14 +4,15 @@
 
 ### Added
 
-- **`--host` calls have a connect deadline.** If `ssh` has not authenticated
-  and started the remote `tendr` within 30 s, it is stopped and the call exits
-  82 naming the host, instead of hanging: a lapsed Tailscale SSH check-mode
-  approval stalls about 30 minutes with no prompt. The remote `tendr` signals
-  that it started, so once it has, `wait` and `log -f` run as long as they need.
-  `TENDR_SSH_CONNECT_TIMEOUT` sets the limit (`0` for none). `attach` is not
-  covered. **The remote `tendr` must be upgraded too:** an older one rejects
-  the hidden `--hello` flag, and the error says so.
+- **`--host` calls have a connect deadline** ([#119](https://github.com/grumpydevorg/tendr/pull/119)).
+  If `ssh` has not authenticated and started the remote `tendr` within 30 s,
+  it is stopped and the call exits 82 naming the host, instead of hanging: a
+  lapsed Tailscale SSH check-mode approval stalls about 30 minutes with no
+  prompt. The remote `tendr` signals that it started, so once it has, `wait`
+  and `log -f` run as long as they need. `TENDR_SSH_CONNECT_TIMEOUT` sets the
+  limit; `0` turns it off. `attach` is not covered. **The remote `tendr` must
+  be upgraded too:** an older one rejects the hidden `--hello` flag and the
+  error says so; with `TENDR_SSH_CONNECT_TIMEOUT=0` it is reached as before.
 
 - **PTY sessions have one input owner, attach takeover and an exact recording**
   ([#68](https://github.com/grumpydevorg/tendr/pull/68)). The sidecar decides who
