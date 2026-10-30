@@ -70,6 +70,73 @@ fn start_pty_session_captures_output() {
     );
 }
 
+/// The `TERM` a PTY child sees when started with `inherited` in the caller's
+/// environment and `extra` arguments to `start`.
+fn pty_child_term(
+    root: &TempDir,
+    session: &str,
+    inherited: Option<&str>,
+    extra: &[&str],
+) -> String {
+    let mut cmd = tendr(root);
+    match inherited {
+        Some(term) => cmd.env("TERM", term),
+        None => cmd.env_remove("TERM"),
+    };
+    cmd.args(["start", session, "--pty"])
+        .args(extra)
+        .args(["--", "sh", "-c", "echo \"TERM=[${TERM-unset}]\""])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(root, session);
+    harness::wait_terminal(root, session);
+    let log = wait_output_contains(root, session, "TERM=[");
+    let start = log.find("TERM=[").unwrap() + "TERM=[".len();
+    let term = log[start..].split(']').next().unwrap().to_owned();
+    assert_eq!(
+        decode_session_recording(root, session).header.term.as_str(),
+        term,
+        "{session}: the recording names the TERM the child ran under"
+    );
+    term
+}
+
+/// A PTY is a real terminal, so a caller's `TERM=dumb` (an agent's tool
+/// shell) or no `TERM` at all (`ssh -T`) would tell its child it cannot draw.
+/// Such a session gets `xterm-256color`; a real `TERM` is kept, and an
+/// explicit `--env TERM=…` always wins.
+#[test]
+fn pty_child_gets_a_usable_term() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    assert_eq!(
+        pty_child_term(&root, "term-dumb", Some("dumb"), &[]),
+        "xterm-256color"
+    );
+    assert_eq!(
+        pty_child_term(&root, "term-unset", None, &[]),
+        "xterm-256color"
+    );
+    assert_eq!(
+        pty_child_term(&root, "term-empty", Some(""), &[]),
+        "xterm-256color"
+    );
+    assert_eq!(
+        pty_child_term(&root, "term-real", Some("xterm-ghostty"), &[]),
+        "xterm-ghostty"
+    );
+    assert_eq!(
+        pty_child_term(
+            &root,
+            "term-explicit",
+            Some("xterm-ghostty"),
+            &["--env", "TERM=dumb"]
+        ),
+        "dumb"
+    );
+}
+
 #[test]
 fn start_pty_session_shows_pty_metadata() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -2527,7 +2594,10 @@ fn pty_output_is_recorded_exactly_with_the_initial_geometry() {
     let root = TempDir::new().unwrap();
 
     // Escape sequences, bytes that are not UTF-8, and no trailing newline.
+    // Started from a caller with `TERM=dumb`, which the child (and so the
+    // recording) gets as `xterm-256color`.
     tendr(&root)
+        .env("TERM", "dumb")
         .args([
             "start",
             "pty-rec",
@@ -2558,12 +2628,11 @@ fn pty_output_is_recorded_exactly_with_the_initial_geometry() {
     );
     assert_eq!((header.geometry.rows(), header.geometry.cols()), (24, 80));
     assert!(!header.input_recorded, "input is not recorded by default");
-    let expected_term = std::env::var("TERM")
-        .ok()
-        .and_then(|t| tendr::recording::TermName::new(t).ok())
-        .map(|t| t.as_str().to_owned())
-        .unwrap_or_default();
-    assert_eq!(header.term.as_str(), expected_term);
+    assert_eq!(
+        header.term.as_str(),
+        "xterm-256color",
+        "the recording names the TERM the child ran under"
+    );
 
     let last = recording.records.last().unwrap().sequence.get();
     let state = &meta["pty"]["recording"];
