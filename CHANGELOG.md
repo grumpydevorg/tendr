@@ -23,6 +23,8 @@
 - A GitHub release is now a draft until every platform's binary is uploaded.
   v0.4.0 was public with no binaries for about 2.5 minutes; a failed build
   lane would have left it incomplete.
+- The guide no longer has a "Tendr and Boo" section, and tendr no longer plans
+  screen reads. Exit code 83 stays reserved and unused.
 
 ### Fixed
 

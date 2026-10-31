@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Shared config and helpers for the slice-1 VM scripts. Source it; do not run it.
+# Shared config and helpers for the cloud PTY VM scripts. Source it; do not run it.
 # Everything is overridable from the environment.
 SLICE1=${SLICE1:-$HOME/slice1}
 S=${S:-cc}                                  # tendr session name

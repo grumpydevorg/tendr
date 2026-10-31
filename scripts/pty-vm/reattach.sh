@@ -1,5 +1,5 @@
 #!/bin/bash
-# Slice-1 step 5: detach with Ctrl-\ d, stay detached for DETACHED_GAP seconds,
+# Cloud PTY step 5: detach with Ctrl-\ d, stay detached for DETACHED_GAP seconds,
 # then reattach from the same ROWSxCOLS terminal and measure what the child
 # redraws. A same-size reattach sends no resize, so delta=0B after reattach means
 # "no repaint on reattach" (the case step 6's repaint nudge exists for).

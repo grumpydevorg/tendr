@@ -232,8 +232,8 @@ fn follow_picks_up_new_segments() {
 
     let follower = harness::ReadyFollower::spawn(&root, "events", &["--follow"]);
 
-    // A new, lexicographically-later segment appears (rotation is slice 4,
-    // but multi-segment logs are already legal). Its events must stream.
+    // A new, lexicographically-later segment appears (tendr does not rotate
+    // segments yet, but multi-segment logs are legal). Its events must stream.
     let seg = newest_segment(&root, "s1");
     let first_line = std::fs::read_to_string(&seg)
         .unwrap()

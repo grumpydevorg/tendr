@@ -38,8 +38,8 @@ fn segments(root: &TempDir, session: &str) -> Vec<std::path::PathBuf> {
 }
 
 /// Split the session's single segment after `keep` lines: the tail moves to
-/// a new, lexicographically-later segment (rotation is slice 4, but
-/// multi-segment logs are already legal — names are permanent identities).
+/// a new, lexicographically-later segment (tendr does not rotate segments yet,
+/// but multi-segment logs are legal — names are permanent identities).
 fn split_segment(root: &TempDir, session: &str, keep: usize) {
     let segs = segments(root, session);
     assert_eq!(segs.len(), 1, "expected a single segment to split");

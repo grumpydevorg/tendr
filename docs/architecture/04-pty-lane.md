@@ -76,6 +76,8 @@ flowchart LR
   ends with `MSG_INPUT_DONE {written | revoked | closed, accepted,
   received}`.
 - The CLI exits 84 with the byte counts unless every byte was written.
+- `accepted` counts bytes written to the PTY master. It does not mean the
+  child has read them. The CLI never resends input.
 - Both ends handle frames as the typed `attach_proto::Frame`. The decoder
   rejects an outcome that breaks these rules, or has an unknown status:
   - `written` requires every received byte to be accepted.
@@ -97,8 +99,14 @@ flowchart LR
 - `--takeover` replaces the holder, which is disconnected. The sidecar first
   sends it `MSG_RETIRED`, best-effort: a client that has stopped reading its
   output misses it and sees only end of stream.
-- The hello must complete within one overall deadline. Any frame that
-  declares more than 64 KiB closes the connection.
+- The hello must complete within one overall deadline of 5 s
+  (`attach_proto::HELLO_TIMEOUT`). Any frame that declares more than 64 KiB
+  closes the connection.
+- A sidecar admits at most eight attach connections at once
+  (`MAX_ATTACH_CONNECTIONS`), counting those still waiting for their hello.
+  Eight connections that never send a hello can refuse a takeover for up to
+  5 s. The socket is owner-only and peer-checked, so only the owner can cause
+  this.
 
 ### Refusals
 
@@ -181,7 +189,8 @@ A `push` to a pipe session that is not running exits 1.
   - A sender thread writes the queued messages.
   - A reader thread writes output to the terminal.
 - `Ctrl-\ d` detaches. `Ctrl-\` twice sends one `Ctrl-\`. `--escape none`
-  disables the escape.
+  disables the escape. Why this escape:
+  [design](../design.md#detach-is-a-fixed-two-key-escape).
 - The escape is recognised in the legacy byte encoding, and in the kitty
   keyboard protocol and xterm `modifyOtherKeys` encodings that a child can
   switch the terminal to (`src/attach_escape.rs`). Forwarded bytes are always
@@ -219,8 +228,9 @@ A `push` to a pipe session that is not running exits 1.
   drains it. A viewer that stops reading is disconnected and loses control. It
   never stalls capture or the child.
 - A viewer gets no recording sequence numbers, so a viewer that disconnects
-  cannot resume from where it stopped. The cloud PTY plan's replay slice adds
-  this ([00_cloud-pty-control.md](../plans/active/00_cloud-pty-control.md)).
+  cannot resume from where it stopped. The typed attach bridge in
+  [remote frame transport](../plans/active/01_remote-frame-transport.md)
+  step 5 adds this.
 - The child starts at 24×80. It gets `TERM=xterm-256color` when the launching
   environment had no `TERM`, an empty one, or `dumb`. An explicit
   `--env TERM` wins (`sidecar::pty_term`).

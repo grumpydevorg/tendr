@@ -108,8 +108,8 @@ DAG semantics, health rules, retries or planning belongs in a tool above tendr.
 
 Choices that are hard to reverse and came from a real choice between
 alternatives. Where an entry names a file as its source, the full text is in
-Git at commit `95dcf1d`, the last commit before the old plans and specs were
-removed.
+Git at commit `95dcf1d`, unless the entry names another commit. `95dcf1d` is
+the last commit before the old plans and specs were removed.
 
 ### Tendr supervises processes; it is not an agent framework
 
@@ -149,6 +149,15 @@ in-memory index was designed and rejected: in a comparison of three designs,
 plain append-only files met the event log's needs without a resident process.
 Source: `docs/plans/specs/persistence-architecture.md` (the rejected design)
 and `docs/plans/specs/event-protocol.md` §0.
+
+Two consequences stand until a named user needs otherwise. Storage is per
+session: large event payloads go to the session's own `events/blobs/`, and
+deleting a session deletes them; there is no global blob store, reference
+count or cache. Control between the CLI and the sidecar uses files, a FIFO
+and the attach socket; there is no request/response protocol. A design for
+each was written and set aside; both are in Git at `83f83ab`
+(`docs/plans/backlog/content-addressable-storage.md` and
+`sidecar-control-protocol.md`).
 
 ### No platform supervisor
 
@@ -228,14 +237,24 @@ the `duckdb` exec target drives, so tendr has no DuckDB library dependency.
 
 ### No terminal emulator in core
 
-*2026-07-09, revised 2026-09-14.* Tendr owns the PTY, input ownership and the
-exact recording. It does not parse or render the screen. Screen reads come
-from outside tendr: from Boo today, or from an optional `tendr-screen`
-extension that tendr would call through a versioned command-line contract.
-That extension is planned and not built. Core does not link a terminal
-emulator such as libghostty, so it gains no Zig or Ghostty build dependency.
-Source: [cloud PTY plan](plans/active/00_cloud-pty-control.md) and
-`docs/plans/specs/ecosystem-landscape.md`.
+*2026-07-09, revised 2026-10-31.* Tendr owns the PTY, input ownership and the
+exact recording. It does not parse or render the screen, and it offers no
+screen reads. Core does not link a terminal emulator such as libghostty, so it
+gains no Zig or Ghostty build dependency. A caller that needs the rendered
+screen replays the recording through a terminal of its own. Source:
+`docs/plans/specs/ecosystem-landscape.md`, and the cloud PTY plan at
+`95dcf1d`, which designed an optional `tendr-screen` extension that was
+dropped on 2026-10-31.
+
+### Detach is a fixed two-key escape
+
+*2026-09-26.* `attach` detaches on `Ctrl-\ d`. It does not need Enter, which
+could submit an unfinished prompt. It is not newline `~.`, because an outer
+`ssh -t` takes that as its own disconnect escape. The prefix is fixed, with
+only an on/off switch; a configurable prefix waits for a measured need.
+`--escape` already takes a value (`ctrl-backslash` or `none`), so one can be
+added later without changing the flag. Source: the cloud PTY plan at
+`83f83ab`.
 
 ### CI stays on native GitHub Actions; Dagger was not adopted
 
