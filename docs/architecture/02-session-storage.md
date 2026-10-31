@@ -38,8 +38,8 @@ flowchart TD
     Session --> CaptureErr["capture_errors.log\nCapture diagnostics"]
 ```
 
-Each fact has one home (Theme 4 in
-[../design-principles.md](../design-principles.md)):
+Each fact has one home (rule 4 in
+[../design.md](../design.md#4-durable-truth-derived-views)):
 
 - `meta.json` is the current run snapshot.
 - `output.log` is the child-output record.

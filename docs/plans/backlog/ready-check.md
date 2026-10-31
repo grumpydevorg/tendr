@@ -22,8 +22,8 @@ cannot start a client once a server is ready, because a server never exits.
 - a TCP port on the host accepting connections.
 
 The caller supplies the condition; tendr evaluates it and records the result.
-Tendr does not decide what "ready" means for any program (design principle
-[Mechanism Over Policy](../../design-principles.md#1-mechanism-over-policy)).
+Tendr does not decide what "ready" means for any program (rule 1 in
+[design](../../design.md#1-mechanism-over-policy)).
 
 The sidecar checks the condition, so it works for detached and remote
 (`--host`) sessions alike. It records a `run.ready` event and a ready time in

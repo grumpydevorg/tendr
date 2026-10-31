@@ -6,7 +6,7 @@ inside it, read its output or wait for it, locally or over SSH.
 
 See also the [README](../README.md) (install),
 [Architecture](architecture/README.md) (internals) and
-[Decisions](decisions.md) (reasons). Coding agents start from the
+[Design](design.md) (rules and reasons). Coding agents start from the
 [`using-tendr` skill](../src/embedded/SKILL.md).
 
 ## Terms
@@ -561,6 +561,6 @@ exits 1 on failure.
 
 ## See also
 
-- [Architecture](architecture/README.md) · [Decisions](decisions.md) · [Design principles](design-principles.md) · [Roadmap](ROADMAP.md)
+- [Architecture](architecture/README.md) · [Design](design.md) · [Plans](plans/README.md)
 - [Analytics recipes](analytics-recipes.md)
 - [`using-tendr` skill](../src/embedded/SKILL.md): the agent-facing entry point to `tendr guide`

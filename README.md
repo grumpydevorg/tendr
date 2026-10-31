@@ -68,9 +68,8 @@ binary, so the skill always matches the installed version.
 | [Guide](docs/guide.md) (also `tendr guide`) | use tendr |
 | [Analytics recipes](docs/analytics-recipes.md) | query the event log with SQL |
 | [Architecture](docs/architecture/README.md) | understand how it works |
-| [Decisions](docs/decisions.md) | understand why it works that way |
-| [Design principles](docs/design-principles.md) | judge a new feature |
-| [Roadmap](docs/ROADMAP.md) | see the planned work |
+| [Design](docs/design.md) | judge a change, and see why tendr works this way |
+| [Plans](docs/plans/README.md) | see the open work |
 | [Changelog](CHANGELOG.md) | see what changed in each release |
 
 ## License

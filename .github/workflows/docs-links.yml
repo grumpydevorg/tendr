@@ -38,10 +38,11 @@ jobs:
       - name: Check repository-internal links (offline)
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
-          # --offline skips every http(s) URL and checks only local file links.
+          # --offline skips every http(s) URL and checks only local file links;
+          # --include-fragments also checks #anchors in them.
           # --exclude-path target drops any build-output copy of the docs (the
           # glob would otherwise pick up target/package/... on a dirty tree).
-          args: "--offline --no-progress --exclude-path target './**/*.md'"
+          args: "--offline --include-fragments --no-progress --exclude-path target './**/*.md'"
           lycheeVersion: v0.24.2
           fail: true
 

@@ -54,12 +54,13 @@
 //! ## Design doctrine & architecture
 //!
 //! This crate documents *what the types are*. The system-level design — the
-//! five-layer stack, the seven themes (one authority per fact, durable truth
-//! vs. derived views, control plane vs. work plane, labelled inference, …),
-//! and the execution-boundary model — lives in the repository docs:
+//! scope (the three layers tendr owns), the seven rules (one authority per
+//! fact, durable truth vs. derived views, separate control and work planes,
+//! labelled inference, …), and the execution-boundary model — lives in the
+//! repository docs:
 //!
 //! - [Architecture overview](https://github.com/grumpydevorg/tendr/blob/main/docs/architecture/README.md)
-//! - [Design principles](https://github.com/grumpydevorg/tendr/blob/main/docs/design-principles.md)
+//! - [Design](https://github.com/grumpydevorg/tendr/blob/main/docs/design.md)
 //! - [Transport boundaries](https://github.com/grumpydevorg/tendr/blob/main/docs/architecture/06-transport-boundaries.md)
 
 // The crate doc and module summaries above lean on intra-doc links; a broken one

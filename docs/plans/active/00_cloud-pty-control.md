@@ -5,10 +5,10 @@ depends_on: []
 
 # Cloud PTY control and replay
 
-## Status and goal
-
 **Status:** slice 1 is partly shipped (v0.4.0). Steps 5, 6, 8 and 9 of slice 1
 remain. Slices 2–4 have not started.
+
+## Goal
 
 The target workflow is Ghostty on the laptop → SSH → Tendr on an exe.dev Linux
 VM → Claude Code in a Tendr-owned PTY. A person can reconnect after losing the
@@ -39,7 +39,7 @@ global daemon, second PTY owner, generic RPC framework or async runtime.
 | Session identity | Reuse Tendr namespace/session/run identity. Every stateful handle also carries its run ID; replacement invalidates old handles. |
 
 The external screen dispatch revises the earlier Boo-only screen decision. See
-[decisions](../../decisions.md) and [boo-integration](../backlog/boo-integration.md).
+[design](../../design.md#no-terminal-emulator-in-core) and [boo-integration](../backlog/boo-integration.md).
 
 ## Rust implementation boundaries
 

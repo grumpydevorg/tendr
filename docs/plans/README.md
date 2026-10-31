@@ -1,7 +1,7 @@
 # Plans
 
-This folder holds open work only. [ROADMAP.md](../ROADMAP.md) is the only index
-of plans; a test checks that it lists every plan file here.
+This folder holds open work only, and it is the only index of plans. What is
+out of scope for tendr is in [design](../design.md#scope).
 
 ## Layout
 
@@ -10,7 +10,8 @@ of plans; a test checks that it lists every plan file here.
 | `active/` | `NN_slug.md` | The ordered queue. The number sets priority; `00_` is first. Reorder by renaming. |
 | `backlog/` | `slug.md` | Unordered future work. |
 
-The folder is the status. Do not add status tables, summaries or counts here.
+The folder is the status. Do not add an index, status tables, summaries or
+counts anywhere else.
 
 ## Frontmatter
 
@@ -32,8 +33,10 @@ them.
 
 ## Plan content
 
-Start each plan with a short status line that says what is left, then the goal.
-Do not narrate shipped steps; name the PR if a remaining step depends on it.
+The line after the title is `**Status:**`, saying what is left, then the goal.
+A backlog plan's status also says what would start it. Do not narrate shipped
+steps; name the PR if a remaining step depends on it. The test checks that the
+status line is there.
 
 ## Lifecycle
 
@@ -41,5 +44,4 @@ Do not narrate shipped steps; name the PR if a remaining step depends on it.
 2. A plan moves between `active/` and `backlog/` with `git mv`.
 3. A finished plan is deleted in the PR that finishes it. First move its lasting
    facts to their home: `docs/guide.md` (how to use), `docs/architecture/` (how
-   it works), `docs/decisions.md` (why), `CHANGELOG.md` (what changed).
-4. Update `docs/ROADMAP.md` in the same PR.
+   it works), `docs/design.md` (why), `CHANGELOG.md` (what changed).

@@ -6,16 +6,18 @@
 
 - **The documentation is rewritten and reorganized.** Each kind of fact has
   one place: the guide says how to use tendr, `docs/architecture/` how it
-  works, the new `docs/decisions.md` why, and `docs/plans/` holds open work
-  only, indexed by `docs/ROADMAP.md`. Finished plans and old design specs are
-  removed; Git keeps them. The event-log and PTY-recording formats move to
-  `docs/architecture/`. The repository's copy of the `using-tendr` skill and
-  its `install.sh` are removed: `tendr skill install` and the Nix package
-  install the skill from the file the binary embeds.
+  works, the new `docs/design.md` the rules for judging a change and the
+  reasons behind past choices, and `docs/plans/` holds open work only. The
+  plans folder is its own index; there is no separate roadmap. Finished plans
+  and old design specs are removed; Git keeps them. The event-log and
+  PTY-recording formats move to `docs/architecture/`. The repository's copy of
+  the `using-tendr` skill and its `install.sh` are removed: `tendr skill
+  install` and the Nix package install the skill from the file the binary
+  embeds.
 - **Documentation drift fails the tests.** `tests/docs.rs` checks that every
-  command, flag and guide topic the current docs show exists, that
-  `docs/plans/` holds only open plans, and that the roadmap lists exactly
-  those plans.
+  command, flag and guide topic the current docs show exists, and that
+  `docs/plans/` holds only open plans, each with a status line under its
+  title.
 - The crate description is now "Keep shells, REPLs and long-running jobs
   alive between tool calls, locally or over SSH".
 

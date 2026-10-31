@@ -25,7 +25,7 @@ until a newline appears or the child exits.
 
 **This is the documented contract, not a defect.** The log is a line-oriented
 observability log, not a byte-exact replay stream, and it buffers partial lines
-until a newline (see [decisions](../../decisions.md)). Nothing is lost —
+until a newline (see [design](../../design.md#outputlog-is-a-line-log-the-pty-recording-is-the-exact-record)). Nothing is lost —
 the operator is blind. Those are different failures and the second one is the one
 that hurt.
 

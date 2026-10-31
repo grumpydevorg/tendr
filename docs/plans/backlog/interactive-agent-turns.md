@@ -247,7 +247,7 @@ into it. A herdr pane running `tendr attach` is a viewer, not a state source.
 
 ## Boundary: process sitter, not agent framework
 
-The process-sitter decision (see [decisions](../../decisions.md)) rejects
+The process-sitter decision (see [design](../../design.md#tendr-supervises-processes-it-is-not-an-agent-framework)) rejects
 native LLM protocols. It was amended on 2026-10-31: agent programs are no
 longer assumed to be one-shot, and tendr does not decide when an agent's turn
 is done. Interpreting events such as "Claude Code semantics" stays in consumer

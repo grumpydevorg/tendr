@@ -1,8 +1,8 @@
 # Tendr Architecture
 
-These files describe how the code on `main` works. The rules for judging new
-features are in [../design-principles.md](../design-principles.md). The
-reasons behind hard-to-reverse choices are in [../decisions.md](../decisions.md).
+These files describe how the code on `main` works. The rules for judging a
+change, and the reasons behind hard-to-reverse choices, are in
+[../design.md](../design.md).
 
 1. [01-system-context.md](01-system-context.md): the processes, who talks to them, and who owns what.
 2. [02-session-storage.md](02-session-storage.md): every file under `~/.tendr/` and how long it lives.

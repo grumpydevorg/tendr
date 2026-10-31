@@ -59,8 +59,8 @@ In `meta.json`, `status` is one of `Starting`, `Running`, `SpawnFailed`,
 
 ## Who writes each transition
 
-This follows Theme 2, One Authority Per Fact, in
-[../design-principles.md](../design-principles.md).
+This follows rule 2, one authority per fact, in
+[../design.md](../design.md#2-one-authority-per-fact).
 
 The sidecar writes:
 
