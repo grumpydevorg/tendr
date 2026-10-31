@@ -35,7 +35,7 @@ use super::{
     PtyRecordingRun, PtyTeardown, ReadyWriter, capture_stream, capture_stream_with_tee,
     collect_warnings, deliver_ready, finished_recording, lock, run_on_exit_hooks,
     setup_kill_watcher, setup_pty_stdin_forwarding, setup_stdin_forwarding, setup_timeout,
-    stopped_state, test_abort_point, test_fault, test_unlock_gate,
+    stopped_state, test_abort_point, test_fault, test_pty_read_delay, test_unlock_gate,
 };
 #[cfg(unix)]
 use super::{
@@ -528,6 +528,7 @@ impl RunCore {
             let stdout_failed = failed.clone();
             let stdout_handle = stdout.map(|s| match attach_sink {
                 Some(sink) => scope.spawn(move || {
+                    test_pty_read_delay();
                     capture_stream_with_tee(s, 'O', log_ref, &stdout_failed, &sink, recorder);
                 }),
                 None => scope.spawn(move || capture_stream(s, 'O', log_ref, &stdout_failed)),

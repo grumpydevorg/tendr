@@ -224,6 +224,19 @@ A `push` to a pipe session that is not running exits 1.
   before they are on disk. After a failed `output.log` write, capture skips
   the log for the rest of the run; the recorder and the viewer still get
   every chunk.
+- Capture ends when the terminal does, not when the child exits: a
+  background job that keeps the terminal keeps capture going until it closes
+  it. On macOS the session leader's exit ends the session's use of the
+  terminal, so capture ends with the child there.
+- The sidecar keeps its own descriptor for the PTY's slave side
+  (close-on-exec, never its controlling terminal) until the child has exited
+  and capture has read the master until it would block; then it closes it.
+  A thread observes the exit with `waitid(WNOWAIT)` and wakes the reader
+  through a pipe, so `child_wait` still reaps the child and the reader never
+  polls on a timer. Without the descriptor, the child's exit would be the
+  last close of the slave. macOS then waits only about 0.65 s for the master
+  to read what is pending before discarding it, so a reader starved of CPU
+  lost a short-lived child's output (`platform::unix::PtyReader`).
 - The viewer's queue holds at most 8 MiB. The viewer's own sender thread
   drains it. A viewer that stops reading is disconnected and loses control. It
   never stalls capture or the child.

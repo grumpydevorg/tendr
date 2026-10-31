@@ -882,6 +882,23 @@ fn test_ready_gate() {
     }
 }
 
+/// Test-only stall of a PTY session's output reader: before its first read it
+/// sleeps for `TENDR_TEST_PTY_READ_DELAY_MS` milliseconds, as a reader starved
+/// of CPU would, so a test can let a short-lived child write and exit before
+/// anything reads the PTY. Compiled into debug builds only; release sidecars
+/// ignore the variable entirely.
+fn test_pty_read_delay() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    if let Some(ms) = std::env::var("TENDR_TEST_PTY_READ_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// Forward pushed stdin for a PTY session through the single input writer.
 #[cfg(unix)]
 fn setup_pty_stdin_forwarding(

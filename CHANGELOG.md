@@ -37,6 +37,13 @@
 - **A line of child output that is not valid UTF-8 no longer ends capture.**
   It is logged with the invalid bytes replaced, and the lines after it are
   logged too.
+- **A short-lived PTY child's output is no longer lost on a busy macOS
+  host.** When a child such as `echo` wrote and exited before the sidecar read
+  the PTY, macOS discarded the unread output after about 0.65 s, leaving an
+  empty log and recording for a run recorded as `ExitedOk`. Under heavy load
+  this lost about one run in five. The sidecar now keeps the terminal open
+  until it has read everything the child left, then lets it close. Linux kept
+  such output and is unaffected.
 
 ## v0.4.0 — PTY control, connect deadline
 

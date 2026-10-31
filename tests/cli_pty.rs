@@ -70,6 +70,81 @@ fn start_pty_session_captures_output() {
     );
 }
 
+/// A short-lived child's output survives a PTY reader that is starved until
+/// well after the child wrote and exited. On macOS the exiting child's close
+/// of the terminal waits only briefly (about 0.65 s measured) for unread
+/// output to be read before discarding it, unless something else still holds
+/// the terminal open; the sidecar does, until it has read what the child
+/// left. The debug-only `TENDR_TEST_PTY_READ_DELAY_MS` stalls the reader.
+#[test]
+fn pty_output_survives_a_reader_stalled_past_the_childs_exit() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .env("TENDR_TEST_PTY_READ_DELAY_MS", "2000")
+        .args(["start", "pty-stall", "--pty", "--", "echo", "pty-hello"])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-stall");
+    let meta = harness::wait_terminal(&root, "pty-stall");
+    assert_eq!(meta["reason"], "ExitedOk", "{meta}");
+
+    let output = tendr(&root)
+        .args(["log", "pty-stall", "--raw"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(log.contains("pty-hello"), "output.log lost it: {log:?}");
+    let recorded = recorded_output(&decode_session_recording(&root, "pty-stall").records);
+    assert!(
+        contains(&recorded, b"pty-hello"),
+        "the recording lost it: {:?}",
+        String::from_utf8_lossy(&recorded)
+    );
+}
+
+/// The PTY capture ends when the terminal does, not when the child exits, and
+/// the sidecar's own hold on the terminal changes neither. A background job
+/// hung up by its session leader's exit ends with it, so capture does not wait
+/// for the job's 30 s. One that ignores the hangup and keeps the terminal is
+/// captured until it closes it on Linux; on macOS the leader's exit ends the
+/// session's use of the terminal, so its later output is not captured.
+#[test]
+fn pty_capture_ends_with_the_terminal_not_the_child() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    let run = |session: &str, script: &str| -> String {
+        tendr(&root)
+            .args(["start", session, "--pty", "--", "sh", "-c", script])
+            .assert()
+            .success();
+        let _session = harness::SessionGuard::new(&root, session);
+        let meta = harness::wait_terminal(&root, session);
+        assert_eq!(meta["reason"], "ExitedOk", "{meta}");
+        let output = tendr(&root)
+            .args(["log", session, "--raw"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let log = run("pty-hungup-job", "sleep 30 & echo started");
+    assert!(log.contains("started"), "{log:?}");
+
+    let log = run(
+        "pty-kept-job",
+        "trap '' HUP; (sleep 1; echo late) & echo started",
+    );
+    assert!(log.contains("started"), "{log:?}");
+    if cfg!(target_os = "macos") {
+        assert!(!log.contains("late"), "{log:?}");
+    } else {
+        assert!(log.contains("late"), "{log:?}");
+    }
+}
+
 /// The `TERM` a PTY child sees when started with `inherited` in the caller's
 /// environment and `extra` arguments to `start`.
 fn pty_child_term(
