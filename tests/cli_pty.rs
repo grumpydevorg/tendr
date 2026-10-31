@@ -70,6 +70,184 @@ fn start_pty_session_captures_output() {
     );
 }
 
+/// A short-lived child's output survives a PTY reader that is starved until
+/// well after the child wrote and exited. On macOS the exiting child's close
+/// of the terminal waits only briefly (about 0.65 s measured) for unread
+/// output to be read before discarding it, unless something else still holds
+/// the terminal open; the sidecar does, until it has read what the child
+/// left. The debug-only `TENDR_TEST_PTY_READ_DELAY_MS` stalls the reader.
+#[test]
+fn pty_output_survives_a_reader_stalled_past_the_childs_exit() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .env("TENDR_TEST_PTY_READ_DELAY_MS", "2000")
+        .args(["start", "pty-stall", "--pty", "--", "echo", "pty-hello"])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-stall");
+    let meta = harness::wait_terminal(&root, "pty-stall");
+    assert_eq!(meta["reason"], "ExitedOk", "{meta}");
+
+    let output = tendr(&root)
+        .args(["log", "pty-stall", "--raw"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(log.contains("pty-hello"), "output.log lost it: {log:?}");
+    let recorded = recorded_output(&decode_session_recording(&root, "pty-stall").records);
+    assert!(
+        contains(&recorded, b"pty-hello"),
+        "the recording lost it: {:?}",
+        String::from_utf8_lossy(&recorded)
+    );
+}
+
+/// The PTY capture ends when the terminal does, not when the child exits, and
+/// the sidecar's own hold on the terminal changes neither. A background job
+/// hung up by its session leader's exit ends with it, so capture does not wait
+/// for the job's 30 s. One that ignores the hangup and keeps the terminal is
+/// captured until it closes it on Linux; on macOS the leader's exit ends the
+/// session's use of the terminal, so its later output is not captured.
+#[test]
+fn pty_capture_ends_with_the_terminal_not_the_child() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    let run = |session: &str, script: &str| -> String {
+        tendr(&root)
+            .args(["start", session, "--pty", "--", "sh", "-c", script])
+            .assert()
+            .success();
+        let _session = harness::SessionGuard::new(&root, session);
+        let meta = harness::wait_terminal(&root, session);
+        assert_eq!(meta["reason"], "ExitedOk", "{meta}");
+        let output = tendr(&root)
+            .args(["log", session, "--raw"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let log = run("pty-hungup-job", "sleep 30 & echo started");
+    assert!(log.contains("started"), "{log:?}");
+
+    let log = run(
+        "pty-kept-job",
+        "trap '' HUP; (sleep 1; echo late) & echo started",
+    );
+    assert!(log.contains("started"), "{log:?}");
+    if cfg!(target_os = "macos") {
+        assert!(!log.contains("late"), "{log:?}");
+    } else {
+        assert!(log.contains("late"), "{log:?}");
+    }
+}
+
+/// A `^S` sent to a PTY session stops its output. On macOS a child that
+/// writes and exits while it is stopped cannot finish exiting until the
+/// output drains, which nothing can do while it is stopped; on Linux the
+/// write itself blocks. Either way `kill` must end the run: every stop
+/// restarts output, and a forced one also releases the sidecar's hold on the
+/// terminal. A graceful stop keeps the hold, so on macOS capture still gets
+/// what the child wrote. Both a child exec'd directly and a shell (which
+/// opens `/dev/tty`, holding the terminal itself) are covered.
+#[test]
+fn kill_ends_a_pty_run_whose_output_is_stopped() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    let direct = r#"$| = 1; select(undef, undef, undef, 0.05) until -e $ARGV[0];
+        print "pending\n"; open(my $f, ">", $ARGV[1]) or die; close $f"#;
+    let shell = r#"while [ ! -e "$1" ]; do sleep 0.05; done; echo pending; : > "$2""#;
+    for (session, program, force) in [
+        ("xoff-direct", ["perl", "-e", direct], true),
+        ("xoff-shell", ["sh", "-c", shell], true),
+        ("xoff-direct-graceful", ["perl", "-e", direct], false),
+        ("xoff-shell-graceful", ["sh", "-c", shell], false),
+    ] {
+        let go = root.path().join(format!("{session}.go"));
+        let written = root.path().join(format!("{session}.written"));
+        let mut argv: Vec<&str> = program.to_vec();
+        if program[0] == "sh" {
+            argv.push("sh");
+        }
+        argv.extend([go.to_str().unwrap(), written.to_str().unwrap()]);
+        tendr(&root)
+            .args(["start", session, "--pty", "--"])
+            .args(&argv)
+            .assert()
+            .success();
+        let _session = harness::SessionGuard::new(&root, session);
+        harness::wait_running(&root, session);
+
+        tendr(&root)
+            .args(["push", session])
+            .write_stdin("\x13")
+            .assert()
+            .success();
+        std::fs::write(&go, b"").unwrap();
+        // macOS queues the write, so the child goes on to exit; Linux blocks
+        // it until output restarts, so the child never gets past it there.
+        if cfg!(target_os = "macos") {
+            harness::poll_path_exists(&written, Duration::from_secs(10), Duration::from_millis(20))
+                .unwrap_or_else(|e| panic!("{session}: the child never wrote: {e}"));
+        }
+        // Let the child reach its exit (macOS) or its write (Linux).
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Already ended by itself is fine too; only a stuck run fails.
+        let mut kill = tendr(&root);
+        kill.args(["kill", session]);
+        if force {
+            kill.arg("--force");
+        }
+        let _ = kill.output();
+        let meta = harness::poll_terminal_ns(&root, "default", session)
+            .unwrap_or_else(|e| panic!("{session}: still not ended after kill: {e}"));
+        assert_eq!(meta["status"], "Exited", "{session}: {meta}");
+        if !force && cfg!(target_os = "macos") {
+            let output = tendr(&root)
+                .args(["log", session, "--raw"])
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&output.stdout);
+            assert!(log.contains("pending"), "{session}: {log:?}");
+        }
+    }
+}
+
+/// A graceful `kill` keeps the sidecar's hold on the terminal while capture
+/// is running, so what the child writes as it hangs up is still captured by
+/// a reader that is stalled past the child's exit. (Only a forced stop, or a
+/// stop with no reader running, gives the hold up at once.) The pause after
+/// `Running` lets capture start, so the kill finds the reader in place.
+#[test]
+fn graceful_kill_keeps_a_stalled_readers_output() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .env("TENDR_TEST_PTY_READ_DELAY_MS", "3000")
+        .args(["start", "pty-hangup", "--pty", "--", "perl", "-e"])
+        .arg(r#"$| = 1; $SIG{HUP} = sub { print "final line\n"; exit 0 }; sleep 60"#)
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-hangup");
+    harness::wait_running(&root, "pty-hangup");
+    std::thread::sleep(Duration::from_millis(300));
+    tendr(&root).args(["kill", "pty-hangup"]).assert().success();
+    harness::wait_terminal(&root, "pty-hangup");
+
+    let output = tendr(&root)
+        .args(["log", "pty-hangup", "--raw"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(log.contains("final line"), "output.log lost it: {log:?}");
+}
+
 /// The `TERM` a PTY child sees when started with `inherited` in the caller's
 /// environment and `extra` arguments to `start`.
 fn pty_child_term(

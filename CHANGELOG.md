@@ -37,6 +37,22 @@
 - **A line of child output that is not valid UTF-8 no longer ends capture.**
   It is logged with the invalid bytes replaced, and the lines after it are
   logged too.
+- **A short-lived PTY child's output is no longer lost on a busy macOS
+  host.** When a child such as `echo` wrote and exited before the sidecar read
+  the PTY, macOS discarded the unread output after about 0.65 s, leaving an
+  empty log and recording for a run recorded as `ExitedOk`. Under heavy load
+  this lost about one run in five. The sidecar now keeps the terminal open
+  until it has read everything the child left, then lets it close; a graceful
+  `kill` keeps it too. A forced stop (`kill --force`, `--timeout`, or a
+  sidecar failure before capture starts) gives the terminal up at once, so
+  the child's exit never waits on output nothing will read; there its last
+  unread output can still be lost under load. Linux kept such output and is
+  unaffected.
+- **`kill` ends a PTY session whose output was stopped with `^S` on macOS.**
+  A shell that wrote and exited while its output was stopped could not finish
+  exiting, and even `kill --force` left the session `Running`. A stop now
+  restarts the output first.
+- **A PTY child no longer inherits the PTY master descriptor.**
 
 ## v0.4.0 — PTY control, connect deadline
 

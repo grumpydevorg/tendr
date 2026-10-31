@@ -422,6 +422,59 @@ fn pty_io_failure_stops_the_session_leader_and_records_sidecar_failed() {
     assert_eq!(code, Some(5));
 }
 
+/// A PTY child that wrote output nobody has read yet is still stopped
+/// promptly when the run fails before capture starts. The sidecar's hold on
+/// the terminal (which makes an exiting child's close wait for capture to
+/// read what it left) is released by the stop, so the child's exit does not
+/// wait on a reader that will never run. The child is exec'd directly, not
+/// through a shell, which would open `/dev/tty` and hold the terminal itself.
+#[cfg(unix)]
+#[test]
+fn pty_failure_stops_a_child_whose_output_was_never_read() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let gate = root.path().join("fault-gate");
+    let hook_out = root.path().join("hook-env");
+    let hook = echo_env_cmd(&hook_out);
+    let pid_file = root.path().join("child.pid");
+    let pid_arg = pid_file.to_str().unwrap();
+    let client = spawn_start(
+        &root,
+        Inject::Fail("running_meta"),
+        &gate,
+        &[
+            "s1",
+            "--on-exit",
+            &hook,
+            "--pty",
+            "--",
+            "perl",
+            "-e",
+            r#"$| = 1; print "written before the fault\n"; open(my $f, ">", $ARGV[0]) or die; print $f $$; close $f; sleep 60"#,
+            pid_arg,
+        ],
+    );
+    wait_for_file(&pid_file, "the child to write");
+    let failed_at = std::time::Instant::now();
+    std::fs::write(&gate, b"").expect("open the fault gate");
+
+    let (code, _, _) = finish_client(client);
+    assert_sidecar_failed(
+        &root,
+        "s1",
+        "running_meta",
+        "injected fault at running_meta",
+        &hook_out,
+    );
+    assert_pid_gone(&pid_file, "the child");
+    let took = failed_at.elapsed();
+    assert!(
+        took < Duration::from_secs(8),
+        "stopping the child took {took:?}"
+    );
+    assert_eq!(code, Some(5));
+}
+
 // === Recording the failure itself fails ===
 
 /// The child is still stopped, and the failure is reported on the channels
