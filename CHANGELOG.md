@@ -21,6 +21,18 @@
 - The crate description is now "Keep shells, REPLs and long-running jobs
   alive between tool calls, locally or over SSH".
 
+### Fixed
+
+- **A failed `output.log` write no longer stops output capture.** The sidecar
+  adds one warning per stream to `meta.json` while the run is live, then keeps
+  reading and discards the rest, so the child does not die or block, and its
+  real exit is still recorded. PTY recordings and attached viewers keep
+  receiving output. `capture_errors.log` is gone; capture warnings go straight
+  to `meta.json`.
+- **A line of child output that is not valid UTF-8 no longer ends capture.**
+  It is logged with the invalid bytes replaced, and the lines after it are
+  logged too.
+
 ## v0.4.0 — PTY control, connect deadline
 
 Breaking: attaching needs the new attach protocol, PTY `attach`/`push` exit

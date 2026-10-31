@@ -35,7 +35,6 @@ flowchart TD
     Session --> KillMarks["kill_forced / kill_acted\nKill classification"]
 
     Session --> AttachPath["a.sock.path\nPTY only: path of the attach socket"]
-    Session --> CaptureErr["capture_errors.log\nCapture diagnostics"]
 ```
 
 Each fact has one home (rule 4 in
@@ -57,7 +56,6 @@ create no state of their own.
 | `events/<uuidv7>.jsonl` | sidecar; `emit`; `exec`; `wrap`; reconciliation | Append-only. Format: [07-event-protocol.md](07-event-protocol.md). |
 | `events/blobs/<sha256>` | any event writer | Payloads over 16 KiB, keyed by SHA-256. |
 | `recording/<run_id>/seg-<index:08>.tndrrec` | sidecar (PTY sessions) | Directories `0700`, segments `0600` on Unix. Format: [08-pty-recording-format.md](08-pty-recording-format.md). |
-| `capture_errors.log` | sidecar | Capture errors. The sidecar copies them into `meta.json` warnings when the run ends. |
 | `~/.tendr/callbacks/<run_id>.json` | sidecar | `--on-exit` results. Outside the session dir, so it survives `--replace`. |
 | `~/.tendr/lost+found/events.jsonl` | `emit`; sidecar | Events whose session dir was gone or whose event log was unwritable. |
 
