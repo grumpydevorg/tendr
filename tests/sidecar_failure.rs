@@ -616,6 +616,28 @@ fn output_log_failure_drains_output_and_recovers() {
     );
 }
 
+/// A mid-run `output.log` write failure keeps draining the child's output,
+/// so a chatty child still runs to its real exit with a warning.
+#[test]
+fn output_log_write_failure_drains_output_and_recovers() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_root, meta) = recovers(
+        Inject::Fail("output_log_write"),
+        &["--timeout", "20"],
+        &[
+            "sh",
+            "-c",
+            "yes tendr | head -c 2000000; yes tendr | head -c 2000000 >&2",
+        ],
+    );
+    assert_exited_ok(&meta);
+    assert_warning(
+        &meta,
+        "log capture: stdout capture: log write failed, later output discarded: \
+         injected fault at output_log_write",
+    );
+}
+
 /// The child exited, so there is nothing to stop: the durable event lets
 /// reconciliation heal meta, a copy goes to lost+found, and hooks still run.
 #[test]

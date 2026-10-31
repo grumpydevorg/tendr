@@ -21,6 +21,13 @@
 - The crate description is now "Keep shells, REPLs and long-running jobs
   alive between tool calls, locally or over SSH".
 
+### Fixed
+
+- **A failed `output.log` write no longer stops output capture.** The sidecar
+  records one `log capture:` warning, then keeps reading and discards the
+  rest, so the child does not block or die of `SIGPIPE`, and its real exit is
+  still recorded. PTY recordings and attached viewers keep receiving output.
+
 ## v0.4.0 — PTY control, connect deadline
 
 Breaking: attaching needs the new attach protocol, PTY `attach`/`push` exit

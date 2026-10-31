@@ -848,8 +848,9 @@ fn test_abort_point(point: &str) {
 /// Test-only fault injection at a named sidecar step. `TENDR_TEST_FAIL` is a
 /// comma-separated list of points that return an injected error;
 /// `TENDR_TEST_PANIC` names points that panic. The points are the
-/// [`SidecarStep`] wire names plus `ready_rewrite`, `terminal_meta` and
-/// `failure_record`. If `TENDR_TEST_FAULT_GATE` names a file, a named point
+/// [`SidecarStep`] wire names plus `ready_rewrite`, `terminal_meta`,
+/// `failure_record` and `output_log_write` (every write to `output.log`). If
+/// `TENDR_TEST_FAULT_GATE` names a file, a named point
 /// first waits for it (bounded), so a test can let the child reach a known
 /// state before the fault fires. Compiled into debug builds only; release
 /// sidecars ignore all three variables entirely.
@@ -1486,14 +1487,16 @@ fn signal_readiness(session: &SessionDir, ready: &mut Option<ReadyWriter>, meta:
     }
 }
 
-/// Read lines from a stream and write to the shared log file.
-/// Returns an error if log writing fails persistently.
+/// Read lines from a stream and write to the shared log file. After the first
+/// failed write, keep reading and discard so the child never blocks; that
+/// error is returned once the stream closes.
 fn capture_stream(
     stream: Box<dyn std::io::Read + Send>,
     tag: char,
     log: &Mutex<Box<dyn Write + Send>>,
 ) -> Result<(), String> {
     let reader = BufReader::new(stream);
+    let mut failed: Option<String> = None;
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -1506,11 +1509,17 @@ fn capture_stream(
         })
         .expect("JSON serialization cannot fail")
             + "\n";
+        if failed.is_some() {
+            continue;
+        }
         let mut f = log.lock().map_err(|e| format!("log mutex poisoned: {e}"))?;
-        f.write_all(formatted.as_bytes())
-            .map_err(|e| format!("log write failed: {e}"))?;
+        if let Err(e) =
+            test_fault("output_log_write").and_then(|()| f.write_all(formatted.as_bytes()))
+        {
+            failed = Some(format!("log write failed, later output discarded: {e}"));
+        }
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 /// Read raw bytes from a stream, record them, write them to the log, and tee
@@ -1523,6 +1532,7 @@ fn capture_stream_with_tee(
     recorder: Option<&Recorder>,
 ) -> Result<(), String> {
     let mut buf = [0u8; 4096];
+    let mut failed: Option<String> = None;
     loop {
         let n = match stream.read(&mut buf) {
             Ok(0) => break,
@@ -1535,8 +1545,9 @@ fn capture_stream_with_tee(
             recorder.output(&buf[..n]);
         }
 
-        // Write to log (best-effort chunk-based transcript)
-        {
+        // Write to log (best-effort chunk-based transcript). After the first
+        // failed write, skip the log but keep recording and teeing.
+        if failed.is_none() {
             let mut f = log.lock().map_err(|e| format!("log mutex: {e}"))?;
             let text = String::from_utf8_lossy(&buf[..n]);
             for line in text.lines() {
@@ -1547,8 +1558,12 @@ fn capture_stream_with_tee(
                 })
                 .expect("JSON serialization cannot fail")
                     + "\n";
-                f.write_all(formatted.as_bytes())
-                    .map_err(|e| format!("log write failed: {e}"))?;
+                if let Err(e) =
+                    test_fault("output_log_write").and_then(|()| f.write_all(formatted.as_bytes()))
+                {
+                    failed = Some(format!("log write failed, later output discarded: {e}"));
+                    break;
+                }
             }
         }
 
@@ -1561,7 +1576,7 @@ fn capture_stream_with_tee(
             }
         }
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 /// The PTY input the single writer drives: the master's write half, a dup used
