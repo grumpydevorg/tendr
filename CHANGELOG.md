@@ -44,6 +44,11 @@
   this lost about one run in five. The sidecar now keeps the terminal open
   until it has read everything the child left, then lets it close. Linux kept
   such output and is unaffected.
+- **`kill` ends a PTY session whose output was stopped with `^S` on macOS.**
+  A shell that wrote and exited while its output was stopped could not finish
+  exiting, and even `kill --force` left the session `Running`. A stop now
+  restarts the output first.
+- **A PTY child no longer inherits the PTY master descriptor.**
 
 ## v0.4.0 — PTY control, connect deadline
 

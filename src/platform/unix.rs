@@ -25,6 +25,9 @@ pub struct SupervisedChild {
     /// PTY output reader (master read half, holding the slave until drained).
     /// None for pipe sessions.
     pty_reader: Option<PtyReader>,
+    /// The reader's hold on the PTY slave, which a stop releases. None for
+    /// pipe sessions.
+    pty_hold: Option<SlaveHold>,
     /// PTY master write half. None for pipe sessions.
     pty_master_write: Option<File>,
 }
@@ -42,13 +45,14 @@ impl SupervisedChild {
 }
 
 /// Lightweight kill handle for Unix. Carries the ProcessIdentity
-/// needed for identity-verified group kill, and whether the child leads a
-/// PTY session, whose graceful stop starts with a hangup. Send + Clone so it
-/// can be moved to a timeout thread.
+/// needed for identity-verified group kill, and for a child that leads a PTY
+/// session, whose graceful stop starts with a hangup, the sidecar's hold on
+/// its terminal, which a stop releases. Send + Clone so it can be moved to a
+/// timeout thread.
 #[derive(Clone)]
 pub struct ChildKillHandle {
     identity: ProcessIdentity,
-    is_pty: bool,
+    pty_hold: Option<SlaveHold>,
 }
 
 impl Platform for UnixPlatform {
@@ -128,6 +132,7 @@ impl Platform for UnixPlatform {
             identity,
             is_pty: false,
             pty_reader: None,
+            pty_hold: None,
             pty_master_write: None,
         })
     }
@@ -167,9 +172,12 @@ impl Platform for UnixPlatform {
         // SAFETY: openpty returned 0, so master_fd and slave_fd are valid open fds.
         let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
-        // The sidecar keeps this slave descriptor until it has read what the
-        // child left (see `PtyReader`); no other process it spawns may inherit
-        // it. The child's own copies are dup2'd below and do not carry the flag.
+        // openpty sets neither descriptor close-on-exec. The master is the
+        // sidecar's alone; the sidecar keeps this slave descriptor until it has
+        // read what the child left (see `PtyReader`). No process the sidecar
+        // spawns may inherit either: the child's own slave copies are dup2'd
+        // below and do not carry the flag.
+        rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
         rustix::io::fcntl_setfd(&slave, rustix::io::FdFlags::CLOEXEC)?;
         // Watches for the child's exit before the child exists, so a failure to
         // start the thread cannot leave a spawned child behind.
@@ -247,11 +255,13 @@ impl Platform for UnixPlatform {
         let pid = child.id();
         let identity = capture_spawned_identity(pid)?;
 
+        let hold = SlaveHold::new(slave);
         Ok(SupervisedChild {
             child,
             identity,
             is_pty: true,
-            pty_reader: Some(PtyReader::holding_slave(master_read, slave, exited)),
+            pty_reader: Some(PtyReader::holding_slave(master_read, hold.clone(), exited)),
+            pty_hold: Some(hold),
             pty_master_write: Some(master_write),
         })
     }
@@ -320,12 +330,18 @@ impl Platform for UnixPlatform {
     fn child_kill_handle(child: &SupervisedChild) -> ChildKillHandle {
         ChildKillHandle {
             identity: child.identity,
-            is_pty: child.is_pty,
+            pty_hold: child.pty_hold.clone(),
         }
     }
 
     fn kill_child(handle: &ChildKillHandle, force: bool) -> io::Result<()> {
-        kill_process(&handle.identity, force, handle.is_pty)
+        // Release the terminal first, so the child's exit never waits on
+        // capture: no reader runs on a failure path, and a reader cannot drain
+        // output stopped by ^S.
+        if let Some(hold) = &handle.pty_hold {
+            hold.release_for_stop();
+        }
+        kill_process(&handle.identity, force, handle.pty_hold.is_some())
     }
 
     fn kill_orphan(id: &ProcessIdentity, force: bool) -> io::Result<()> {
@@ -820,37 +836,74 @@ pub fn set_nonblocking(fd: &impl rustix::fd::AsFd) -> io::Result<()> {
 /// the last close of the slave, the kernel waits only briefly (about 0.65 s
 /// measured) for the master to read what the child wrote, then discards it;
 /// a reader starved of CPU for longer lost a short-lived child's output.
-/// Holding the slave means the child's close is never the last one. Once the
-/// slave is released, end of stream comes as before: when every other holder
+/// Holding the slave means the child's close is never the last one, so on
+/// macOS the child's exit waits in the kernel, without a time limit, until
+/// this reader has drained the master. A stop (`kill_child`) therefore
+/// releases the hold first, and restarts output stopped by `^S`, so no exit
+/// waits on a reader that is not running or cannot drain. Once the slave is
+/// released, end of stream comes as before: when every other holder
 /// (descendants that inherited the terminal) has closed it.
 pub struct PtyReader {
     file: File,
-    hold: Option<SlaveHold>,
+    drain: Option<DrainWatch>,
 }
 
-/// The slave descriptor a [`PtyReader`] holds, and how it learns that the
-/// child has exited.
-struct SlaveHold {
-    _slave: OwnedFd,
+/// What a holding [`PtyReader`] needs to release its hold once drained.
+struct DrainWatch {
+    hold: SlaveHold,
     /// Read end of a pipe whose write end closes once the child has exited.
     exited: File,
     /// The exit has been seen: release the slave once the master would block.
     exit_seen: bool,
 }
 
+/// The sidecar's descriptor for a PTY's slave side, shared by the reader,
+/// which releases it once drained, and the stop path, which releases it at
+/// once. Whichever comes first closes it.
+#[derive(Clone)]
+struct SlaveHold(std::sync::Arc<std::sync::Mutex<Option<OwnedFd>>>);
+
+impl SlaveHold {
+    fn new(slave: OwnedFd) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(slave))))
+    }
+
+    fn take(&self) -> Option<OwnedFd> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Close the slave descriptor, if still held.
+    fn release(&self) {
+        drop(self.take());
+    }
+
+    /// Release for a stop: first restart output stopped by `^S` (`TCOON`),
+    /// which nothing can drain while stopped, then close the descriptor. A
+    /// no-op once released: the child has then exited and been drained.
+    fn release_for_stop(&self) {
+        if let Some(slave) = self.take() {
+            // Best effort: the stop goes ahead either way.
+            let _ = rustix::termios::tcflow(&slave, rustix::termios::Action::OOn);
+        }
+    }
+}
+
 impl PtyReader {
     #[must_use]
     pub fn new(file: File) -> Self {
-        Self { file, hold: None }
+        Self { file, drain: None }
     }
 
-    /// A reader that holds `slave` open until the pipe read by `exited`
-    /// reports the child's exit and the master is then drained.
-    fn holding_slave(file: File, slave: OwnedFd, exited: File) -> Self {
+    /// A reader that holds `hold` until the pipe read by `exited` reports
+    /// the child's exit and the master is then drained.
+    fn holding_slave(file: File, hold: SlaveHold, exited: File) -> Self {
         Self {
             file,
-            hold: Some(SlaveHold {
-                _slave: slave,
+            drain: Some(DrainWatch {
+                hold,
                 exited,
                 exit_seen: false,
             }),
@@ -865,17 +918,18 @@ impl PtyReader {
     fn wait_readable(&mut self) -> io::Result<()> {
         use rustix::event::{PollFd, PollFlags, poll};
 
-        let Some(hold) = &mut self.hold else {
+        let Some(drain) = &mut self.drain else {
             wait_for(&self.file, PollFlags::IN, None)?;
             return Ok(());
         };
-        if hold.exit_seen {
-            self.hold = None;
+        if drain.exit_seen {
+            drain.hold.release();
+            self.drain = None;
             return Ok(());
         }
         let mut fds = [
             PollFd::new(&self.file, PollFlags::IN),
-            PollFd::new(&hold.exited, PollFlags::IN),
+            PollFd::new(&drain.exited, PollFlags::IN),
         ];
         loop {
             match poll(&mut fds, None) {
@@ -884,8 +938,7 @@ impl PtyReader {
                 Err(e) => return Err(e.into()),
             }
         }
-        let exited = !fds[1].revents().is_empty();
-        hold.exit_seen = exited;
+        drain.exit_seen = !fds[1].revents().is_empty();
         Ok(())
     }
 }
@@ -921,6 +974,10 @@ impl ExitWatch {
                 if let Ok(pid) = pid_rx.recv() {
                     // WNOWAIT leaves the child waitable. Any other error
                     // (ECHILD: it was already reaped) also means it is gone.
+                    // Residual: if a failure path reaps the child, and its pid
+                    // is reused by another child of the sidecar (an on-exit
+                    // hook) before this call, it waits on that one instead;
+                    // the hold is then released by the stop, not by this.
                     while let Err(rustix::io::Errno::INTR) = waitid(
                         WaitId::Pid(pid),
                         WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,

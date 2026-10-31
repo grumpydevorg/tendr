@@ -237,6 +237,14 @@ A `push` to a pipe session that is not running exits 1.
   last close of the slave. macOS then waits only about 0.65 s for the master
   to read what is pending before discarding it, so a reader starved of CPU
   lost a short-lived child's output (`platform::unix::PtyReader`).
+- So on macOS a PTY child's exit waits in the kernel, with no time limit,
+  until capture has drained the master. A shell that opened `/dev/tty`
+  already waited this way. Any stop (`kill`, `--timeout`, a sidecar failure)
+  therefore first restarts output stopped by `^S` (`TCOON`) and releases the
+  sidecar's descriptor, so no exit waits on a reader that is not running or
+  cannot drain. A stopped child's last unread output is then subject to the
+  0.65 s discard again. A child that exits while its output is stopped by
+  `^S` stays exiting until `^Q` or a stop.
 - The viewer's queue holds at most 8 MiB. The viewer's own sender thread
   drains it. A viewer that stops reading is disconnected and loses control. It
   never stalls capture or the child.

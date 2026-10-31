@@ -145,6 +145,63 @@ fn pty_capture_ends_with_the_terminal_not_the_child() {
     }
 }
 
+/// A `^S` sent to a PTY session stops its output. On macOS a child that
+/// writes and exits while it is stopped cannot finish exiting until the
+/// output drains, which nothing can do while it is stopped; on Linux the
+/// write itself blocks. Either way `kill --force` must end the run: the stop
+/// restarts output and releases the sidecar's hold on the terminal. Both a
+/// child exec'd directly and a shell (which opens `/dev/tty`, holding the
+/// terminal itself) are covered.
+#[test]
+fn kill_ends_a_pty_run_whose_output_is_stopped() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    let direct = r#"$| = 1; select(undef, undef, undef, 0.05) until -e $ARGV[0];
+        print "pending\n"; open(my $f, ">", $ARGV[1]) or die; close $f"#;
+    let shell = r#"while [ ! -e "$1" ]; do sleep 0.05; done; echo pending; : > "$2""#;
+    for (session, program) in [
+        ("xoff-direct", ["perl", "-e", direct]),
+        ("xoff-shell", ["sh", "-c", shell]),
+    ] {
+        let go = root.path().join(format!("{session}.go"));
+        let written = root.path().join(format!("{session}.written"));
+        let mut argv: Vec<&str> = program.to_vec();
+        if program[0] == "sh" {
+            argv.push("sh");
+        }
+        argv.extend([go.to_str().unwrap(), written.to_str().unwrap()]);
+        tendr(&root)
+            .args(["start", session, "--pty", "--"])
+            .args(&argv)
+            .assert()
+            .success();
+        let _session = harness::SessionGuard::new(&root, session);
+        harness::wait_running(&root, session);
+
+        tendr(&root)
+            .args(["push", session])
+            .write_stdin("\x13")
+            .assert()
+            .success();
+        std::fs::write(&go, b"").unwrap();
+        // macOS queues the write, so the child goes on to exit; Linux blocks
+        // it until output restarts, so the child never gets past it there.
+        if cfg!(target_os = "macos") {
+            harness::poll_path_exists(&written, Duration::from_secs(10), Duration::from_millis(20))
+                .unwrap_or_else(|e| panic!("{session}: the child never wrote: {e}"));
+        }
+        // Let the child reach its exit (macOS) or its write (Linux).
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Already ended by itself is fine too; only a stuck run fails.
+        let _ = tendr(&root).args(["kill", session, "--force"]).output();
+        let meta = harness::poll_terminal_ns(&root, "default", session)
+            .unwrap_or_else(|e| panic!("{session}: still not ended after kill --force: {e}"));
+        assert_eq!(meta["status"], "Exited", "{session}: {meta}");
+    }
+}
+
 /// The `TERM` a PTY child sees when started with `inherited` in the caller's
 /// environment and `extra` arguments to `start`.
 fn pty_child_term(
