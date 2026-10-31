@@ -5,8 +5,8 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 5, 6, 8 and 9 remain. Step 5 waits for a VM and fixes step
-6's design; step 8 needs any sshd (`TENDR_TEST_SSH_HOST`); step 9 the VM.
+**Status:** steps 6, 8, 9 and 10 remain. Step 5's measurement (below) settled
+step 6's design. Step 8 needs any sshd (`TENDR_TEST_SSH_HOST`); step 9 the VM.
 
 ## Goal
 
@@ -25,40 +25,52 @@ back is [PTY replay](../backlog/pty-replay.md).
 
 ## Remaining steps (one PR each)
 
-- **Step 5. Query and repaint measurement on the VM** (waits for a VM; docs only).
-   - Detached vs attached Claude; same-size reattach redraw; same-size resize
-     vs `kill -WINCH` vs rows−1 and restore; `Ctrl-\ d` and `Ctrl-]` through
-     Ghostty → `ssh -t`; exe.dev half-open timing.
-   - Launch Claude each way the workflow does: from the SSH login shell, from
-     an agent's bash tool on the VM, and with `tendr --host` from the laptop
-     (`ssh -T`, so sshd sets no `TERM`). A PTY child inherits the caller's
-     environment except `TERM`
-     ([PTY lane](../../architecture/04-pty-lane.md#output-and-viewers)). omp's
-     non-PTY bash tool sets `TERM=dumb`, `CI=true`, `NO_COLOR=1`,
-     `EDITOR`/`VISUAL`/`GIT_EDITOR=true`, `PAGER`/`GIT_PAGER=cat` and
-     `GIT_TERMINAL_PROMPT=0` (measured locally, 2026-10-30). Record the full
-     `env | sort` diff between launch paths and how Claude renders and behaves
-     under each; `CI` and `NO_COLOR` are the ones expected to change
-     rendering.
-   - Use a bounded capture deadline so a query stall shows up. Do not log real
-     credentials. `examples/dump-recording.rs` flags the query sequences to
-     inspect.
-   - Output: a "Measurement" subsection in this plan with the Claude and
-     Ghostty versions, the decision for step 6, and whether `start --pty`
-     should offer an env unset.
-   - If Claude stalls while detached, that blocks this plan. The fix is a
-     small documented responder for the measured queries only. It has one
-     responder per attach epoch, writes through the input writer, and stays
-     silent while a human is attached. Do not invent cursor-position replies.
-- **Step 6. Best-effort repaint nudge after (re)attach** (local; design fixed by
-   step 5). New `MSG_REPAINT`, recorded as `ResizeCause::Repaint
-   { correlation }`; the codec supports it and nothing emits it yet. Prefer a
-   same-size repaint if step 5 shows Claude redraws on one; use a tagged
-   shrink-and-restore pair only if it does not. A repaint does not restore
-   history. Tests:
-   `reattach_at_the_same_size_records_a_tagged_repaint_pair`,
-   `reattach_at_a_new_size_records_only_a_user_resize`,
-   `a_repaint_is_authorized_like_input`.
+- **Step 6. Terminal modes and a repaint on (re)attach** (local; design from
+  the [measurement](#measurement-step-5-2026-11-01)). Two parts, one PR each:
+   - **6a. Restore the user's terminal modes.** A streaming parser tracks the
+     terminal modes the child's output turns on: alternate screen, cursor
+     visibility, application cursor keys and keypad, mouse tracking and
+     encodings, focus events, bracketed paste, colour-scheme reports,
+     synchronized output, kitty keyboard flags (one stack per screen) and
+     `modifyOtherKeys`. A full reset (`ESC c`) clears them; a soft reset
+     (`CSI ! p`) shows the cursor and resets cursor keys and keypad.
+     - Sidecar: the tracker lives with the viewer slot under the tee's lock
+       and is fed in the same critical section that offers each chunk. A new
+       viewer gets the replay on its queue before it is installed, so no
+       chunk is both replayed and delivered (a kitty push is not idempotent).
+     - Replay order: main-screen kitty pushes, the alternate screen, its
+       pushes, then the other modes. The inverse runs backwards: synchronized
+       output off, alternate-screen pops, leave it, main-screen pops, the
+       other modes off.
+     - Client: the reader tracks each chunk before writing it, under a lock
+       it also holds while writing. However the attach ends, a helper takes
+       that lock, marks the screen done so the reader writes nothing more,
+       and writes the inverse; the client waits for it at most 200 ms, so a
+       terminal that is not reading cannot hold the exit.
+     - Not tracked: the window title, character sets, cursor shape. A
+       terminal whose last client could not write the inverse (SIGKILL, a
+       dead connection, then `--takeover` from the same window) keeps that
+       state under the replay.
+     - Old clients and sidecars interoperate: the replay is ordinary data.
+       Tests: `detach_turns_off_the_modes_the_child_turned_on`,
+       `attach_replays_the_modes_set_before_it`,
+       `kitty_flags_are_restored_per_screen`,
+       `a_reset_from_the_child_clears_tracked_modes`.
+   - **6b. Repaint nudge.** New `MSG_REPAINT`, sent once by the client after
+     its first resize, authorized like input. When that attach did not change
+     the size, the attach handler shrinks the PTY by one row and later
+     restores it, as two separate writer controls so neither blocks input or
+     a takeover. Both are recorded as `ResizeCause::Repaint { correlation }`
+     after the attach's `user` resize. The restore applies only if the PTY is
+     still at the shrunk size; a user resize or takeover in between cancels
+     it. The first output after a shrink is Claude re-sending its mouse modes
+     (0.25 ms), and the redraw follows 19 ms later, so the restore waits until
+     output has been quiet for 50 ms, at most 500 ms; the VM check must show
+     Claude redraws on that pair. A repaint does not restore history. Old
+     sidecars ignore the frame. Tests:
+     `reattach_at_the_same_size_records_a_tagged_repaint_pair`,
+     `reattach_at_a_new_size_records_only_a_user_resize`,
+     `a_repaint_is_authorized_like_input`.
 - **Step 8. Nested `ssh -t` fixtures, opt-in** (sshd; `TENDR_TEST_SSH_HOST`).
    `tests/cli_attach_ssh.rs`: detach on `Ctrl-\ d`, `Ctrl-]` passthrough,
    paste with prefixes, terminal restore, takeover over a stopped first
@@ -96,8 +108,21 @@ back is [PTY replay](../backlog/pty-replay.md).
    orphans. macOS has neither: the sidecar would list processes before
    signalling them, which races with new forks, and `proc_pidinfo` already
    returns EPERM for a process in another session (`src/platform/unix.rs`).
+- **Step 10. Unset an inherited variable** (local). `--unset-env NAME`
+  (repeatable) on `start` and `run` removes `NAME` from the child's
+  environment. An agent's shell exports `CI`, and Claude turns colour off for
+  any `CI` value, empty included, so `--env` cannot undo it.
+   - A new `LaunchSpec` field, `#[serde(default, skip_serializing_if =
+     "BTreeSet::is_empty")]` like `boundary`, so existing specs and their
+     idempotency hashes do not change.
+   - Applied as `env_remove` before the `--env` and `TENDR_*` overrides, which
+     still win. A name containing `=` is a usage error.
+   - `--host` rebuilds `start` and `run` arguments field by field
+     (`src/main.rs`), so it must pass the option on.
+   - Tests: the child does not see the variable; `--env` of the same name
+     still sets it; `--unset-env CI=true` is refused; `--host` passes it on.
 
-Steps 5 and 9 use the VM harness in
+Step 9 uses the VM harness in
 [`scripts/pty-vm/`](../../../scripts/pty-vm/README.md).
 
 ## What step 9 must show
@@ -116,12 +141,63 @@ Steps 5 and 9 use the VM harness in
 
 CI's checks; red-first tests; never mark a VM row passed from local tests.
 
+## Measurement (step 5, 2026-11-01)
+
+On an exe.dev VM: Ubuntu 24.04.5, kernel 6.12.113, x86_64, 2 vCPU. tendr
+0.4.1; Claude Code 2.1.316 through exe.dev's LLM gateway. The scripted
+terminal was tmux 3.4 (`launch.sh`, `reattach.sh`, `resize.sh`); the real one
+was Ghostty 1.4.0 on macOS, attached over `ssh -t <vm>.exe.xyz` and driven by
+`scripts/pty-vm/gt`.
+
+- **Detached start does not stall.** About 0.4 s after start Claude sends
+  XTVERSION, a kitty keyboard query, `OSC 7501` and DA1. Nobody answers while
+  detached. Claude draws its screen anyway, and answers a prompt after a later
+  attach. No responder is needed.
+- **`TERM` decides the keyboard modes and synchronized output, not the
+  replies.** Under `TERM=xterm-ghostty` Claude pushes kitty keyboard flags 5,
+  sets `modifyOtherKeys` 2 and draws inside synchronized output before any
+  reply could arrive; under `xterm-256color` it does none of these. Started
+  with Ghostty attached, the replies lead to more queries (DECRQM 2026 and
+  1016, kitty graphics, `CSI 16 t`, DA1).
+- **Same-size reattach draws nothing.** Neither does a same-size
+  `TIOCSWINSZ` (the kernel sends no SIGWINCH) nor `kill -WINCH` at an
+  unchanged size. Rows−1 and then restore each give a full redraw (about
+  2 KB, 19 ms and 9 ms after the resize). Attaching at a new size also redraws
+  fully. Step 6b uses the shrink-and-restore pair.
+- **Detach leaves the terminal in Claude's modes.** After `Ctrl-\ d` the
+  alternate screen, mouse tracking (1000, 1002, 1003, 1006), focus events,
+  bracketed paste, kitty keyboard flags and `modifyOtherKeys` stay on. In
+  Ghostty, mouse moves then typed `ESC[<35;11;5M` into the shell, and `Ctrl-C`
+  arrived as `ESC[99;5u` and did not interrupt `cat`. A redraw after reattach
+  sends only the mouse modes again. Step 6a fixes both directions.
+- **The escape works through Ghostty → `ssh -t` → attach** in both
+  encodings. Legacy: `Ctrl-\ d` detaches, `Ctrl-]` reaches the child as
+  `0x1d`, a doubled `Ctrl-\` as one `0x1c`. Kitty: `ESC[92;5u` then `d`
+  detaches, `Ctrl-]` reaches the child as `ESC[93;5u`, the prefix then `x`
+  forwards both, a doubled prefix forwards one.
+- **exe.dev half-open:** an attached `ssh -t` frozen with SIGSTOP (its kernel
+  still ACKs) for 600 s. The VM kept the attach client and human control the
+  whole time; after SIGCONT the same connection worked and detached cleanly.
+  exe.dev's front end does not end a silent connection within 10 minutes.
+  `--takeover` is the recovery, so this is not a correctness dependency.
+
+Launch paths. `TERM` is repaired when missing, empty or `dumb`; everything
+else is inherited from the caller:
+
+| Launched from | `TERM` the child sees | Inherited extras | Claude renders |
+|---|---|---|---|
+| Login shell, Ghostty → `ssh -t` | `xterm-ghostty` (terminfo in exe.dev's image at `/etc/terminfo`, not from an Ubuntu package) | none; `COLORTERM` is not forwarded | truecolor, kitty keyboard |
+| An agent's bash tool on the VM (omp's environment) | `dumb`, repaired to `xterm-256color` | `CI=true`, `NO_COLOR=1`, `EDITOR`, `PAGER` and others | no colour |
+| `tendr --host` from the laptop (`ssh -T`) | none, repaired to `xterm-256color` | none | 256 colours |
+
+`NO_COLOR=1` turns colour off and `NO_COLOR=` (empty) does not. `CI` turns it
+off with any value, empty included, so `--env` cannot undo it: step 10.
+
 ## Open measurements
 
-exe.dev's half-open SSH timeout is unmeasured and is not a correctness
-dependency. Claude's same-size repaint and its handling of the detach prefix
-through Ghostty are step-5 measurements. The deployed host logout policies
-(exe.dev, NixOS) are not validated.
+A half-open loss without ACKs (dropping the Mac's packets with a `pf` rule,
+which needs root) is unmeasured. The deployed host logout policies (exe.dev,
+NixOS) are not validated.
 
 Found while building the harness on an exe.dev VM (2026-09-26):
 

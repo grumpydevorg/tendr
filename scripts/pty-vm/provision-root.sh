@@ -30,6 +30,9 @@ PrintMotd no
 AcceptEnv LANG LC_*
 Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
+# exeuntu does not run the stock sshd, so its privilege separation directory
+# does not exist until something creates it.
+install -d -m 0755 /run/sshd
 /usr/sbin/sshd -t -f /etc/ssh/sshd_accept_config
 
 cat > /etc/systemd/system/sshd-accept.service <<'EOF'
