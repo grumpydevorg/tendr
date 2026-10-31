@@ -5,6 +5,7 @@ links:
   - ../specs/event-protocol.md
   - ../specs/ecosystem-landscape.md
   - boo-integration.md
+  - interactive-agent-turns.md
 ---
 
 # Agent Hook Routing — teach agents to publish into the event stream
@@ -56,6 +57,11 @@ protocol names/schema only:
    snippet. Verify the current Hermes hook names against its docs before
    writing (the old plan's hook inventory was flagged unverified). No code in
    either codebase.
+
+   A measured Claude Code recipe (hooks → `tendr emit --data-stdin`, with
+   submit/blocked/stop events and their correlation by `prompt_id`) is in
+   [interactive-agent-turns](interactive-agent-turns.md). Publish it alongside
+   the Hermes example.
 
 3. **Consumer note.** State plainly that Boo / Ghostty / a future egui view /
    `tendr query` analytics are **consumers** of `hook.*` events, not core
