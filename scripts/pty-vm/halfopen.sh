@@ -1,5 +1,5 @@
 #!/bin/bash
-# Slice-1 half-open timer (VM side). Silently drops one client's packets to sshd
+# Cloud PTY half-open timer (VM side). Silently drops one client's packets to sshd
 # for N seconds with iptables, times when the server side notices, then removes
 # the rule. Run as a sudo-capable user; it calls sudo for iptables.
 #

@@ -448,13 +448,6 @@ on your `PATH`. See the [analytics recipes](analytics-recipes.md).
 tendr query "SELECT kind, count(*) FROM events GROUP BY kind"
 ```
 
-## Tendr and Boo
-
-Tendr manages the process; [Boo](https://github.com/coder/boo) manages the
-screen. Run a Boo session under tendr to get a supervised process with an exit
-code and log, and use Boo to drive and read the live TUI. Tendr does not read
-rendered screens.
-
 ## Tendr inside herdr
 
 [herdr](https://herdr.dev) hosts interactive agents in panes and shows whether
@@ -532,7 +525,7 @@ or an I/O error.
 |`guide`, `skill install`|2|Unknown topic; refusing to overwrite a modified skill file|
 |`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not within 10 s (an older or newer `tendr`)|
 |`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach, or the session's run has ended|
-|`attach`, `push` to a PTY session|82, 83|Reserved: operation deadline exceeded; missing or incompatible screen extension|
+|`attach`, `push` to a PTY session|82, 83|Reserved, not used yet|
 |`attach`, `push` to a PTY session|84|Runtime or transport: the attach socket is missing or unreachable, the connection fails, or a push ended revoked or stopped with bytes unwritten (stderr gives the byte counts)|
 |`attach`, `push` to a PTY session|85|Identity: the socket's listener, or the connecting client, is another user|
 

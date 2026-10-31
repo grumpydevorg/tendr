@@ -10,7 +10,7 @@
 //! 82 (deadline exceeded) is used outside this module by the `--host` connect
 //! deadline (`ssh::SshError::ConnectDeadline`); a remote command's own 82
 //! passes through `--host` unchanged, so the stderr message tells them apart.
-//! 83 (missing or incompatible screen extension) is reserved and not used yet.
+//! 83 is reserved and not used.
 
 use std::io;
 

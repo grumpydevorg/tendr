@@ -1,5 +1,5 @@
 #!/bin/bash
-# Slice-1 step 5: start Claude Code in a tendr PTY at a fixed TERM, observe it
+# Cloud PTY step 5: start Claude Code in a tendr PTY at a fixed TERM, observe it
 # detached (nobody answers terminal queries; PTY at tendr's initial 24x80), then
 # attach from a ROWSxCOLS tmux pane (a VT that answers queries) and optionally
 # send one prompt. Leaves the session attached for reattach.sh / resize.sh.
