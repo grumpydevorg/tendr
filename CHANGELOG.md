@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.4.1 — capture fixes
+
+No breaking changes: a 0.4.1 host works with a 0.4.0 one over `--host` and
+attach.
 
 ### Changed
 
