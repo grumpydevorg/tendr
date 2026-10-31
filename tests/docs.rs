@@ -100,6 +100,9 @@ fn snippets(text: &str) -> Vec<(usize, String)> {
 
 /// The words of each `tendr` invocation in a snippet, up to the end of its
 /// arguments (`--`, a pipe, `;`, `&&`, `||` or a closing parenthesis).
+/// Square brackets of a synopsis such as `[--from-now | --since <ts>]` are
+/// dropped, and a `|` inside them separates alternatives instead of ending
+/// the invocation.
 fn invocations(snippet: &str) -> Vec<Vec<String>> {
     let tokens: Vec<&str> = snippet.split_whitespace().collect();
     let mut out = Vec::new();
@@ -108,10 +111,20 @@ fn invocations(snippet: &str) -> Vec<Vec<String>> {
             continue;
         }
         let mut words = Vec::new();
+        let mut depth = 0usize;
         for t in &tokens[i + 1..] {
-            if matches!(*t, "--" | "|" | "||" | "&&" | ";" | ">" | "2>&1") || t.starts_with('#') {
+            let opens = t.chars().take_while(|c| *c == '[').count();
+            depth += opens;
+            let t = &t[opens..];
+            if depth > 0 && t == "|" {
+                continue;
+            }
+            if matches!(t, "--" | "|" | "||" | "&&" | ";" | ">" | "2>&1") || t.starts_with('#') {
                 break;
             }
+            let closes = t.chars().rev().take_while(|c| *c == ']').count();
+            depth = depth.saturating_sub(closes);
+            let t = &t[..t.len() - closes];
             let end = t.ends_with(')') || t.ends_with(';');
             words.push(t.trim_end_matches([')', ';']).to_string());
             if end {
@@ -174,6 +187,23 @@ fn accepts_flag(path: &[&str], flag: &str) -> bool {
     !String::from_utf8_lossy(&out.stderr).contains("unexpected argument")
 }
 
+/// Whether `flag` appears in a help text as a whole flag name.
+fn mentions_flag(help: &str, flag: &str) -> bool {
+    help.match_indices(flag).any(|(at, _)| {
+        let next = help[at + flag.len()..].chars().next();
+        !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// Directory entries, without hidden files such as `.DS_Store`.
+fn entries(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with('.'))
+        .collect()
+}
+
 fn guide_topic_exists(topic: &str) -> bool {
     Command::cargo_bin("tendr")
         .unwrap()
@@ -192,8 +222,31 @@ fn docs_show_only_commands_flags_and_topics_that_exist() {
     let mut topics: BTreeMap<String, bool> = BTreeMap::new();
     let mut errors = Vec::new();
 
+    // Every long flag any command lists, for flags a document names on their
+    // own, as in a table of `start` options.
+    let mut all_help = top.clone();
+    for sub in &subcommands {
+        let text = help.get(&[sub]).unwrap_or_default();
+        for subsub in commands(&text) {
+            all_help.push_str(&help.get(&[sub, &subsub]).unwrap_or_default());
+        }
+        all_help.push_str(&text);
+    }
+
     for doc in current_docs() {
         for (line, snippet) in snippets(&read(&doc)) {
+            if let Some(flag) = snippet
+                .split_whitespace()
+                .next()
+                .filter(|w| w.starts_with("--") && w.len() > 2)
+            {
+                let name = flag.split('=').next().unwrap();
+                if !mentions_flag(&all_help, name) && !accepts_flag(&[], name) {
+                    errors.push(format!(
+                        "{doc}:{line}: `{snippet}`: no command has the flag {name}"
+                    ));
+                }
+            }
             for words in invocations(&snippet) {
                 let at = format!("{doc}:{line}: `tendr {}`", words.join(" "));
                 let mut rest = words.iter().map(String::as_str).peekable();
@@ -253,9 +306,8 @@ struct Plan {
 }
 
 fn plans(dir: &str) -> Vec<Plan> {
-    let mut plans: Vec<Plan> = fs::read_dir(repo().join("docs/plans").join(dir))
-        .unwrap_or_else(|e| panic!("docs/plans/{dir}: {e}"))
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
+    let mut plans: Vec<Plan> = entries(&repo().join("docs/plans").join(dir))
+        .into_iter()
         .map(|name| Plan {
             slug: name.trim_end_matches(".md").to_string(),
             path: format!("plans/{dir}/{name}"),
@@ -271,21 +323,32 @@ fn is_slug(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// The `id` and `depends_on` ids in a plan's front matter.
-fn front_matter(path: &Path) -> (Option<String>, Vec<String>) {
+struct FrontMatter {
+    id: Option<String>,
+    depends_on: Vec<String>,
+    /// Keys other than `id` and `depends_on`.
+    other: Vec<String>,
+}
+
+fn front_matter(path: &Path) -> FrontMatter {
     let text = fs::read_to_string(path).unwrap();
+    let mut fm = FrontMatter {
+        id: None,
+        depends_on: Vec::new(),
+        other: Vec::new(),
+    };
     let mut lines = text.lines();
     if lines.next() != Some("---") {
-        return (None, Vec::new());
+        return fm;
     }
-    let (mut id, mut deps, mut in_deps) = (None, Vec::new(), false);
+    let mut in_deps = false;
     for line in lines.take_while(|l| *l != "---") {
         if let Some(v) = line.strip_prefix("id:") {
-            id = Some(v.trim().to_string());
+            fm.id = Some(v.trim().to_string());
             in_deps = false;
         } else if let Some(v) = line.strip_prefix("depends_on:") {
             let v = v.trim().trim_start_matches('[').trim_end_matches(']');
-            deps.extend(
+            fm.depends_on.extend(
                 v.split(',')
                     .map(str::trim)
                     .filter(|d| !d.is_empty())
@@ -293,20 +356,18 @@ fn front_matter(path: &Path) -> (Option<String>, Vec<String>) {
             );
             in_deps = true;
         } else if let Some(v) = line.trim_start().strip_prefix("- ").filter(|_| in_deps) {
-            deps.push(v.trim().to_string());
-        } else {
+            fm.depends_on.push(v.trim().to_string());
+        } else if let Some((key, _)) = line.split_once(':').filter(|_| !line.starts_with(' ')) {
+            fm.other.push(key.to_string());
             in_deps = false;
         }
     }
-    (id, deps)
+    fm
 }
 
 #[test]
 fn docs_plans_folder_holds_only_open_plans() {
-    let entries: BTreeSet<String> = fs::read_dir(repo().join("docs/plans"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
+    let entries: BTreeSet<String> = entries(&repo().join("docs/plans")).into_iter().collect();
     let expected: BTreeSet<String> = ["README.md", "active", "backlog"]
         .iter()
         .map(|s| s.to_string())
@@ -344,14 +405,20 @@ fn docs_plans_folder_holds_only_open_plans() {
         ids.insert(plan.slug.clone());
     }
     for plan in &all {
-        let (id, deps) = front_matter(&repo().join("docs").join(&plan.path));
-        if id.as_deref() != Some(plan.slug.as_str()) {
+        let fm = front_matter(&repo().join("docs").join(&plan.path));
+        if fm.id.as_deref() != Some(plan.slug.as_str()) {
             errors.push(format!(
-                "{}: front matter id must be `{}`, found {id:?}",
-                plan.path, plan.slug
+                "{}: front matter id must be `{}`, found {:?}",
+                plan.path, plan.slug, fm.id
             ));
         }
-        for dep in deps.iter().filter(|d| !ids.contains(*d)) {
+        for key in &fm.other {
+            errors.push(format!(
+                "{}: front matter holds only id and depends_on, found `{key}`",
+                plan.path
+            ));
+        }
+        for dep in fm.depends_on.iter().filter(|d| !ids.contains(*d)) {
             errors.push(format!(
                 "{}: depends_on names `{dep}`, which is not an open plan",
                 plan.path

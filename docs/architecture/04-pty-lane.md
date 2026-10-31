@@ -209,10 +209,16 @@ A `push` to a pipe session that is not running exits 1.
 ## Output and viewers
 
 - PTY output is merged and recorded as `O` lines in `output.log`.
-- Capture only offers output to the attached viewer's queue, which holds at
-  most 8 MiB. The viewer's own sender thread drains it. A viewer that stops
-  reading is disconnected and loses control. It never stalls capture or the
-  child.
+- For each chunk of output, capture first hands it to the recorder, then
+  writes it to `output.log`, then offers it to the attached viewer's queue.
+  The recorder does not wait for its storage, so a viewer can receive bytes
+  before they are on disk.
+- The viewer's queue holds at most 8 MiB. The viewer's own sender thread
+  drains it. A viewer that stops reading is disconnected and loses control. It
+  never stalls capture or the child.
+- A viewer gets no recording sequence numbers, so a viewer that disconnects
+  cannot resume from where it stopped. The cloud PTY plan's replay slice adds
+  this ([00_cloud-pty-control.md](../plans/active/00_cloud-pty-control.md)).
 - The child starts at 24×80. It gets `TERM=xterm-256color` when the launching
   environment had no `TERM`, an empty one, or `dumb`. An explicit
   `--env TERM` wins (`sidecar::pty_term`).

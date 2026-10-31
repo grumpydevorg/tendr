@@ -164,7 +164,7 @@ What a failed post-spawn step does:
 
 | Step (`step`) | Action | Reason |
 |---|---|---|
-| readiness to the client (`readiness`), and the meta rewrite that records a lost delivery | recover, with a warning | Readiness is a courtesy to the client that asked, never a condition of the run. It is a `#[must_use]` value, not a `Result`. |
+| readiness to the client (`readiness`), and the meta rewrite that records a lost delivery | recover, with a warning | Readiness only informs the client that asked; the run never depends on it. It is a `#[must_use]` value, not a `Result`. |
 | `child_pid` breadcrumb (`breadcrumb`) | recover, with a warning | Only crash recovery reads it. |
 | PTY I/O setup (`attach_bind`): the recorder, the input writer, and the listener on the socket bound before spawn | end the run | A PTY session never runs without its listener. The listener reaches the PTY only through the input writer. |
 | `output.log` open (`output_log`) | recover: drain the output, warning `output not captured` | The exit is still worth recording, and a child that nobody reads blocks on a full pipe. |

@@ -26,6 +26,10 @@ heading is the title, and Git holds dates. `depends_on` names only plans that
 still exist. Remove an id when that plan ships. The test in `tests/docs.rs`
 checks these rules.
 
+Other repositories that use this layout also allow a `links:` field. Tendr
+does not: links belong in the plan body, where the link checker in CI sees
+them.
+
 ## Plan content
 
 Start each plan with a short status line that says what is left, then the goal.

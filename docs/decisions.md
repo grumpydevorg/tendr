@@ -33,9 +33,9 @@ tool-specific code. Source: `docs/plans/specs/tender-as-block-runtime.md`.
 sidecar process. It is born with the run and exits after it. All state is in
 files: `meta.json` holds the current state of a session, and `events/` holds
 its history. Consumers read the files directly. A per-host daemon with an
-in-memory index was designed and then rejected in a comparison of three
-designs: append-only files met the event log's requirements without adding a
-resident process. Source: `docs/plans/specs/persistence-architecture.md` (the
+in-memory index was designed and then rejected. In a comparison of three
+designs, plain append-only files met the event log's needs without a resident
+process. Source: `docs/plans/specs/persistence-architecture.md` (the
 rejected design) and `docs/plans/specs/event-protocol.md` §0.
 
 ## No platform supervisor
@@ -94,12 +94,33 @@ hides its window. Source: `src/platform/windows.rs`.
 session is a local session on that host. Upgrade `tendr` on both ends
 together: a release can change what the two ends send each other.
 
+## No automatic restart
+
+*2026-03.* Tendr never restarts a child that exits. Restarting an operating
+system process is riskier than restarting an in-memory actor: the working
+directory, environment, pipes and any half-done external work may all be in an
+unknown state. Deciding when a restart is safe is the caller's policy. A
+restart policy was designed (never, on-failure, always, with bounded retries)
+and not built. Source: `docs/plans/specs/tender-agent-process-sitter.md`,
+"Restart Policy".
+
+## Analytics is `tendr query`, run by the `duckdb` program
+
+*2026-07-09.* `tendr query` runs SQL over the event logs. It is a separate
+command, not an option of `tendr events`: `events` replays and follows the log
+with a fixed output format, and SQL analysis is a different job. It runs the
+external `duckdb` program found on `PATH`, the same program the `duckdb` exec
+target drives, so tendr has no DuckDB library dependency. `query` therefore
+needs `duckdb` installed. Source:
+`docs/plans/completed/2026-07-09-event-log-analytics-v1.md`.
+
 ## No terminal emulator in core
 
 *2026-07-09, revised 2026-09-14.* Tendr owns the PTY, input ownership and the
 exact recording. It does not parse or render the screen. Screen reads come
-from outside: an optional `tendr-screen` extension that tendr calls through a
-versioned command-line contract, or Boo. Core does not link a terminal
+from outside tendr: from Boo today, or from an optional `tendr-screen`
+extension that tendr would call through a versioned command-line contract.
+That extension is planned and not built. Core does not link a terminal
 emulator such as libghostty, so it gains no Zig or Ghostty build dependency.
 Source: [cloud PTY plan](plans/active/00_cloud-pty-control.md) and
 `docs/plans/specs/ecosystem-landscape.md`.
@@ -107,10 +128,11 @@ Source: [cloud PTY plan](plans/active/00_cloud-pty-control.md) and
 ## CI stays on native GitHub Actions; Dagger was not adopted
 
 *2026-09-25.* A pilot ran the Linux checks under Dagger beside `ci.yml`.
-Coverage and failure reporting were equal, but Dagger added 38–70 s of setup
-to every cold hosted job (limit 60 s; msrv was within it in 3 of 6 attempts).
-With its engine state cached through `actions/cache`, a one-line edit cost
-+47 to +95 s per job against a 15 s limit. Hosted runners keep no engine
-between jobs, and the safe ways to keep one need a self-hosted or paid engine.
+Coverage and failure reporting were equal. But Dagger added 38–70 s of setup to
+every cold hosted job, against a limit of 60 s. The msrv job stayed within
+that limit in only 3 of 6 attempts. With the engine state cached through
+`actions/cache`, a one-line edit cost 47–95 s more per job, against a limit of
+15 s. Hosted runners keep no engine between jobs. The safe ways to keep one
+need a self-hosted runner or a paid engine.
 Source: `docs/plans/completed/2026-09-25-dagger-ci.md` and its data folder;
 closed PR #78.

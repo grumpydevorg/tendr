@@ -15,7 +15,7 @@ See also the [README](../README.md) (install),
 |---|---|
 |session|A named, supervised child process: a shell, REPL, database client or script. It keeps its state between commands.|
 |run|One launch of a session's child. `start --replace` begins a new run of the same session.|
-|sidecar|The per-session supervisor process. The CLI talks to it; it outlives the CLI.|
+|sidecar|The supervisor process of one run. It starts with the run, outlives the CLI call that started it, and exits after the run ends.|
 |namespace|A group of sessions. The default is `default`. A session name is unique within its namespace.|
 |pipe session|A session started with `--stdin`. `exec` and `push` write to the child's stdin.|
 |PTY session|A session started with `--pty`. The child gets a terminal; you can `attach` to it.|
@@ -75,9 +75,10 @@ flags:
 |`--any-exit`|With `--after`, start even if the dependency exited non-zero.|
 |`--on-exit <command>`|Run a command after the child exits. Repeatable.|
 
-Tendr infers the exec target from argv[0]: `bash`, `sh` or `zsh` →
-`posix-shell`; `pwsh` or `powershell` → `powershell`; `python3` or `ipython` →
-`python-repl`; `duckdb` → `duckdb`. Set it yourself when inference fails:
+Tendr infers the exec target from argv[0]: `bash`, `sh`, `zsh`, `dash` or `ash`
+→ `posix-shell`; `pwsh` or `powershell` → `powershell`; `python`, `python3`,
+`ipython` or `py` → `python-repl`; `duckdb` → `duckdb`. Set it yourself when
+inference fails:
 
 ```bash
 tendr start --stdin py --exec-target python-repl -- ipython --no-banner --no-confirm-exit
@@ -222,8 +223,9 @@ tendr watch --namespace nightly --events --logs
   one namespace with `--namespace`. Choose streams with `--events` (run
   lifecycle), `--logs` (output) and `--annotations`. `--from-now` skips the
   initial snapshot.
-- `tendr events` replays the event log as NDJSON. Filter with `--session`,
-  `--kind` and `--source` (prefix matches, repeatable). Use `--follow` to keep
+- `tendr events` replays the event log as NDJSON. Filter with
+  `--session <ns>/<name>` (exact), and `--kind` and `--source` (prefix matches).
+  All three are repeatable. Use `--follow` to keep
   reading, `--since <RFC 3339>` or `--last <N>` to limit history, and
   `--cursors` with `--from-cursor` to resume where you stopped.
   `--include-logs` merges output lines in.
@@ -396,7 +398,7 @@ systemd-run --user --slice=tendr.slice --scope --quiet \
   enforces the tightest limit of all ancestors, so `tendr.slice` applies.
 - The limit is on the slice, so all sessions in it share one budget. Size it
   for their sum.
-- `systemd-run` without `--user` needs root or polkit. The `--user` form above
+- Plain `systemd-run` needs root or polkit. `systemd-run --user`, as above,
   does not.
 - Some locked-down NAS and appliance systems reset the linger setting or user
   units on reboot. Reapply them at boot on those hosts.
@@ -460,8 +462,8 @@ each is working, blocked or idle. Run the agent in a herdr pane, and run its
 builds, REPLs and remote jobs under `tendr start` and `tendr exec`, which return
 exit codes instead of a screen to scrape.
 
-Observed on macOS with herdr 0.9.1, oh-my-pi 18.3.0 and `tender` 0.2.1 (the
-release before the rename to `tendr`):
+Observed on macOS on 2026-09-25 with herdr 0.9.1, oh-my-pi 18.3.0 and `tender`
+0.2.1 (the release before the rename to `tendr`):
 
 - A session started from a pane kept running after `herdr pane close` and
   after `herdr session stop`. A `--stdin` shell kept its cwd and exported
@@ -473,7 +475,9 @@ release before the rename to `tendr`):
   `HERDR_SOCKET_PATH`, `HERDR_SESSION`, `HERDR_BIN_PATH`, `HERDR_TAB_ID` and
   `HERDR_WORKSPACE_ID`. An `--on-exit` command uses them to reach the right
   herdr session. herdr accepts lifecycle reports only from the pane's own
-  agent, so these variables do not confuse its agent state.
+  agent, so these variables do not confuse its agent state: an omp started
+  with `tendr start --pty` from a pane's shell, and a hand-sent
+  `pane.report_agent`, were both acknowledged and ignored.
 
 To raise a herdr notification when a job ends, put the command in a script,
 for example `~/bin/notify-herdr`, because `--on-exit` does not expand
@@ -522,7 +526,7 @@ or an I/O error.
 |`wait`|124, 137|A dependency timed out; killed while waiting on a dependency|
 |`exec`|the command's|The command's own exit code; 124 if `--timeout` passed; 2 for a malformed `--frame-from-stdin` frame|
 |`events`|44, 65|`--from-cursor` names history that is gone; `--strict` found unparseable lines|
-|`emit`|2, 5, 6|Invalid `--parent`; corrupt session; invalid kind or source|
+|`emit`|2, 3, 5, 6|Invalid `--parent`; no session given and none in `TENDR_SESSION`, or an invalid `TENDR_NAMESPACE`/`TENDR_SESSION`; corrupt session; invalid kind or source|
 |`wrap`|the child's|The wrapped command's code; 6 for an `--event` with a reserved prefix|
 |`query`|DuckDB's|DuckDB's exit code|
 |`guide`, `skill install`|2|Unknown topic; refusing to overwrite a modified skill file|
@@ -548,7 +552,8 @@ exits 1 on failure.
 |`TENDR_GENERATION`|tendr, for the child and `--on-exit`|Run counter for the session; `--replace` increments it|
 |`TENDR_SESSION_DIR`|tendr, for the child and `--on-exit`|Path of the session directory|
 |`TENDR_EXIT_REASON`|tendr, for `--on-exit` only|`ExitedOk`, `ExitedError { code: N }`, `Killed`, `KilledForced`, `TimedOut` or `SidecarFailed`|
-|`TENDR_BLOCK_ID`, `TENDR_PARENT_EVENT_ID`|`tendr wrap`, for its command|IDs that link events emitted inside the command to the wrap event|
+|`TENDR_BLOCK_ID`|`tendr wrap`, and `exec` in a POSIX shell, for the command they run|ID that links events emitted inside the command to its wrap or exec event|
+|`TENDR_PARENT_EVENT_ID`|`tendr wrap`, for its command|ID of the wrap event|
 |`TENDR_SSH_CONNECT_TIMEOUT`|you|Connect deadline for `--host` commands, in seconds. Default 30; `0` turns it off.|
 
 `wrap` and `emit` read `TENDR_SESSION`, `TENDR_NAMESPACE`, `TENDR_RUN_ID` and

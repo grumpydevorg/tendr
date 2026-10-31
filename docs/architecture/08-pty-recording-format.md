@@ -104,11 +104,14 @@ incomplete tail. `record_crc` additionally covers both length words.
 
 Any other `kind` → `Invalid(UnknownKind)`.
 
-`RESIZE.cause`: `0x01` = `USER` (a client resize; `correlation` must be `0`),
-`0x02` = `REPAINT` (a repaint nudge; `correlation` must be nonzero and is shared by
-the two records of a temporary shrink/restore pair). Any other cause →
-`Invalid(UnknownResizeCause)`. A `RESIZE` records a geometry that the owner
-actually applied; repaint records are tagged, never omitted.
+`RESIZE.cause` is one of:
+
+- `0x01` = `USER`: a client resize. `correlation` must be `0`.
+- `0x02` = `REPAINT`: a repaint nudge, which shrinks the window and restores it.
+  `correlation` must be nonzero, and both records of the pair share it.
+
+Any other cause → `Invalid(UnknownResizeCause)`. A `RESIZE` records a geometry
+that the owner actually applied. Repaint records are tagged, never omitted.
 
 ## Record decoding and end of segment
 
@@ -157,21 +160,28 @@ Across the segments of one recording:
 
 Violations → `Invalid(...)` unless stated otherwise.
 
-**Check continuity before trusting a segment's records.** When decoding a
-recording, a segment's header continuity rules (index, identity fields,
-`first_sequence`, geometry) are checked immediately after its header decodes, and
-elapsed-time continuity is checked on its first record before that record is
-accepted. The last valid sequence reported with any later error therefore never
-includes a record from a segment that breaks continuity, even if corruption
-follows it in the same segment.
+**Check continuity before trusting a segment's records.** A decoder checks two
+things before it accepts any record from a segment:
+
+- the segment's header continuity (index, identity fields, `first_sequence`,
+  geometry), right after the header decodes;
+- elapsed-time continuity, on the segment's first record.
+
+So the last valid sequence reported with a later error never includes a record
+from a segment that breaks continuity, even if corruption follows in the same
+segment.
 
 ## Golden fixture
 
-`tests/fixtures/recording/v1-segment0.hex` is annotated hex (lines starting with
-`#` are comments). It holds segment 0 of a run with `TERM=xterm-ghostty`, 80×24,
-input recording off, and four records: an `OUTPUT` ending in a split escape
-sequence, an `OUTPUT` containing invalid UTF-8, a `USER` resize to 100×30, and a
-`REPAINT` resize to 100×29 with an equal timestamp. Its checksums were produced by
-an independent bitwise CRC-32C implementation, not by the crate under test.
-Decoding the fixture must yield exactly those records, and encoding them must
-reproduce the fixture byte for byte.
+`tests/fixtures/recording/v1-segment0.hex` is annotated hex. Lines starting with
+`#` are comments. It holds segment 0 of a run with `TERM=xterm-ghostty`, 80×24
+and input recording off. It has four records:
+
+1. an `OUTPUT` ending in a split escape sequence;
+2. an `OUTPUT` containing invalid UTF-8;
+3. a `USER` resize to 100×30;
+4. a `REPAINT` resize to 100×29 with an equal timestamp.
+
+Its checksums come from an independent bitwise CRC-32C implementation, not from
+the crate under test. Decoding the fixture must yield exactly those records.
+Encoding them must reproduce the fixture byte for byte.

@@ -18,7 +18,7 @@ use tendr::model::event::{Event, EventTimestamp};
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::session::{self, SessionRoot};
 
-/// Bookmark cadence (plan pinned decision): every 100 emitted records or
+/// Bookmark cadence: every 100 emitted records or
 /// 5 s idle, counters reset on each bookmark.
 const BOOKMARK_EVERY_RECORDS: usize = 100;
 const BOOKMARK_IDLE: Duration = Duration::from_secs(5);
@@ -151,7 +151,7 @@ impl CursorTracker {
     }
 }
 
-/// Bookmark cadence counters — reset on each bookmark (plan pinned).
+/// Bookmark cadence counters — reset on each bookmark.
 struct BookmarkState {
     since_count: usize,
     last_mark: Instant,
@@ -191,7 +191,7 @@ fn read_log_lines(path: &Path, from: u64) -> io::Result<(Vec<LogLine>, u64)> {
 /// Incremental reader over the event segments (and optionally output.log)
 /// of all matched sessions. Every `poll` re-discovers sessions and
 /// segments, so sessions and segments that appear mid-follow are picked up
-/// and replay from their start (plan scope item 1).
+/// and replay from their start.
 struct StreamReader {
     root: SessionRoot,
     namespace_filter: Option<Namespace>,
@@ -201,7 +201,7 @@ struct StreamReader {
     filters: Filters,
     include_logs: bool,
     /// After `--from-cursor`, log projection restarts at the resume
-    /// wall-clock — cursors never cover output.log (plan scope item 5).
+    /// wall-clock — cursors never cover output.log.
     logs_from_end: bool,
     tracker: CursorTracker,
     /// `<ns>/<session>/events/<seg>.jsonl` → offset after last consumed line.
@@ -363,7 +363,7 @@ fn cursor_gone(gone: Vec<String>) -> ! {
 }
 
 /// Emit one `cursor.bookmark` record: read-time only, no stored identity
-/// (plan scope item 4). Returns false when stdout's pipe closed.
+/// (spec §5.2). Returns false when stdout's pipe closed.
 fn write_bookmark(
     out: &mut impl Write,
     tracker: &CursorTracker,
@@ -430,7 +430,7 @@ fn emit_batch(
 }
 
 /// `--strict`: unparseable segment lines are a defect wherever observed —
-/// after a full replay batch or mid-follow (plan pinned decision). Valid
+/// after a full replay batch or mid-follow. Valid
 /// records of the offending batch have already been printed.
 fn strict_check(opts: &EventsOptions, skipped: usize) {
     if opts.strict && skipped > 0 {

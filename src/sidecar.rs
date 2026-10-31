@@ -772,7 +772,7 @@ impl LifecycleEvents {
 
     /// Append a non-lifecycle sidecar fact (`callback.finished`, spec §1)
     /// through the same writer, so `seq` stays contiguous after the
-    /// terminal transition. Best-effort by design (plan slice 3): no
+    /// terminal transition. Best-effort by design: no
     /// salvage, no meta warning — these are not terminal transitions.
     fn append_fact(&mut self, fact: Fact, data: &impl serde::Serialize) {
         let (Ok(kind), Ok(data)) = (Kind::new(fact.kind()), serde_json::to_value(data)) else {
@@ -1351,7 +1351,7 @@ fn run_on_exit_hooks(meta: &Meta, session_dir: &Path, lifecycle: &mut LifecycleE
                 })
             }
         };
-        // The durable per-callback fact (plan scope 5): emitted as each
+        // The durable per-callback fact: emitted as each
         // callback finishes, same record shape as the batch file.
         lifecycle.append_fact(Fact::CallbackFinished, &record);
         callback_results.push(record);

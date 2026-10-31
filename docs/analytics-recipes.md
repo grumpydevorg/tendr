@@ -123,14 +123,16 @@ ORDER BY calls DESC;
 
 ### 6. Run outcomes by exit reason
 
-`run.exited` events hold the outcome in `data->>'reason'`: `ExitedOk`,
-`ExitedError`, `Killed` and so on.
+A finished run writes one of four kinds: `run.exited` (`ExitedOk`,
+`ExitedError`), `run.killed` (`Killed`, `KilledForced`), `run.timed_out`
+(`TimedOut`) or `run.sidecar_failed` (`SidecarFailed`). Each holds the outcome
+in `data->>'reason'`.
 
 ```sql
 SELECT data->>'reason' AS reason,
        COUNT(*)         AS runs
 FROM events
-WHERE kind = 'run.exited'
+WHERE kind IN ('run.exited', 'run.killed', 'run.timed_out', 'run.sidecar_failed')
 GROUP BY reason
 ORDER BY runs DESC;
 ```

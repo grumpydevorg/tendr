@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn unix_frame_exports_block_id_around_payload() {
-        // Spec §2 / plan scope 2: set before the payload, capture the exit
+        // Spec §2: set before the payload, capture the exit
         // code first, unset before the sentinel — the session shell is not
         // left polluted.
         let frame = unix_frame(&["echo".into(), "hi".into()], "a1b2c3", BLOCK);

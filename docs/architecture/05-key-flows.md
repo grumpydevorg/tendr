@@ -34,7 +34,7 @@ Notes:
   [03-run-lifecycle.md](03-run-lifecycle.md#dependency-wait-start---after).
 - If spawn fails, the sidecar sends a `SpawnFailed` snapshot over the ready
   pipe and the CLI exits non-zero.
-- Readiness is a courtesy to the CLI, not a condition of the run. If the CLI
+- Readiness only informs the CLI; the run never depends on it. If the CLI
   is gone before the sidecar signals (killed, or its terminal closed), the
   write fails. The sidecar records a `readiness not delivered` warning in
   meta and carries on.
@@ -230,4 +230,7 @@ Notes:
 - With a valid `--event` kind, it appends an event and an `A` line linked by
   `event_id`. With a name that is not a valid kind, it appends only the `A`
   line. See [07-event-protocol.md](07-event-protocol.md#6-write-surface).
+- If `wrap` itself is asked to stop (SIGTERM on Unix, a console control event
+  on Windows), it stops the wrapped command the same way `kill` stops a child:
+  gracefully first, then forcibly. It still records the result.
 - It exits with the wrapped command's exit code.

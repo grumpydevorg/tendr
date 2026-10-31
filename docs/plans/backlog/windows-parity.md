@@ -30,6 +30,14 @@ plus native Ubuntu, macOS, Windows x64 and Windows ARM64 test lanes). Local
 supervision uses Job Objects and Ctrl-Break but has the lifecycle gaps below.
 PowerShell `exec` works, but an ordinary `$x` assignment does not persist.
 
+The only evidence for remote `exec` against a Windows host is one manual check
+on 2026-07-10: a Parallels ARM Windows VM over SSH, running the released Tendr
+0.2.0 x64 binary under emulation. Remote `exec` kept PowerShell session state
+across frames, returned clean JSON, and worked with remote `start` and `kill`.
+It used simple arguments only. It shows the mechanism runs; it does not prove
+that general Windows `--host` use is safe. No CI test covers it (see "Remote
+tests" below).
+
 ## Gap inventory
 
 | Track | Current | Parity gap |
