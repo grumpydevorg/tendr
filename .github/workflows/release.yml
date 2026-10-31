@@ -8,6 +8,13 @@ name: release
 # published only after every lane has uploaded, so it is never public with
 # assets missing; if a lane fails it stays a draft.
 #
+# Run `cargo publish` only after the `publish` job is green: `cargo binstall`
+# downloads from this release, which 404s while it is a draft.
+# Recovery: a failed lane → "Re-run failed jobs" (re-runs the lane, then
+# `publish`); a cancelled run → "Re-run all jobs" (the draft is reused). To
+# publish by hand after checking all 12 assets:
+# `gh release edit <tag> --draft=false --latest`.
+#
 # Validated by the v0.2.0 and v0.2.1 releases across all six target lanes.
 # The first tagged release after an action-version or job-shape change remains
 # its live test.
@@ -33,9 +40,17 @@ jobs:
           # git remote — point it at the repo explicitly (the create/view calls
           # are pure API operations, no working tree needed).
           GH_REPO: ${{ github.repository }}
+        # Create the draft only when the release does not exist; any other
+        # `view` error fails the job instead of making a second draft.
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+          if out=$(gh release view "$GITHUB_REF_NAME" 2>&1); then
+            echo "release $GITHUB_REF_NAME exists"
+          elif [[ $out == *"release not found"* ]]; then
+            gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+          else
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
 
   build:
     name: ${{ matrix.target }}
