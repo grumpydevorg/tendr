@@ -814,7 +814,7 @@ pub fn set_nonblocking(fd: &impl rustix::fd::AsFd) -> io::Result<()> {
 /// reader waits for readability with `poll(2)` when a read would block, and
 /// retries on `Interrupted`; neither is end of stream.
 ///
-/// A reader made by [`PtyReader::holding_slave`] also keeps a descriptor for
+/// A reader made by `PtyReader::holding_slave` also keeps a descriptor for
 /// the PTY's slave side open until the child has exited and the master has
 /// been read until it would block. On macOS, when an exiting child's close is
 /// the last close of the slave, the kernel waits only briefly (about 0.65 s
