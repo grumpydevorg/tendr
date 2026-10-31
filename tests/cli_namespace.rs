@@ -1,53 +1,10 @@
 mod harness;
 
-use harness::{tendr, wait_terminal};
+use harness::{tendr, wait_running_ns, wait_terminal, wait_terminal_ns};
 use std::sync::Mutex;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
-
-/// Wait for meta.json to show Running state under a specific namespace.
-fn wait_running_ns(root: &TempDir, namespace: &str, session: &str) {
-    let path = root
-        .path()
-        .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                if meta["status"].as_str() == Some("Running") {
-                    return;
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for Running state in {namespace}/{session}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-
-/// Wait for meta.json to reach a terminal state under a specific namespace.
-fn wait_terminal_ns(root: &TempDir, namespace: &str, session: &str) -> serde_json::Value {
-    let path = root
-        .path()
-        .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                let status = meta["status"].as_str().unwrap_or("");
-                if status != "Starting" && status != "Running" {
-                    return meta;
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for terminal state in {namespace}/{session}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
 
 #[test]
 fn start_in_explicit_namespace() {

@@ -196,9 +196,29 @@ pub fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
     events
 }
 
+// Polling. A wait on the filesystem or a process (meta.json, event logs, a
+// path, PID liveness, `try_wait`, `try_acquire`, `tendr log` or `status`
+// output) goes through `poll_until` or a wrapper below. The rules:
+//
+// - Probe at once: never sleep before the first probe.
+// - One `Instant` deadline per wait, computed on entry.
+// - Keep the call site's timeout, interval and what it does on a timeout:
+//   panic, return `false`, return the error so cleanup runs first, or ignore
+//   it for best-effort cleanup. `poll_*` wrappers return the `Result`;
+//   `wait_*` wrappers panic.
+// - `Pending` describes the last state for the timeout message. Keep it short,
+//   or move in output the probe already owns; never clone a large buffer.
+// - Add a wrapper only when three or more call sites share a probe.
+//
+// Some loops stay hand-written. Waits on in-process producer threads
+// (`ReadyFollower` records, PTY reader buffers, mpsc channels) could use a
+// `Condvar` or channel instead, but that changes how they synchronise and no
+// failure calls for it. Loops that are not "probe until true or deadline"
+// (settling streaks, one deadline shared by several phases, fixed pacing)
+// also stay as they are.
+
 /// One probe result: ready with a value, or not-yet with a cheap description of
-/// the current state (retained only for the timeout message — keep it a summary,
-/// never a full buffer dump).
+/// the current state (retained only for the timeout message).
 #[allow(dead_code)]
 pub enum Observation<T> {
     Ready(T),
@@ -286,9 +306,15 @@ fn meta_status(session_meta: &Path) -> Option<String> {
 /// Wait for meta.json to show Running state on disk.
 #[allow(dead_code)]
 pub fn wait_running(root: &TempDir, session: &str) {
+    wait_running_ns(root, "default", session)
+}
+
+/// [`wait_running`] for a session in `namespace`.
+#[allow(dead_code)]
+pub fn wait_running_ns(root: &TempDir, namespace: &str, session: &str) {
     let path = root
         .path()
-        .join(format!(".tendr/sessions/default/{session}/meta.json"));
+        .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
     poll_until(
         Duration::from_secs(5),
         Duration::from_millis(50),
@@ -297,15 +323,32 @@ pub fn wait_running(root: &TempDir, session: &str) {
             other => Observation::Pending(format!("status={}", other.unwrap_or("<unreadable>"))),
         },
     )
-    .unwrap_or_else(|e| panic!("waiting for Running state in {session}: {e}"))
+    .unwrap_or_else(|e| panic!("waiting for Running state in {namespace}/{session}: {e}"))
 }
 
 /// Wait for meta.json to reach any terminal state on disk.
 #[allow(dead_code)]
 pub fn wait_terminal(root: &TempDir, session: &str) -> serde_json::Value {
+    wait_terminal_ns(root, "default", session)
+}
+
+/// [`wait_terminal`] for a session in `namespace`.
+#[allow(dead_code)]
+pub fn wait_terminal_ns(root: &TempDir, namespace: &str, session: &str) -> serde_json::Value {
+    poll_terminal_ns(root, namespace, session)
+        .unwrap_or_else(|e| panic!("waiting for terminal state in {namespace}/{session}: {e}"))
+}
+
+/// [`wait_terminal_ns`] that returns the timeout instead of panicking.
+#[allow(dead_code)]
+pub fn poll_terminal_ns(
+    root: &TempDir,
+    namespace: &str,
+    session: &str,
+) -> Result<serde_json::Value, WaitTimeout> {
     let path = root
         .path()
-        .join(format!(".tendr/sessions/default/{session}/meta.json"));
+        .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
     poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
         let meta = std::fs::read_to_string(&path)
             .ok()
@@ -317,7 +360,60 @@ pub fn wait_terminal(root: &TempDir, session: &str) -> serde_json::Value {
             other => Observation::Pending(format!("status={}", other.unwrap_or("<unreadable>"))),
         }
     })
-    .unwrap_or_else(|e| panic!("waiting for terminal state in {session}: {e}"))
+}
+
+/// Wait until `path` exists, probing every `interval`.
+#[allow(dead_code)]
+pub fn poll_path_exists(
+    path: &Path,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<(), WaitTimeout> {
+    poll_until(timeout, interval, || {
+        if path.exists() {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("{} absent", path.display()))
+        }
+    })
+}
+
+/// Wait until `child` exits, probing `try_wait` every `interval`. On a timeout
+/// the child is still running: the caller decides whether to kill it.
+#[allow(dead_code)]
+pub fn poll_child_exit(
+    child: &mut Child,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<std::process::ExitStatus, WaitTimeout> {
+    poll_until(timeout, interval, || {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => Observation::Ready(status),
+            None => Observation::Pending(format!("pid {} still running", child.id())),
+        }
+    })
+}
+
+/// Wait until `kill(pid, 0)` fails, probing every `interval`.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn poll_pid_dead(pid: i32, timeout: Duration, interval: Duration) -> Result<(), WaitTimeout> {
+    poll_until(timeout, interval, || {
+        // SAFETY: signal 0 only probes for existence.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("pid {pid} alive"))
+        }
+    })
+}
+
+/// Wait up to 5 s for `pid` to die (not just be signalled).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_pid_dead(pid: i32) {
+    poll_pid_dead(pid, Duration::from_secs(5), Duration::from_millis(50))
+        .unwrap_or_else(|e| panic!("waiting for pid {pid} to die: {e}"))
 }
 
 /// Proof that a session is terminal and its sidecar has released ownership.
@@ -475,14 +571,8 @@ static FOLLOWER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// post-spawn sleep.
 #[allow(dead_code)]
 pub fn wait_ready_file(path: &Path, deadline: Duration) {
-    poll_until(deadline, Duration::from_millis(10), || {
-        if path.exists() {
-            Observation::Ready(())
-        } else {
-            Observation::Pending(format!("ready-file {} absent", path.display()))
-        }
-    })
-    .unwrap_or_else(|e| panic!("waiting for ready-file {}: {e}", path.display()))
+    poll_path_exists(path, deadline, Duration::from_millis(10))
+        .unwrap_or_else(|e| panic!("waiting for ready-file {}: {e}", path.display()))
 }
 
 /// An opaque handle to a running follower (`tendr events --follow` or
@@ -559,39 +649,37 @@ impl ReadyFollower {
             }))
         };
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        // `Ready(Some(status))` is an exit before readiness.
+        let ready = poll_until(Duration::from_secs(10), Duration::from_millis(10), || {
             if ready_path.exists() {
-                break;
+                return Observation::Ready(None);
             }
-            // On failure, reap the child and join both readers so the captured
-            // stderr is complete (the pipes EOF once the child is gone), instead
-            // of sampling it after a fixed sleep.
-            if let Ok(Some(status)) = child.try_wait() {
-                if let Some(h) = stdout_reader.take() {
-                    let _ = h.join();
-                }
-                if let Some(h) = stderr_reader.take() {
-                    let _ = h.join();
-                }
-                let stderr = stderr_buf.lock().unwrap().clone();
-                panic!("follower `{label}` exited before readiness ({status}); stderr:\n{stderr}");
+            match child.try_wait() {
+                Ok(Some(status)) => Observation::Ready(Some(status)),
+                _ => Observation::Pending(format!("ready-file {} absent", ready_path.display())),
             }
-            if Instant::now() >= deadline {
+        });
+        let failure = match ready {
+            Ok(None) => None,
+            Ok(Some(status)) => Some(format!("exited before readiness ({status})")),
+            Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(h) = stdout_reader.take() {
-                    let _ = h.join();
-                }
-                if let Some(h) = stderr_reader.take() {
-                    let _ = h.join();
-                }
-                let stderr = stderr_buf.lock().unwrap().clone();
-                panic!(
-                    "follower `{label}` never published its ready-file within 10s; stderr:\n{stderr}"
-                );
+                Some(format!("never published its ready-file within 10s ({e})"))
             }
-            std::thread::sleep(Duration::from_millis(10));
+        };
+        // On failure, join both readers so the captured stderr is complete (the
+        // pipes EOF once the child is gone), instead of sampling it after a
+        // fixed sleep.
+        if let Some(failure) = failure {
+            if let Some(h) = stdout_reader.take() {
+                let _ = h.join();
+            }
+            if let Some(h) = stderr_reader.take() {
+                let _ = h.join();
+            }
+            let stderr = stderr_buf.lock().unwrap().clone();
+            panic!("follower `{label}` {failure}; stderr:\n{stderr}");
         }
 
         ReadyFollower {

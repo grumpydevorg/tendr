@@ -1129,23 +1129,23 @@ fn exec_duckdb_path_with_spaces() {
     cmd.assert().success();
 
     // Wait for running
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let mut status_cmd = assert_cmd::Command::cargo_bin("tendr").unwrap();
-        status_cmd.env("HOME", &spaced_dir);
-        status_cmd.args(["status", "db"]);
-        let out = status_cmd.output().unwrap();
-        if out.status.success() {
+    harness::poll_until(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(100),
+        || {
+            let mut status_cmd = assert_cmd::Command::cargo_bin("tendr").unwrap();
+            status_cmd.env("HOME", &spaced_dir);
+            status_cmd.args(["status", "db"]);
+            let out = status_cmd.output().unwrap();
             let s = String::from_utf8_lossy(&out.stdout);
-            if s.contains("Running") {
-                break;
+            if out.status.success() && s.contains("Running") {
+                harness::Observation::Ready(())
+            } else {
+                harness::Observation::Pending(format!("status exit {}: {s}", out.status))
             }
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for db to start");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+        },
+    )
+    .unwrap_or_else(|e| panic!("timed out waiting for db to start: {e}"));
 
     let mut exec_cmd = assert_cmd::Command::cargo_bin("tendr").unwrap();
     exec_cmd.env("HOME", &spaced_dir);
