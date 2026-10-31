@@ -506,15 +506,16 @@ impl RunCore {
     }
 
     /// Capture stdout/stderr into `log` until the child closes them. Capture
-    /// errors become `capture_errors.log` (sidecar stderr is /dev/null) and
-    /// never fail supervision: the child's exit status is still meaningful.
+    /// errors never fail supervision: the child's exit status is still
+    /// meaningful. A failed `output.log` write becomes a meta warning while the
+    /// run is live, once per stream.
     fn capture_output(&mut self, log: Box<dyn Write + Send>) {
         let log = Mutex::new(log);
         let stdout = Current::child_stdout(&mut self.child);
         let stderr = Current::child_stderr(&mut self.child); // None for PTY sessions
         let (attach_sink, recorder) = match &self.pty {
             Some(PtySide::Started(pty)) => (
-                Some(&pty.sink),
+                Some(Arc::clone(&pty.sink)),
                 pty.recording.as_ref().map(|r| r.thread.recorder()),
             ),
             _ => (None, None),
@@ -522,37 +523,31 @@ impl RunCore {
         let recorder = recorder.as_ref();
 
         let log_ref = &log;
-        let (stdout_result, stderr_result) = std::thread::scope(|scope| {
+        let (failed, failures) = std::sync::mpsc::channel();
+        let panicked = std::thread::scope(|scope| {
+            let stdout_failed = failed.clone();
             let stdout_handle = stdout.map(|s| match attach_sink {
-                Some(sink) => {
-                    scope.spawn(move || capture_stream_with_tee(s, 'O', log_ref, sink, recorder))
-                }
-                None => scope.spawn(move || capture_stream(s, 'O', log_ref)),
+                Some(sink) => scope.spawn(move || {
+                    capture_stream_with_tee(s, 'O', log_ref, &stdout_failed, &sink, recorder);
+                }),
+                None => scope.spawn(move || capture_stream(s, 'O', log_ref, &stdout_failed)),
             });
             let stderr_handle =
-                stderr.map(|s| scope.spawn(move || capture_stream(s, 'E', log_ref)));
-            let join = |handle: Option<std::thread::ScopedJoinHandle<'_, Result<(), String>>>,
-                        name: &str| {
-                handle
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| Err(format!("{name} capture thread panicked")))
-                    })
-                    .unwrap_or(Ok(()))
-            };
-            (join(stdout_handle, "stdout"), join(stderr_handle, "stderr"))
+                stderr.map(|s| scope.spawn(move || capture_stream(s, 'E', log_ref, &failed)));
+            // Ends once both capture threads have dropped their senders.
+            for warning in failures {
+                self.meta.add_warning(warning);
+                // Best effort; the terminal write carries the warning regardless.
+                let _ = self.write_meta();
+            }
+            [(stdout_handle, "stdout"), (stderr_handle, "stderr")]
+                .into_iter()
+                .filter_map(|(handle, name)| handle?.join().is_err().then_some(name))
+                .collect::<Vec<_>>()
         });
-
-        let mut capture_errors = Vec::new();
-        if let Err(e) = stdout_result {
-            capture_errors.push(format!("stdout capture: {e}"));
-        }
-        if let Err(e) = stderr_result {
-            capture_errors.push(format!("stderr capture: {e}"));
-        }
-        if !capture_errors.is_empty() {
-            let err_path = self.session_dir().join("capture_errors.log");
-            let _ = std::fs::write(&err_path, capture_errors.join("\n"));
+        for name in panicked {
+            self.meta
+                .add_warning(format!("log capture: {name} capture thread panicked"));
         }
     }
 
@@ -567,7 +562,7 @@ impl RunCore {
         self.clean_up_control_files();
         // Breadcrumb no longer needed: meta carries the child identity.
         let _ = std::fs::remove_file(dir.join("child_pid"));
-        for warning in collect_warnings(&dir, &self.stdin_errors) {
+        for warning in collect_warnings(&self.stdin_errors) {
             self.meta.add_warning(warning);
         }
 
@@ -651,7 +646,7 @@ impl RunCore {
             self.meta.add_warning(note.clone());
         }
         self.clean_up_control_files();
-        for warning in collect_warnings(&dir, &self.stdin_errors) {
+        for warning in collect_warnings(&self.stdin_errors) {
             self.meta.add_warning(warning);
         }
 

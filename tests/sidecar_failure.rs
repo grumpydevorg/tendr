@@ -12,11 +12,11 @@
 
 mod harness;
 
-use harness::{echo_env_cmd, read_events, tendr, touch_cmd};
+use harness::{Observation, echo_env_cmd, poll_until, read_events, tendr, touch_cmd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 use tendr::model::ids::{Namespace, ProcessIdentity, SessionName};
 use tendr::platform::{Current, Platform, ProcessStatus};
@@ -64,22 +64,19 @@ fn spawn_start(root: &TempDir, inject: Inject, gate: &Path, args: &[&str]) -> Ch
 }
 
 fn wait_for_file(path: &Path, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !path.exists() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    harness::poll_path_exists(path, Duration::from_secs(10), Duration::from_millis(10))
+        .unwrap_or_else(|e| panic!("timed out waiting for {what}: {e}"));
 }
 
 /// Reap the start client (bounded) and return (exit code, stdout, stderr).
 fn finish_client(mut client: Child) -> (Option<i32>, String, String) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while client.try_wait().expect("poll start client").is_none() {
-        if Instant::now() >= deadline {
-            let _ = client.kill();
-            panic!("start client did not return");
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    if let Err(e) = harness::poll_child_exit(
+        &mut client,
+        Duration::from_secs(30),
+        Duration::from_millis(10),
+    ) {
+        let _ = client.kill();
+        panic!("start client did not return: {e}");
     }
     let output = client.wait_with_output().expect("collect start output");
     (
@@ -98,23 +95,22 @@ fn wait_sidecar_gone(root: &TempDir, session: &str) -> (serde_json::Value, LockG
     let dir = session::open(&session_root, &namespace, &name)
         .expect("open session")
         .expect("session exists");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match LockGuard::try_acquire(&dir) {
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(10),
+        || match LockGuard::try_acquire(&dir) {
             Ok(lock) => {
                 let path = session_dir(root, session).join("meta.json");
                 let meta = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-                return (meta, lock);
+                Observation::Ready((meta, lock))
             }
-            Err(session::SessionError::Locked(_)) => {}
+            Err(session::SessionError::Locked(_)) => Observation::Pending("locked".into()),
             Err(error) => panic!("failed to acquire session lock: {error}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {session}'s sidecar to release its lock"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        },
+    )
+    .unwrap_or_else(|e| {
+        panic!("timed out waiting for {session}'s sidecar to release its lock: {e}")
+    })
 }
 
 fn warnings(meta: &serde_json::Value) -> Vec<String> {
@@ -142,18 +138,15 @@ fn child_identity(meta: &serde_json::Value) -> ProcessIdentity {
 
 /// The child is gone: not merely signalled, but no longer a live process.
 fn assert_process_gone(id: &ProcessIdentity, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match Current::process_status(id) {
-            ProcessStatus::Missing | ProcessStatus::IdentityMismatch => return,
-            status => assert!(
-                Instant::now() < deadline,
-                "{what} (pid {}) is still alive: {status:?}",
-                id.pid
-            ),
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || match Current::process_status(id) {
+            ProcessStatus::Missing | ProcessStatus::IdentityMismatch => Observation::Ready(()),
+            status => Observation::Pending(format!("{status:?}")),
+        },
+    )
+    .unwrap_or_else(|e| panic!("{what} (pid {}) is still alive: {e}", id.pid));
 }
 
 /// A grandchild the test only knows by pid: gone once `kill(pid, 0)` fails
@@ -165,15 +158,8 @@ fn assert_pid_gone(pid_file: &Path, what: &str) {
         .trim()
         .parse()
         .expect("pid");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    // SAFETY: signal 0 only probes for existence.
-    while unsafe { libc::kill(pid, 0) } == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "{what} (pid {pid}) survived the group kill"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    harness::poll_pid_dead(pid, Duration::from_secs(10), Duration::from_millis(20))
+        .unwrap_or_else(|e| panic!("{what} (pid {pid}) survived the group kill: {e}"));
 }
 
 fn event_kinds(root: &TempDir, session: &str) -> Vec<String> {
@@ -183,16 +169,18 @@ fn event_kinds(root: &TempDir, session: &str) -> Vec<String> {
         .collect()
 }
 
+/// The hook's output, or an empty string if it is still empty after 5 s.
 fn wait_file_content(path: &Path) -> String {
     wait_for_file(path, "the --on-exit hook");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    poll_until(Duration::from_secs(5), Duration::from_millis(10), || {
         let content = std::fs::read_to_string(path).unwrap_or_default();
-        if !content.is_empty() || Instant::now() >= deadline {
-            return content;
+        if content.is_empty() {
+            Observation::Pending("empty".into())
+        } else {
+            Observation::Ready(content)
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    })
+    .unwrap_or_default()
 }
 
 /// Everything a `SidecarFailed { step }` must show: meta, event, `wait`'s exit
@@ -614,6 +602,126 @@ fn output_log_failure_drains_output_and_recovers() {
         std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) == 0,
         "nothing was written to output.log"
     );
+}
+
+/// The warning a failed `output.log` write leaves, once per stream.
+fn write_warning(stream: &str) -> String {
+    format!(
+        "{stream} capture: output.log write failed; later output not logged: \
+         injected fault at output_log_write"
+    )
+}
+
+/// Exactly one warning per stream for a failed `output.log` write.
+fn assert_one_write_warning(meta: &serde_json::Value, stream: &str) {
+    let needle = write_warning(stream);
+    let warnings = warnings(meta);
+    let count = warnings.iter().filter(|w| w.contains(&needle)).count();
+    assert_eq!(count, 1, "expected one {needle:?}, got {warnings:?}");
+}
+
+/// A mid-run `output.log` write failure keeps draining the child's output,
+/// so a chatty child still runs to its real exit with a warning.
+#[test]
+fn output_log_write_failure_drains_output_and_recovers() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_root, meta) = recovers(
+        Inject::Fail("output_log_write"),
+        &["--timeout", "20"],
+        &[
+            "sh",
+            "-c",
+            "yes tendr | head -c 2000000; yes tendr | head -c 2000000 >&2",
+        ],
+    );
+    assert_exited_ok(&meta);
+    assert_one_write_warning(&meta, "stdout");
+    assert_one_write_warning(&meta, "stderr");
+}
+
+/// The write-failure warning reaches meta while the child still runs.
+#[test]
+fn output_log_write_failure_warns_while_the_run_is_live() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let gate = root.path().join("fault-gate");
+    std::fs::write(&gate, b"").unwrap();
+    let client = spawn_start(
+        &root,
+        Inject::Fail("output_log_write"),
+        &gate,
+        &[
+            "s1",
+            "--timeout",
+            "20",
+            "--",
+            "sh",
+            "-c",
+            "yes tendr | head -c 2000000; sleep 5",
+        ],
+    );
+    let _ = finish_client(client);
+    let needle = write_warning("stdout");
+    poll_until(Duration::from_secs(4), Duration::from_millis(50), || {
+        let meta = status_of(&root, "s1");
+        assert_eq!(
+            meta["status"], "Running",
+            "the warning must show before exit: {meta}"
+        );
+        if warnings(&meta).iter().any(|w| w.contains(&needle)) {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("status={}", meta["status"]))
+        }
+    })
+    .unwrap_or_else(|e| panic!("no live warning: {e}"));
+    let (meta, _lock) = wait_sidecar_gone(&root, "s1");
+    assert_exited_ok(&meta);
+    assert_one_write_warning(&meta, "stdout");
+}
+
+/// The PTY tee path: the recorder keeps receiving output after the log fails.
+#[cfg(unix)]
+#[test]
+fn pty_output_log_write_failure_keeps_recording_and_recovers() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, meta) = recovers(
+        Inject::Fail("output_log_write"),
+        &["--pty", "--timeout", "20"],
+        &["sh", "-c", "yes tendr | head -c 2000000"],
+    );
+    assert_exited_ok(&meta);
+    assert_one_write_warning(&meta, "stdout");
+    let recording = session_dir(&root, "s1").join("recording");
+    let mut bytes = 0;
+    for run in std::fs::read_dir(&recording).expect("recording dir") {
+        for seg in std::fs::read_dir(run.unwrap().path()).unwrap() {
+            bytes += seg.unwrap().metadata().unwrap().len();
+        }
+    }
+    assert!(bytes > 1_000_000, "recording holds only {bytes} bytes");
+}
+
+/// A line that is not valid UTF-8 is logged lossily, and capture goes on.
+#[cfg(unix)]
+#[test]
+fn invalid_utf8_line_is_logged_and_capture_continues() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, meta) = recovers(
+        Inject::Fail("none"),
+        &["--timeout", "20"],
+        &["sh", "-c", r"printf 'a\377b\r\nafter\n'"],
+    );
+    assert_exited_ok(&meta);
+    let log = std::fs::read_to_string(session_dir(&root, "s1").join("output.log")).unwrap();
+    let lines: Vec<String> = log
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["content"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(lines, ["a\u{FFFD}b", "after"], "{log}");
 }
 
 /// The child exited, so there is nothing to stop: the durable event lets

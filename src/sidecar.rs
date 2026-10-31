@@ -375,28 +375,9 @@ fn setup_kill_watcher(
     });
 }
 
-/// Collect capture errors and stdin forwarding errors into a warning list.
-fn collect_warnings(session_dir: &Path, stdin_errors: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
-    let mut warnings = Vec::new();
-
-    // Collect capture errors
-    let capture_err_path = session_dir.join("capture_errors.log");
-    if let Ok(errors) = std::fs::read_to_string(&capture_err_path) {
-        for line in errors.lines() {
-            if !line.is_empty() {
-                warnings.push(format!("log capture: {line}"));
-            }
-        }
-    }
-
-    // Collect stdin forwarding errors
-    if let Ok(errs) = stdin_errors.lock() {
-        for e in errs.iter() {
-            warnings.push(e.clone());
-        }
-    }
-
-    warnings
+/// Collect stdin forwarding errors into a warning list.
+fn collect_warnings(stdin_errors: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    lock(stdin_errors).clone()
 }
 
 /// Outcome of the dependency wait phase.
@@ -848,8 +829,9 @@ fn test_abort_point(point: &str) {
 /// Test-only fault injection at a named sidecar step. `TENDR_TEST_FAIL` is a
 /// comma-separated list of points that return an injected error;
 /// `TENDR_TEST_PANIC` names points that panic. The points are the
-/// [`SidecarStep`] wire names plus `ready_rewrite`, `terminal_meta` and
-/// `failure_record`. If `TENDR_TEST_FAULT_GATE` names a file, a named point
+/// [`SidecarStep`] wire names plus `ready_rewrite`, `terminal_meta`,
+/// `failure_record` and `output_log_write` (every write to `output.log`). If
+/// `TENDR_TEST_FAULT_GATE` names a file, a named point
 /// first waits for it (bounded), so a test can let the child reach a known
 /// state before the fault fires. Compiled into debug builds only; release
 /// sidecars ignore all three variables entirely.
@@ -1486,31 +1468,54 @@ fn signal_readiness(session: &SessionDir, ready: &mut Option<ReadyWriter>, meta:
     }
 }
 
-/// Read lines from a stream and write to the shared log file.
-/// Returns an error if log writing fails persistently.
+/// Write one line of a stream to the shared log file.
+fn write_log_line(log: &Mutex<Box<dyn Write + Send>>, tag: char, line: String) -> io::Result<()> {
+    let formatted = serde_json::to_string(&crate::log::LogLine {
+        ts: crate::log::timestamp_secs(),
+        tag: tag.to_string(),
+        content: serde_json::Value::String(line),
+    })
+    .expect("JSON serialization cannot fail")
+        + "\n";
+    test_fault("output_log_write").and_then(|()| lock(log).write_all(formatted.as_bytes()))
+}
+
+/// The warning for a stream whose `output.log` write failed.
+fn log_write_warning(tag: char, e: &io::Error) -> String {
+    let stream = if tag == 'E' { "stderr" } else { "stdout" };
+    format!("{stream} capture: output.log write failed; later output not logged: {e}")
+}
+
+/// Read lines from a stream and write them to the shared log file. Invalid
+/// UTF-8 is logged lossily. After the first failed write, send its warning to
+/// `failed`, then drain the rest unparsed so the child never blocks.
 fn capture_stream(
     stream: Box<dyn std::io::Read + Send>,
     tag: char,
     log: &Mutex<Box<dyn Write + Send>>,
-) -> Result<(), String> {
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break, // pipe closed
-        };
-        let formatted = serde_json::to_string(&crate::log::LogLine {
-            ts: crate::log::timestamp_secs(),
-            tag: tag.to_string(),
-            content: serde_json::Value::String(line),
-        })
-        .expect("JSON serialization cannot fail")
-            + "\n";
-        let mut f = log.lock().map_err(|e| format!("log mutex poisoned: {e}"))?;
-        f.write_all(formatted.as_bytes())
-            .map_err(|e| format!("log write failed: {e}"))?;
+    failed: &std::sync::mpsc::Sender<String>,
+) {
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return, // pipe closed
+            Ok(_) => {}
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        let text = String::from_utf8_lossy(&line).into_owned();
+        if let Err(e) = write_log_line(log, tag, text) {
+            let _ = failed.send(log_write_warning(tag, &e));
+            let _ = io::copy(&mut reader, &mut io::sink());
+            return;
+        }
     }
-    Ok(())
 }
 
 /// Read raw bytes from a stream, record them, write them to the log, and tee
@@ -1519,10 +1524,12 @@ fn capture_stream_with_tee(
     mut stream: Box<dyn std::io::Read + Send>,
     tag: char,
     log: &Mutex<Box<dyn Write + Send>>,
+    failed: &std::sync::mpsc::Sender<String>,
     attach_sink: &AttachSink,
     recorder: Option<&Recorder>,
-) -> Result<(), String> {
+) {
     let mut buf = [0u8; 4096];
+    let mut logging = true;
     loop {
         let n = match stream.read(&mut buf) {
             Ok(0) => break,
@@ -1535,20 +1542,16 @@ fn capture_stream_with_tee(
             recorder.output(&buf[..n]);
         }
 
-        // Write to log (best-effort chunk-based transcript)
-        {
-            let mut f = log.lock().map_err(|e| format!("log mutex: {e}"))?;
+        // Write to log (best-effort chunk-based transcript). After the first
+        // failed write, skip the log but keep recording and teeing.
+        if logging {
             let text = String::from_utf8_lossy(&buf[..n]);
             for line in text.lines() {
-                let formatted = serde_json::to_string(&crate::log::LogLine {
-                    ts: crate::log::timestamp_secs(),
-                    tag: tag.to_string(),
-                    content: serde_json::Value::String(line.to_owned()),
-                })
-                .expect("JSON serialization cannot fail")
-                    + "\n";
-                f.write_all(formatted.as_bytes())
-                    .map_err(|e| format!("log write failed: {e}"))?;
+                if let Err(e) = write_log_line(log, tag, line.to_owned()) {
+                    let _ = failed.send(log_write_warning(tag, &e));
+                    logging = false;
+                    break;
+                }
             }
         }
 
@@ -1561,7 +1564,6 @@ fn capture_stream_with_tee(
             }
         }
     }
-    Ok(())
 }
 
 /// The PTY input the single writer drives: the master's write half, a dup used

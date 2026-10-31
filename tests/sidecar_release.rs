@@ -64,11 +64,12 @@ fn spawn_tendr(root: &TempDir, args: &[&str]) -> Child {
 
 /// Wait for a background `tendr` to exit, bounded.
 fn finish(mut child: Child) -> std::process::Output {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while child.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline, "tendr did not exit");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    harness::poll_child_exit(
+        &mut child,
+        Duration::from_secs(15),
+        Duration::from_millis(20),
+    )
+    .unwrap_or_else(|e| panic!("tendr did not exit: {e}"));
     child.wait_with_output().unwrap()
 }
 

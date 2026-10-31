@@ -2,7 +2,7 @@
 
 mod harness;
 
-use harness::tendr;
+use harness::{Observation, poll_until, tendr};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -233,17 +233,12 @@ fn attach_socket_exists_for_pty_session() {
         .join(".tendr/sessions/default/pty-attach/a.sock.path");
 
     // The attach listener thread may not have written the breadcrumb yet.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !breadcrumb.exists() {
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for a.sock.path breadcrumb to appear");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(
-        breadcrumb.exists(),
-        "a.sock.path breadcrumb should exist for PTY session"
-    );
+    harness::poll_path_exists(
+        &breadcrumb,
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+    )
+    .unwrap_or_else(|e| panic!("timed out waiting for a.sock.path breadcrumb to appear: {e}"));
 
     // The breadcrumb should point to an actual socket file
     let sock_path = std::fs::read_to_string(&breadcrumb).unwrap();
@@ -275,22 +270,19 @@ fn push_to_pty_session_delivers_input_without_stdin_flag() {
         .success();
 
     // Poll the log until the pushed input echoes through the PTY (no fixed sleep).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
+    poll_until(Duration::from_secs(10), Duration::from_millis(20), || {
         let output = tendr(&root)
             .args(["log", "pty-push", "--raw"])
             .output()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if stdout.contains("hello-from-push") {
-            break;
+            Observation::Ready(())
+        } else {
+            Observation::Pending(stdout)
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "push input never appeared in PTY log: {stdout}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    })
+    .unwrap_or_else(|e| panic!("push input never appeared in PTY log: {e}"));
 }
 
 /// A PTY session still waiting on `--after` has no `pty` record yet, but it
@@ -478,19 +470,22 @@ fn wait_for_attach_socket(root: &TempDir, session: &str) -> std::path::PathBuf {
     let breadcrumb = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/a.sock.path"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Ok(content) = std::fs::read_to_string(&breadcrumb) {
-            let p = std::path::PathBuf::from(content.trim());
-            if p.exists() {
-                return p;
+    poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || match std::fs::read_to_string(&breadcrumb) {
+            Ok(content) => {
+                let p = std::path::PathBuf::from(content.trim());
+                if p.exists() {
+                    Observation::Ready(p)
+                } else {
+                    Observation::Pending(format!("socket {} absent", p.display()))
+                }
             }
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for attach socket in {session}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+            Err(e) => Observation::Pending(format!("breadcrumb unreadable: {e}")),
+        },
+    )
+    .unwrap_or_else(|e| panic!("timed out waiting for attach socket in {session}: {e}"))
 }
 
 /// Connect, send a v1 hello in `mode`, and return the stream with the sidecar's
@@ -530,8 +525,7 @@ fn attach_as_human(sock_path: &std::path::Path) -> UnixStream {
 /// whole there. For a child whose output has no newlines of its own, joining
 /// the lines recovers the stream.
 fn wait_output_contains(root: &TempDir, session: &str, needle: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
+    poll_until(Duration::from_secs(15), Duration::from_millis(20), || {
         let output = tendr(root)
             .args(["log", session, "--raw"])
             .output()
@@ -541,34 +535,29 @@ fn wait_output_contains(root: &TempDir, session: &str, needle: &str) -> String {
             .filter(|&c| c != '\n')
             .collect();
         if joined.contains(needle) {
-            return joined;
+            Observation::Ready(joined)
+        } else {
+            Observation::Pending(joined)
         }
-        assert!(
-            Instant::now() < deadline,
-            "output of {session} never contained {needle:?}; got: {joined}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    })
+    .unwrap_or_else(|e| panic!("output of {session} never contained {needle:?}: {e}"))
 }
 
 /// Poll `tendr log --raw` until it contains `needle`.
 fn wait_log_contains(root: &TempDir, session: &str, needle: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
+    poll_until(Duration::from_secs(15), Duration::from_millis(20), || {
         let output = tendr(root)
             .args(["log", session, "--raw"])
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if stdout.contains(needle) {
-            return stdout;
+            Observation::Ready(stdout)
+        } else {
+            Observation::Pending(stdout)
         }
-        assert!(
-            Instant::now() < deadline,
-            "log for {session} never contained {needle:?}; got: {stdout}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    })
+    .unwrap_or_else(|e| panic!("log for {session} never contained {needle:?}: {e}"))
 }
 
 /// Read until the sidecar closes the stream, returning every message seen.
@@ -598,20 +587,18 @@ fn wait_for_pty_control(root: &TempDir, session: &str, expected: &str) {
     let meta_path = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/meta.json"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Ok(content) = std::fs::read_to_string(&meta_path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                if meta["pty"]["control"].as_str() == Some(expected) {
-                    return;
-                }
-            }
+    poll_until(Duration::from_secs(5), Duration::from_millis(50), || {
+        let control = std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .map(|meta| meta["pty"]["control"].clone());
+        match control {
+            Some(c) if c.as_str() == Some(expected) => Observation::Ready(()),
+            Some(c) => Observation::Pending(format!("pty.control={c}")),
+            None => Observation::Pending("meta unreadable".into()),
         }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for pty.control={expected} in {session}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    })
+    .unwrap_or_else(|e| panic!("timed out waiting for pty.control={expected} in {session}: {e}"))
 }
 
 #[test]
@@ -691,8 +678,7 @@ fn sidecar_meta_write_keeps_human_control() {
     let meta_path = root
         .path()
         .join(".tendr/sessions/default/pty-keep/meta.json");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let meta = loop {
+    let meta = poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
         let written = meta["warnings"].as_array().is_some_and(|w| {
@@ -700,14 +686,12 @@ fn sidecar_meta_write_keeps_human_control() {
                 .any(|w| w.as_str().is_some_and(|w| w.contains("output.log")))
         });
         if written {
-            break meta;
+            Observation::Ready(meta)
+        } else {
+            Observation::Pending(meta.to_string())
         }
-        assert!(
-            Instant::now() < deadline,
-            "sidecar never rewrote meta: {meta}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    })
+    .unwrap_or_else(|e| panic!("sidecar never rewrote meta: {e}"));
 
     assert_eq!(meta["status"], "Running");
     assert_eq!(meta["pty"]["control"], "HumanControl");
@@ -1011,23 +995,24 @@ impl CliAttach {
     /// enters raw mode are discarded (`TCSAFLUSH`), so a single write races the
     /// handshake; the marker is idempotent, so retyping is safe.
     fn type_until_logged(&mut self, root: &TempDir, session: &str, line: &str) {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
+        poll_until(Duration::from_secs(15), Duration::from_millis(200), || {
             self.type_bytes(line.as_bytes());
             let output = tendr(root)
                 .args(["log", session, "--raw"])
                 .output()
                 .unwrap();
             if String::from_utf8_lossy(&output.stdout).contains(line.trim_end()) {
-                return;
+                Observation::Ready(())
+            } else {
+                Observation::Pending(format!("{session} log lacks {line:?}"))
             }
-            assert!(
-                Instant::now() < deadline,
-                "typed {line:?} never reached {session}; cli output: {}",
+        })
+        .unwrap_or_else(|e| {
+            panic!(
+                "typed {line:?} never reached {session} ({e}); cli output: {}",
                 self.output()
-            );
-            std::thread::sleep(Duration::from_millis(200));
-        }
+            )
+        });
     }
 
     fn output(&self) -> String {
@@ -1098,11 +1083,8 @@ impl WrappedAttach {
             cmd = attach.join(" "),
         );
         let cli = CliAttach::spawn_argv(root, &["sh".to_owned(), "-c".to_owned(), script]);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !before.exists() {
-            assert!(Instant::now() < deadline, "wrapper never started");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        harness::poll_path_exists(&before, Duration::from_secs(10), Duration::from_millis(20))
+            .unwrap_or_else(|e| panic!("wrapper never started: {e}"));
         Self {
             cli,
             before,
@@ -1114,17 +1096,17 @@ impl WrappedAttach {
 
     /// Send `signal` to `tendr attach` itself, not to the shell running it.
     fn signal(&self, signal: libc::c_int) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let pid: libc::pid_t = loop {
-            if let Some(pid) = std::fs::read_to_string(&self.pid)
-                .ok()
-                .and_then(|p| p.trim().parse().ok())
-            {
-                break pid;
-            }
-            assert!(Instant::now() < deadline, "attach pid never recorded");
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let pid: libc::pid_t =
+            poll_until(Duration::from_secs(10), Duration::from_millis(20), || {
+                match std::fs::read_to_string(&self.pid)
+                    .ok()
+                    .and_then(|p| p.trim().parse().ok())
+                {
+                    Some(pid) => Observation::Ready(pid),
+                    None => Observation::Pending(format!("{} has no pid", self.pid.display())),
+                }
+            })
+            .unwrap_or_else(|e| panic!("attach pid never recorded: {e}"));
         // SAFETY: kill(2) takes a pid and a signal number.
         let rc = unsafe { libc::kill(pid, signal) };
         assert_eq!(rc, 0, "signal tendr attach (pid {pid})");
@@ -1149,15 +1131,14 @@ impl WrappedAttach {
 
     /// Wait for `tendr attach` to exit and return its exit code.
     fn wait_exit(&self, within: Duration) -> i32 {
-        let deadline = Instant::now() + within;
-        while !self.code.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "tendr attach did not exit within {within:?}; cli output: {}",
-                self.cli.output()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        harness::poll_path_exists(&self.code, within, Duration::from_millis(20)).unwrap_or_else(
+            |e| {
+                panic!(
+                    "tendr attach did not exit within {within:?} ({e}); cli output: {}",
+                    self.cli.output()
+                )
+            },
+        );
         std::fs::read_to_string(&self.code)
             .unwrap()
             .trim()
@@ -1417,23 +1398,24 @@ fn cli_forwards_later_terminal_resizes() {
 
     // Resized after the attach started: only continuous forwarding delivers it.
     cli.resize(33, 111);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
+    poll_until(Duration::from_secs(15), Duration::from_millis(200), || {
         cli.type_bytes(b"stty size\n");
         let log = tendr(&root)
             .args(["log", "pty-winch", "--raw"])
             .output()
             .unwrap();
         if String::from_utf8_lossy(&log.stdout).contains("33 111") {
-            break;
+            Observation::Ready(())
+        } else {
+            Observation::Pending("log lacks 33 111".into())
         }
-        assert!(
-            Instant::now() < deadline,
-            "the session never saw the new size; cli output: {}",
+    })
+    .unwrap_or_else(|e| {
+        panic!(
+            "the session never saw the new size ({e}); cli output: {}",
             cli.output()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+        )
+    });
 }
 
 // --- Attach client signals: cancellation, and SIGWINCH as an early size check ---
@@ -1535,23 +1517,24 @@ fn cli_sigwinch_forwards_the_size_before_the_next_poll() {
     cli.type_until_logged(&root, "pty-sigwinch", "echo sigwinch-ready\n");
 
     cli.resize(37, 97);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
+    poll_until(Duration::from_secs(15), Duration::from_millis(200), || {
         cli.type_bytes(b"stty size\n");
         let log = tendr(&root)
             .args(["log", "pty-sigwinch", "--raw"])
             .output()
             .unwrap();
         if String::from_utf8_lossy(&log.stdout).contains("37 97") {
-            break;
+            Observation::Ready(())
+        } else {
+            Observation::Pending("log lacks 37 97".into())
         }
-        assert!(
-            Instant::now() < deadline,
-            "the session never saw the new size; cli output: {}",
+    })
+    .unwrap_or_else(|e| {
+        panic!(
+            "the session never saw the new size ({e}); cli output: {}",
             cli.output()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+        )
+    });
 }
 
 #[test]
@@ -1972,19 +1955,15 @@ fn stalled_viewer_cannot_block_output_capture() {
     let log_path = root
         .path()
         .join(".tendr/sessions/default/pty-stalled/output.log");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
+    poll_until(Duration::from_secs(60), Duration::from_millis(200), || {
         let log = std::fs::read(&log_path).unwrap_or_default();
         if log.windows(15).any(|w| w == b"ALL-OUTPUT-DONE") {
-            break;
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("{} log bytes", log.len()))
         }
-        assert!(
-            Instant::now() < deadline,
-            "output capture stalled behind a viewer that never reads ({} log bytes)",
-            log.len()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    })
+    .unwrap_or_else(|e| panic!("output capture stalled behind a viewer that never reads: {e}"));
 
     // The stalled viewer was disconnected rather than buffered without bound,
     // and with it went its control.
@@ -2230,19 +2209,15 @@ fn a_disconnected_push_releases_control_behind_a_full_pty() {
     agent.shutdown(std::net::Shutdown::Both).unwrap();
     drop(agent);
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    poll_until(Duration::from_secs(5), Duration::from_millis(50), || {
         let (_next, (msg_type, reason)) = hello(&sock_path, Mode::Attach);
         if msg_type == MSG_ACCEPTED {
-            break;
+            Observation::Ready(())
+        } else {
+            Observation::Pending(String::from_utf8_lossy(&reason).into_owned())
         }
-        assert!(
-            Instant::now() < deadline,
-            "a disconnected push still holds the terminal: {}",
-            String::from_utf8_lossy(&reason)
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    })
+    .unwrap_or_else(|e| panic!("a disconnected push still holds the terminal: {e}"));
 }
 
 #[test]
@@ -2399,23 +2374,24 @@ fn thirty_two_half_open_takeovers_do_not_grow_connections_or_threads() {
         // the client side (nothing below has dropped `retired` yet): the
         // sidecar's own retirement must be what frees its fd and thread, not
         // a client eventually closing its end.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
             let fds = proc_count(sidecar_pid, "fd");
             let threads = proc_count(sidecar_pid, "task");
             if fds <= baseline.0 && threads <= baseline.1 {
-                break;
+                Observation::Ready(())
+            } else {
+                Observation::Pending(format!(
+                    "fds {fds} (baseline {}), threads {threads} (baseline {})",
+                    baseline.0, baseline.1
+                ))
             }
-            assert!(
-                Instant::now() < deadline,
+        })
+        .unwrap_or_else(|e| {
+            panic!(
                 "sidecar {sidecar_pid} did not release its resources while \
-                 every retired socket was still open on the client side: \
-                 fds {fds} (baseline {}), threads {threads} (baseline {})",
-                baseline.0,
-                baseline.1
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+                 every retired socket was still open on the client side: {e}"
+            )
+        });
     }
 
     // Only now: nothing above depended on the client side ever closing.
@@ -2504,11 +2480,8 @@ fn an_old_runs_cleanup_cannot_remove_its_replacements_breadcrumb() {
         .args(["kill", "pty-replaced", "--force"])
         .output()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !started.exists() {
-        assert!(Instant::now() < deadline, "exit callback never started");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    harness::poll_path_exists(&started, Duration::from_secs(10), Duration::from_millis(20))
+        .unwrap_or_else(|e| panic!("exit callback never started: {e}"));
 
     // A replacement starts while the old sidecar is still in its callback.
     tendr(&root)
@@ -2532,11 +2505,8 @@ fn an_old_runs_cleanup_cannot_remove_its_replacements_breadcrumb() {
     let record = root
         .path()
         .join(format!(".tendr/callbacks/{old_run_id}.json"));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !record.exists() {
-        assert!(Instant::now() < deadline, "old sidecar never finished");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    harness::poll_path_exists(&record, Duration::from_secs(10), Duration::from_millis(20))
+        .unwrap_or_else(|e| panic!("old sidecar never finished: {e}"));
 
     let session = root.path().join(".tendr/sessions/default/pty-replaced");
     assert!(!old_socket.exists(), "the old run's socket is gone");
@@ -2759,15 +2729,15 @@ fn a_recording_size_limit_stops_recording_but_not_the_session() {
     let line = format!("{}\n", "x".repeat(59));
     push(&root, "pty-rec-limit", line.repeat(50).as_bytes());
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let meta = loop {
+    let meta = poll_until(Duration::from_secs(10), Duration::from_millis(20), || {
         let meta = session_meta(&root, "pty-rec-limit");
         if meta["pty"]["recording"]["state"] == "Stopped" {
-            break meta;
+            Observation::Ready(meta)
+        } else {
+            Observation::Pending(meta.to_string())
         }
-        assert!(Instant::now() < deadline, "recording never stopped: {meta}");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    })
+    .unwrap_or_else(|e| panic!("recording never stopped: {e}"));
     assert_eq!(meta["status"], "Running", "the session keeps running");
     assert_eq!(meta["pty"]["recording"]["reason"], "size_limit");
     let last = meta["pty"]["recording"]["last_recorded_sequence"]

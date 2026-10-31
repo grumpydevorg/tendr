@@ -2,7 +2,7 @@
 
 mod harness;
 
-use harness::{tendr, wait_terminal};
+use harness::{tendr, wait_terminal, wait_terminal_ns};
 use tempfile::TempDir;
 
 fn finished_session(root: &TempDir, name: &str) {
@@ -136,20 +136,7 @@ fn events_namespace_filter() {
         .args(["start", "s2", "--namespace", "other", "--", "echo", "hi"])
         .assert()
         .success();
-    // wait_terminal helper assumes default ns; poll the other-ns meta directly.
-    let meta_path = root.path().join(".tendr/sessions/other/s2/meta.json");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if let Ok(content) = std::fs::read_to_string(&meta_path) {
-            let meta: serde_json::Value = serde_json::from_str(&content).unwrap();
-            let status = meta["status"].as_str().unwrap_or("");
-            if status != "Starting" && status != "Running" {
-                break;
-            }
-        }
-        assert!(std::time::Instant::now() < deadline, "s2 never finished");
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    wait_terminal_ns(&root, "other", "s2");
 
     let output = tendr(&root)
         .args(["events", "--namespace", "other"])
