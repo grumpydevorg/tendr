@@ -2,10 +2,9 @@
 //!
 //! - Every `tendr` command, long flag and guide topic shown in a document that
 //!   describes current behavior exists in the binary.
-//! - `docs/plans/` holds only open plans, named and linked by the rules in
-//!   `docs/plans/README.md`.
-//! - `docs/ROADMAP.md` lists exactly the open plans, the active ones in queue
-//!   order.
+//! - `docs/plans/` holds only open plans, named and described by the rules in
+//!   `docs/plans/README.md`. The folder is the index: the `NN_` prefix sets the
+//!   queue order, and each plan's status line says what is left.
 //!
 //! These tests read the repository's documents. The Nix package's source set
 //! leaves them out, so `flake.nix` skips tests whose names start with `docs_`.
@@ -24,15 +23,14 @@ fn read(rel: &str) -> String {
     fs::read_to_string(repo().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// Documents that describe what the current binary does. Plans and the roadmap
-/// are left out: they name commands that do not exist yet.
+/// Documents that describe what the current binary does. Plans are left out:
+/// they name commands that do not exist yet.
 fn current_docs() -> Vec<String> {
     let mut docs: Vec<String> = [
         "README.md",
         "docs/guide.md",
         "docs/analytics-recipes.md",
-        "docs/decisions.md",
-        "docs/design-principles.md",
+        "docs/design.md",
         "src/embedded/SKILL.md",
     ]
     .iter()
@@ -406,6 +404,18 @@ fn docs_plans_folder_holds_only_open_plans() {
     }
     for plan in &all {
         let fm = front_matter(&repo().join("docs").join(&plan.path));
+        let text = read(&format!("docs/{}", plan.path));
+        let after_title = text
+            .lines()
+            .skip_while(|l| !l.starts_with("# "))
+            .skip(1)
+            .find(|l| !l.trim().is_empty());
+        if !after_title.is_some_and(|l| l.starts_with("**Status:**")) {
+            errors.push(format!(
+                "{}: the line after the title must be the `**Status:**` line",
+                plan.path
+            ));
+        }
         if fm.id.as_deref() != Some(plan.slug.as_str()) {
             errors.push(format!(
                 "{}: front matter id must be `{}`, found {:?}",
@@ -426,48 +436,4 @@ fn docs_plans_folder_holds_only_open_plans() {
         }
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
-}
-
-#[test]
-fn docs_roadmap_lists_exactly_the_open_plans() {
-    let roadmap = read("docs/ROADMAP.md");
-    let mut section = String::new();
-    let mut now = Vec::new();
-    let mut backlog = BTreeSet::new();
-    let mut errors = Vec::new();
-    for line in roadmap.lines() {
-        if let Some(h) = line.strip_prefix("## ") {
-            section = h.trim().to_string();
-        }
-        for (at, _) in line.match_indices("](plans/") {
-            let target = &line[at + 2..];
-            let target = &target[..target.find(')').unwrap_or(target.len())];
-            let active = target.starts_with("plans/active/");
-            if !active && !target.starts_with("plans/backlog/") {
-                continue; // e.g. the plans README
-            }
-            match (section.as_str(), active) {
-                ("Now", true) => now.push(target.to_string()),
-                ("Backlog", false) => {
-                    if !backlog.insert(target.to_string()) {
-                        errors.push(format!("{target} is listed twice"));
-                    }
-                }
-                _ => errors.push(format!("{target} is linked under \"{section}\"")),
-            }
-        }
-    }
-    let active: Vec<String> = plans("active").into_iter().map(|p| p.path).collect();
-    let open_backlog: BTreeSet<String> = plans("backlog").into_iter().map(|p| p.path).collect();
-    if now != active {
-        errors.push(format!("\"Now\" must link the active plans in queue order:\n  expected {active:?}\n  found    {now:?}"));
-    }
-    if backlog != open_backlog {
-        errors.push(format!("\"Backlog\" must link every backlog plan once:\n  expected {open_backlog:?}\n  found    {backlog:?}"));
-    }
-    assert!(
-        errors.is_empty(),
-        "docs/ROADMAP.md is out of step with docs/plans/:\n{}",
-        errors.join("\n")
-    );
 }

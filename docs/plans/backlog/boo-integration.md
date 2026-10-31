@@ -16,7 +16,7 @@ events. This plan composes the two without code in either project.
 Screen reads inside Tendr (`tendr pty snapshot`, screen waits, an optional
 `tendr-screen` extension) belong to
 [cloud PTY control](../active/00_cloud-pty-control.md) slice 4. The reasons are
-in [decisions](../../decisions.md).
+in [design](../../design.md#no-terminal-emulator-in-core).
 
 ## Boo facts this recipe relies on
 

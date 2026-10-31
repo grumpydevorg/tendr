@@ -3,7 +3,7 @@
 This is the reference for tendr's structured event log: the envelope, the
 files, the append rules, ordering, and the read and write commands. Code
 comments cite its sections as "spec §N", so the section numbers are stable.
-The reasons behind the design are in [../decisions.md](../decisions.md).
+The reasons behind the design are in [../design.md](../design.md#decisions).
 
 ## 0. Summary
 

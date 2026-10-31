@@ -10,7 +10,7 @@ A recording is the exact, ordered record of what the sidecar observed and
 applied on one run's PTY: output bytes, geometry, and, if input recording is
 on, accepted input bytes. It is separate from `output.log`, which is a lossy
 readable transcript, and from the event log. Why both exist:
-[../decisions.md](../decisions.md).
+[../design.md](../design.md#outputlog-is-a-line-log-the-pty-recording-is-the-exact-record).
 
 ## Storage
 

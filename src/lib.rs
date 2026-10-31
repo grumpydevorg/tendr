@@ -59,7 +59,7 @@
 //! and the execution-boundary model — lives in the repository docs:
 //!
 //! - [Architecture overview](https://github.com/grumpydevorg/tendr/blob/main/docs/architecture/README.md)
-//! - [Design principles](https://github.com/grumpydevorg/tendr/blob/main/docs/design-principles.md)
+//! - [Design](https://github.com/grumpydevorg/tendr/blob/main/docs/design.md)
 //! - [Transport boundaries](https://github.com/grumpydevorg/tendr/blob/main/docs/architecture/06-transport-boundaries.md)
 
 // The crate doc and module summaries above lean on intra-doc links; a broken one

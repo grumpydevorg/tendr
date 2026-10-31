@@ -115,8 +115,8 @@ In practice:
   container jobs. Tendr supervises the `docker` client process, not the
   container. Do not use it with `docker run -d`: tendr would supervise the
   short-lived client and lose the real workload.
-- **Sharing one session between containers** breaks Theme 2, One Authority
-  Per Fact ([../design-principles.md](../design-principles.md)). A shared
+- **Sharing one session between containers** breaks rule 2, one authority
+  per fact ([../design.md](../design.md#2-one-authority-per-fact)). A shared
   volume for artifacts is fine. Several tendr instances writing the same
   session state is not.
 

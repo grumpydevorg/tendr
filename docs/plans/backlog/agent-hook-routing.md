@@ -55,7 +55,7 @@ protocol names/schema only:
 3. **Consumer note.** State plainly that Boo / Ghostty / a future egui view /
    `tendr query` analytics are **consumers** of `hook.*` events, not core
    Tendr — routing/rendering lives in those adapters (see
-   [boo-integration](boo-integration.md) and [decisions](../../decisions.md)).
+   [boo-integration](boo-integration.md) and [design](../../design.md#no-terminal-emulator-in-core)).
    Core stays narrow.
 
 ## Non-goals
