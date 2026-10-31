@@ -5,9 +5,7 @@
 //! frame and ships it over the SSH stdin channel, so the payload never
 //! traverses a shell and the remote argv contains nothing
 //! user-controlled (docs/architecture/06-transport-boundaries.md). The shape
-//! is a self-contained params object so it can become the `exec_begin`
-//! request params of the future sidecar control protocol unchanged
-//! (docs/plans/backlog/sidecar-control-protocol.md).
+//! is a self-contained params object, independent of how it is carried.
 
 use serde::{Deserialize, Serialize};
 

@@ -6,10 +6,9 @@ depends_on: []
 # Remote frame transport: make `--host` cross-platform
 
 **Status:** not started, apart from the `--host` destination guard (v0.2.1).
-Steps 0a and 1–7 remain. The Unix `ssh -T` PTY bridge is
-[cloud PTY control](00_cloud-pty-control.md) slice 3 and ships before steps
-1–4. It shares this plan's codec and validation but not the full
-`RemoteOperation` enum.
+Steps 0a and 1–7 remain. Step 5's Unix attach bridge is the part the
+[cloud PTY](00_cloud-pty-control.md) workflow needs first; it needs only the
+step 2 codec, so it may land before steps 3 and 4.
 
 Goal: every `--host` command travels as a typed request over SSH stdin, as
 `exec` already does. No user- or host-derived value is rebuilt into a remote
@@ -144,9 +143,7 @@ local tendr → SSH → remote tendr CLI → existing local IPC → sidecar
 ```
 
 Preserves durable `meta.json` + logs, one lifecycle authority, **no listening
-network daemon, no gRPC/Tokio/mTLS**, and the current output contracts. The full
-[sidecar-control-protocol](../backlog/sidecar-control-protocol.md) design applies
-only if *local* correlated IPC needs it; this plan does not.
+network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
 
 ## Implementation sequence (safe, incremental)
 
@@ -173,15 +170,33 @@ only if *local* correlated IPC needs it; this plan does not.
    `--boundary`/`--boundary-parent` labels, and (easy to miss) **`log --since`**
    are all currently shell-exposed.
 4. Move `push` (header + raw body framing).
-5. Build the `attach` bridge. The Unix bridge is cloud PTY control slice 3.
-   This plan keeps the Windows halves: **5a Windows-as-target** (ConPTY + a
-   Windows named-pipe carrier) and **5b Windows-as-client** (a local
-   Windows-console raw-mode frontend). 5b is needed because moving raw mode and
-   resize to the local frontend over `ssh -T` replaces today's `ssh -t` model,
-   which handles Windows-client→Unix-remote attach with no Windows terminal
-   code. Keep the `ssh -t` path during transition if that case matters. The
-   ConPTY backend and console frontend themselves are
-   [windows-parity](../backlog/windows-parity.md) phase 5.
+5. Build the `attach` bridge.
+   - **Unix bridge.** `attach --host` runs `ssh -T` to the constant entry
+     point; the hello and typed PTY frames follow the header. Raw mode,
+     resize and the detach escape move to the laptop. The remote sidecar
+     keeps controller epochs and the recording; the bridge has no lifecycle
+     authority. Keep control frames (takeover, resize, detach) on a bounded
+     path that never waits behind output, so a stalled viewer cannot delay a
+     takeover.
+   - **Resumable viewers.** A viewer reconnects with its run ID and the last
+     sequence it consumed, and gets the retained contiguous suffix of the
+     recording. History that is gone is an error with the available range
+     (as `events --from-cursor` exits 44); it never skips forward. Input is
+     never resent automatically. Today a viewer gets no sequence numbers
+     ([PTY lane](../../architecture/04-pty-lane.md#output-and-viewers)).
+   - **Read-only viewers.** Up to eight per run, admitted through a separate
+     bounded pool for pending hellos, so a full viewer set never refuses a
+     replacement controller. Today one pool of eight holds every connection,
+     hellos included
+     ([PTY lane](../../architecture/04-pty-lane.md#the-attach-handshake)).
+   - **5a Windows-as-target** (ConPTY + a Windows named-pipe carrier) and
+     **5b Windows-as-client** (a local Windows-console raw-mode frontend).
+     5b is needed because moving raw mode and resize to the local frontend
+     over `ssh -T` replaces today's `ssh -t` model, which handles
+     Windows-client→Unix-remote attach with no Windows terminal code. Keep
+     the `ssh -t` path during transition if that case matters. The ConPTY
+     backend and console frontend themselves are in
+     [windows-parity](../backlog/windows-parity.md#no-pty-or-attach).
 6. Delete general POSIX remote-argv reconstruction. Keep shell quoting only for
    the human-facing copy/paste **fallback text** (verified: `local_fallback_args`
    is only `eprintln!`'d, never spawned) — label it "(POSIX shell)" so users don't

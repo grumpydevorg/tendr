@@ -8,20 +8,23 @@ depends_on: []
 **Status:** not started. Needs a measurement first: how large do the logs of a
 long-running session get in practice?
 
-Three files grow without limit while a session exists, and one grows for
-ever:
+Two parts of a session grow without limit while it exists, and two files under
+`~/.tendr` are never removed. `--replace` and `prune` delete the whole session
+directory (`src/commands/start.rs:219`, `src/commands/prune.rs:159`).
 
-| File | Grows until | Today |
-|---|---|---|
-| `output.log` | the session is pruned or replaced | no rotation and no size limit |
-| `events/` segment | the session is pruned or replaced | writers append to the newest segment and create one only when `events/` is empty, so a session has one segment |
-| `recording/<run_id>/` | 1 GiB per run | split into 64 MiB segments; recording stops at 1 GiB and the session keeps running |
-| `~/.tendr/lost+found/events.jsonl` | never removed | `prune` does not touch it |
+| File | Limit today |
+|---|---|
+| `output.log` | none; no rotation and no size cap |
+| `events/*.jsonl` and `events/blobs/` | none; writers append to the newest segment and create one only when `events/` has none (`open_segment`, `src/events.rs:296`), so a session has one segment |
+| `recording/<run_id>/` | bounded: 64 MiB segments, recording stops at 1 GiB and the session keeps running (`src/recorder.rs:32-34`) |
+| `~/.tendr/lost+found/events.jsonl` | never removed; written by `emit` and by the sidecar when an event has no session dir or log to go to |
+| `~/.tendr/callbacks/<run_id>.json` | never removed; one file per run with `--on-exit` (`src/sidecar.rs:1361-1376`) |
 
-The event-protocol design (in Git at `95dcf1d`,
-`docs/plans/specs/event-protocol.md`) described rotation of event segments at
-64 MiB, with a `segment.opened` event, and a `prune` that sweeps lost+found.
-Neither was built. `segment.opened` is only a reserved event-kind prefix.
+The event-protocol spec (in Git at `95dcf1d`,
+`docs/plans/specs/event-protocol.md`) described event segments rotating at
+64 MiB with a `segment.opened` event, and a `prune` that sweeps lost+found.
+Neither was built: `segment.` is a reserved kind prefix
+(`src/model/event.rs:28`) and nothing writes `segment.opened`.
 
 ## Goal
 
@@ -32,13 +35,13 @@ A session that runs for weeks keeps bounded disk use, and nothing under
 
 - Measure first: the size of `output.log` and `events/` for real long-running
   sessions, for example a dev server or a build host over a week.
-- `output.log`: rotate by size, keep the last N files, or cap and drop the
+- `output.log`: rotate by size and keep the last N files, or cap and drop the
   oldest lines? `tendr log --since` and `--tail` must keep working across
   rotated files.
-- Event segments: rotate at a size and keep cursors (`docs/architecture/07-event-protocol.md`
-  §5.2) valid across segments. Cursors already name segments by file, which
-  is why segments are never renamed.
-- lost+found: should `prune --older-than` remove old lost+found lines?
+- Event segments: rotate at a size and keep cursors
+  ([event protocol](../../architecture/07-event-protocol.md) §5.2) valid. Cursors
+  name segments by file, which is why segments are never renamed.
+- lost+found and callbacks: should `prune --older-than` remove old entries?
 
 ## Acceptance
 

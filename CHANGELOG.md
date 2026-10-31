@@ -20,6 +20,8 @@
   title.
 - The crate description is now "Keep shells, REPLs and long-running jobs
   alive between tool calls, locally or over SSH".
+- The guide no longer has a "Tendr and Boo" section, and tendr no longer plans
+  screen reads. Exit code 83 stays reserved and unused.
 
 ## v0.4.0 — PTY control, connect deadline
 

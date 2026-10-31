@@ -1714,7 +1714,7 @@ fn exec_event_append_is_best_effort() {
 /// the payload sees exactly the block_id its exec events carry.
 #[cfg_attr(
     windows,
-    ignore = "PowerShell TENDR_BLOCK_ID env propagation — windows-parity Phase 3"
+    ignore = "PowerShell TENDR_BLOCK_ID env propagation — windows-parity, PowerShell state"
 )]
 #[test]
 fn exec_payload_sees_block_id_env() {
@@ -1971,7 +1971,7 @@ fn exec_frame_empty_cmd_exits_2() {
 fn windows_ignored_exec_set_is_exactly_tracked() {
     // Tracked parity gaps (see the attribute above each named test):
     //   exec_payload_sees_block_id_env — PowerShell has no TENDR_BLOCK_ID env
-    //     propagation yet (windows-parity Phase 3).
+    //     propagation yet (windows-parity, PowerShell state).
     const EXPECTED: &[&str] = &["exec_payload_sees_block_id_env"];
 
     let src = include_str!("cli_exec.rs");
