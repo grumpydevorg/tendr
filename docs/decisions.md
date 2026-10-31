@@ -10,13 +10,22 @@ the last commit before the old plans and specs were removed.
 
 ## Tendr supervises processes; it is not an agent framework
 
-*2026-04-03.* This is the "process sitter" decision. Tendr starts, watches,
-chains and stops processes. It does not learn LLM protocols, count tokens,
-retry API calls or choose models. An agent runs under tendr as its own
-command-line program, for example
+*2026-04-03, amended 2026-10-31.* This is the "process sitter" decision.
+Tendr starts, watches, chains and stops processes. It does not learn LLM
+protocols, count tokens, retry API calls or choose models. An agent runs under
+tendr as its own command-line program, for example
 `tendr start task -- claude -p "…"`. Adding LLM knowledge would turn tendr into
 an AI framework, with a different scope, users and maintenance cost. Source:
 `docs/plans/specs/decision-process-sitter-not-framework.md`.
+
+The amendment corrects a premise. The 2026-04 decision assumed agent programs
+run once and exit. Many now stay up: Claude Code's interactive-only features
+and background mode, and omp's RPC mode. Tendr supervises them like any other
+long-running process, and the rejection of LLM knowledge stands. It also sets
+one more boundary: tendr does not decide when an agent's turn is done. An agent
+can report its turn as events (see the next entry); what those events mean is
+the caller's policy. Source: the
+[interactive agent turns](plans/backlog/interactive-agent-turns.md) plan.
 
 ## Processes may publish events; tendr does not interpret them
 

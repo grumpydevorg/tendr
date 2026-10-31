@@ -248,10 +248,10 @@ into it. A herdr pane running `tendr attach` is a viewer, not a state source.
 ## Boundary: process sitter, not agent framework
 
 The process-sitter decision (see [decisions](../../decisions.md)) rejects
-native LLM protocols. Its premise that agent CLIs are one-shot no longer
-holds: interactive-only features, Claude Code's background mode, and omp's RPC
-mode are all long-lived. The rejection itself still holds. Interpreting events
-such as "Claude Code semantics" stays in consumer territory.
+native LLM protocols. It was amended on 2026-10-31: agent programs are no
+longer assumed to be one-shot, and tendr does not decide when an agent's turn
+is done. Interpreting events such as "Claude Code semantics" stays in consumer
+territory.
 
 An adversarial review on 2026-10-08 (GPT-6 Astra and Claude Fable 5.1,
 independently, then a rebuttal round) rejected both extremes:
@@ -306,11 +306,7 @@ omp's own session machinery and is not proposed.
 3. **Submission without a sleep.** The text–pause–CR rule is an inference about
    one TUI. The proper fix is the cloud PTY plan's slice 4 mode-aware keys and
    bracketed paste. Do not add a core "submit" verb ahead of that.
-4. **Decision amendment (owner's call).** In [decisions](../../decisions.md),
-   correct the one-shot premise of the process-sitter decision and add the
-   boundary "does not decide when an agent turn is done". Amend; do not
-   supersede.
-5. **herdr.** No Tendr change. Raise an agent kind whose state comes from a
+4. **herdr.** No Tendr change. Raise an agent kind whose state comes from a
    Tendr session's `hook.*` events with herdr only if the viewer layout gets
    used.
 

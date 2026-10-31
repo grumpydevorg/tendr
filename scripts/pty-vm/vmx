@@ -1,0 +1,4 @@
+#!/bin/bash
+# Run a command on the slice-1 VM non-interactively. Usage: vmx [timeout_s] 'cmd'  (stdin passed through)
+t=120; if [[ "$1" =~ ^[0-9]+$ ]]; then t=$1; shift; fi
+exec gtimeout "$t" ssh -T -o BatchMode=yes -o ConnectTimeout=10 "${VM_HOST:?set VM_HOST to the VM, e.g. my-vm.exe.xyz}" "$@"
