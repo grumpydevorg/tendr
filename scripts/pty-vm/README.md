@@ -5,26 +5,30 @@ Scripts for steps 5 and 9 of the
 Claude Code behaves in a tendr PTY session on a VM, and check attach, takeover
 and half-open SSH connections from a Mac.
 
-They were written on an exe.dev VM on 2026-09-26 against tendr 0.3.0, and ran
-only a practice pass with `keyprobe` in place of Claude. Neither step has been
-run with them on 0.4.0. Expect to fix them as you go.
+They were written on an exe.dev VM on 2026-09-26 for a development build of the
+PTY takeover branch (PR #68), before attach moved to exit codes 80–85. They ran
+only a practice pass with `keyprobe` in place of Claude, and have not run on
+tendr 0.4.0. Expect to fix them as you go.
 
 ## Set up the VM
 
-Run these on the VM, in order:
+The VM needs Debian or Ubuntu with systemd, `python3` and passwordless `sudo`.
 
-1. `sudo ./provision-root.sh '<ssh public key>'`: adds the test users `acc`
-   and `intruder` and an OpenSSH server with PAM and logind on
-   `127.0.0.1:2222`. Save its last line as `known_hosts.acc` next to these
-   scripts on the Mac.
-2. Install tendr into `/usr/local/bin`.
-3. `./install-claude.sh`: installs Claude Code, checks its checksum, and points
-   `acc`'s Claude at exe.dev's LLM gateway, so no credential is stored on the
-   VM.
-4. `./install-helpers.sh`: installs the test children and `tsnap`.
+1. On the Mac: `VM_HOST=<vm> ./sync-vm.sh` copies these scripts to `~/slice1`
+   on the VM.
+2. On the VM, from `~/slice1`:
+   1. `sudo ./provision-root.sh '<ssh public key>'`: adds the test users `acc`
+      and `intruder` and an OpenSSH server with PAM and logind on
+      `127.0.0.1:2222`. Save its last line as `known_hosts.acc` next to these
+      scripts on the Mac.
+   2. Install tendr into `/usr/local/bin`.
+   3. `./install-claude.sh`: installs Claude Code, stops if its checksum does
+      not match, and points `acc`'s Claude at exe.dev's LLM gateway, so no
+      credential is stored on the VM.
+   4. `./install-helpers.sh`: installs the test children, `tsnap`, `iptables`,
+      `jq` and `tmux`.
 
-Then copy the VM-side scripts across from the Mac with
-`VM_HOST=<vm> ./sync-vm.sh`. They land in `~/slice1`.
+Run `sync-vm.sh` again after changing a script.
 
 ## Scripts
 
@@ -53,6 +57,7 @@ The test children installed by `install-helpers.sh`:
 `tsnap <user> <session>` prints the sidecar's open files and threads, the attach
 clients and the login sessions, for before-and-after comparisons.
 
-The Mac-side scripts need `VM_HOST`, `SSH_BIN` (an absolute path to `ssh`) and
-GNU `timeout` as `gtimeout`. `halfopen-loopback.sh` also needs `ACC_KEY`, the
-private half of the key given to `provision-root.sh`.
+The Mac-side scripts need `VM_HOST` and GNU `timeout` as `gtimeout`. All but
+`vmx` and `sync-vm.sh` also need `SSH_BIN`, an absolute path to `ssh`; those two
+use it when set and `ssh` from `PATH` otherwise. `halfopen-loopback.sh` also
+needs `ACC_KEY`, the private half of the key given to `provision-root.sh`.

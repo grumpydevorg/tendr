@@ -1,8 +1,7 @@
 #!/bin/bash
 # Mac side: freeze the exe.dev SSH path of an attached client and time when the
-# VM notices. exe.dev terminates SSH at its front end (host key SHA256:JJOP...)
-# and relays to the VM over vsock, so no VM-side rule can cut this path; the
-# client end is the only place to break it without Rick's sudo.
+# VM notices. No VM-side rule can cut exe.dev's own SSH path (see the cloud PTY
+# plan, "Open measurements"), so this breaks the client end.
 #
 # This freezes the local ssh with SIGSTOP for N s: its kernel still ACKs TCP, so
 # only SSH-level keepalives (the front end's policy, unknown) can notice. A real

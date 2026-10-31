@@ -40,7 +40,7 @@ case "$CHILD" in
 esac
 {
   echo "date=$(date -Is)"
-  echo "tendr=$(tendr --version) commit=$(git -C "$HOME/tendr" rev-parse HEAD 2>/dev/null)"
+  echo "tendr=$(tendr --version)"
   echo "child=${argv[*]}"
   [ "$CHILD" = claude ] && echo "claude=$(claude --version 2>&1 | head -1)"
   echo "TERM_FIXED=$TERM_FIXED size=${ROWS}x${COLS} mode=$LAUNCH_MODE tmux=$(tmux -V)"

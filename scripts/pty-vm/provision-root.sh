@@ -34,7 +34,7 @@ EOF
 
 cat > /etc/systemd/system/sshd-accept.service <<'EOF'
 [Unit]
-Description=OpenSSH with PAM/logind on 127.0.0.1:2222 (Tender acceptance)
+Description=OpenSSH with PAM/logind on 127.0.0.1:2222 (tendr acceptance)
 After=network.target
 
 [Service]
@@ -51,5 +51,5 @@ systemctl daemon-reload
 systemctl enable --now sshd-accept.service
 systemctl is-active sshd-accept.service
 loginctl show-user acc -p Linger 2>&1 || true
-ls /var/lib/systemd/linger
+ls /var/lib/systemd/linger 2>/dev/null || true
 printf 'slice1-acc %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)"

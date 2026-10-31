@@ -55,7 +55,7 @@ wait-exit 5
 STEPS
 check refused-driver $? 0
 grep -q 'already under human control' "$D/refused.raw"; check refused-message $? 0
-grep -q 'exit status=exit:1' "$D/refused.events"; check refused-exit-1 $? 0
+grep -q 'exit status=exit:81' "$D/refused.events"; check refused-exit-81 $? 0
 
 $PD --rows 40 --cols 120 --log "$D/takeover" - -- tendr attach "$S" --takeover <<'STEPS'
 sleep 1

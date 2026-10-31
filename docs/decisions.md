@@ -24,8 +24,10 @@ and background mode, and omp's RPC mode. Tendr supervises them like any other
 long-running process, and the rejection of LLM knowledge stands. It also sets
 one more boundary: tendr does not decide when an agent's turn is done. An agent
 can report its turn as events (see the next entry); what those events mean is
-the caller's policy. Source: the
-[interactive agent turns](plans/backlog/interactive-agent-turns.md) plan.
+the caller's policy. A review on 2026-10-08 (two models, independently)
+rejected a turn contract in core because "done", "blocked" and "settled" are
+vendor terms that change between releases. Source: PR #123, which took the
+change from the interactive agent turns plan.
 
 ## Processes may publish events; tendr does not interpret them
 

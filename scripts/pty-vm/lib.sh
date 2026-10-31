@@ -13,7 +13,7 @@ TM_TARGET=${TM_TARGET:-slice1}
 
 # tmux is the "attached terminal": a real VT that answers DA1/DSR/etc, sized
 # exactly ROWSxCOLS (status line off, manual window size), scriptable with
-# send-keys and capture-pane. It is not Ghostty; Rick's Ghostty leg is separate.
+# send-keys and capture-pane. It is not Ghostty; the Ghostty leg is separate.
 tm() { tmux -L "$TM_SOCK" -f /dev/null "$@"; }
 now() { date +%s.%N | cut -c1-14; }
 

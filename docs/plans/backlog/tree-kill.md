@@ -25,21 +25,24 @@ what it cannot reach.
 ## Options to measure
 
 - **Linux, cgroup v2.** Put each run in its own cgroup and stop it with
-  `cgroup.kill`. This catches every descendant, including those that call
-  `setsid`. It needs a delegated cgroup subtree (the guide's
-  [memory cap](../../guide.md#cap-a-sessions-memory) section already relies on
-  one) and a fallback when there is none.
+  `cgroup.kill` (Linux 5.14 or later). This catches every descendant,
+  including those that call `setsid`. It needs a delegated cgroup subtree (the
+  guide's [memory cap](../../guide.md#cap-a-sessions-memory) section already
+  relies on one) and a fallback when there is none.
 - **Linux, child subreaper.** `PR_SET_CHILD_SUBREAPER` makes orphaned
   descendants re-parent to the sidecar, so it can find and signal them. It
   works without cgroups, but a descendant whose parent is still alive is not
   re-parented.
 - **macOS.** No cgroups and no subreaper. The sidecar could list processes by
-  session or parent before it signals them, which races with new forks.
+  session or parent before it signals them, which races with new forks. Its
+  identity check already gets EPERM from `proc_pidinfo` for a process in
+  another session (`src/platform/unix.rs`), and a PTY child always leads its
+  own session, so measure what such a listing can see.
 
 ## Before choosing
 
-- Snapshot `ps -eo pid,ppid,pgid,sid,comm` before and after a stop for Claude
-  Code, omp, a dev server and a shell with background jobs. The cloud PTY
-  plan's step 9 already takes this snapshot on its VM; reuse its data.
-- Whether `--timeout` should hang up a PTY session first, as `kill` does, is
-  decided in that same step, not here.
+Measure what real workloads leave behind after a stop: Claude Code, omp, a dev
+server and a shell with background jobs. Step 9 of the
+[cloud PTY plan](../active/00_cloud-pty-control.md) takes this snapshot on its
+VM, and also decides whether `--timeout` should hang up a PTY session first;
+reuse its data.

@@ -12,7 +12,8 @@ curl -fsSL "$base/$ver/manifest.json" -o claude-manifest.json
 want=$(python3 -c 'import json;print(json.load(open("claude-manifest.json"))["platforms"]["linux-x64"]["checksum"])')
 curl -fsSL "$base/$ver/linux-x64/claude" -o claude-bin
 got=$(sha256sum claude-bin | cut -d' ' -f1)
-[ "$want" = "$got" ] && echo "claude $ver sha256 OK $got"
+[ "$want" = "$got" ] || { echo "install-claude.sh: sha256 mismatch want=$want got=$got" >&2; exit 1; }
+echo "claude $ver sha256 OK $got"
 sudo install -m 0755 claude-bin /usr/local/bin/claude
 command -v tendr >/dev/null || { echo "install-claude.sh: install tendr first" >&2; exit 1; }
 

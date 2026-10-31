@@ -7,10 +7,9 @@
 #               [--both] [--watch-after 10] [--session S --user acc]
 #   halfopen.sh --test-removal       # install a rule for 5 s, prove it is gone
 #
-# Which sshd: exe.dev's own SSH (ssh <vm>.exe.xyz) does NOT arrive over TCP. It
-# reaches the VM over vsock port 22 into /exe.dev/bin/exe-init guestd, so
-# $SSH_CLIENT is empty and no iptables rule can touch it. The real OpenSSH path
-# on this VM is sshd-accept.service on 127.0.0.1:2222 (UsePAM, logind), reached
+# Which sshd: exe.dev's own SSH path cannot be cut on the VM (see the cloud PTY
+# plan, "Open measurements"). Use sshd-accept.service on 127.0.0.1:2222 (UsePAM,
+# logind; set up by provision-root.sh), reached
 # from the Mac with
 #   ssh -J <vm>.exe.xyz -p 2222 acc@127.0.0.1
 # where $SSH_CLIENT inside the session is "127.0.0.1 <port> 2222": pass that

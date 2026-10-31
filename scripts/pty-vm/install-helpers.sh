@@ -60,7 +60,7 @@ sudo tee /usr/local/bin/tsnap >/dev/null <<'EOF'
 # tsnap <user> <session>
 u=$1; s=$2
 meta=/home/$u/.tendr/sessions/default/$s/meta.json
-sc=$(python3 -c 'import json,sys;m=json.load(open(sys.argv[1]));print(m["sidecar"]["pid"],m["child"]["pid"],m["run_id"],m["status"],m["pty"]["control"],m["pty"]["recording"]["state"] if isinstance(m["pty"]["recording"]["state"],str) else json.dumps(m["pty"]["recording"]["state"]))' "$meta")
+sc=$(python3 -c 'import json,sys;m=json.load(open(sys.argv[1]));c=m.get("child") or {};p=m.get("pty") or {};r=p.get("recording") or {};print(m["sidecar"]["pid"],c.get("pid","-"),m["run_id"],m["status"],p.get("control","-"),r.get("state","-"))' "$meta")
 set -- $sc
 sp=$1; cp=$2
 printf 't=%s run_id=%s status=%s control=%s recording=%s\n' "$(date +%s.%N)" "$3" "$4" "$5" "$6"
@@ -112,6 +112,6 @@ while True:
             len(b), b.count(b"A"), b.count(b"B"), b"NEWMARK" in b, b"OLDMARK" in b, time.time())).encode())
 EOF
 sudo chmod 0755 /usr/local/bin/keyprobe /usr/local/bin/noread /usr/local/bin/flood /usr/local/bin/tsnap /usr/local/bin/slowread
-sudo apt-get install -y -qq iptables >/dev/null 2>&1 || true
+sudo apt-get install -y -qq iptables jq tmux >/dev/null 2>&1 || true
 which iptables nft || true
 sudo iptables -L INPUT -n 2>&1 | head -3

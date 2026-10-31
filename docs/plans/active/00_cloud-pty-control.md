@@ -496,7 +496,7 @@ comes with slice 3's viewers.
 
 Steps 5 and 9 have a VM harness in [`scripts/pty-vm/`](../../../scripts/pty-vm/README.md):
 VM setup, test children, half-open timers and a PTY driver. It was written for
-0.3.0 and has not run on 0.4.0.
+a development build of #68 and has not run on 0.4.0.
 
 Gates for every step: `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked --all-targets --no-fail-fast`, `cargo test --locked --doc`, `cargo +1.85.0 check --locked --all-targets`, `cargo doc --no-deps` with `-D warnings`. Red-first for each new test. Never mark a VM row passed from local tests.
 
