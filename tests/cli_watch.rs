@@ -1,38 +1,11 @@
 mod harness;
 
-use harness::tendr;
+use harness::{tendr, wait_terminal, wait_terminal_ns};
 use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
-
-/// Wait for meta.json to reach a terminal state under a specific namespace.
-fn wait_terminal_ns(root: &TempDir, namespace: &str, session: &str) -> serde_json::Value {
-    let path = root
-        .path()
-        .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                let status = meta["status"].as_str().unwrap_or("");
-                if status != "Starting" && status != "Running" {
-                    return meta;
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for terminal state in {namespace}/{session}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-
-/// Wait for meta.json to reach terminal state in the default namespace.
-fn wait_terminal_default(root: &TempDir, session: &str) -> serde_json::Value {
-    wait_terminal_ns(root, "default", session)
-}
 
 #[test]
 fn watch_emits_initial_state_snapshot() {
@@ -44,7 +17,7 @@ fn watch_emits_initial_state_snapshot() {
         .args(["start", "snap-echo", "--", "echo", "hi"])
         .output()
         .unwrap();
-    wait_terminal_default(&root, "snap-echo");
+    wait_terminal(&root, "snap-echo");
 
     // The initial snapshot is flushed before the follower signals readiness.
     let follower = harness::ReadyFollower::spawn(&root, "watch", &["--events"]);
@@ -89,7 +62,7 @@ fn watch_emits_log_events() {
         .args(["start", "log-echo", "--", "echo", "hello-watch"])
         .output()
         .unwrap();
-    wait_terminal_default(&root, "log-echo");
+    wait_terminal(&root, "log-echo");
 
     // Watch with --logs only; the log.stdout snapshot must surface.
     let follower = harness::ReadyFollower::spawn(&root, "watch", &["--logs"]);
@@ -171,7 +144,7 @@ fn watch_from_now_skips_existing() {
         .args(["start", "old-session", "--", "echo", "old"])
         .output()
         .unwrap();
-    wait_terminal_default(&root, "old-session");
+    wait_terminal(&root, "old-session");
 
     let follower = harness::ReadyFollower::spawn(&root, "watch", &["--from-now"]);
 
@@ -182,7 +155,7 @@ fn watch_from_now_skips_existing() {
         .args(["start", "sentinel", "--", "echo", "sentinel-out"])
         .output()
         .unwrap();
-    wait_terminal_default(&root, "sentinel");
+    wait_terminal(&root, "sentinel");
     follower.read_until(Duration::from_secs(10), |r| {
         r["session"] == "sentinel" && r["kind"] == "run"
     });
@@ -217,7 +190,7 @@ fn watch_both_events_and_logs_by_default() {
         .args(["start", "both-echo", "--", "echo", "dual-output"])
         .output()
         .unwrap();
-    wait_terminal_default(&root, "both-echo");
+    wait_terminal(&root, "both-echo");
 
     // No --events/--logs -> both. The run snapshot precedes the log snapshot,
     // so waiting for the log proves both are downstream.
@@ -261,7 +234,7 @@ fn watch_from_now_surfaces_new_session() {
         .args(["start", "after-watch", "--", "echo", "post-watch-output"])
         .output()
         .unwrap();
-    wait_terminal_default(&root, "after-watch");
+    wait_terminal(&root, "after-watch");
 
     let rec = follower.read_until(Duration::from_secs(10), |r| {
         r["kind"] == "run" && r["session"] == "after-watch"
@@ -280,7 +253,7 @@ fn watch_detects_replace_and_resets_log_offset() {
         .args(["start", "replace-watch", "--", "echo", "first-run-output"])
         .output()
         .unwrap();
-    wait_terminal_default(&root, "replace-watch");
+    wait_terminal(&root, "replace-watch");
 
     // Watch's initial snapshot of the first run is flushed before readiness.
     let follower = harness::ReadyFollower::spawn(&root, "watch", &[]);
@@ -297,7 +270,7 @@ fn watch_detects_replace_and_resets_log_offset() {
         ])
         .output()
         .unwrap();
-    wait_terminal_default(&root, "replace-watch");
+    wait_terminal(&root, "replace-watch");
 
     // The replaced run's log surfacing proves the offset was reset on run_id
     // change; read_until is the assertion.

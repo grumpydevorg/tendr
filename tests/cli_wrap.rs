@@ -1,6 +1,6 @@
 mod harness;
 
-use harness::{tendr, wait_terminal};
+use harness::{tendr, wait_running_ns, wait_terminal};
 // Command/Stdio remain only for the cfg(unix) SIGTERM test below.
 #[cfg(unix)]
 use std::process::{Command, Stdio};
@@ -21,27 +21,6 @@ fn create_running_session(root: &TempDir, name: &str, namespace: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
     wait_running_ns(root, namespace, name);
-}
-
-/// Wait for meta.json to show Running state under a specific namespace.
-fn wait_running_ns(root: &TempDir, namespace: &str, session: &str) {
-    let path = root
-        .path()
-        .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                if meta["status"].as_str() == Some("Running") {
-                    return;
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for Running state in {namespace}/{session}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
 }
 
 /// Read the run_id from a session's meta.json.
@@ -374,24 +353,7 @@ fn wrap_defaults_session_from_env() {
         .args(["kill", "--force", "wrap-env-default", "--namespace", "myns"])
         .output()
         .unwrap();
-    let path = root
-        .path()
-        .join(".tendr/sessions/myns/wrap-env-default/meta.json");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                let status = meta["status"].as_str().unwrap_or("");
-                if status != "Starting" && status != "Running" {
-                    break;
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let _ = harness::poll_terminal_ns(&root, "myns", "wrap-env-default");
 }
 
 #[test]
@@ -602,17 +564,15 @@ fn wrap_forwards_sigterm_and_writes_annotation() {
         libc::kill(wrap_child.id() as i32, libc::SIGTERM);
     }
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-    let status = loop {
-        if let Some(status) = wrap_child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = wrap_child.kill();
-            panic!("wrap did not exit after SIGTERM");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
+    let status = harness::poll_child_exit(
+        &mut wrap_child,
+        std::time::Duration::from_secs(8),
+        std::time::Duration::from_millis(50),
+    )
+    .unwrap_or_else(|e| {
+        let _ = wrap_child.kill();
+        panic!("wrap did not exit after SIGTERM: {e}");
+    });
     assert!(
         status.success(),
         "wrap should exit cleanly after forwarding SIGTERM, got: {status:?}"
