@@ -494,6 +494,10 @@ comes with slice 3's viewers.
 8. **Nested `ssh -t` fixtures, opt-in** (sshd; `TENDR_TEST_SSH_HOST`). `tests/cli_attach_ssh.rs`: detach on `Ctrl-\ d`, `Ctrl-]` passthrough, paste with prefixes, terminal restore, takeover over a stopped first client.
 9. **Remote acceptance on the Linux VM.** Same Claude pid throughout; attach from Ghostty; half-open two ways plus takeover; agent → human → agent; blocked child input and stalled viewer during takeover (time it); 32 idle half-open reconnects with fd/task/admission counts equal before and after; logout/relogin; cross-user rejection; dump the whole recording. Before and after `tendr kill`, and separately `--timeout`, snapshot `ps -eo pid,ppid,pgid,sid,comm` and diff: the sid is the Claude pid, and anything left with it (shells, MCP servers, background jobs) outlived the stop. `kill` hangs up a PTY session first; `--timeout` SIGKILLs at once, so record what it leaves and decide whether it should hang up too.
 
+Steps 5 and 9 have a VM harness in [`scripts/pty-vm/`](../../../scripts/pty-vm/README.md):
+VM setup, test children, half-open timers and a PTY driver. It was written for
+a development build of #68 and has not run on 0.4.0.
+
 Gates for every step: `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked --all-targets --no-fail-fast`, `cargo test --locked --doc`, `cargo +1.85.0 check --locked --all-targets`, `cargo doc --no-deps` with `-D warnings`. Red-first for each new test. Never mark a VM row passed from local tests.
 
 ### Open measurements and references
@@ -502,6 +506,22 @@ exe.dev's half-open SSH timeout is unmeasured and is not a correctness
 dependency. Claude's same-size repaint and its handling of the detach prefix
 through Ghostty are step-5 measurements. The deployed host policies (exe.dev,
 NixOS) for logout and temporary-file aging are not validated.
+
+Found while building that harness on an exe.dev VM (2026-09-26):
+
+- `ssh <vm>.exe.xyz` does not reach the VM's sshd over TCP. exe.dev ends SSH
+  at its front end and relays to `/exe.dev/bin/exe-init guestd` over vsock
+  port 22, so `$SSH_CLIENT` is empty and no VM-side firewall rule can cut the
+  connection.
+- To half-open that path, break the client end: stopping the local `ssh` with
+  SIGSTOP leaves its kernel ACKing TCP, so only the front end's SSH keepalives,
+  whose policy is unknown, can notice. Dropping the packets needs a `pf` rule
+  on the Mac, which needs root.
+- For a VM-side half-open test, run a real OpenSSH server on the VM (the
+  harness used `127.0.0.1:2222`, reached with `ssh -J <vm>.exe.xyz -p 2222`)
+  and drop that connection's packets with `iptables`.
+
+References:
 
 - [Linux dup: shared file status flags](https://man7.org/linux/man-pages/man2/dup.2.html)
 - [Linux poll: writable readiness and blocking writes](https://man7.org/linux/man-pages/man2/poll.2.html)

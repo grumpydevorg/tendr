@@ -32,6 +32,12 @@ Not in order. Each plan says what would start it.
 - [Interactive agent turns](plans/backlog/interactive-agent-turns.md): drive a
   live agent's turns in a PTY session through its hook events, and let
   `tendr events --follow` exit on its first match.
+- [Ready check](plans/backlog/ready-check.md): let `start` report when a
+  server is ready (an output pattern or an open port), with a deadline, so
+  callers need not poll.
+- [Tree kill](plans/backlog/tree-kill.md): stop descendants that left the
+  process group, with cgroups or a subreaper on Linux, and state what macOS
+  cannot reach.
 - [Capture stop drain](plans/backlog/capture-stop-drain.md): keep reading a
   child's output after a log write fails, so the run cannot hang.
 - [Log delimiter: CR framing](plans/backlog/log-delimiter-cr-framing.md):
