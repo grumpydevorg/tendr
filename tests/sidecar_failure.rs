@@ -662,19 +662,19 @@ fn output_log_write_failure_warns_while_the_run_is_live() {
     );
     let _ = finish_client(client);
     let needle = write_warning("stdout");
-    let deadline = Instant::now() + Duration::from_secs(4);
-    loop {
+    poll_until(Duration::from_secs(4), Duration::from_millis(50), || {
         let meta = status_of(&root, "s1");
         assert_eq!(
             meta["status"], "Running",
             "the warning must show before exit: {meta}"
         );
         if warnings(&meta).iter().any(|w| w.contains(&needle)) {
-            break;
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("status={}", meta["status"]))
         }
-        assert!(Instant::now() < deadline, "no live warning: {meta}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    })
+    .unwrap_or_else(|e| panic!("no live warning: {e}"));
     let (meta, _lock) = wait_sidecar_gone(&root, "s1");
     assert_exited_ok(&meta);
     assert_one_write_warning(&meta, "stdout");
