@@ -258,20 +258,21 @@ A `push` to a pipe session that is not running exits 1.
   [remote frame transport](../plans/active/01_remote-frame-transport.md)
   step 5 adds this.
 - Capture also tracks the terminal modes the child's output turns on
-  (`term_modes::TermModes`): the alternate screen, cursor visibility, cursor
-  keys and keypad, mouse tracking and its encodings, focus events, bracketed
-  paste, synchronized output, colour-scheme reports, kitty keyboard flags (one
-  stack per screen) and `modifyOtherKeys`. When a viewer is installed, the
-  sequences that turn those modes on are queued first, under the same lock
-  capture offers output under, so no output lands between them. A full reset
+  (`term_modes::TermModes`, which lists them): among them the alternate
+  screen, mouse tracking, bracketed paste, kitty keyboard flags (one stack
+  per screen) and `modifyOtherKeys`. When a viewer is installed, the
+  sequences that turn those modes on are queued first, under the lock capture
+  holds while it offers output, so no output lands between them. A full reset
   (`ESC c`) from the child clears the tracked modes.
 - The client tracks the same modes over everything it writes to the terminal,
-  and however the attach ends it writes their inverse once: each kitty stack
-  popped by the depth it was pushed, the alternate screen left, the other
-  modes turned off. It waits at most 200 ms for a terminal that is not
-  reading. Without this, a detached terminal kept the child's mouse reports
-  and keyboard protocol, so mouse moves typed escape sequences into the shell
-  and `Ctrl-C` arrived as `ESC[99;5u`.
+  and however the attach ends it writes their inverse once: each kitty
+  keyboard stack popped as many times as it was pushed, the alternate screen
+  left, the other modes turned off. Once leaving starts the reader writes
+  nothing more, so at most the chunk being written precedes the inverse. The
+  client waits at most 1 s for a terminal that is slow or not reading, 200 ms
+  after a signal. Without this, a detached terminal kept the child's mouse
+  reports and keyboard protocol, so mouse moves typed escape sequences into
+  the shell and `Ctrl-C` arrived as `ESC[99;5u`.
 - The child starts at 24×80. It gets `TERM=xterm-256color` when the launching
   environment had no `TERM`, an empty one, or `dumb`. An explicit
   `--env TERM` wins (`sidecar::pty_term`).

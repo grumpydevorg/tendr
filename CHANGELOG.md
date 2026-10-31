@@ -4,9 +4,10 @@
 
 ### Fixed
 
-- **Detaching gives your terminal back.** `tendr attach` now turns off the
-  terminal modes the session turned on when it ends: the alternate screen,
-  mouse reports, focus events, bracketed paste, kitty keyboard flags and
+- **Detaching gives your terminal back.** When you detach, or the attach ends
+  for any other reason, `tendr attach` now turns off the terminal modes the
+  session turned on: among them the alternate screen, mouse reports, focus
+  events, bracketed paste, a hidden cursor, kitty keyboard flags and
   `modifyOtherKeys`. Before, after detaching from Claude Code in Ghostty,
   mouse moves typed escape sequences into the shell and `Ctrl-C` did not
   interrupt. Attaching turns the session's modes on again before any output,

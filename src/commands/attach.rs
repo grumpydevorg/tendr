@@ -239,8 +239,9 @@ mod unix_relay {
     /// terminal that may be gone or not reading.
     const REPORT_GRACE: Duration = Duration::from_millis(200);
     /// How long leaving waits to turn off the session's terminal modes in a
-    /// terminal that may be gone or not reading.
-    const MODES_GRACE: Duration = Duration::from_millis(200);
+    /// terminal that is slow, gone or not reading. After a signal the shorter
+    /// [`REPORT_GRACE`] applies: SIGHUP means the terminal is gone.
+    const MODES_GRACE: Duration = Duration::from_secs(1);
 
     pub fn relay(stream: UnixStream, escape: EscapeMode) -> anyhow::Result<()> {
         let socket = |e| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket: {e}"));
@@ -249,7 +250,7 @@ mod unix_relay {
         let closed = Arc::new(AtomicBool::new(false));
         let retired = Arc::new(AtomicBool::new(false));
         let outbox = Arc::new(Outbox::default());
-        let screen = Arc::new(Mutex::new(Screen::default()));
+        let screen = Arc::new(Screen::default());
 
         // Installed before raw mode, so no cancelling signal can arrive between
         // the two and leave the terminal raw; restored when dropped, after the
@@ -339,7 +340,14 @@ mod unix_relay {
         // closed connection as a detach.
         let _ = shutdown.shutdown(std::net::Shutdown::Both);
         outbox.close();
-        turn_off_modes(&screen);
+        turn_off_modes(
+            &screen,
+            if matches!(ending, Ending::Signalled(_)) {
+                REPORT_GRACE
+            } else {
+                MODES_GRACE
+            },
+        );
         drop(terminal);
         drop(handlers);
 
@@ -416,30 +424,33 @@ mod unix_relay {
     /// What the session's output has done to the user's terminal.
     #[derive(Default)]
     struct Screen {
-        /// The modes turned on by everything written so far.
-        modes: TermModes,
-        /// Set when leaving: nothing more is written.
-        done: bool,
+        /// The modes turned on by everything written so far. Held while
+        /// writing, so a reset cannot interleave with output.
+        modes: Mutex<TermModes>,
+        /// Set by the main thread when leaving: the reader writes nothing
+        /// more, so at most the chunk it is writing precedes the reset.
+        done: AtomicBool,
     }
 
     /// Turn off the terminal modes the session turned on (the alternate
     /// screen, mouse reports, keyboard protocols), so the user's shell gets its
     /// terminal back. Waits for a write in progress, but not for longer than
-    /// [`MODES_GRACE`]: a terminal that is not reading cannot hold the exit.
-    fn turn_off_modes(screen: &Arc<Mutex<Screen>>) {
+    /// `grace`: a terminal that is not reading cannot hold the exit.
+    fn turn_off_modes(screen: &Arc<Screen>, grace: Duration) {
+        screen.done.store(true, Ordering::SeqCst);
         let (done, written) = std::sync::mpsc::channel();
         let screen = Arc::clone(screen);
         std::thread::spawn(move || {
-            let mut screen = screen.lock().unwrap_or_else(|e| e.into_inner());
-            screen.done = true;
-            let reset = screen.modes.reset();
+            let modes = screen.modes.lock().unwrap_or_else(|e| e.into_inner());
+            let reset = modes.reset();
             if !reset.is_empty() {
                 let mut stdout = std::io::stdout().lock();
                 let _ = stdout.write_all(&reset).and_then(|()| stdout.flush());
             }
+            drop(modes);
             let _ = done.send(());
         });
-        let _ = written.recv_timeout(MODES_GRACE);
+        let _ = written.recv_timeout(grace);
     }
 
     /// Raw mode for the user's terminal, restored on drop.
@@ -589,19 +600,19 @@ mod unix_relay {
         mut stream: UnixStream,
         closed: Arc<AtomicBool>,
         retired: Arc<AtomicBool>,
-        screen: Arc<Mutex<Screen>>,
+        screen: Arc<Screen>,
     ) {
         std::thread::spawn(move || {
             loop {
                 match attach_proto::read_frame(&mut stream) {
                     Ok(Frame::Data(payload)) => {
-                        // Track before writing: modes from a partial write are
-                        // still turned off when leaving.
-                        let mut screen = screen.lock().unwrap_or_else(|e| e.into_inner());
-                        if screen.done {
+                        let mut modes = screen.modes.lock().unwrap_or_else(|e| e.into_inner());
+                        if screen.done.load(Ordering::SeqCst) {
                             break;
                         }
-                        screen.modes.feed(&payload);
+                        // Track before writing: modes from a partial write are
+                        // still turned off when leaving.
+                        modes.feed(&payload);
                         let mut stdout = std::io::stdout().lock();
                         if stdout.write_all(&payload).is_err() || stdout.flush().is_err() {
                             break;
