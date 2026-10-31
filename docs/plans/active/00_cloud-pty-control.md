@@ -5,8 +5,8 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** mostly shipped in v0.4.0. Steps 5, 6, 8 and 9 remain. Step 5
-waits for a VM; steps 6 and 8 need none.
+**Status:** steps 5, 6, 8 and 9 remain. Step 5 waits for a VM and fixes step
+6's design; step 8 needs any sshd (`TENDR_TEST_SSH_HOST`); step 9 the VM.
 
 ## Goal
 
@@ -77,15 +77,19 @@ back is [PTY replay](../backlog/pty-replay.md).
    - Cross-user rejection. It needs two accounts; never mark it passed
      without them.
    - Dump the whole recording.
-   - Before and after `tendr kill`, and separately `--timeout`, snapshot
-     `ps -eo pid,ppid,pgid,sid,comm` and diff. The sid is the Claude pid, and
-     anything left with it (shells, MCP servers, background jobs) outlived the
-     stop. `kill` hangs up a PTY session first; `--timeout` sends SIGKILL at
-     once, so record what it leaves and decide whether it should hang up too.
+   - Run Claude Code, omp, a dev server and a shell with background jobs.
+     For each, before and after `tendr kill`, and separately `--timeout`,
+     snapshot `ps -eo pid,ppid,pgid,sid,comm` and diff. The sid is the run's
+     child pid, and anything left with it (shells, MCP servers, background
+     jobs) outlived the stop. `kill` hangs up a PTY session first;
+     `--timeout` sends SIGKILL at once, so record what it leaves and decide
+     whether it should hang up too.
      [Run lifecycle, Limits](../../architecture/03-run-lifecycle.md#limits)
      lists the known cases.
 
-   If descendants survive, choose a fix from this data. On Linux, cgroup v2
+   If descendants survive, choose a fix from this data. The goal is that no
+   process the run started outlives the stop on Linux; on macOS, tendr does
+   the same or states plainly what it cannot reach. On Linux, cgroup v2
    `cgroup.kill` (5.14 or later) stops every descendant, including those that
    call `setsid`, but needs a delegated cgroup subtree and a fallback without
    one. `PR_SET_CHILD_SUBREAPER` works without cgroups but only catches
@@ -93,9 +97,8 @@ back is [PTY replay](../backlog/pty-replay.md).
    signalling them, which races with new forks, and `proc_pidinfo` already
    returns EPERM for a process in another session (`src/platform/unix.rs`).
 
-Steps 5 and 9 have a VM harness in [`scripts/pty-vm/`](../../../scripts/pty-vm/README.md):
-VM setup, test children, half-open timers and a PTY driver. It was written for
-a development build of #68 and has not run on 0.4.0.
+Steps 5 and 9 use the VM harness in
+[`scripts/pty-vm/`](../../../scripts/pty-vm/README.md).
 
 ## What step 9 must show
 
@@ -111,12 +114,7 @@ a development build of #68 and has not run on 0.4.0.
 
 ## Gates
 
-Every step: `cargo fmt --all --check`, `cargo clippy --all-targets --locked
--- -D warnings`, `cargo test --locked --all-targets --no-fail-fast`, `cargo
-test --locked --doc`, `cargo +1.85.0 check --locked --all-targets`, `cargo doc
---no-deps` with `-D warnings`. Write each new test first and see it fail.
-Never mark a VM row passed from local tests. Record versions, commands,
-results and untested limits in the PR.
+CI's checks; red-first tests; never mark a VM row passed from local tests.
 
 ## Open measurements
 

@@ -904,7 +904,7 @@ fn attach_detach_emit_control_changed_events() {
     assert_eq!(changed[1]["seq"], 2);
 }
 
-// --- Cloud PTY control, slice 1: sidecar-enforced input authority ---
+// --- Cloud PTY plan: sidecar-enforced input authority ---
 
 /// Run the real `tendr attach` CLI inside a PTY, as a terminal user would.
 struct CliAttach {
@@ -2547,7 +2547,7 @@ fn an_old_runs_cleanup_cannot_remove_its_replacements_breadcrumb() {
     );
 }
 
-// --- Cloud PTY control, slice 1: exact recording ---
+// --- Cloud PTY plan: exact recording ---
 
 fn session_meta(root: &TempDir, session: &str) -> serde_json::Value {
     let path = root
@@ -3108,7 +3108,7 @@ fn fifo_input_is_delivered_after_its_writer_closes() {
     assert_eq!(&bytes[written..], b"AFTER\n");
 }
 
-// Exit codes of `attach` and PTY `push` (plan slice 1, step 7): 80 protocol,
+// Exit codes of `attach` and PTY `push` (exit-code table, #107): 80 protocol,
 // 81 control conflict, 84 runtime/transport or a partial write, 85 identity.
 // The helpers and tests below are one block.
 

@@ -108,8 +108,8 @@ DAG semantics, health rules, retries or planning belongs in a tool above tendr.
 
 Choices that are hard to reverse and came from a real choice between
 alternatives. Where an entry names a file as its source, the full text is in
-Git at commit `95dcf1d`, the last commit before the old plans and specs were
-removed.
+Git at commit `95dcf1d`, unless the entry names another commit. `95dcf1d` is
+the last commit before the old plans and specs were removed.
 
 ### Tendr supervises processes; it is not an agent framework
 
@@ -245,6 +245,16 @@ screen replays the recording through a terminal of its own. Source:
 `docs/plans/specs/ecosystem-landscape.md`, and the cloud PTY plan at
 `95dcf1d`, which designed an optional `tendr-screen` extension that was
 dropped on 2026-10-31.
+
+### Detach is a fixed two-key escape
+
+*2026-09-26.* `attach` detaches on `Ctrl-\ d`. It does not need Enter, which
+could submit an unfinished prompt. It is not newline `~.`, because an outer
+`ssh -t` takes that as its own disconnect escape. The prefix is fixed, with
+only an on/off switch; a configurable prefix waits for a measured need.
+`--escape` already takes a value (`ctrl-backslash` or `none`), so one can be
+added later without changing the flag. Source: the cloud PTY plan at
+`83f83ab`.
 
 ### CI stays on native GitHub Actions; Dagger was not adopted
 

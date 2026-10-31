@@ -5,7 +5,8 @@ depends_on: [remote-frame-transport]
 
 # Windows parity
 
-**Status:** not started. Each gap below is a separate change; none waits for
+**Status:** not started. Starts when a Windows user hits a gap below. Each gap
+is a separate change; none waits for
 another except ConPTY, which reuses the suspended launcher. General `--host` use
 against a Windows host is fixed by
 [remote frame transport](../active/01_remote-frame-transport.md), not here.
@@ -75,8 +76,19 @@ fake-SSH harness is part of remote frame transport.
 
 ## Acceptance
 
-Native Windows tests show: a session started over SSH survives disconnect, or
-`start` fails clearly; stopping a session stops a child that forks at once;
-an orphan kill stops the whole tree; `$x = 42` then `$x` returns 42 under
-PowerShell 5.1 and 7; a `--pty` session can be attached, resized, detached and
-reattached. The guide's PowerShell and platform notes are updated to match.
+Native Windows tests show:
+
+- a session started over SSH survives disconnect, or `start` fails clearly;
+- stopping a session stops a child that forks at once, and an orphan kill
+  stops the whole tree;
+- a recycled PID is never killed in place of the session's process;
+- repeated connects to the stdin named pipe work;
+- several processes appending events at once leave complete, valid JSONL (a
+  native multi-process stress test);
+- under PowerShell 5.1 and 7, `$x = 42` then `$x` returns 42, `function f {7}`
+  then `f` returns 7, and `Set-Location` and `$env:` changes persist, while
+  `$LASTEXITCODE`, native exit codes, terminating and non-terminating errors,
+  and clean stdout and stderr behave as today;
+- a `--pty` session can be attached, resized, detached and reattached.
+
+The guide's PowerShell and platform notes are updated to match.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Slice-1 step 5: three repaint nudges, measured separately, each followed by a
+# Cloud PTY step 5: three repaint nudges, measured separately, each followed by a
 # bounded capture wait on the recording:
 #   1. same-size TIOCSWINSZ on the child's PTY (the kernel sends no SIGWINCH when
 #      the size is unchanged; this checks whether anything happens at all)

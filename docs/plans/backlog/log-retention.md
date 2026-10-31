@@ -5,8 +5,9 @@ depends_on: []
 
 # Log retention
 
-**Status:** not started. Needs a measurement first: how large do the logs of a
-long-running session get in practice?
+**Status:** not started. Starts when a long-running session's logs use enough
+disk to matter. Needs a measurement first: how large do those logs get in
+practice?
 
 Two parts of a session grow without limit while it exists, and two files under
 `~/.tendr` are never removed. `--replace` and `prune` delete the whole session

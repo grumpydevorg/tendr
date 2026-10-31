@@ -5,8 +5,9 @@ depends_on: []
 
 # Interactive agent turns: route agent hooks into the event log
 
-**Status:** not started. Ready: a guide topic, then one generic exit-on-match
-option for `tendr events --follow`.
+**Status:** not started. Starts when a program next drives a Claude Code turn
+under tendr. Ready: a guide topic, then one generic exit-on-match option for
+`tendr events --follow`.
 
 Some agent features exist only in an interactive session. A caller (a script or
 another agent) needs to send that session a prompt, learn when the turn ended or

@@ -7,8 +7,9 @@ depends_on: []
 
 **Status:** not started, apart from the `--host` destination guard (v0.2.1).
 Steps 0a and 1–7 remain. Step 5's Unix attach bridge is the part the
-[cloud PTY](00_cloud-pty-control.md) workflow needs first; it needs only the
-step 2 codec, so it may land before steps 3 and 4.
+[cloud PTY](00_cloud-pty-control.md) workflow needs first. It needs steps 0a
+and 2 (the fake-SSH harness and the codec), so it may land before steps 3
+and 4.
 
 Goal: every `--host` command travels as a typed request over SSH stdin, as
 `exec` already does. No user- or host-derived value is rebuilt into a remote
@@ -177,7 +178,10 @@ network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
      keeps controller epochs and the recording; the bridge has no lifecycle
      authority. Keep control frames (takeover, resize, detach) on a bounded
      path that never waits behind output, so a stalled viewer cannot delay a
-     takeover.
+     takeover. An earlier design for typed PTY operations (send, resize,
+     claim, release, observe; reads retryable, bounded writes never retried
+     automatically, finite default deadlines) is slice 3 of the cloud PTY
+     plan at `83f83ab`.
    - **Resumable viewers.** A viewer reconnects with its run ID and the last
      sequence it consumed, and gets the retained contiguous suffix of the
      recording. History that is gone is an error with the available range

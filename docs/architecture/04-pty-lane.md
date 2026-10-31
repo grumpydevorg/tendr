@@ -189,9 +189,8 @@ A `push` to a pipe session that is not running exits 1.
   - A sender thread writes the queued messages.
   - A reader thread writes output to the terminal.
 - `Ctrl-\ d` detaches. `Ctrl-\` twice sends one `Ctrl-\`. `--escape none`
-  disables the escape. Detach does not need Enter, which could submit an
-  unfinished prompt. It is not newline `~.`, because an outer `ssh -t`
-  takes that as its own disconnect escape.
+  disables the escape. Why this escape:
+  [design](../design.md#detach-is-a-fixed-two-key-escape).
 - The escape is recognised in the legacy byte encoding, and in the kitty
   keyboard protocol and xterm `modifyOtherKeys` encodings that a child can
   switch the terminal to (`src/attach_escape.rs`). Forwarded bytes are always

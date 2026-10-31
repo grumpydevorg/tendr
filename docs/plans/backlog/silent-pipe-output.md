@@ -5,8 +5,9 @@ depends_on: []
 
 # Silent pipe output: CR framing and partial-line status
 
-**Status:** not started. Ready, except for the open questions below. Change 1
-(the reader) can ship without change 2 (status).
+**Status:** not started. Starts with the next `\r`-framed pipe job, or when the
+rsync hook below is to be retired. Ready, except for the open questions. Change
+1 (the reader) can ship without change 2 (status).
 
 A pipe session whose child writes progress with carriage returns shows nothing
 in `output.log` until the child writes a newline or exits. The operator cannot
@@ -19,7 +20,9 @@ On 2026-07-27 a 251 GiB `rsync --info=progress2,stats1` ran about two hours in a
 pipe session (tender 0.2.1, rsync 3.4.4). 63 minutes in, while it moved about
 33 MB/s, `output.log` was 0 bytes with its creation mtime. When the child closed
 stdout the file went to 18,010,442 bytes in 4 records; the largest record was
-17,773,603 characters, about 296,000 progress updates.
+17,773,603 characters, about 296,000 progress updates. That single huge record
+describes the faulty reader; it is a characterisation, not a contract, and
+change 1 deliberately replaces it with bounded records.
 
 | Setup | Bytes in log mid-run |
 |---|---|
@@ -27,28 +30,26 @@ stdout the file went to 18,010,442 bytes in 4 records; the largest record was
 | pipe, `--info=progress2 --outbuf=N` | 0 at 25 s |
 | pipe, `--info=name2,stats2` | 143 records, streaming |
 | `--pty`, `--info=progress2` | 3,863 at 20 s |
+| plain shell `> file`, `--info=progress2` | 874 at 20 s |
 
 `--outbuf` changing nothing shows the delay is in Tendr's reader, not the child.
 
 ## Cause
 
-`capture_stream` (`src/sidecar.rs:1491`) reads with `BufReader::lines()`, which
-yields only on `\n`. rsync ends each update with `\r`, so the whole run of
-updates collects in one `String`. This is the documented contract
+`capture_stream` (`src/sidecar.rs`) reads one `\n`-terminated line at a time.
+rsync ends each update with `\r`, so the whole run of updates collects in one
+buffer. This is the documented contract
 ([design](../../design.md#outputlog-is-a-line-log-the-pty-recording-is-the-exact-record)),
 but it has three costs:
 
 - The operator sees nothing until a newline.
-- The `String` has no size limit. A multi-day job can exhaust the sidecar's
+- The buffer has no size limit. A multi-day job can exhaust the sidecar's
   memory.
 - The record that finally lands is too large for `--tail`, `--grep` or a JSON
   reader.
 
-A related fault in the same loop: `lines()` also fails on a line that is not
-valid UTF-8, and `Err(_) => break` (`src/sidecar.rs:1500`) treats that as a
-closed pipe. One bad byte ends capture for the rest of the run. The new reader
-should decode lossily, as the PTY path already does
-(`capture_stream_with_tee`, `String::from_utf8_lossy`).
+The new byte reader must keep lossy UTF-8 decoding, as `capture_stream` does
+after #125.
 
 `--pty` avoids the problem but merges stdout and stderr and makes the child see
 a terminal. On Windows there is no PTY (`src/platform/windows.rs:183`), so no
@@ -79,6 +80,10 @@ workaround exists there.
   (`log -f`, `watch --logs`, `events --follow`) show every update, because they
   cannot know which update is last. `fragment` records never collapse.
 
+Rejected for following readers (reasons in `log-delimiter-cr-framing.md` at
+`83f83ab`): holding CR output until LF or EOF, keyed replacement events, and
+redrawing in place on `-f`.
+
 PTY capture is unchanged; it already writes per read chunk.
 
 ## Change 2: `tendr status` explains an empty log
@@ -107,16 +112,19 @@ sidecar-owned file rewritten at a bounded rate, read best-effort by `status`.
 ## Documentation
 
 `docs/guide.md` does not say that the log holds a partial line until a newline.
-Add that rule to "Observe long-running work", with the choice between
-`--log-delimiter newline-or-cr`, a newline-framed mode of the child (for rsync,
-`--info=name2,stats2`) and `--pty`. Add one line to `src/embedded/SKILL.md`:
-check `tendr log <name>` within a minute of starting a long job.
+Put that rule under its own heading in "Observe long-running work", with the
+choice between `--log-delimiter newline-or-cr`, a newline-framed mode of the
+child (for rsync, `--info=name2,stats2`) and `--pty`. Expose it as
+`tendr guide pty` (a `TOPICS` entry in `src/commands/guide.rs`), and add one
+line to `src/embedded/SKILL.md`: check `tendr log <name>` within a minute of
+starting a long job.
 
 One user's Claude Code install has a stopgap hook outside this repo
 (`~/.claude/hooks/tendr-pty-guard.py`). It refuses a `tendr start` of rsync with
-a progress meter and no `--pty`. It can go once `status` reports pending bytes
-where agents look, or CR framing becomes the default. Its rsync rule must not
-move into Tendr.
+a progress meter and no `--pty`. It can go when any one of these holds: CR
+framing becomes the default; `status` reports pending bytes where agents look;
+or an enforcement every caller goes through replaces one agent's config. Its
+rsync rule must not move into Tendr.
 
 ## Acceptance
 
@@ -127,7 +135,7 @@ move into Tendr.
 - In both modes, an unterminated span longer than the cap gives `fragment`
   records that concatenate to the original bytes, and reader memory stays
   within the cap.
-- Invalid UTF-8 from the child does not end capture.
+- Invalid UTF-8 from the child is decoded lossily and does not end capture.
 - A default spec's `canonical_hash()` is unchanged; old `LogLine` records still
   parse; LF records carry no `terminator`.
 - `log --tail N` over 10,000 CR updates and 3 real lines returns the collapsed
