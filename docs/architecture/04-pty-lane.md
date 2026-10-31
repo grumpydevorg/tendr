@@ -241,9 +241,11 @@ A `push` to a pipe session that is not running exits 1.
   until capture has drained the master. A shell that opened `/dev/tty`
   already waited this way. Every stop (`kill`, `--timeout`, a sidecar
   failure) therefore first restarts output stopped by `^S` (`TCOON`). A
-  graceful stop while capture is reading keeps the descriptor, so what the
-  child writes as it stops is captured. A forced stop, or any stop while no
-  reader is running (a sidecar failure before capture), closes it at once,
+  graceful `kill` while capture is reading keeps the descriptor, so what the
+  child writes as it stops is captured. A forced stop (`kill --force` or
+  `--timeout`), or any stop while no reader is running (a sidecar failure
+  before capture, or a `kill` that lands before capture has taken the
+  reader), closes it at once,
   so no exit waits on a reader that cannot drain; that child's last unread
   output is then subject to the 0.65 s discard again. A reader that ends
   early (an error, a panic) also closes it. A child that exits while its
