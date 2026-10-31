@@ -2,7 +2,8 @@
 
 mod harness;
 
-use harness::{tendr, wait_running, wait_terminal};
+use harness::{Observation, poll_until, tendr, wait_running, wait_terminal};
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Read all events for a session, merged by (ts, writer, seq).
@@ -45,22 +46,21 @@ fn kinds(events: &[serde_json::Value]) -> Vec<String> {
 
 /// Poll until the session's event log contains `kind`, or panic after 10 s.
 fn wait_for_event_kind(root: &TempDir, session: &str, kind: &str) -> Vec<serde_json::Value> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let events_dir = root
-            .path()
-            .join(format!(".tendr/sessions/default/{session}/events"));
-        if events_dir.exists() {
-            let events = read_events(root, session);
-            if kinds(&events).iter().any(|k| k == kind) {
-                return events;
-            }
+    let events_dir = root
+        .path()
+        .join(format!(".tendr/sessions/default/{session}/events"));
+    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        if !events_dir.exists() {
+            return Observation::Pending("no events dir".into());
         }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for event kind {kind} in {session}");
+        let events = read_events(root, session);
+        if kinds(&events).iter().any(|k| k == kind) {
+            Observation::Ready(events)
+        } else {
+            Observation::Pending(format!("{} events, none of kind {kind}", events.len()))
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    })
+    .unwrap_or_else(|e| panic!("waiting for event kind {kind} in {session}: {e}"))
 }
 
 #[test]

@@ -5,7 +5,11 @@
 
 mod harness;
 
+#[cfg(unix)]
+use harness::{Observation, poll_until};
 use harness::{tendr, wait_running, wait_terminal};
+#[cfg(unix)]
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
@@ -34,11 +38,8 @@ fn kill_nine_replays_full_lifecycle_via_events() {
         serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
     let sc_pid = meta["sidecar"]["pid"].as_u64().unwrap() as i32;
     unsafe { libc::kill(sc_pid, libc::SIGKILL) };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while unsafe { libc::kill(sc_pid, 0) } == 0 {
-        assert!(std::time::Instant::now() < deadline, "sidecar never died");
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    harness::poll_pid_dead(sc_pid, Duration::from_secs(5), Duration::from_millis(50))
+        .unwrap_or_else(|e| panic!("sidecar never died: {e}"));
 
     // Reconciliation runs on the next status/wait touch ("after reboot" in
     // the criterion = any later CLI contact).
@@ -316,22 +317,18 @@ fn exec_payload_emit_chains_and_env_unsets() {
         .assert()
         .success();
     let log_path = root.path().join(".tendr/sessions/default/shell/output.log");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    poll_until(Duration::from_secs(5), Duration::from_millis(50), || {
         let content = std::fs::read_to_string(&log_path).unwrap_or_default();
         if content.contains("probe_unset") {
-            break;
+            return Observation::Ready(());
         }
         assert!(
             !content.contains("probe_01"),
             "TENDR_BLOCK_ID leaked past the block"
         );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "probe output never arrived"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+        Observation::Pending(format!("{} log bytes, no probe_unset", content.len()))
+    })
+    .unwrap_or_else(|e| panic!("probe output never arrived: {e}"));
 }
 
 /// exec with ≥1 MiB stdout: the full data spills to a content-addressed

@@ -5,8 +5,9 @@
 
 mod harness;
 
-use harness::{tendr, wait_running};
+use harness::{Observation, poll_until, tendr, wait_pid_dead, wait_running};
 use std::sync::Mutex;
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Sidecar-killing and crash-injection tests are timing-sensitive under
@@ -56,58 +57,37 @@ fn sidecar_pid(meta: &serde_json::Value) -> i32 {
     meta["sidecar"]["pid"].as_u64().expect("sidecar.pid") as i32
 }
 
-fn wait_pid_dead(pid: i32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if unsafe { libc::kill(pid, 0) } != 0 {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for pid {pid} to die");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-
 /// Poll `tendr status` until it reports a terminal state, or panic after
 /// 10 s. Needed after crash injection: the aborting sidecar releases the
 /// session lock only when the process finishes dying (macOS crash reporting
 /// can delay that well past the fsync'd event append), and reconciliation
 /// deliberately no-ops while the lock is held.
 fn poll_status_until_terminal(root: &TempDir, session: &str) -> serde_json::Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
+    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
         let output = tendr(root).args(["status", session]).output().unwrap();
         assert!(output.status.success());
         let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        if status["status"]
-            .as_str()
-            .is_some_and(|s| s != "Starting" && s != "Running")
-        {
-            return status;
+        match status["status"].as_str() {
+            Some(s) if s != "Starting" && s != "Running" => Observation::Ready(status),
+            other => Observation::Pending(format!("status={}", other.unwrap_or("<missing>"))),
         }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for {session} to reconcile to a terminal state");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    })
+    .unwrap_or_else(|e| panic!("waiting for {session} to reconcile to a terminal state: {e}"))
 }
 
 /// Poll until the session's event log contains `kind`, or panic after 10 s.
 fn wait_for_event_kind(root: &TempDir, session: &str, kind: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let events_dir = root
-            .path()
-            .join(format!(".tendr/sessions/default/{session}/events"));
+    let events_dir = root
+        .path()
+        .join(format!(".tendr/sessions/default/{session}/events"));
+    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
         if events_dir.exists() && read_events(root, session).iter().any(|e| e["kind"] == kind) {
-            return;
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("no event kind {kind} yet"))
         }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for event kind {kind}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    })
+    .unwrap_or_else(|e| panic!("waiting for event kind {kind}: {e}"))
 }
 
 /// Acceptance criterion 1 (plan): kill -9 the sidecar; reconciliation appends

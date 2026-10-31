@@ -21,15 +21,13 @@ fn wait_for_callbacks(root: &TempDir, session: &str) {
     let run_id = meta["run_id"].as_str().unwrap();
 
     let callbacks_path = root.path().join(format!(".tendr/callbacks/{run_id}.json"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if callbacks_path.exists() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
     // Callbacks may have no failures and still write the record, so not finding
     // the file just means we timed out waiting — tests that need it will assert.
+    let _ = harness::poll_path_exists(
+        &callbacks_path,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(50),
+    );
 }
 
 /// Read the callback record for a session (by run_id from meta.json).
