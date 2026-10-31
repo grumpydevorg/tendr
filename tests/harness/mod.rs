@@ -202,20 +202,20 @@ pub fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
 //
 // - Probe at once: never sleep before the first probe.
 // - One `Instant` deadline per wait, computed on entry.
-// - Keep the call site's timeout, interval and what it does on a timeout:
-//   panic, return `false`, return the error so cleanup runs first, or ignore
-//   it for best-effort cleanup. `poll_*` wrappers return the `Result`;
-//   `wait_*` wrappers panic.
+// - A wait keeps its own timeout and interval. On a timeout it panics,
+//   returns `false`, returns the error so cleanup runs first, or ignores it
+//   for best-effort cleanup. `poll_*` wrappers return the `Result`; `wait_*`
+//   wrappers panic.
 // - `Pending` describes the last state for the timeout message. Keep it short,
 //   or move in output the probe already owns; never clone a large buffer.
 // - Add a wrapper only when three or more call sites share a probe.
 //
 // Some loops stay hand-written. Waits on in-process producer threads
-// (`ReadyFollower` records, PTY reader buffers, mpsc channels) could use a
-// `Condvar` or channel instead, but that changes how they synchronise and no
-// failure calls for it. Loops that are not "probe until true or deadline"
-// (settling streaks, one deadline shared by several phases, fixed pacing)
-// also stay as they are.
+// (`ReadyFollower` records, PTY reader buffers, mpsc channels) do not use
+// `poll_until`: their replacement, if one is ever needed, is a `Condvar` or
+// channel, and no failure has called for it. Loops that are not "probe until
+// true or deadline" (settling streaks, one deadline shared by several phases,
+// fixed pacing) also stay as they are.
 
 /// One probe result: ready with a value, or not-yet with a cheap description of
 /// the current state (retained only for the timeout message).

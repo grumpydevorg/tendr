@@ -239,10 +239,6 @@ fn attach_socket_exists_for_pty_session() {
         Duration::from_millis(50),
     )
     .unwrap_or_else(|e| panic!("timed out waiting for a.sock.path breadcrumb to appear: {e}"));
-    assert!(
-        breadcrumb.exists(),
-        "a.sock.path breadcrumb should exist for PTY session"
-    );
 
     // The breadcrumb should point to an actual socket file
     let sock_path = std::fs::read_to_string(&breadcrumb).unwrap();
