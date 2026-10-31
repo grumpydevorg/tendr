@@ -24,7 +24,8 @@ These stay outside tendr:
 - terminal emulation and screen rendering (see
   [No terminal emulator in core](#no-terminal-emulator-in-core));
 - block-terminal interfaces, completion, and routing between shell and AI;
-- workflow scheduling and agent logic;
+- agent logic (see
+  [Tendr supervises processes](#tendr-supervises-processes-it-is-not-an-agent-framework));
 - container and Kubernetes lifecycle management.
 
 ## Rules
@@ -39,7 +40,7 @@ workflow judgments for them. `wait`, `watch`, `--after` and `--on-exit` are
 mechanisms; none of them decides what "healthy" means, when to retry, or how
 to deploy. Ask: does this give the caller a primitive, or decide for them?
 
-Rejected example: a new `exec` strictness flag, proposed before anyone checked
+Rejected: a new `exec` strictness flag, proposed before anyone checked
 that `tendr exec` already passes on the inner exit code. Check what the
 mechanism already does before adding a flag.
 
@@ -52,7 +53,10 @@ PTY control changes go through one typed path in the sidecar. Ask: does this
 add a second writer for an existing fact?
 
 Rejected: patching `meta.json` as untyped JSON from unrelated code paths. It
-creates several writers, bypasses typed invariants and adds races.
+creates several writers, bypasses typed invariants and adds races. Also
+rejected: PTY control state that said an agent had exclusive input while
+`push` still accepted anonymous writes. The transport must enforce authority,
+not only record it.
 
 ### 3. State machine first, protocol second
 
@@ -60,21 +64,23 @@ For a control feature, define the typed states and legal transitions first,
 then the flags, files, sockets and payloads. The run lifecycle is a state
 machine, and PTY control is a typed `InputArbiter` with controller epochs
 (`src/model/pty_control.rs`). Ask: if the transport disappeared, would the
-state model still be clear and testable?
+state model still be clear and testable? If not, the protocol is standing in
+for the specification.
 
-Rejected: PTY control state that said an agent had exclusive input while
-`push` still accepted anonymous writes. The transport must enforce authority,
-not only record it.
+Rejected: a control design that started with request files and CLI flags
+before its state machine. Invalid states stayed hidden until review, and the
+transport became the specification.
 
 ### 4. Durable truth, derived views
 
-Tendr stores facts once and derives views from them. `meta.json` is the
-current run, `output.log` the child's output, and the event log the history.
-`status`, `list`, `log`, `watch`, `events` and `query` read those files and
-store nothing of their own. Ask: is this a view over existing facts, or a new
-store that copies them?
+Tendr stores authoritative facts and derives views from them; it adds no
+stored state just to support a view. `meta.json` is the current run,
+`output.log` the child's output, and the event log the history. `status`,
+`list`, `log`, `watch`, `events` and `query` read those files and store
+nothing of their own. Ask: is this a view over existing facts, or a new store
+that copies them?
 
-### 5. Control plane apart from work plane
+### 5. Separate control and work planes
 
 Control operations (`start`, `status`, `wait`, `watch`, `kill`, `attach`) and
 payload bytes (child stdin and output, PTY bytes, framed `exec` payloads) stay
@@ -82,7 +88,7 @@ on separate paths. `watch` never writes to child stdin. Do not pass workflow
 state through stdin, transcript parsing or shell conventions when a control
 field or state transition is the real model.
 
-### 6. Label inference
+### 6. Labelled inference
 
 Tendr observes some facts and infers others, and the two must look different.
 The sidecar writes a terminal state after it sees the child exit; reconciliation
@@ -93,15 +99,17 @@ overloaded status name.
 
 ### 7. Shallow composition
 
-`--after`, `--on-exit`, `wait`, `watch` and namespaces compose runs without a
-retry engine, scheduler or planner. A feature that needs DAG semantics, health
-rules, retries or planning belongs in a tool above tendr.
+Tendr supports shallow composition of supervised runs; it is not an
+orchestration engine. `--after`, `--on-exit`, `wait`, `watch` and namespaces
+compose runs without a retry engine, scheduler or planner. A feature that needs
+DAG semantics, health rules, retries or planning belongs in a tool above tendr.
 
 ## Decisions
 
 Choices that are hard to reverse and came from a real choice between
 alternatives. Where an entry names a file as its source, the full text is in
-Git at commit `95dcf1d`.
+Git at commit `95dcf1d`, the last commit before the old plans and specs were
+removed.
 
 ### Tendr supervises processes; it is not an agent framework
 

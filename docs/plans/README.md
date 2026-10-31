@@ -34,8 +34,9 @@ them.
 ## Plan content
 
 The line after the title is `**Status:**`, saying what is left, then the goal.
-Do not narrate shipped steps; name the PR if a remaining step depends on it.
-The test also checks this line.
+A backlog plan's status also says what would start it. Do not narrate shipped
+steps; name the PR if a remaining step depends on it. The test checks that the
+status line is there.
 
 ## Lifecycle
 
