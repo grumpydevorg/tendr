@@ -1,9 +1,9 @@
-//! # Tendr — an agent process sitter
+//! # Tendr
 //!
-//! Tendr supervises *runs*, not processes: a command executes under a durable
-//! per-session sidecar so its lifecycle, output, and exit survive the CLI
-//! invocation that launched it. The `tendr` binary is a transactional CLI
-//! over that durable session model; this crate is the library it is built
+//! Tendr keeps shells, REPLs and long-running jobs alive between tool calls.
+//! Each command runs under its own sidecar process, so its lifecycle, output
+//! and exit status outlive the CLI call that started it. The `tendr` binary
+//! is a CLI over that session model; this crate is the library it is built
 //! from.
 //!
 //! ## Responsibility split

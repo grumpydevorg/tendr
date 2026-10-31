@@ -1,31 +1,24 @@
 ---
 id: remote-frame-transport
 depends_on: []
-links:
-  - ../specs/event-protocol.md
-  - ../specs/sidecar-control-protocol.md
-  - ../../architecture/06-transport-boundaries.md
-  - ../completed/2026-07-08-remote-exec-host-parity.md
 ---
 
-# Remote Frame Transport — Make `--host` Genuinely Cross-Platform
+# Remote frame transport: make `--host` cross-platform
 
-> **Sequence revised 2026-09-14:** [Cloud PTY control and replay](00_cloud-pty-control.md)
-> is the first consumer. Its slice 1 delivers Unix reattach over the existing
-> `ssh -t` path; slice 3 extracts the minimal typed `ssh -T` PTY bridge from
-> this plan's step 5 and implements it before the general migration in steps
-> 1–4. That bridge needs its own bounded, versioned handshake and constant remote
-> entrypoint, but does not require the full `RemoteOperation` enum. Share the
-> codec and validation with the later migration. Windows target/client work
-> stays here; do not imply that the Unix bridge delivers ConPTY support.
-> The numbered sequence below is the original general-transport migration;
-> the cloud plan governs the earlier PTY slices. Step 0 remains shipped.
+**Status:** not started, apart from the `--host` destination guard (v0.2.1).
+Steps 0a and 1–7 remain. The Unix `ssh -T` PTY bridge is
+[cloud PTY control](00_cloud-pty-control.md) slice 3 and ships before steps
+1–4. It shares this plan's codec and validation but not the full
+`RemoteOperation` enum.
 
-Promote the `exec` frame transport's principle from one operation to the whole
-remote surface: every `--host` command travels as a typed request over SSH
-stdin, so **no user- or host-derived value is ever reconstructed into a remote
-shell argv.** This closes a real command-injection vector on Windows and makes
-the transport OS-neutral — without turning Tendr into a daemon or RPC framework.
+Goal: every `--host` command travels as a typed request over SSH stdin, as
+`exec` already does. No user- or host-derived value is rebuilt into a remote
+shell argv. This closes a command-injection hole on Windows and makes the
+transport independent of the remote OS. Tendr does not become a daemon or an
+RPC framework.
+
+Windows-specific work outside the transport (lifecycle hardening, ConPTY,
+PowerShell state) belongs to [windows-parity](../backlog/windows-parity.md).
 
 ## Why — the security motivation
 
@@ -47,17 +40,11 @@ The gap is exploitable, not cosmetic:
 (`src/ssh.rs:96`). That is the proof the framed approach is correct; the older
 reconstructed-argv transport is not.
 
-### A second, higher-severity vector — LOCAL ssh-option injection (review 2026-07-10)
+### The local ssh-option vector (fixed)
 
-Surfaced by the pre-implementation review: the `--host` **destination** is placed
-as a **bare argument** to the local `ssh` binary — no `--` guard, no leading-dash
-rejection — in *both* `build_ssh_command` (`ssh.rs:60`) **and the already-shipped
-constant-argv frame path** `build_ssh_exec_frame_command` (`ssh.rs:100-109`). So
-`tendr --host '-oProxyCommand=<cmd>'` is parsed by the *local* ssh as an option
-→ **arbitrary local command execution**, before any remote hop. This does **not**
-reach the remote shell, so the frame redesign does **not** fix it, and it affected
-shipped `0.2.0`. It was hardened independently — **✅ resolved in v0.2.1**
-(`1ee737d` + `b80b510`); see **Step 0** below.
+A `--host` value that starts with `-` used to reach the local `ssh` as an
+option (`-oProxyCommand=…`). The frame redesign does not cover this, so it was
+fixed separately in v0.2.1 (`1ee737d`, `b80b510`); see step 0.
 
 ## Design
 
@@ -158,22 +145,19 @@ local tendr → SSH → remote tendr CLI → existing local IPC → sidecar
 
 Preserves durable `meta.json` + logs, one lifecycle authority, **no listening
 network daemon, no gRPC/Tokio/mTLS**, and the current output contracts. The full
-[sidecar-control-protocol](../specs/sidecar-control-protocol.md) remains relevant
-only if *local* correlated IPC genuinely needs it — this is not that.
+[sidecar-control-protocol](../backlog/sidecar-control-protocol.md) design applies
+only if *local* correlated IPC needs it; this plan does not.
 
 ## Implementation sequence (safe, incremental)
 
-> **Review additions (2026-07-10) marked in bold.**
-
-0. **✅ DONE (v0.2.1, `1ee737d` + `b80b510`) — Harden the `--host` destination.**
-   Any `--host` value that is empty or begins with `-` (ssh-option-shaped) is
-   rejected at the CLI boundary (`main.rs:879`) before ssh spawns — exit 2 — and
-   both SSH builders fail closed via `ssh::validate_destination` (`ssh.rs:65`):
-   `build_ssh_command` and the constant-argv `build_ssh_exec_frame_command`, so
-   no caller can bypass it. Regression tests prove ssh is never spawned on
-   rejection for both the general and framed-exec paths (`cli_remote.rs:1070`),
-   plus unit coverage (`ssh.rs:229`/`246`). This closed the local
-   ssh-option-injection vector independent of the frame redesign, as planned.
+0. **Shipped (v0.2.1).** A `--host` value that is empty or starts with `-` is
+   rejected with exit 2 before ssh starts. Both SSH builders fail closed through
+   `ssh::validate_destination`.
+0a. **Portable fake-SSH harness.** `tests/cli_remote.rs` is `cfg(unix)` because
+   its fake ssh is a shell script. Replace it with a Rust test-helper exe that
+   records argv, captures and forwards stdin, emits configured stdout/stderr
+   and exit code, and installs as `ssh`/`ssh.exe` on the temp PATH. It must land
+   before step 3 moves any operation onto the frame.
 1. Add `RemoteOperation` request types + shared `dispatch`. **Pin every DTO's
    completeness here, where it's defined.** `StartRequest` must mirror the FULL
    start/`LaunchSpec` surface: session, namespace, argv, cwd, env, stdin, timeout,
@@ -189,19 +173,21 @@ only if *local* correlated IPC genuinely needs it — this is not that.
    `--boundary`/`--boundary-parent` labels, and (easy to miss) **`log --since`**
    are all currently shell-exposed.
 4. Move `push` (header + raw body framing).
-5. Build the `attach` bridge — **two distinct halves**: **5a Windows-as-target**
-   (ConPTY + a Windows named-pipe carrier) and **5b Windows-as-client** (a local
-   Windows-console raw-mode frontend — newly required because moving raw-mode/resize
-   to the local frontend over `ssh -T` replaces today's `ssh -t` remote-frontend
-   model, which currently handles Windows-client→Unix-remote attach with zero
-   Windows terminal code). Keep the `ssh -t` path during transition if that case
-   matters. Unix first.
+5. Build the `attach` bridge. The Unix bridge is cloud PTY control slice 3.
+   This plan keeps the Windows halves: **5a Windows-as-target** (ConPTY + a
+   Windows named-pipe carrier) and **5b Windows-as-client** (a local
+   Windows-console raw-mode frontend). 5b is needed because moving raw mode and
+   resize to the local frontend over `ssh -T` replaces today's `ssh -t` model,
+   which handles Windows-client→Unix-remote attach with no Windows terminal
+   code. Keep the `ssh -t` path during transition if that case matters. The
+   ConPTY backend and console frontend themselves are
+   [windows-parity](../backlog/windows-parity.md) phase 5.
 6. Delete general POSIX remote-argv reconstruction. Keep shell quoting only for
    the human-facing copy/paste **fallback text** (verified: `local_fallback_args`
    is only `eprintln!`'d, never spawned) — label it "(POSIX shell)" so users don't
    paste POSIX-quoted text at a Windows host.
-7. Add native Windows x64 + ARM64 CI, including real cmd.exe and PowerShell
-   OpenSSH tests.
+7. Add real cmd.exe and PowerShell OpenSSH tests to the native Windows x64 and
+   ARM64 CI lanes (the lanes already exist).
 
 ## Phase 1 build pins (the dispatch refactor)
 
@@ -247,9 +233,8 @@ tests above.
 - Every remote op emits the identical constant SSH argv — mirror the shipped
   `exec_frame_argv_is_constant` test (`ssh.rs:159`) so a future refactor that
   sneaks a user value into argv fails CI.
-- **✅ `--host` values beginning with `-` (ssh-option-shaped) are rejected before
-  ssh spawns** — the local option-injection guard (step 0), shipped v0.2.1
-  (`cli_remote.rs:1070`, `ssh.rs:229`).
+- `--host` values beginning with `-` are rejected before ssh starts (step 0,
+  shipped; `cli_remote.rs`, `ssh.rs` unit tests).
 - Hostile values round-trip exactly: `` & | $ ; ( ) " ' ` ``, CR/LF, Unicode,
   Windows paths, spaces — **including `log --since`, which round-trips as data,
   never executes.**

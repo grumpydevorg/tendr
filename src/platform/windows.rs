@@ -142,14 +142,17 @@ impl Platform for WindowsPlatform {
 
         // CREATE_NEW_PROCESS_GROUP: required for GenerateConsoleCtrlEvent targeting.
         // No CREATE_SUSPENDED — std::process::Child doesn't expose the thread
-        // handle needed for ResumeThread. See Decision #2 for the race trade-off.
+        // handle needed for ResumeThread, so the child can run briefly before
+        // the Job Object assignment below. Accepted for now; the fix (raw
+        // CreateProcessW, CREATE_SUSPENDED) is in
+        // docs/plans/backlog/windows-parity.md, "Windows child containment".
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
         let mut child = cmd.spawn()?;
 
         let job = create_job_object()?;
 
         // Assign child to Job Object immediately after spawn.
-        // Race window: child may briefly run before assignment. See Decision #2.
+        // Race window: the child may briefly run before assignment (see above).
         if let Err(e) = assign_process_to_job(
             job.as_raw_handle() as *mut _,
             child.as_raw_handle() as *mut _,

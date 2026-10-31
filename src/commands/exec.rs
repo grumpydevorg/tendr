@@ -100,7 +100,7 @@ struct SideChannelResult {
 }
 
 /// Execute one exec request read as a JSON frame from stdin
-/// (`--frame-from-stdin`, 2026-07-08-remote-exec-host-parity.md slice 2). The
+/// (`--frame-from-stdin`; docs/architecture/06-transport-boundaries.md). The
 /// frame is the whole request; a malformed or wrong-version frame is a
 /// usage error (exit 2) before any side effect. After decoding this is
 /// exactly `cmd_exec` — same exec lock, same session semantics.
@@ -257,7 +257,7 @@ pub fn cmd_exec(
     // The output.log A-line projection (bounded by MAX_LINE), linked to the
     // authoritative event by event_id (spec §0). Shape additive-only. Overflow
     // degrades quietly — full → field-truncated → compact breadcrumb — with no
-    // stderr warning; see write_exec_annotation (exec-annotation-ergonomics).
+    // stderr warning; see write_exec_annotation.
     {
         let log_path = session.path().join("output.log");
         let event_id = result_event.as_ref().map(|event| event.id.to_string());
@@ -354,9 +354,9 @@ fn run_exec(
     }
 
     let (framed, wait_mode) = match meta.launch_spec().exec_target {
-        // PosixShell is the only target with env propagation this slice
-        // (plan scope 2) — REPL/PowerShell frames are deferred until a
-        // consumer demands it.
+        // PosixShell is the only target that exports TENDR_BLOCK_ID; the
+        // REPL and PowerShell frames do not yet, and will when a consumer
+        // needs it.
         ExecTarget::PosixShell => (
             exec_frame::unix_frame(cmd, token, &block_id.to_string()),
             WaitMode::Sentinel,
@@ -827,7 +827,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// compact `exec_truncated` breadcrumb (lengths + digests, no raw bytes).
 ///
 /// Annotation overflow is normal for large-output execs, so it is silent — no
-/// stderr warning to grep away (exec-annotation-ergonomics plan). The final
+/// stderr warning to grep away. The final
 /// breadcrumb is bounded by construction, so an oversized exec always leaves a
 /// durable record instead of a silent hole. The exec's own JSON result and
 /// exit code are untouched (spec §6).

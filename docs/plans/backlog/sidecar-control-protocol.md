@@ -1,38 +1,40 @@
-# Sidecar Control Protocol — Design Spec
+---
+id: sidecar-control-protocol
+depends_on: []
+---
 
-Target architecture for portable, typed control IPC between the Tendr CLI and the per-session sidecar. This spec describes a future control plane shape. It does not commit to a timeline and is explicitly not a prerequisite for any current backlog item including PTY automation.
+# Sidecar control protocol
 
-## Status
+**Status:** unscheduled design. Start only when one of these is true:
 
-Design spec only. Not scheduled. Not blocking.
+- a feature needs portable correlated request/response over a boundary that
+  files cannot serve cleanly;
+- a required remote control flow cannot be expressed as a one-shot typed Tendr
+  CLI frame over SSH stdio
+  ([remote frame transport](../active/01_remote-frame-transport.md)).
 
-## Migration trigger
+Do not build it because the number of file-based IPC patterns grows. The trigger
+is demand to cross a boundary.
 
-Build the control protocol when either:
-
-- a feature needs portable correlated request/response over a boundary that files cannot serve cleanly, or
-- a required remote control flow cannot be represented cleanly as a one-shot typed Tendr CLI frame over SSH stdio.
-
-Do not build it because the file-based IPC pattern count reaches some threshold. The decision is about boundary-crossing demand, not pattern proliferation.
+Goal: portable, typed control IPC between the Tendr CLI and the per-session
+sidecar. No current plan depends on it.
 
 ## The problem
 
-Tendr's current IPC is file-based and local:
+Tendr's control IPC is local:
 
-- `kill_request` — atomic file write, sidecar polls, consumes
-- PTY lease IPC — per-request files under `lease/requests/` and `lease/responses/`
-- push authorization — framed `PushHeader` on the stdin FIFO
-- push rejection — out-of-band `push_rejects/<request_id>.json`
-- attach — Unix domain socket with framed messages
+- `kill_request`: atomic file write; the sidecar polls for it and consumes it.
+- pipe `push`: bytes on the session's stdin FIFO.
+- `attach` and PTY `push`: framed messages on the session's Unix attach socket.
 
-This works well on a single host with a shared filesystem. It is inspectable, durable, restart-tolerant, and requires no connection state. Those are real advantages for a process sitter.
+This works well on one host with a shared filesystem. Files are inspectable,
+durable and survive a restart, and they need no connection state.
 
-It does not generalize cleanly across:
+It does not carry over cleanly to:
 
-- container boundaries without shared mounts
-- Windows named pipes vs Unix FIFOs
-- SSH transport (current `--host` cannot carry `exec` or other coordinated commands)
-- features that need reliable correlated request/response with typed errors
+- container boundaries without shared mounts;
+- Windows named pipes instead of Unix FIFOs and sockets;
+- features that need correlated request/response with typed errors.
 
 ## Target architecture: three layers
 
@@ -114,13 +116,10 @@ These are the operations that would migrate from file-based IPC to control RPC i
 | Method | Current IPC | Why it's a candidate |
 |--------|-------------|---------------------|
 | `request_kill` | `kill_request` file | Correlated request/response; currently fire-and-poll |
-| `acquire_lease` | `lease/requests/<id>.json` | Correlated; needs typed error on denial |
-| `refresh_lease` | Same | Same |
-| `release_lease` | Same | Same |
-| `authorize_push` | Framed `PushHeader` on FIFO | Currently one-way; reject is out-of-band file |
+| `authorize_push` | stdin FIFO (pipe sessions) | Currently one-way |
 | `watch_subscribe` | CLI polls `output.log` | Event stream is the natural fit for control RPC |
 | `get_status` | CLI reads `meta.json` | Could be live rather than file-poll |
-| `exec_begin` | CLI-side FIFO + lock + log scan | **The big one**: would make exec remotable |
+| `exec_begin` | CLI-side FIFO + lock + log scan | **The big one**: correlated exec over any carrier |
 
 ### What stays out
 
@@ -135,28 +134,17 @@ These are the operations that would migrate from file-based IPC to control RPC i
 ## What this is not
 
 - **Not a second lifecycle model.** The sidecar still owns lifecycle truth; the protocol is how clients talk to it, not a competing authority.
-- **Not a container manager.** Boundary metadata (see `completed/2026-07-10-boundary-metadata.md`) describes where sessions run; the control protocol does not manage those environments.
+- **Not a container manager.** Boundary metadata (`--boundary`) describes where sessions run; the control protocol does not manage those environments.
 - **Not a durability replacement.** `meta.json` and `output.log` survive sidecar death. RPC connections do not. The protocol augments file-based truth with live control; it does not replace it.
 - **Not HTTP or gRPC.** Too much ceremony for sidecar-local control. Length-prefixed JSON over a duplex stream is sufficient.
-- **Not a multiplexed mega-stream.** Control, work, and terminal traffic stay on separate channels. Mixing semantics violates the control/work plane split (Theme 5).
+- **Not a multiplexed stream.** Control, work and terminal traffic stay on separate channels.
 
-## Relationship to current plans
+## Relationship to other work
 
-### PTY automation (`backlog/pty-automation.md`)
-
-PTY automation is designed against file-based lease IPC and does not depend on this protocol. Note (2026-07-09): PTY automation is now **deferred hardening** — built only if real PTY-input contention actually shows up (see `backlog/pty-automation.md`). If it is ever revived, the preserved file-based lease design stands on its own; and if this control protocol already exists by then, lease operations are natural migration candidates onto it. Either way PTY automation neither gates nor is gated by this protocol.
-
-### Provenance (`completed/2026-04-16-provenance-on-lifecycle-transitions.md`)
-
-Already shipped. The provenance model (Direct vs Inferred) applies equally to file-based and RPC-based writes. No interaction.
-
-### Boundary metadata (`completed/2026-07-10-boundary-metadata.md`)
-
-Describes where sessions run. The control protocol describes how clients talk to the sidecar. Orthogonal.
-
-### Exec annotation ergonomics (`completed/2026-07-09-exec-annotation-ergonomics.md`)
-
-Annotation noise and breadcrumbs are log-side concerns. If `exec_begin` migrates to control RPC, the annotation model would still write to `output.log` via the sidecar, not via the protocol.
+- Provenance (Direct vs Inferred) applies equally to file-based and RPC-based writes.
+- Boundary metadata describes where sessions run; this protocol describes how clients talk to the sidecar.
+- Exec annotations are written to `output.log` by the sidecar, whether or not `exec_begin` moves to this protocol.
+- PTY input ownership already goes over the attach socket ([cloud PTY control](../active/00_cloud-pty-control.md)); it does not need this protocol.
 
 ## Design constraints
 
@@ -166,10 +154,6 @@ Annotation noise and breadcrumbs are log-side concerns. If `exec_begin` migrates
 
 ## When to revisit
 
-Re-evaluate this spec when:
-
-- a required remote flow needs long-lived or correlated sidecar interaction that the typed remote CLI frame cannot serve
-- a new feature proposal requires correlated request/response that file IPC cannot cleanly serve
-- the file-based IPC surface has grown beyond "files + framed FIFO" into a pattern that resists local reasoning
-
-Until then, this spec is a north star, not a plan.
+Re-evaluate this design when a start trigger at the top is met, or when the
+file-based IPC grows beyond "files + FIFO + attach socket" into something hard
+to reason about locally.

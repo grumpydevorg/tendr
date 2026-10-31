@@ -1,5 +1,5 @@
 //! Per-session event log — append path (spec §3.2–3.5) and read path (§5)
-//! of docs/plans/specs/event-protocol.md.
+//! of docs/architecture/07-event-protocol.md.
 //!
 //! Layout, per session dir:
 //! ```text
@@ -394,7 +394,7 @@ pub fn lifecycle_kind(status: &RunStatus) -> Kind {
 /// the `run.starting` / `run.started` events only (the launch events). This is
 /// a copy *derived from* `LaunchSpec.boundary`; historical analytics read it,
 /// or join other events to the launch event on `run_id`. Terminal events do not
-/// re-carry it (docs/plans/completed/2026-07-10-boundary-metadata.md).
+/// re-carry it (docs/architecture/07-event-protocol.md §1).
 #[must_use]
 pub fn lifecycle_data(
     status: &RunStatus,
@@ -657,7 +657,8 @@ pub fn project_log_line(
 
 /// Append a fully-addressed event to `<tendr-root>/lost+found/events.jsonl`
 /// (spec §7): emits from a process whose session dir was pruned or replaced
-/// keep their data without resurrecting the session dir. Swept by `prune`.
+/// keep their data without resurrecting the session dir. Nothing removes it
+/// yet (docs/plans/backlog/log-retention.md).
 ///
 /// # Errors
 /// Returns IO errors from creating or appending to the lost+found log.

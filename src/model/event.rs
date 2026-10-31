@@ -1,4 +1,4 @@
-//! Event envelope — spec §1 of docs/plans/specs/event-protocol.md.
+//! Event envelope — spec §1 of docs/architecture/07-event-protocol.md.
 //!
 //! One JSON object per line in a session's `events/*.jsonl` segments.
 //! Fields outside `data` are stamped by the tendr binary (trusted tier).

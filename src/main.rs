@@ -51,7 +51,7 @@ impl From<CliExecTarget> for tendr::model::spec::ExecTarget {
 #[derive(Parser)]
 #[command(
     name = "tendr",
-    about = "Agent process sitter",
+    about, // Cargo.toml's description
     version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
@@ -446,7 +446,7 @@ enum Commands {
     /// Print the usage guide (embedded), optionally a single topic
     ///
     /// `tendr guide` prints the whole guide; `tendr guide <topic>` prints one
-    /// section. Topics: exec, remote, python, duckdb, powershell, boundary.
+    /// section. An unknown topic prints the list of topics.
     /// Local-only.
     Guide {
         /// Topic to print (omit for the whole guide)
@@ -935,8 +935,7 @@ fn main() {
             eprintln!("error: {e}");
             std::process::exit(2);
         }
-        // exec goes remote via the frame transport
-        // (2026-07-08-remote-exec-host-parity.md slice 2): the whole request is
+        // exec goes remote via the frame transport: the whole request is
         // one JSON frame on the SSH stdin channel; the remote argv is
         // constant, so the payload never traverses a shell.
         if let Commands::Exec {
@@ -972,8 +971,7 @@ fn main() {
         if !tendr::ssh::is_remote_supported(cmd_name) {
             // The local-only verbs are a usage error (exit 2) with a
             // pre-filled, copy-pasteable fallback — rejected before any
-            // connection or side effect (2026-07-08-remote-exec-host-parity.md
-            // slice 1).
+            // connection or side effect.
             if let Some(args) = cli.command.local_fallback_args() {
                 let mut full = vec!["tendr".to_string()];
                 full.extend(args);

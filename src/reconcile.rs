@@ -1,5 +1,5 @@
 //! CLI-side reconciliation of sessions whose sidecar is gone — the shared
-//! path behind `wait`/`status`/`run` (spec §3.6 of event-protocol.md).
+//! path behind `wait`/`status`/`run` (docs/architecture/07-event-protocol.md §3.6).
 //!
 //! Before inferring `run.sidecar_lost`, read the event-log tail: if the
 //! sidecar's own terminal event exists (it died in the WAL crash window

@@ -1,6 +1,7 @@
 # Transport Boundaries
 
-Tendr’s architecture is easier to understand if you separate pure in-process logic from the places where bytes cross a boundary.
+This file lists every place where bytes cross a process boundary. Everything
+else is in-process logic.
 
 ```mermaid
 flowchart TD
@@ -22,87 +23,104 @@ flowchart TD
     RemoteCLI -->|same local boundaries on remote host| Sidecar
 ```
 
-Boundary inventory:
+## Boundary inventory
 
-- Ready pipe:
-  - created by `start`
-  - used once for sidecar startup handshake
-  - carries `OK:<meta>` or `ERROR:<message>`
+| Boundary | Who uses it | What it carries |
+|---|---|---|
+| Ready pipe | Created by `start`; used once at sidecar startup. | `OK:<meta>` or `ERROR:<message>`. |
+| `stdin.pipe` | Created with `--stdin`. Used by `push` to a pipe session, and by `exec` to send framed commands. A PTY `push` uses the attach socket. | Raw input bytes. |
+| `kill_request` | Written by `kill`; read by the sidecar's kill watcher. | `force` and `run_id`; a request for another run is ignored. |
+| `output.log` | Appended by the sidecar, `wrap` and `exec`. Read by `log`, `watch`, `exec` and `events --include-logs`. | JSONL lines tagged `O`, `E` or `A`. |
+| `events/*.jsonl` | Appended by the sidecar, `emit`, `exec`, `wrap` and reconciliation. Read by `events`, `watch` and `query`. | Event envelopes ([07-event-protocol.md](07-event-protocol.md)). |
+| PTY attach socket | Unix socket under `~/.tendr/sockets`, found through `a.sock.path`. | The attach protocol: `MSG_HELLO`, `MSG_DATA`, `MSG_RESIZE`, `MSG_DETACH` and others ([04-pty-lane.md](04-pty-lane.md)). |
+| SSH | `--host` on an allowlisted command. | The same CLI call, run on the remote host. |
 
-- `stdin.pipe`:
-  - created when `--stdin` is enabled
-  - input transport for `push` to a pipe session (a PTY `push` uses the attach socket)
-  - also used by `exec` to inject framed commands into running shell-like sessions
+## SSH transport
 
-- `kill_request` file:
-  - written by `kill`
-  - consumed by the sidecar kill watcher
-  - validated against current `run_id`
+`--host` runs the same tendr command on the remote host. It adds no event
+model or session store of its own.
 
-- `output.log`:
-  - append-only JSONL from sidecar and wrapper writers
-  - queried directly by `log`
-  - projected into NDJSON events by `watch`
+| Over `--host` | Commands |
+|---|---|
+| supported | `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `attach`, `exec` |
+| local-only, exit 2 with a ready-to-paste `ssh <host> 'tendr …'` command | `run`, `wrap`, `prune`, `query`, `guide`, `skill` |
+| local-only, exit 1 with the list of supported commands | `emit`, `events` |
 
-- PTY attach socket:
-  - local Unix socket on the sidecar host
-  - breadcrumbed through `a.sock.path`
-  - framed with `MSG_DATA`, `MSG_RESIZE`, `MSG_DETACH`
+`wrap` also needs the supervised-process environment, so it only works
+inside a tendr-supervised process on the target host.
 
-- SSH transport:
-  - forwards only an allowlisted subset of commands today
-  - does not invent a separate event model or remote session store
-  - connect deadline (`src/ssh.rs`): every call except `attach` runs the remote
-    as `tendr --hello …`, whose first stderr line is `ssh::HELLO_LINE`. The
-    local end reads stderr, drops the hello, and passes the rest through. ssh's
-    `ConnectTimeout` ends at key exchange; authentication can then stall (a
-    lapsed Tailscale SSH check-mode approval waits about 30 minutes, silently),
-    so if the hello has not arrived within `TENDR_SSH_CONNECT_TIMEOUT` seconds
-    (default 30) ssh gets SIGTERM, then SIGKILL a second later, and the call
-    exits 82. After the hello there is no deadline, so `wait` and `log -f` run
-    as long as they need. The marker comes from the remote tendr, not from
-    ssh's log, which ControlMaster reuse and OpenSSH versions make unreliable.
-    `attach` gets none: its stderr shares the terminal. `0` sends no `--hello`
-    and leaves stderr inherited, which is how an older remote is reached.
-    Stdout stays inherited while a thread relays stderr, so the order between
-    the two streams is not exact; each stream's own order is kept
+`attach` uses `ssh -t`; every other command uses `ssh -T`.
 
-What stays in-process:
+### Remote `exec`
+
+`exec` sends the whole request as one JSON frame over ssh stdin to a remote
+`tendr exec --frame-from-stdin`. Everything else runs on the remote host
+exactly as for a local exec: the FIFO, `exec.lock`, the `output.log` scan, and
+`exec-results/<token>.json`. Only the request frame and the JSON result cross
+the SSH boundary.
+
+### Connect deadline
+
+The connect deadline (`src/ssh.rs`) catches an SSH connection that stalls
+before the remote tendr starts.
+
+- Every call except `attach` runs the remote as `tendr --hello …`. Its first
+  stderr line is `ssh::HELLO_LINE` (`tendr-hello 1`).
+- The local end reads stderr, drops the hello line, and passes the rest
+  through.
+- If the hello has not arrived within `TENDR_SSH_CONNECT_TIMEOUT` seconds
+  (default 30), tendr sends ssh SIGTERM, then SIGKILL one second later. The
+  call exits 82.
+- After the hello there is no deadline, so `wait` and `log -f` run as long
+  as they need.
+- ssh's own `ConnectTimeout` ends at key exchange. Authentication can still
+  stall afterwards; for example, a lapsed Tailscale SSH check-mode approval
+  waits about 30 minutes with no output.
+- The marker comes from the remote tendr, not from ssh's log. ssh's log is
+  unreliable across ControlMaster reuse and OpenSSH versions.
+- `attach` gets no deadline, because its stderr shares the terminal.
+- `TENDR_SSH_CONNECT_TIMEOUT=0` sends no `--hello` and leaves stderr
+  inherited. Use it to reach a remote tendr that does not know `--hello`.
+- stdout stays inherited while a thread relays stderr. So the order between
+  the two streams is not exact; each stream keeps its own order.
+
+## In-process logic
+
+These never cross a boundary:
 
 - `Meta` transition methods
 - launch-spec hashing and idempotency checks
-- watch event formatting once state/log lines have been read
+- `watch` event formatting, once state and log lines are read
 - annotation payload construction before append
 
-Current remote-command scope:
+## Execution environments
 
-This split follows Theme 5: Separate Control Plane From Work Plane; see [../design-principles.md](../design-principles.md).
-
-- supported over `--host`: `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `attach`, `exec`
-- local-only: `run`, `wrap`, `prune`, `query`, `guide`, `skill`, `emit`, `events` (everything not in the remote list above)
-
-How `exec` goes remote: the whole exec request is serialized as one JSON frame and streamed to a remote `tendr exec --frame-from-stdin` over the ssh stdin channel. The shared-filesystem IPC that exec needs — the session's FIFO, `exec.lock`, `output.log` scan, and side-channel result files (`exec-results/<token>.json` for Python REPL) — all runs locally on the *remote* host exactly as it would for a local exec; only the request frame and the JSON result envelope cross the ssh boundary. That is a one-shot request/response, so no second lifecycle protocol is needed. (The earlier design treated `exec` as local-only for the IPC reasons above; the frame transport resolved it — see the remote-exec-host-parity plan.)
-
-`run`, `wrap`, and `prune` stay local-only by design: `--host` on those exits 2 with a pre-filled `ssh host 'tendr <cmd>'` fallback. `wrap` additionally needs the supervised-process environment, so it only makes sense inside a tendr-supervised process on the target host.
-
-## Execution-environment boundaries
-
-Tendr's IPC is process-native and filesystem-local. That means every IPC primitive assumes a shared filesystem + same UID within a single trust domain. When sessions run inside containers, VMs, or across hosts, the question is not "does Tendr work?" — it's "where does the session dir live?"
-
-Five axes define the boundary relationship between Tendr and any execution environment:
+Tendr's IPC assumes one shared filesystem and one user ID, in one trust
+domain. When sessions run in containers, VMs or other hosts, the question is
+where the session dir lives.
 
 | Axis | Tendr's position |
 |------|-------------------|
-| **Identity** | `ProcessIdentity { pid, start_time_ns }` — process-native, no container/VM ID concept |
-| **Lifecycle** | `RunStatus` state machine — process-native; container states like `paused`/`restarting` are out of scope |
-| **Authority** | The kernel (process tables, signals) — not a container daemon |
-| **Boundaries** | Implicit — whatever process tree is visible to the sidecar |
-| **IPC** | Shared filesystem + local sockets — works inside any boundary that satisfies those assumptions |
+| **Identity** | `ProcessIdentity { pid, start_time_ns }`. No container or VM ID. |
+| **Lifecycle** | The `RunStatus` state machine. Container states such as `paused` or `restarting` are out of scope. |
+| **Authority** | The kernel (process tables, signals), not a container daemon. |
+| **Boundaries** | Implicit: whatever process tree the sidecar can see. |
+| **IPC** | Shared filesystem and local sockets. Works inside any boundary that provides both. |
 
-The practical consequence:
+In practice:
 
-- **Tendr inside a container** is the cleanest pattern for persistent shells/REPLs. Tendr owns the child directly; all IPC works normally.
-- **Tendr outside, supervising `docker run ...`** works for foreground container jobs. Tendr supervises the `docker` client process, not the container object. Do not use with detached containers (`docker run -d`) — Tendr would supervise the short-lived client and lose the real workload.
-- **Cross-container session sharing** violates *Theme 2: One authority per fact*. Shared volumes for artifacts are fine; shared volumes for multiple Tendr instances mutating the same session state are not.
+- **Tendr inside a container** works best for persistent shells and REPLs.
+  Tendr owns the child directly, and all IPC works normally.
+- **Tendr outside, supervising `docker run ...`** works for foreground
+  container jobs. Tendr supervises the `docker` client process, not the
+  container. Do not use it with `docker run -d`: tendr would supervise the
+  short-lived client and lose the real workload.
+- **Sharing one session between containers** breaks Theme 2, One Authority
+  Per Fact ([../design-principles.md](../design-principles.md)). A shared
+  volume for artifacts is fine. Several tendr instances writing the same
+  session state is not.
 
-Tendr does not model containers, VMs, or orchestrators as first-class objects. The `Boundary` metadata field (shipped 2026-07-10) *describes* where a session runs without *managing* that environment. See [../plans/completed/2026-07-10-boundary-metadata.md](../plans/completed/2026-07-10-boundary-metadata.md).
+Tendr does not manage containers, VMs or orchestrators. The `--boundary`
+field on `start` records where a session runs; it does not manage that
+environment. Lifecycle events copy it into `run.starting` and `run.started`
+only. See the [guide](../guide.md#record-where-a-session-runs---boundary).

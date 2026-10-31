@@ -4,9 +4,8 @@
 //! The socket lives in `sockets/` under Tendr's persistent state root
 //! (`~/.tendr/sockets`), an owner-only directory that survives logout, with a
 //! short name derived from the session and run. Both ends verify the peer's
-//! user id before any terminal bytes flow. Specified in
-//! `docs/plans/active/00_cloud-pty-control.md` ("Local socket identity and
-//! readiness").
+//! user id before any terminal bytes flow. Described in
+//! `docs/architecture/04-pty-lane.md` ("The attach socket").
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};

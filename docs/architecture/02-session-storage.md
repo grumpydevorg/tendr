@@ -1,73 +1,104 @@
 # Session Storage
 
-Tendr persists one directory per session under `~/.tendr/sessions/<namespace>/<session>/`. Some files are durable record, some are transient control breadcrumbs, and some exist only for specific execution lanes.
+Tendr keeps its state under `~/.tendr/`. Each session has one directory,
+`~/.tendr/sessions/<namespace>/<session>/`. Some files are the durable
+record. Others are short-lived control files, or exist only for one kind of
+session.
 
 ```mermaid
 flowchart TD
     Root["~/.tendr/"] --> Sessions["sessions/"]
-    Root --> Callbacks["callbacks/<run_id>.json"]
+    Root --> Callbacks["callbacks/<run_id>.json\n--on-exit results"]
+    Root --> Sockets["sockets/<hash>.sock\nPTY attach sockets"]
+    Root --> LostFound["lost+found/events.jsonl\nEvents with no session dir"]
 
     Sessions --> Namespace["<namespace>/"]
     Namespace --> Session["<session>/"]
 
-    Session --> Meta["meta.json\nDurable run snapshot"]
+    Session --> Meta["meta.json\nCurrent run snapshot"]
     Session --> Lock["lock\nSession ownership"]
     Session --> Log["output.log\nJSONL stdout/stderr/annotations"]
-    Session --> Events["events/<segment>.jsonl\nDurable lifecycle/provenance history"]
-    Session --> EventBlobs["events/blobs/<sha256>\nDurable spilled event payloads"]
-    Session --> EventLock["events/append.lock\nTransient append lock"]
+    Session --> Events["events/<uuidv7>.jsonl\nLifecycle and provenance history"]
+    Session --> EventBlobs["events/blobs/<sha256>\nSpilled event payloads"]
+    Session --> EventLock["events/append.lock\nAppend lock (Unix)"]
+    Session --> Recording["recording/<run_id>/seg-<index>.tndrrec\nPTY recording"]
 
-    Session --> Launch["launch_spec.json\nTransient pre-sidecar handoff"]
-    Session --> Generation["generation\nTransient replace hint"]
-    Session --> ChildPid["child_pid\nTransient orphan breadcrumb"]
+    Session --> Launch["launch_spec.json\nCLI to sidecar handoff"]
+    Session --> Generation["generation\nReplace hint"]
+    Session --> ChildPid["child_pid\nOrphan breadcrumb"]
 
-    Session --> Stdin["stdin.pipe\nConditional: --stdin"]
-    Session --> ExecLock["exec.lock\nConditional: exec serialization"]
-    Session --> ExecResults["exec-results/<token>.json\nConditional: PythonRepl + PowerShell exec"]
+    Session --> Stdin["stdin.pipe\nOnly with --stdin (Unix FIFO)"]
+    Session --> ExecLock["exec.lock\nExec serialization"]
+    Session --> ExecResults["exec-results/<token>.json\nPython REPL and PowerShell exec"]
 
-    Session --> KillReq["kill_request / kill_request.tmp\nTransient control file"]
-    Session --> KillForced["kill_forced / kill_acted\nTransient kill classification"]
+    Session --> KillReq["kill_request\nKill control file"]
+    Session --> KillMarks["kill_forced / kill_acted\nKill classification"]
 
-    Session --> AttachSock["a.sock.path\nConditional: PTY breadcrumb"]
-    Session --> CaptureErr["capture_errors.log\nBest-effort diagnostics"]
+    Session --> AttachPath["a.sock.path\nPTY only: path of the attach socket"]
+    Session --> CaptureErr["capture_errors.log\nCapture diagnostics"]
 ```
 
-This split follows Theme 4: Durable Truth, Derived Views; see [../design-principles.md](../design-principles.md). `meta.json` is the current run snapshot, `output.log` is the child-output record, and `events/*.jsonl` is lifecycle/provenance history. `status`, `list`, `log`, `watch`, `events`, `query`, and any future `graph`/`check` commands project those authorities rather than creating new state.
+Each fact has one home (Theme 4 in
+[../design-principles.md](../design-principles.md)):
 
-Durable by design:
+- `meta.json` is the current run snapshot.
+- `output.log` is the child-output record.
+- `events/*.jsonl` is lifecycle and provenance history.
 
-- `meta.json`
-- `output.log`
-- `events/*.jsonl`
-- `events/blobs/*`
-- `callbacks/<run_id>.json`
+`status`, `list`, `log`, `watch`, `events` and `query` read these files. They
+create no state of their own.
 
-Transient / control-plane artifacts:
+## Durable files
 
-- `launch_spec.json`
-- `generation`
-- `child_pid`
-- `kill_request*`
-- `kill_forced`
-- `kill_acted`
-- `exec.lock`
-- `exec-results/*`
-- `stdin.pipe`
-- `a.sock.path`
-- `events/append.lock`
+| Path | Written by | Notes |
+|---|---|---|
+| `meta.json` | sidecar; CLI reconciliation | Written to `meta.json.tmp`, then renamed. |
+| `output.log` | sidecar; `wrap`; `exec` | Append-only JSONL. See tags below. |
+| `events/<uuidv7>.jsonl` | sidecar; `emit`; `exec`; `wrap`; reconciliation | Append-only. Format: [07-event-protocol.md](07-event-protocol.md). |
+| `events/blobs/<sha256>` | any event writer | Payloads over 16 KiB, keyed by SHA-256. |
+| `recording/<run_id>/seg-<index:08>.tndrrec` | sidecar (PTY sessions) | Directories `0700`, segments `0600` on Unix. Format: [08-pty-recording-format.md](08-pty-recording-format.md). |
+| `capture_errors.log` | sidecar | Capture errors. The sidecar copies them into `meta.json` warnings when the run ends. |
+| `~/.tendr/callbacks/<run_id>.json` | sidecar | `--on-exit` results. Outside the session dir, so it survives `--replace`. |
+| `~/.tendr/lost+found/events.jsonl` | `emit`; sidecar | Events whose session dir was gone or whose event log was unwritable. |
 
-Session directory rules:
+`output.log` line tags:
 
-- `meta.json` is written atomically via temp-file + rename.
-- `output.log` is append-only JSONL:
-  - `O` for stdout / PTY merged output
-  - `E` for stderr on pipe sessions
-  - `A` for annotations written by `wrap` and `exec`
-- `events/*.jsonl` is segmented, append-only lifecycle/provenance history;
-  oversized event payloads spill into content-addressed `events/blobs/`.
-- PTY attach uses a Unix socket stored in the system temp directory, with `a.sock.path` as the breadcrumb back to the real socket path.
+| Tag | Content |
+|---|---|
+| `O` | stdout, or the merged PTY output |
+| `E` | stderr (pipe sessions only) |
+| `A` | annotations written by `wrap` and `exec` |
 
-What this diagram omits:
+## Control files
 
-- the run state machine encoded inside `meta.json`
-- the specific control semantics of `stdin.pipe`, `kill_request`, and PTY attach
+These files carry one request or hint between processes. Most are removed
+once used.
+
+| Path | Purpose | Lifetime |
+|---|---|---|
+| `lock` | Held by the sidecar for the whole run; reconciliation takes it once the sidecar is gone. | Stays; only the lock matters. |
+| `launch_spec.json` | The launch request from `start` to the sidecar. | The sidecar deletes it after reading. |
+| `generation` | The next generation number after `--replace`. | The sidecar deletes it after reading. |
+| `child_pid` | Child identity, written right after spawn, for crash recovery. | Removed once the exit is recorded. |
+| `kill_request` (via `kill_request.tmp`) | A kill request with `force` and `run_id`. | Removed when the run ends. |
+| `kill_forced` | Written by `kill --force` before it signals. | Removed when the run ends. |
+| `kill_acted` | Written by the sidecar when it acts on a graceful kill. | Removed when the run ends. |
+| `stdin.pipe` | Unix FIFO for `push` and `exec`. Windows uses a named pipe outside the session dir. | Removed when the run ends. |
+| `exec.lock` | Serializes `exec` calls on one session. | Stays; only the lock matters. |
+| `exec-results/<token>.json` | Result file for a Python REPL or PowerShell exec. | `exec` deletes it after reading. |
+| `events/append.lock` | Unix advisory lock for event appends. | Stays; only the lock matters. |
+| `a.sock.path` (via `a.sock.path.tmp`) | Path of the PTY attach socket. | Removed with the socket when the run ends. |
+
+## PTY attach socket
+
+The attach socket is not in the session dir. It is
+`~/.tendr/sockets/<name>.sock`, where `<name>` is 12 hex characters of a
+SHA-256 over the session path and run ID (`src/attach_socket.rs`). The
+`sockets/` directory is owner-only (`0700`) and the socket is `0600`.
+`a.sock.path` in the session dir holds the socket's full path.
+
+Covered elsewhere:
+
+- the run state machine inside `meta.json`: [03-run-lifecycle.md](03-run-lifecycle.md)
+- how `stdin.pipe`, `kill_request` and the attach socket are used:
+  [05-key-flows.md](05-key-flows.md) and [04-pty-lane.md](04-pty-lane.md)

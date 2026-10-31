@@ -1,4 +1,4 @@
-//! Event envelope contract tests — spec §1 (docs/plans/specs/event-protocol.md).
+//! Event envelope contract tests — spec §1 (docs/architecture/07-event-protocol.md).
 
 use tendr::model::event::{Event, EventTimestamp, Kind, Uuid7};
 use tendr::model::ids::{Namespace, RunId, SessionName, Source};

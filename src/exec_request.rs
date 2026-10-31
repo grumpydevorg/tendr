@@ -4,10 +4,10 @@
 //! Local and remote exec share this schema: `--host` serializes the
 //! frame and ships it over the SSH stdin channel, so the payload never
 //! traverses a shell and the remote argv contains nothing
-//! user-controlled (2026-07-08-remote-exec-host-parity.md slice 2). The shape
+//! user-controlled (docs/architecture/06-transport-boundaries.md). The shape
 //! is a self-contained params object so it can become the `exec_begin`
 //! request params of the future sidecar control protocol unchanged
-//! (specs/sidecar-control-protocol.md).
+//! (docs/plans/backlog/sidecar-control-protocol.md).
 
 use serde::{Deserialize, Serialize};
 

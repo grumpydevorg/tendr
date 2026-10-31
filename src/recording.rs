@@ -6,7 +6,7 @@
 //! transcript.
 //!
 //! **The wire format is specified in
-//! [`docs/plans/specs/pty-recording-format.md`](https://github.com/grumpydevorg/tendr/blob/main/docs/plans/specs/pty-recording-format.md).**
+//! [`docs/architecture/08-pty-recording-format.md`](https://github.com/grumpydevorg/tendr/blob/main/docs/architecture/08-pty-recording-format.md).**
 //! That document is the authority for byte layout, checksums, and decoding
 //! order; this module does not restate it. The golden fixture
 //! `tests/fixtures/recording/v1-segment0.hex` guards compatibility.
