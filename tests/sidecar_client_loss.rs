@@ -12,11 +12,11 @@
 
 mod harness;
 
-use harness::{read_events, tendr, touch_cmd};
+use harness::{Observation, poll_until, read_events, tendr, touch_cmd};
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::session::{self, LockGuard, SessionRoot};
@@ -62,17 +62,16 @@ fn start_and_lose_client(root: &TempDir, session: &str, rest: &[&str]) {
     args.extend_from_slice(rest);
     let mut client = spawn_gated_start(root, &gate, &args);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !meta_path(root, session).exists() {
+    poll_until(Duration::from_secs(10), Duration::from_millis(10), || {
+        if meta_path(root, session).exists() {
+            return Observation::Ready(());
+        }
         if let Some(status) = client.try_wait().expect("poll start client") {
             panic!("start client exited ({status}) before the sidecar wrote meta");
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {session}'s sidecar to write meta"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        Observation::Pending("no meta yet".into())
+    })
+    .unwrap_or_else(|e| panic!("timed out waiting for {session}'s sidecar to write meta: {e}"));
 
     assert!(
         client.try_wait().expect("poll start client").is_none(),
@@ -96,22 +95,21 @@ fn wait_sidecar_gone(root: &TempDir, session: &str) -> (serde_json::Value, LockG
     let dir = session::open(&session_root, &namespace, &name)
         .expect("open session")
         .expect("session exists");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        match LockGuard::try_acquire(&dir) {
+    poll_until(
+        Duration::from_secs(15),
+        Duration::from_millis(10),
+        || match LockGuard::try_acquire(&dir) {
             Ok(lock) => {
                 let content = std::fs::read_to_string(meta_path(root, session)).unwrap();
-                return (serde_json::from_str(&content).unwrap(), lock);
+                Observation::Ready((serde_json::from_str(&content).unwrap(), lock))
             }
-            Err(session::SessionError::Locked(_)) => {}
+            Err(session::SessionError::Locked(_)) => Observation::Pending("locked".into()),
             Err(error) => panic!("failed to acquire session lock: {error}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {session}'s sidecar to release its lock"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        },
+    )
+    .unwrap_or_else(|e| {
+        panic!("timed out waiting for {session}'s sidecar to release its lock: {e}")
+    })
 }
 
 fn warnings(meta: &serde_json::Value) -> Vec<String> {
@@ -175,14 +173,8 @@ fn client_lost_after_spawn_still_runs_on_exit_hook() {
     drop(lock);
 
     // Hooks run after the sidecar releases the lock.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !marker.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the --on-exit hook never ran: {marker:?} missing"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    harness::poll_path_exists(&marker, Duration::from_secs(10), Duration::from_millis(10))
+        .unwrap_or_else(|e| panic!("the --on-exit hook never ran: {marker:?} missing ({e})"));
 }
 
 #[test]

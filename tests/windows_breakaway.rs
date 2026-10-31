@@ -18,9 +18,12 @@
 //!   4. TerminateJobObject — kills anything still in the job
 //!   5. Assert sidecar PID still alive
 
+mod harness;
+
+use harness::{Observation, poll_until};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::STILL_ACTIVE;
 use windows_sys::Win32::System::JobObjects::{
@@ -96,14 +99,14 @@ fn process_alive(pid: u32) -> bool {
 /// than a hard sleep and surfaces a regression as soon as the kill happens
 /// rather than waiting the full timeout.
 fn process_dies_within(pid: u32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !process_alive(pid) {
-            return true;
+    poll_until(timeout, Duration::from_millis(25), || {
+        if process_alive(pid) {
+            Observation::Pending(format!("pid {pid} alive"))
+        } else {
+            Observation::Ready(())
         }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    false
+    })
+    .is_ok()
 }
 
 /// Resolve a binary path: prefer runtime env var (so the test can be moved to

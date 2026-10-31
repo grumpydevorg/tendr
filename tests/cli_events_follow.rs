@@ -6,7 +6,7 @@ mod harness;
 use std::io::Write as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use harness::{tendr, wait_running, wait_terminal};
 use predicates::prelude::*;
@@ -285,17 +285,12 @@ fn follow_strict_exits_65_on_first_observed_parse_skip() {
     f.write_all(b"{\"v\":1,\"torn\n").unwrap();
     drop(f);
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "--strict follower must exit on the parse skip"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let status = harness::poll_child_exit(
+        &mut child,
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+    )
+    .unwrap_or_else(|e| panic!("--strict follower must exit on the parse skip: {e}"));
     assert_eq!(status.code(), Some(65));
 }
 

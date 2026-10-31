@@ -2,7 +2,7 @@
 
 mod harness;
 
-use harness::{tendr, wait_running};
+use harness::{tendr, wait_pid_dead, wait_running};
 use predicates::prelude::*;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -23,21 +23,6 @@ fn sidecar_pid(meta: &serde_json::Value) -> i32 {
     meta["sidecar"]["pid"]
         .as_u64()
         .expect("sidecar.pid not found") as i32
-}
-
-/// Wait for a process to actually die (not just be signaled).
-fn wait_pid_dead(pid: i32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let ret = unsafe { libc::kill(pid, 0) };
-        if ret != 0 {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for pid {pid} to die");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
 }
 
 #[test]
