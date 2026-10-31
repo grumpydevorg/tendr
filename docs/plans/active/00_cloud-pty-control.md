@@ -5,7 +5,7 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 6, 8, 9 and 10 remain. Step 5's measurement (below) fixed
+**Status:** steps 6, 8, 9 and 10 remain. Step 5's measurement (below) settled
 step 6's design. Step 8 needs any sshd (`TENDR_TEST_SSH_HOST`); step 9 the VM.
 
 ## Goal
@@ -27,28 +27,47 @@ back is [PTY replay](../backlog/pty-replay.md).
 
 - **Step 6. Terminal modes and a repaint on (re)attach** (local; design from
   the [measurement](#measurement-step-5-2026-11-01)). Two parts, one PR each:
-   - **6a. Restore the user's terminal modes.** The sidecar tracks the
+   - **6a. Restore the user's terminal modes.** A streaming parser tracks the
      terminal modes the child's output turns on: alternate screen, cursor
      visibility, application cursor keys and keypad, mouse tracking and
      encodings, focus events, bracketed paste, colour-scheme reports,
      synchronized output, kitty keyboard flags (one stack per screen) and
-     `modifyOtherKeys`. A reset (`ESC c`) clears them. When a client is
-     accepted, the sidecar queues the sequences that turn the current set on
-     ahead of any live output. The client tracks every byte it writes and,
-     however the attach ends (detach, takeover, signal, session exit), writes
-     the inverse once, bounded like the signal report so a terminal that is
-     not reading cannot hold it. Old clients and sidecars interoperate: the
-     replay is ordinary data. Tests:
-     `detach_turns_off_the_modes_the_child_turned_on`,
-     `attach_replays_the_modes_set_before_it`,
-     `kitty_flags_are_restored_per_screen`,
-     `a_reset_from_the_child_clears_tracked_modes`.
+     `modifyOtherKeys`. A full reset (`ESC c`) clears them; a soft reset
+     (`CSI ! p`) shows the cursor and resets cursor keys and keypad.
+     - Sidecar: the tracker lives with the viewer slot under the tee's lock
+       and is fed in the same critical section that offers each chunk. A new
+       viewer gets the replay on its queue before it is installed, so no
+       chunk is both replayed and delivered (a kitty push is not idempotent).
+     - Replay order: main-screen kitty pushes, the alternate screen, its
+       pushes, then the other modes. The inverse runs backwards: synchronized
+       output off, alternate-screen pops, leave it, main-screen pops, the
+       other modes off.
+     - Client: the reader tracks each chunk before writing it, under a lock
+       it also holds while writing. However the attach ends, a helper takes
+       that lock, marks the screen done so the reader writes nothing more,
+       and writes the inverse; the client waits for it at most 200 ms, so a
+       terminal that is not reading cannot hold the exit.
+     - Not tracked: the window title, character sets, cursor shape. A
+       terminal whose last client could not write the inverse (SIGKILL, a
+       dead connection, then `--takeover` from the same window) keeps that
+       state under the replay.
+     - Old clients and sidecars interoperate: the replay is ordinary data.
+       Tests: `detach_turns_off_the_modes_the_child_turned_on`,
+       `attach_replays_the_modes_set_before_it`,
+       `kitty_flags_are_restored_per_screen`,
+       `a_reset_from_the_child_clears_tracked_modes`.
    - **6b. Repaint nudge.** New `MSG_REPAINT`, sent once by the client after
      its first resize, authorized like input. When that attach did not change
-     the size, the sidecar shrinks the PTY by one row and restores it, both
-     recorded as `ResizeCause::Repaint { correlation }`, waiting for output
-     after the shrink (bounded) so the two SIGWINCHes do not coalesce. A
-     repaint does not restore history. Old sidecars ignore the frame. Tests:
+     the size, the attach handler shrinks the PTY by one row and later
+     restores it, as two separate writer controls so neither blocks input or
+     a takeover. Both are recorded as `ResizeCause::Repaint { correlation }`
+     after the attach's `user` resize. The restore applies only if the PTY is
+     still at the shrunk size; a user resize or takeover in between cancels
+     it. The first output after a shrink is Claude re-sending its mouse modes
+     (0.25 ms), and the redraw follows 19 ms later, so the restore waits until
+     output has been quiet for 50 ms, at most 500 ms; the VM check must show
+     Claude redraws on that pair. A repaint does not restore history. Old
+     sidecars ignore the frame. Tests:
      `reattach_at_the_same_size_records_a_tagged_repaint_pair`,
      `reattach_at_a_new_size_records_only_a_user_resize`,
      `a_repaint_is_authorized_like_input`.
@@ -89,12 +108,19 @@ back is [PTY replay](../backlog/pty-replay.md).
    orphans. macOS has neither: the sidecar would list processes before
    signalling them, which races with new forks, and `proc_pidinfo` already
    returns EPERM for a process in another session (`src/platform/unix.rs`).
-- **Step 10. Unset an inherited variable** (local). `tendr start --unset-env
-  NAME` (repeatable) removes `NAME` from the child's environment before
-  `--env` applies. An agent's shell exports `CI`, and Claude turns colour off
-  for any `CI` value, empty included, so `--env` cannot undo it. Tests: the
-  child does not see the variable; `--env` of the same name still sets it;
-  `--host` passes the option through.
+- **Step 10. Unset an inherited variable** (local). `--unset-env NAME`
+  (repeatable) on `start` and `run` removes `NAME` from the child's
+  environment. An agent's shell exports `CI`, and Claude turns colour off for
+  any `CI` value, empty included, so `--env` cannot undo it.
+   - A new `LaunchSpec` field, `#[serde(default, skip_serializing_if =
+     "BTreeSet::is_empty")]` like `boundary`, so existing specs and their
+     idempotency hashes do not change.
+   - Applied as `env_remove` before the `--env` and `TENDR_*` overrides, which
+     still win. A name containing `=` is a usage error.
+   - `--host` rebuilds `start` and `run` arguments field by field
+     (`src/main.rs`), so it must pass the option on.
+   - Tests: the child does not see the variable; `--env` of the same name
+     still sets it; `--unset-env CI=true` is refused; `--host` passes it on.
 
 Step 9 uses the VM harness in
 [`scripts/pty-vm/`](../../../scripts/pty-vm/README.md).
@@ -127,16 +153,16 @@ was Ghostty 1.4.0 on macOS, attached over `ssh -t <vm>.exe.xyz` and driven by
   XTVERSION, a kitty keyboard query, `OSC 7501` and DA1. Nobody answers while
   detached. Claude draws its screen anyway, and answers a prompt after a later
   attach. No responder is needed.
-- **`TERM` decides the keyboard modes, not the replies.** Under
-  `TERM=xterm-ghostty` Claude pushes kitty keyboard flags 5 and sets
-  `modifyOtherKeys` 2 before any reply could arrive; under `xterm-256color` it
-  does neither. Started with Ghostty attached, the replies lead to more
-  queries (DECRQM 2026 and 1016, kitty graphics, `CSI 16 t`, DA1) and to
-  synchronized output.
+- **`TERM` decides the keyboard modes and synchronized output, not the
+  replies.** Under `TERM=xterm-ghostty` Claude pushes kitty keyboard flags 5,
+  sets `modifyOtherKeys` 2 and draws inside synchronized output before any
+  reply could arrive; under `xterm-256color` it does none of these. Started
+  with Ghostty attached, the replies lead to more queries (DECRQM 2026 and
+  1016, kitty graphics, `CSI 16 t`, DA1).
 - **Same-size reattach draws nothing.** Neither does a same-size
   `TIOCSWINSZ` (the kernel sends no SIGWINCH) nor `kill -WINCH` at an
   unchanged size. Rows−1 and then restore each give a full redraw (about
-  2.1 KB, within 20 ms of the resize). Attaching at a new size also redraws
+  2 KB, 19 ms and 9 ms after the resize). Attaching at a new size also redraws
   fully. Step 6b uses the shrink-and-restore pair.
 - **Detach leaves the terminal in Claude's modes.** After `Ctrl-\ d` the
   alternate screen, mouse tracking (1000, 1002, 1003, 1006), focus events,
@@ -155,11 +181,12 @@ was Ghostty 1.4.0 on macOS, attached over `ssh -t <vm>.exe.xyz` and driven by
   exe.dev's front end does not end a silent connection within 10 minutes.
   `--takeover` is the recovery, so this is not a correctness dependency.
 
-Launch paths. A PTY child inherits the caller's environment except `TERM`:
+Launch paths. `TERM` is repaired when missing, empty or `dumb`; everything
+else is inherited from the caller:
 
 | Launched from | `TERM` the child sees | Inherited extras | Claude renders |
 |---|---|---|---|
-| Login shell, Ghostty → `ssh -t` | `xterm-ghostty` (terminfo is in Ubuntu's `ncurses-term`) | none; `COLORTERM` is not forwarded | truecolor, kitty keyboard |
+| Login shell, Ghostty → `ssh -t` | `xterm-ghostty` (terminfo in exe.dev's image at `/etc/terminfo`, not from an Ubuntu package) | none; `COLORTERM` is not forwarded | truecolor, kitty keyboard |
 | An agent's bash tool on the VM (omp's environment) | `dumb`, repaired to `xterm-256color` | `CI=true`, `NO_COLOR=1`, `EDITOR`, `PAGER` and others | no colour |
 | `tendr --host` from the laptop (`ssh -T`) | none, repaired to `xterm-256color` | none | 256 colours |
 

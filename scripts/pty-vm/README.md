@@ -5,8 +5,8 @@ Scripts for steps 5 and 9 of the
 Claude Code behaves in a tendr PTY session on a VM, and check attach, takeover
 and half-open SSH connections from a Mac.
 
-They were written on an exe.dev VM on 2026-09-26 and first used in full for
-step 5 on 2026-11-01, with tendr 0.4.1, Claude Code 2.1.316 and Ghostty 1.4.0.
+They were written on an exe.dev VM on 2026-09-26 and first used for step 5 on
+2026-11-01, with tendr 0.4.1, Claude Code 2.1.316 and Ghostty 1.4.0.
 The scripts step 5 did not use (`smoke.sh`, the half-open pair on the VM's own
 sshd, `nested-ssh.sh`) have not run since attach moved to exit codes 80–85.
 

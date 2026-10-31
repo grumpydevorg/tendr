@@ -1,7 +1,8 @@
 #!/bin/bash
 # Runs as the VM's sudo-capable user on the disposable VM, after provision-root.sh.
-# Installs Claude Code (checksum-verified) and gives the acc user a Claude config
-# that uses exe.dev's LLM gateway, so no credential is stored on the VM.
+# Installs Claude Code (checksum-verified) and gives acc and the calling user a
+# Claude config that uses exe.dev's LLM gateway, so no credential is stored on
+# the VM. It overwrites both users' ~/.claude/settings.json.
 # Install tendr separately, e.g. from a release binary into /usr/local/bin.
 set -euo pipefail
 base=https://downloads.claude.ai/claude-code-releases
@@ -41,7 +42,7 @@ claude --version >/dev/null  # creates ~/.claude.json
 python3 - "$(claude --version | cut -d" " -f1)" <<PY
 import json, os, sys
 path = os.path.expanduser("~/.claude.json")
-d = json.load(open(path))
+d = json.load(open(path)) if os.path.exists(path) else {}
 d.update(hasCompletedOnboarding=True, theme="dark", lastOnboardingVersion=sys.argv[1])
 for w in ("~/slice1/work", "~/work"):
     p = d.setdefault("projects", {}).setdefault(os.path.expanduser(w), {})
