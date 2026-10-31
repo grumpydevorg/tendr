@@ -52,7 +52,10 @@ cover:
 
 ## Measured 2026-10-08
 
-macOS 26.6.2, tendr 0.3.0, Claude Code 2.1.293, herdr 0.9.3.
+macOS 26.6.2, tendr 0.3.0, Claude Code 2.1.293, herdr 0.9.3. Facts 6 and 12
+note what changed in tendr 0.4.0 (2026-10-31), and the recipe's launch line
+follows them; it was not re-run with Claude Code, and nothing else was
+re-measured.
 
 | Driver | Result |
 |---|---|
@@ -93,8 +96,10 @@ Facts from the Tendr run:
 5. **`tendr wait` is not a turn primitive.** It waits for process exit, as
    documented. On the live session it timed out (`--timeout 3`, exit 1) after
    two completed turns.
-6. **The PTY needs `--stdin` for `push`.** `start --pty` without `--stdin`
-   refused `push` with "session was not started with --stdin".
+6. **The PTY needed `--stdin` for `push` (0.3.0).** `start --pty` without
+   `--stdin` refused `push` with "session was not started with --stdin". Since
+   0.4.0 (#115) a PTY `push` goes over the attach socket and needs no
+   `--stdin`; the recipe below no longer passes it.
 7. **Launch the executable, not a shell word.** `tendr start` takes argv, so
    aliases and builtins such as `command claude` do not apply. Resolve the
    binary (`readlink -f "$(command -v claude)"`). On the measuring machine the
@@ -114,6 +119,11 @@ Facts from the Tendr run:
 11. **The gap is exit-on-match.** The probe ran a background follower into a
     file and polled it with `jq`. Piping `--follow` into `jq` or `grep -m1`
     does not end on the match while the producer is silent.
+12. **A dumb `TERM` is repaired (0.4.0).** A session started from an agent's
+    tool shell inherits `TERM=dumb`; since #117 a PTY child gets
+    `xterm-256color` instead, unless `--env TERM=…` says otherwise. Other
+    variables such as `CI=true` and `NO_COLOR=1` are still inherited, so the
+    recipe unsets them.
 
 ## The recipe (works today)
 
@@ -158,9 +168,9 @@ until [ -f ./ready ]; do sleep 0.1; done
 
 # 2. Launch the resolved binary.
 CLAUDE=$(readlink -f "$(command -v claude)")
-tendr start cc --namespace agents --pty --stdin --cwd "$PWD" \
+tendr start cc --namespace agents --pty --cwd "$PWD" \
   --env CLAUDE_CODE_ARTIFACT_AUTO_OPEN=0 \
-  -- "$CLAUDE" --settings ./tendr-hooks.json
+  -- env -u CI -u NO_COLOR "$CLAUDE" --settings ./tendr-hooks.json
 
 # 3. After hook.session_start, give the input box a moment (the probe used 3 s):
 printf '/design a settings screen' | tendr push cc --namespace agents
