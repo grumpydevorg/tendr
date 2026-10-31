@@ -362,7 +362,7 @@ impl RunCore {
         let recording = start_pty_recording(
             self.session.path(),
             self.meta.run_id(),
-            &self.meta.launch_spec().env,
+            self.meta.launch_spec(),
             recorder_limits(),
             effects.sender(),
         );

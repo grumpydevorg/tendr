@@ -61,6 +61,7 @@ pub fn cmd_run(
         replace,
         cwd,
         env_vars,
+        unset_env,
         on_exit,
         after,
         any_exit,
@@ -315,6 +316,7 @@ fn merge_directives_with_cli(
     cli_replace: bool,
     cli_cwd: Option<&Path>,
     cli_env_vars: &[String],
+    cli_unset_env: &[String],
     cli_on_exit: &[String],
     cli_after: &[String],
     cli_any_exit: bool,
@@ -338,8 +340,14 @@ fn merge_directives_with_cli(
         .or_else(|| d.cwd.as_ref().map(PathBuf::from));
 
     // Directive env entries + CLI env entries. CLI entries come after,
-    // so they override in cmd_start's BTreeMap insertion.
-    let mut env_vars: Vec<String> = d.env.values().cloned().collect();
+    // so they override in cmd_start's BTreeMap insertion. A CLI --unset-env
+    // drops a directive entry of that name; a CLI --env still sets it.
+    let mut env_vars: Vec<String> = d
+        .env
+        .iter()
+        .filter(|(key, _)| !cli_unset_env.contains(key))
+        .map(|(_, entry)| entry.clone())
+        .collect();
     env_vars.extend(cli_env_vars.iter().cloned());
 
     // on-exit: if CLI specifies any, use CLI only (override). Otherwise use directives.

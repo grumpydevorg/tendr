@@ -95,6 +95,40 @@ fn run_unset_env_removes_inherited_var() {
         .stdout(predicate::str::contains("CI=unset"));
 }
 
+/// Command-line values win over directives: `--unset-env CI` also drops an
+/// `env=CI=…` directive, and `--env CI=…` still wins over the unset.
+#[test]
+fn run_unset_env_drops_directive_env_but_cli_env_wins() {
+    let root = TempDir::new().unwrap();
+    let script = write_py_script(
+        root.path(),
+        "ci_directive.py",
+        "#tendr: env=CI=from-directive\nimport os\nprint('CI=' + os.environ.get('CI', 'unset'))",
+    );
+
+    tendr(&root)
+        .env("CI", "true")
+        .args(["run", "--unset-env", "CI", script.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CI=unset"));
+
+    tendr(&root)
+        .env("CI", "true")
+        .args([
+            "run",
+            "--replace",
+            "--unset-env",
+            "CI",
+            "--env",
+            "CI=from-cli",
+            script.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CI=from-cli"));
+}
+
 #[test]
 fn run_replace_reruns_script() {
     let root = TempDir::new().unwrap();

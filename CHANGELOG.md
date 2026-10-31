@@ -5,11 +5,14 @@
 ### Added
 
 - **`--unset-env NAME` removes an inherited variable from the child.** It is
-  repeatable, works on `start` and `run`, and passes through `--host`. An
-  agent's shell exports `CI`, and Claude Code turns colour off for any `CI`
-  value, even an empty one, so `--env CI=` cannot undo it. `--env` of the same
-  name still sets it. A spec without the flag hashes as before, so idempotent
-  starts still match runs from older versions.
+  repeatable and works on `start` and `run`. An agent's shell exports `CI`,
+  and Claude Code turns colour off for any `CI` value, even an empty one, so
+  `--env CI=` cannot undo it. `--env` of the same name still sets it, and on
+  `run` the flag also drops a `#tendr: env=` directive of that name. A PTY
+  child started with `--unset-env TERM` gets `xterm-256color`. A spec without
+  the flag hashes as before, so idempotent starts still match runs from older
+  versions. Using it over `--host` needs this version on the remote host; a
+  `run` over `--host` goes through the printed `ssh` fallback.
 
 ### Fixed
 
