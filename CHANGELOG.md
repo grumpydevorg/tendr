@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.4.0 — PTY control, connect deadline
+
+Breaking: attaching needs the new attach protocol, PTY `attach`/`push` exit
+80–85, and a `--host` call needs a remote `tendr` of this version (or
+`TENDR_SSH_CONNECT_TIMEOUT=0`). Upgrade both ends together.
+
 ### Added
 
 - **`--host` calls have a connect deadline** ([#119](https://github.com/grumpydevorg/tendr/pull/119)).

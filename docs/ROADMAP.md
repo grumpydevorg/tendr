@@ -9,7 +9,7 @@ is under [plans/completed/](plans/completed/).
 - Cloud PTY control and replay — Ghostty → SSH → exe.dev, with immediate reattach/takeover, one input writer, bounded viewer queues, and exact output recording; input recording is opt-in ([plan](plans/active/00_cloud-pty-control.md))
 - Remote frame transport — deliver the Unix typed PTY bridge first, then migrate general `--host` operations and close the Windows remote-shell quoting gap ([plan](plans/active/01_remote-frame-transport.md))
 - Shipped: native Windows CI (x64 + ARM64) gates Windows regressions
-- Shipped: crate and binary `tendr` on crates.io (v0.3.0), attested multi-platform releases; 0.2.x shipped as crate `agenttender` with binary `tender`
+- Shipped: crate and binary `tendr` on crates.io (v0.4.0), attested multi-platform releases; 0.2.x shipped as crate `agenttender` with binary `tender`
 
 ## Next
 
