@@ -71,6 +71,7 @@ flags:
 |`--replace`|Kill an existing session of the same name and start a new run.|
 |`--timeout <sec>`|Kill the child after this many seconds.|
 |`--cwd <dir>`, `--env KEY=VALUE`|Set the child's working directory or an environment variable.|
+|`--unset-env NAME`|Remove an inherited variable from the child's environment. Repeatable. `--env` still sets it. Use it for a variable whose mere presence matters: an agent's shell exports `CI`, and Claude Code turns colour off for any `CI` value, even an empty one.|
 |`--after <session>`|Wait for that session to exit before starting. Repeatable.|
 |`--any-exit`|With `--after`, start even if the dependency exited non-zero.|
 |`--on-exit <command>`|Run a command after the child exits. Repeatable.|

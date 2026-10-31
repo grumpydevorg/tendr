@@ -1101,7 +1101,8 @@ impl CliAttach {
         for (key, value) in extra_env {
             env.insert((*key).to_owned(), (*value).to_owned());
         }
-        let mut child = Current::spawn_child_pty(argv, None, &env).unwrap();
+        let mut child =
+            Current::spawn_child_pty(argv, None, &std::collections::BTreeSet::new(), &env).unwrap();
         // Take the resize handle before stdin takes the master's write half.
         let resize_fd = Current::pty_resize_fd(&child);
         let input = Current::child_stdin(&mut child).unwrap();

@@ -79,6 +79,23 @@ fn run_passes_script_arguments() {
 }
 
 #[test]
+fn run_unset_env_removes_inherited_var() {
+    let root = TempDir::new().unwrap();
+    let script = write_py_script(
+        root.path(),
+        "ci.py",
+        "import os\nprint('CI=' + os.environ.get('CI', 'unset'))",
+    );
+
+    tendr(&root)
+        .env("CI", "true")
+        .args(["run", "--unset-env", "CI", script.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CI=unset"));
+}
+
+#[test]
 fn run_replace_reruns_script() {
     let root = TempDir::new().unwrap();
     let script = write_py_script(root.path(), "rerun.py", "print('rerun-output')");

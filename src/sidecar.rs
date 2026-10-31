@@ -1123,6 +1123,8 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
     }
 
     // Build effective env: user-supplied first, then TENDR_* overlay (authoritative).
+    // The spawn removes `unset_env` names from the inherited env before applying
+    // this, so both still win over an unset.
     let mut effective_env = meta.launch_spec().env.clone();
     effective_env.insert(
         "TENDR_SESSION".to_owned(),
@@ -1262,6 +1264,7 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
         Current::spawn_child_pty(
             meta.launch_spec().argv(),
             meta.launch_spec().cwd.as_deref(),
+            &meta.launch_spec().unset_env,
             &effective_env,
         )
     } else {
@@ -1269,6 +1272,7 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
             meta.launch_spec().argv(),
             meta.launch_spec().stdin_mode == crate::model::spec::StdinMode::Pipe,
             meta.launch_spec().cwd.as_deref(),
+            &meta.launch_spec().unset_env,
             &effective_env,
         )
     };

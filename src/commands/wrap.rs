@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -82,7 +82,7 @@ pub fn cmd_wrap(
         env.insert("TENDR_BLOCK_ID".to_owned(), block_id.to_string());
         env.insert("TENDR_PARENT_EVENT_ID".to_owned(), event_id.to_string());
     }
-    let mut child = Current::spawn_child(&cmd, true, None, &env)
+    let mut child = Current::spawn_child(&cmd, true, None, &BTreeSet::new(), &env)
         .map_err(|e| anyhow::anyhow!("failed to spawn '{}': {e}", cmd[0]))?;
     let kill_handle = Current::child_kill_handle(&child);
 

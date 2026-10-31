@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use super::boundary::BoundaryContext;
@@ -61,6 +61,10 @@ pub struct LaunchSpec {
     pub cwd: Option<PathBuf>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub env: BTreeMap<String, String>,
+    /// Names removed from the inherited environment before `env` is applied.
+    /// Omitted when empty so existing specs keep their canonical hash.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unset_env: BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -95,6 +99,7 @@ impl LaunchSpec {
             argv,
             cwd: None,
             env: BTreeMap::new(),
+            unset_env: BTreeSet::new(),
             timeout_s: None,
             after: vec![],
             after_any_exit: false,
@@ -130,6 +135,8 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             cwd: Option<PathBuf>,
             #[serde(default)]
             env: BTreeMap<String, String>,
+            #[serde(default)]
+            unset_env: BTreeSet<String>,
             timeout_s: Option<u64>,
             #[serde(default)]
             after: Vec<DependencyBinding>,
@@ -154,6 +161,7 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             argv: raw.argv,
             cwd: raw.cwd,
             env: raw.env,
+            unset_env: raw.unset_env,
             timeout_s: raw.timeout_s,
             after: raw.after,
             after_any_exit: raw.after_any_exit,

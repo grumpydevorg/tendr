@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **`--unset-env NAME` removes an inherited variable from the child.** It is
+  repeatable, works on `start` and `run`, and passes through `--host`. An
+  agent's shell exports `CI`, and Claude Code turns colour off for any `CI`
+  value, even an empty one, so `--env CI=` cannot undo it. `--env` of the same
+  name still sets it. A spec without the flag hashes as before, so idempotent
+  starts still match runs from older versions.
+
 ### Fixed
 
 - **Detaching gives your terminal back.** When you detach, or the attach ends

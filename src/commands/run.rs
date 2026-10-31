@@ -22,6 +22,7 @@ pub fn cmd_run(
     replace: bool,
     cwd: Option<&Path>,
     env_vars: &[String],
+    unset_env: &[String],
     on_exit: &[String],
     after: &[String],
     any_exit: bool,
@@ -84,6 +85,7 @@ pub fn cmd_run(
         effective.timeout,
         effective.cwd.as_deref(),
         &effective.env_vars,
+        unset_env, // CLI-only, no directive equivalent
         &effective.on_exit,
         &effective.after,
         effective.any_exit,

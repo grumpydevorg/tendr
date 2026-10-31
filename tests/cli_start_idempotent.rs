@@ -304,6 +304,83 @@ fn start_with_empty_env_key_fails() {
     );
 }
 
+/// Start `sh -c 'echo CI=${CI-unset}'` with `CI=true` in tendr's own
+/// environment, plus `extra` tendr flags. Returns the child's output.
+fn start_ci_probe(root: &TempDir, name: &str, extra: &[&str]) -> String {
+    let out = tendr(root)
+        .env("CI", "true")
+        .args(["start", name])
+        .args(extra)
+        .args(["--", "sh", "-c", "echo CI=${CI-unset}"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_terminal(root, name);
+    let log_out = tendr(root).args(["log", name, "--raw"]).output().unwrap();
+    String::from_utf8_lossy(&log_out.stdout).into_owned()
+}
+
+#[test]
+fn start_with_unset_env_child_does_not_see_inherited_var() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    // Control: without the flag the child inherits CI from tendr.
+    let log = start_ci_probe(&root, "ci-inherit", &[]);
+    assert!(log.contains("CI=true"), "child should inherit CI: {log}");
+
+    let log = start_ci_probe(&root, "ci-unset", &["--unset-env", "CI"]);
+    assert!(
+        log.contains("CI=unset"),
+        "--unset-env CI should remove CI from the child, got log: {log}"
+    );
+}
+
+#[test]
+fn start_with_unset_env_and_env_of_same_name_sets_it() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    let log = start_ci_probe(
+        &root,
+        "ci-override",
+        &["--unset-env", "CI", "--env", "CI=forced"],
+    );
+    assert!(
+        log.contains("CI=forced"),
+        "--env should win over --unset-env, got log: {log}"
+    );
+}
+
+#[test]
+fn start_with_invalid_unset_env_name_fails() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    for (name, bad, expected) in [
+        ("unset-eq", "CI=true", "cannot contain '='"),
+        ("unset-empty", "", "name cannot be empty"),
+    ] {
+        let out = tendr(&root)
+            .args(["start", name, "--unset-env", bad, "--", "true"])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "--unset-env {bad:?} should be refused"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("invalid --unset-env") && stderr.contains(expected),
+            "--unset-env {bad:?} error should say {expected:?}, got: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn start_with_env_preserves_inherited_environment() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
