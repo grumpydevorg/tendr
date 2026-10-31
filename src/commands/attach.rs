@@ -222,6 +222,7 @@ mod unix_relay {
     use tendr::attach_escape::{Escape, EscapeMode, EscapeParser};
     use tendr::attach_proto::{self, Frame, FrameError};
     use tendr::pty_exit::PtyExitCode;
+    use tendr::term_modes::TermModes;
 
     /// Keystrokes that may wait for a session that is not accepting input.
     /// Beyond this, further keystrokes are dropped (and reported) rather than
@@ -237,6 +238,9 @@ mod unix_relay {
     /// How long leaving on a signal waits for its report to be written to a
     /// terminal that may be gone or not reading.
     const REPORT_GRACE: Duration = Duration::from_millis(200);
+    /// How long leaving waits to turn off the session's terminal modes in a
+    /// terminal that may be gone or not reading.
+    const MODES_GRACE: Duration = Duration::from_millis(200);
 
     pub fn relay(stream: UnixStream, escape: EscapeMode) -> anyhow::Result<()> {
         let socket = |e| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket: {e}"));
@@ -245,6 +249,7 @@ mod unix_relay {
         let closed = Arc::new(AtomicBool::new(false));
         let retired = Arc::new(AtomicBool::new(false));
         let outbox = Arc::new(Outbox::default());
+        let screen = Arc::new(Mutex::new(Screen::default()));
 
         // Installed before raw mode, so no cancelling signal can arrive between
         // the two and leave the terminal raw; restored when dropped, after the
@@ -256,7 +261,12 @@ mod unix_relay {
         let terminal = RawTerminal::enter()?;
 
         spawn_sender(stream, Arc::clone(&outbox), Arc::clone(&closed));
-        spawn_reader(reader_stream, Arc::clone(&closed), Arc::clone(&retired));
+        spawn_reader(
+            reader_stream,
+            Arc::clone(&closed),
+            Arc::clone(&retired),
+            Arc::clone(&screen),
+        );
 
         let mut size = terminal_size();
         if let Some(size) = size {
@@ -329,6 +339,7 @@ mod unix_relay {
         // closed connection as a detach.
         let _ = shutdown.shutdown(std::net::Shutdown::Both);
         outbox.close();
+        turn_off_modes(&screen);
         drop(terminal);
         drop(handlers);
 
@@ -400,6 +411,35 @@ mod unix_relay {
         });
         let _ = written.recv_timeout(REPORT_GRACE);
         std::process::exit(1);
+    }
+
+    /// What the session's output has done to the user's terminal.
+    #[derive(Default)]
+    struct Screen {
+        /// The modes turned on by everything written so far.
+        modes: TermModes,
+        /// Set when leaving: nothing more is written.
+        done: bool,
+    }
+
+    /// Turn off the terminal modes the session turned on (the alternate
+    /// screen, mouse reports, keyboard protocols), so the user's shell gets its
+    /// terminal back. Waits for a write in progress, but not for longer than
+    /// [`MODES_GRACE`]: a terminal that is not reading cannot hold the exit.
+    fn turn_off_modes(screen: &Arc<Mutex<Screen>>) {
+        let (done, written) = std::sync::mpsc::channel();
+        let screen = Arc::clone(screen);
+        std::thread::spawn(move || {
+            let mut screen = screen.lock().unwrap_or_else(|e| e.into_inner());
+            screen.done = true;
+            let reset = screen.modes.reset();
+            if !reset.is_empty() {
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(&reset).and_then(|()| stdout.flush());
+            }
+            let _ = done.send(());
+        });
+        let _ = written.recv_timeout(MODES_GRACE);
     }
 
     /// Raw mode for the user's terminal, restored on drop.
@@ -545,12 +585,24 @@ mod unix_relay {
         });
     }
 
-    fn spawn_reader(mut stream: UnixStream, closed: Arc<AtomicBool>, retired: Arc<AtomicBool>) {
+    fn spawn_reader(
+        mut stream: UnixStream,
+        closed: Arc<AtomicBool>,
+        retired: Arc<AtomicBool>,
+        screen: Arc<Mutex<Screen>>,
+    ) {
         std::thread::spawn(move || {
-            let mut stdout = std::io::stdout().lock();
             loop {
                 match attach_proto::read_frame(&mut stream) {
                     Ok(Frame::Data(payload)) => {
+                        // Track before writing: modes from a partial write are
+                        // still turned off when leaving.
+                        let mut screen = screen.lock().unwrap_or_else(|e| e.into_inner());
+                        if screen.done {
+                            break;
+                        }
+                        screen.modes.feed(&payload);
+                        let mut stdout = std::io::stdout().lock();
                         if stdout.write_all(&payload).is_err() || stdout.flush().is_err() {
                             break;
                         }

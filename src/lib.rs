@@ -89,3 +89,4 @@ pub mod recording;
 pub mod session;
 pub mod sidecar;
 pub mod ssh;
+pub mod term_modes;

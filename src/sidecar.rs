@@ -130,8 +130,16 @@ fn run_viewer_sender(queue: &ViewerQueue, conn: &Mutex<Box<dyn Write + Send>>) {
     }
 }
 
+/// Tees PTY output to the attached client, and tracks the terminal modes that
+/// output has turned on, so that a client accepted later gets them first.
+#[derive(Default)]
+struct AttachTee {
+    viewer: Option<AttachViewer>,
+    modes: crate::term_modes::TermModes,
+}
+
 /// Shared sink for teeing PTY output to the attached client.
-type AttachSink = Arc<Mutex<Option<AttachViewer>>>;
+type AttachSink = Arc<Mutex<AttachTee>>;
 
 /// Lock a mutex, recovering the data if another thread panicked while holding it.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1573,11 +1581,12 @@ fn capture_stream_with_tee(
         }
 
         // Offer raw bytes to the attached viewer's bounded queue; never block.
-        let mut sink_guard = lock(attach_sink);
-        if let Some(viewer) = sink_guard.as_ref() {
+        let mut tee = lock(attach_sink);
+        tee.modes.feed(&buf[..n]);
+        if let Some(viewer) = tee.viewer.as_ref() {
             if !viewer.queue.offer(&buf[..n]) {
                 (viewer.disconnect)();
-                *sink_guard = None; // closed, or fell a full budget behind
+                tee.viewer = None; // closed, or fell a full budget behind
             }
         }
     }
@@ -2007,9 +2016,9 @@ fn retire_connection(
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let _ = control.shutdown(std::net::Shutdown::Both);
-    let mut viewer = lock(sink);
-    if viewer.as_ref().is_some_and(|v| v.holder == holder) {
-        if let Some(v) = viewer.take() {
+    let mut tee = lock(sink);
+    if tee.viewer.as_ref().is_some_and(|v| v.holder == holder) {
+        if let Some(v) = tee.viewer.take() {
             v.queue.close();
         }
     }
@@ -2181,13 +2190,18 @@ fn await_push_write(
 /// connection can never install its viewer over its successor's.
 #[cfg(unix)]
 fn install_viewer(registry: &ConnectionRegistry, sink: &AttachSink, viewer: AttachViewer) -> bool {
-    let mut current = lock(sink);
-    if registry.contains(viewer.holder) {
-        *current = Some(viewer);
-        true
-    } else {
-        false
+    let mut tee = lock(sink);
+    if !registry.contains(viewer.holder) {
+        return false;
     }
+    // Under the tee's lock, so no output can land between the modes it has
+    // seen and the output that follows them.
+    let replay = tee.modes.replay();
+    if !replay.is_empty() && !viewer.queue.offer(&replay) {
+        return false;
+    }
+    tee.viewer = Some(viewer);
+    true
 }
 
 #[cfg(unix)]
@@ -2389,11 +2403,11 @@ fn handle_attach_connection(
     let _ = stream.shutdown(std::net::Shutdown::Both);
     writer.disconnect(handle);
     registry.remove(holder);
-    let mut viewer = lock(attach_sink);
-    if viewer.as_ref().is_some_and(|v| v.holder == holder) {
-        *viewer = None;
+    let mut tee = lock(attach_sink);
+    if tee.viewer.as_ref().is_some_and(|v| v.holder == holder) {
+        tee.viewer = None;
     }
-    drop(viewer);
+    drop(tee);
     queue.close();
 }
 
@@ -2619,7 +2633,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let registry = ConnectionRegistry::default();
-        let sink: AttachSink = Arc::new(Mutex::new(None));
+        let sink: AttachSink = Arc::default();
         let (old_conn, _peer) = UnixStream::pair().unwrap();
         let old = HolderId::new(1);
         assert!(registry.insert(
@@ -2649,7 +2663,7 @@ mod tests {
             },
         );
         assert!(!installed, "a retired connection installed its viewer");
-        assert!(lock(&sink).is_none());
+        assert!(lock(&sink).viewer.is_none());
     }
 
     /// Control hooks for a session at `dir`, the owner they publish, and the
@@ -2671,7 +2685,7 @@ mod tests {
         let hooks = SidecarControlHooks {
             effects: effects.sender(),
             registry: registry.clone(),
-            attach_sink: Arc::new(Mutex::new(None)),
+            attach_sink: Arc::default(),
         };
         let teardown = PtyTeardown { registry, effects };
         (hooks, control, teardown)

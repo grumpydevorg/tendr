@@ -1,0 +1,603 @@
+//! The terminal modes a PTY child's output has turned on.
+//!
+//! A child such as Claude Code switches the terminal to the alternate screen,
+//! turns on mouse reports and a keyboard protocol, and expects them to stay on.
+//! A terminal that attaches later never saw those sequences, and a terminal
+//! that detaches keeps them: mouse moves and `Ctrl-C` then reach the user's
+//! shell as escape sequences. The sidecar keeps a [`TermModes`] fed with the
+//! child's output and queues [`TermModes::replay`] ahead of live output for
+//! every client it accepts. The client keeps one fed with everything it writes
+//! to the terminal and writes [`TermModes::reset`] when it leaves.
+//!
+//! Tracked: the alternate screen (DEC modes 47, 1047, 1049), cursor
+//! visibility (25), application cursor keys (1) and keypad (`ESC =`), mouse
+//! tracking and its encodings (1000, 1002, 1003, 1005, 1006, 1015, 1016),
+//! alternate scroll (1007), focus events (1004), bracketed paste (2004),
+//! synchronized output (2026), colour-scheme reports (2031), the kitty
+//! keyboard flags with one stack per screen
+//! (<https://sw.kovidgoyal.net/kitty/keyboard-protocol/>) and xterm's
+//! `modifyOtherKeys` (<https://invisible-island.net/xterm/ctlseqs/ctlseqs.html>).
+//! A full reset (`ESC c`) clears them; a soft reset (`CSI ! p`) shows the
+//! cursor and resets the cursor keys and keypad.
+//!
+//! Synchronized output is turned off on leaving, so a frame cut short by a
+//! detach cannot hold the terminal's display, but never replayed: a new client
+//! starts outside any frame.
+
+/// DEC private modes tracked as on or off, in the order they are replayed.
+const DEC_MODES: [u16; 13] = [
+    1, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 2004, 2026, 2031,
+];
+const SYNCHRONIZED_OUTPUT: u16 = 2026;
+/// The most kitty keyboard entries kept per screen; older ones are dropped.
+const KITTY_STACK_LIMIT: usize = 32;
+/// The most parameter and intermediate bytes of a CSI sequence kept. A longer
+/// sequence is consumed and ignored.
+const CSI_LIMIT: usize = 64;
+
+/// What a terminal's modes look like after a child's output.
+#[derive(Debug, Clone, Default)]
+pub struct TermModes {
+    parser: Parser,
+    /// Bit `i` set: `DEC_MODES[i]` is on.
+    dec: u16,
+    cursor_hidden: bool,
+    application_keypad: bool,
+    /// The DEC mode that entered the alternate screen, while it is shown.
+    alternate_screen: Option<u16>,
+    kitty_main: KittyFlags,
+    kitty_alternate: KittyFlags,
+    /// The `modifyOtherKeys` level, when above 0.
+    modify_other_keys: Option<u32>,
+}
+
+impl TermModes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Track the modes `bytes` turn on and off. Sequences may be split across
+    /// calls.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.parser.advance(byte) {
+                Action::None => {}
+                Action::FullReset => self.full_reset(),
+                Action::Keypad(application) => self.application_keypad = application,
+                Action::Csi(final_byte) => {
+                    let sequence = std::mem::take(&mut self.parser.csi);
+                    self.csi(&sequence, final_byte);
+                    self.parser.csi = sequence;
+                }
+            }
+        }
+    }
+
+    /// The sequences that turn the tracked modes on in a terminal in its
+    /// default state; empty when none are on.
+    pub fn replay(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.kitty_main.replay(&mut out);
+        if let Some(mode) = self.alternate_screen {
+            dec_mode(&mut out, mode, true);
+            self.kitty_alternate.replay(&mut out);
+        }
+        for (i, &mode) in DEC_MODES.iter().enumerate() {
+            if self.dec & (1 << i) != 0 && mode != SYNCHRONIZED_OUTPUT {
+                dec_mode(&mut out, mode, true);
+            }
+        }
+        if self.cursor_hidden {
+            dec_mode(&mut out, 25, false);
+        }
+        if self.application_keypad {
+            out.extend_from_slice(b"\x1b=");
+        }
+        if let Some(level) = self.modify_other_keys {
+            out.extend_from_slice(format!("\x1b[>4;{level}m").as_bytes());
+        }
+        out
+    }
+
+    /// The sequences that turn the tracked modes off again; empty when none
+    /// are on.
+    pub fn reset(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.is_on(SYNCHRONIZED_OUTPUT) {
+            dec_mode(&mut out, SYNCHRONIZED_OUTPUT, false);
+        }
+        if let Some(mode) = self.alternate_screen {
+            self.kitty_alternate.reset(&mut out);
+            dec_mode(&mut out, mode, false);
+        }
+        self.kitty_main.reset(&mut out);
+        for (i, &mode) in DEC_MODES.iter().enumerate() {
+            if self.dec & (1 << i) != 0 && mode != SYNCHRONIZED_OUTPUT {
+                dec_mode(&mut out, mode, false);
+            }
+        }
+        if self.cursor_hidden {
+            dec_mode(&mut out, 25, true);
+        }
+        if self.application_keypad {
+            out.extend_from_slice(b"\x1b>");
+        }
+        if self.modify_other_keys.is_some() {
+            out.extend_from_slice(b"\x1b[>4m");
+        }
+        out
+    }
+
+    fn is_on(&self, mode: u16) -> bool {
+        DEC_MODES
+            .iter()
+            .position(|&m| m == mode)
+            .is_some_and(|i| self.dec & (1 << i) != 0)
+    }
+
+    fn full_reset(&mut self) {
+        *self = Self {
+            parser: std::mem::take(&mut self.parser),
+            ..Self::default()
+        };
+    }
+
+    fn kitty(&mut self) -> &mut KittyFlags {
+        if self.alternate_screen.is_some() {
+            &mut self.kitty_alternate
+        } else {
+            &mut self.kitty_main
+        }
+    }
+
+    fn set_dec(&mut self, mode: u16, on: bool) {
+        match mode {
+            25 => self.cursor_hidden = !on,
+            47 | 1047 | 1049 => {
+                // Each entry to the alternate screen starts its keyboard
+                // stack afresh, and leaving it ends that stack.
+                if on && self.alternate_screen.is_none() {
+                    self.alternate_screen = Some(mode);
+                    self.kitty_alternate = KittyFlags::default();
+                } else if !on && self.alternate_screen.is_some() {
+                    self.alternate_screen = None;
+                    self.kitty_alternate = KittyFlags::default();
+                }
+            }
+            _ => {
+                if let Some(i) = DEC_MODES.iter().position(|&m| m == mode) {
+                    if on {
+                        self.dec |= 1 << i;
+                    } else {
+                        self.dec &= !(1 << i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply one complete CSI sequence: `sequence` is its parameter and
+    /// intermediate bytes.
+    fn csi(&mut self, sequence: &[u8], final_byte: u8) {
+        let (prefix, rest) = match sequence.first() {
+            Some(&p @ (b'?' | b'>' | b'<' | b'=')) => (Some(p), &sequence[1..]),
+            _ => (None, sequence),
+        };
+        let split = rest
+            .iter()
+            .position(|b| (0x20..=0x2f).contains(b))
+            .unwrap_or(rest.len());
+        let (params, intermediates) = rest.split_at(split);
+        let Some(params) = parameters(params) else {
+            return;
+        };
+        let param = |i: usize| params.get(i).copied().flatten();
+        match (prefix, intermediates, final_byte) {
+            (Some(b'?'), b"", b'h' | b'l') => {
+                for mode in params.iter().flatten() {
+                    if let Ok(mode) = u16::try_from(*mode) {
+                        self.set_dec(mode, final_byte == b'h');
+                    }
+                }
+            }
+            (Some(b'>'), b"", b'u') => self.kitty().push(param(0).unwrap_or(0)),
+            (Some(b'<'), b"", b'u') => self.kitty().pop(param(0).unwrap_or(1).max(1)),
+            (Some(b'='), b"", b'u') => self
+                .kitty()
+                .set(param(0).unwrap_or(0), param(1).unwrap_or(1)),
+            (Some(b'>'), b"", b'm') => {
+                if params.iter().all(Option::is_none) {
+                    // XTMODKEYS with no resource resets every one.
+                    self.modify_other_keys = None;
+                } else if param(0) == Some(4) {
+                    self.modify_other_keys = param(1).filter(|&level| level > 0);
+                }
+            }
+            (Some(b'>'), b"", b'n') if param(0) == Some(4) => self.modify_other_keys = None,
+            (None, b"!", b'p') => {
+                self.cursor_hidden = false;
+                self.set_dec(1, false);
+                self.application_keypad = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One screen's kitty keyboard flags: the flags in force with an empty stack,
+/// and the stack of pushed entries above them.
+#[derive(Debug, Clone, Default)]
+struct KittyFlags {
+    base: u32,
+    stack: Vec<u32>,
+}
+
+impl KittyFlags {
+    fn push(&mut self, flags: u32) {
+        if self.stack.len() == KITTY_STACK_LIMIT {
+            self.stack.remove(0);
+        }
+        self.stack.push(flags);
+    }
+
+    fn pop(&mut self, count: u32) {
+        let keep = self
+            .stack
+            .len()
+            .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
+        self.stack.truncate(keep);
+    }
+
+    /// `CSI = flags ; mode u`: 1 sets the current flags, 2 adds to them, 3
+    /// removes from them.
+    fn set(&mut self, flags: u32, mode: u32) {
+        let current = self.stack.last_mut().unwrap_or(&mut self.base);
+        match mode {
+            1 => *current = flags,
+            2 => *current |= flags,
+            3 => *current &= !flags,
+            _ => {}
+        }
+    }
+
+    fn replay(&self, out: &mut Vec<u8>) {
+        if self.base != 0 {
+            out.extend_from_slice(format!("\x1b[={}u", self.base).as_bytes());
+        }
+        for flags in &self.stack {
+            out.extend_from_slice(format!("\x1b[>{flags}u").as_bytes());
+        }
+    }
+
+    fn reset(&self, out: &mut Vec<u8>) {
+        if !self.stack.is_empty() {
+            out.extend_from_slice(format!("\x1b[<{}u", self.stack.len()).as_bytes());
+        }
+        if self.base != 0 {
+            out.extend_from_slice(b"\x1b[=0u");
+        }
+    }
+}
+
+fn dec_mode(out: &mut Vec<u8>, mode: u16, on: bool) {
+    let set = if on { 'h' } else { 'l' };
+    out.extend_from_slice(format!("\x1b[?{mode}{set}").as_bytes());
+}
+
+/// Split CSI parameters on `;`, ignoring sub-parameters after `:`. An empty
+/// parameter is `None`; anything but digits makes the sequence one this
+/// module does not act on.
+fn parameters(params: &[u8]) -> Option<Vec<Option<u32>>> {
+    if params.is_empty() {
+        return Some(Vec::new());
+    }
+    params
+        .split(|&b| b == b';')
+        .map(|param| {
+            let main = param.split(|&b| b == b':').next().unwrap_or_default();
+            if main.is_empty() {
+                return Some(None);
+            }
+            if !main.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            Some(Some(main.iter().fold(0u32, |n, &d| {
+                n.saturating_mul(10).saturating_add(u32::from(d - b'0'))
+            })))
+        })
+        .collect()
+}
+
+/// What a byte completed.
+enum Action {
+    None,
+    /// `ESC c`.
+    FullReset,
+    /// `ESC =` (true) or `ESC >` (false).
+    Keypad(bool),
+    /// A CSI sequence ended with this final byte; its parameter and
+    /// intermediate bytes are in [`Parser::csi`].
+    Csi(u8),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum State {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    /// Inside OSC, DCS, APC, PM or SOS, whose text is not parsed.
+    String,
+    StringEscape,
+}
+
+/// A minimal VT parser (after <https://vt100.net/emu/dec_ansi_parser>): enough
+/// to find escape and CSI sequences and to skip the strings that may contain
+/// text looking like them. UTF-8 bytes are never C1 controls here.
+#[derive(Debug, Clone, Default)]
+struct Parser {
+    state: State,
+    csi: Vec<u8>,
+    overflow: bool,
+}
+
+const CAN: u8 = 0x18;
+const SUB: u8 = 0x1a;
+const ESC: u8 = 0x1b;
+const BEL: u8 = 0x07;
+
+impl Parser {
+    fn advance(&mut self, byte: u8) -> Action {
+        match self.state {
+            State::Ground => {
+                if byte == ESC {
+                    self.state = State::Escape;
+                }
+                Action::None
+            }
+            State::Escape => self.escape(byte),
+            State::EscapeIntermediate => {
+                match byte {
+                    ESC => self.state = State::Escape,
+                    CAN | SUB | 0x30..=0x7e => self.state = State::Ground,
+                    _ => {}
+                }
+                Action::None
+            }
+            State::Csi => match byte {
+                0x20..=0x3f => {
+                    if self.csi.len() < CSI_LIMIT {
+                        self.csi.push(byte);
+                    } else {
+                        self.overflow = true;
+                    }
+                    Action::None
+                }
+                0x40..=0x7e => {
+                    self.state = State::Ground;
+                    if self.overflow {
+                        Action::None
+                    } else {
+                        Action::Csi(byte)
+                    }
+                }
+                ESC => {
+                    self.state = State::Escape;
+                    Action::None
+                }
+                CAN | SUB | 0x80..=0xff => {
+                    self.state = State::Ground;
+                    Action::None
+                }
+                // Other C0 controls act within the sequence; DEL is ignored.
+                _ => Action::None,
+            },
+            State::String => {
+                match byte {
+                    BEL | CAN | SUB => self.state = State::Ground,
+                    ESC => self.state = State::StringEscape,
+                    _ => {}
+                }
+                Action::None
+            }
+            State::StringEscape => {
+                if byte == b'\\' {
+                    self.state = State::Ground;
+                    Action::None
+                } else {
+                    // ESC followed by anything else ends the string and starts
+                    // a new sequence.
+                    self.escape(byte)
+                }
+            }
+        }
+    }
+
+    fn escape(&mut self, byte: u8) -> Action {
+        self.state = State::Ground;
+        match byte {
+            b'[' => {
+                self.state = State::Csi;
+                self.csi.clear();
+                self.overflow = false;
+                Action::None
+            }
+            b']' | b'P' | b'_' | b'^' | b'X' => {
+                self.state = State::String;
+                Action::None
+            }
+            b'c' => Action::FullReset,
+            b'=' => Action::Keypad(true),
+            b'>' => Action::Keypad(false),
+            ESC => {
+                self.state = State::Escape;
+                Action::None
+            }
+            0x20..=0x2f => {
+                self.state = State::EscapeIntermediate;
+                Action::None
+            }
+            // Other C0 controls act within the sequence.
+            0x00..=0x1f if byte != CAN && byte != SUB => {
+                self.state = State::Escape;
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fed(chunks: &[&[u8]]) -> TermModes {
+        let mut modes = TermModes::new();
+        for chunk in chunks {
+            modes.feed(chunk);
+        }
+        modes
+    }
+
+    fn text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).replace('\x1b', "^[")
+    }
+
+    #[test]
+    fn nothing_tracked_means_nothing_to_replay_or_reset() {
+        let modes = fed(&[b"plain text\r\n\x1b[1;31mred\x1b[0m\x1b[2J\x1b[H"]);
+        assert_eq!(text(&modes.replay()), "");
+        assert_eq!(text(&modes.reset()), "");
+    }
+
+    /// Claude Code 2.1.316's start-up under `TERM=xterm-ghostty`, as recorded
+    /// on the cloud PTY VM (plan 00, step 5).
+    const CLAUDE_START: &[u8] = b"\x1b7\x1b[r\x1b8\x1b[?25h\
+        \x1b[?2004h\x1b[?2031h\x1b[?1004h\x1b[<u\x1b[>5u\x1b[>4;2m\
+        \x1b]0;\xe2\x9c\xb3 Claude Code\x07\
+        \x1b[?1049h\x1b[2J\x1b[H\x1b[<u\x1b[>5u\x1b[>4;2m\
+        \x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?25l\x1b[?25l\x1b[?2026h\x1b[H\r\
+        \x1b[>0q\x1b[?u\x1b]7501;?\x07\x1b[c\x1b[?2026$p";
+
+    #[test]
+    fn claude_start_up_is_replayed_and_reset_in_order() {
+        let modes = fed(&[CLAUDE_START]);
+        assert_eq!(
+            text(&modes.replay()),
+            "^[[>5u^[[?1049h^[[>5u\
+             ^[[?1000h^[[?1002h^[[?1003h^[[?1004h^[[?1006h^[[?2004h^[[?2031h\
+             ^[[?25l^[[>4;2m"
+        );
+        assert_eq!(
+            text(&modes.reset()),
+            "^[[?2026l^[[<1u^[[?1049l^[[<1u\
+             ^[[?1000l^[[?1002l^[[?1003l^[[?1004l^[[?1006l^[[?2004l^[[?2031l\
+             ^[[?25h^[[>4m"
+        );
+    }
+
+    #[test]
+    fn sequences_split_across_feeds_are_tracked() {
+        let whole = fed(&[CLAUDE_START]);
+        for at in 1..CLAUDE_START.len() {
+            let split = fed(&[&CLAUDE_START[..at], &CLAUDE_START[at..]]);
+            assert_eq!(split.replay(), whole.replay(), "split at {at}");
+        }
+        let bytewise: Vec<&[u8]> = CLAUDE_START.chunks(1).collect();
+        assert_eq!(fed(&bytewise).reset(), whole.reset());
+    }
+
+    #[test]
+    fn modes_turned_off_again_are_not_tracked() {
+        let modes = fed(&[b"\x1b[?1049h\x1b[?1003;1006h\x1b[?25l\x1b=\x1b[>4;1m\
+            \x1b[?1003;1006l\x1b[?1049l\x1b[?25h\x1b>\x1b[>4m"]);
+        assert_eq!(text(&modes.replay()), "");
+        assert_eq!(text(&modes.reset()), "");
+    }
+
+    #[test]
+    fn kitty_flags_are_restored_per_screen() {
+        // Main screen: push 1, then 3; set the top to 3|8. Alternate screen:
+        // a pop on its empty stack, then push 5 and 7, pop one.
+        let modes = fed(&[b"\x1b[>1u\x1b[>3u\x1b[=8;2u\
+            \x1b[?1049h\x1b[<u\x1b[>5u\x1b[>7u\x1b[<1u"]);
+        assert_eq!(text(&modes.replay()), "^[[>1u^[[>11u^[[?1049h^[[>5u");
+        assert_eq!(text(&modes.reset()), "^[[<1u^[[?1049l^[[<2u");
+
+        // Leaving the alternate screen ends its stack; the main one remains.
+        let mut left = modes.clone();
+        left.feed(b"\x1b[?1049l");
+        assert_eq!(text(&left.replay()), "^[[>1u^[[>11u");
+        left.feed(b"\x1b[?1049h");
+        assert_eq!(text(&left.replay()), "^[[>1u^[[>11u^[[?1049h");
+    }
+
+    #[test]
+    fn kitty_flags_set_without_a_push_are_reset_to_zero() {
+        let modes = fed(&[b"\x1b[=5u"]);
+        assert_eq!(text(&modes.replay()), "^[[=5u");
+        assert_eq!(text(&modes.reset()), "^[[=0u");
+        let cleared = fed(&[b"\x1b[=5u\x1b[=5;3u"]);
+        assert_eq!(text(&cleared.replay()), "");
+    }
+
+    #[test]
+    fn a_reset_from_the_child_clears_tracked_modes() {
+        let mut modes = fed(&[CLAUDE_START, b"\x1b=\x1b[?1h"]);
+        modes.feed(b"\x1bc");
+        assert_eq!(text(&modes.replay()), "");
+        assert_eq!(text(&modes.reset()), "");
+    }
+
+    #[test]
+    fn a_soft_reset_shows_the_cursor_and_resets_the_keys() {
+        let modes = fed(&[b"\x1b[?25l\x1b[?1h\x1b=\x1b[?1003h\x1b[!p"]);
+        assert_eq!(text(&modes.replay()), "^[[?1003h");
+    }
+
+    #[test]
+    fn modify_other_keys_forms() {
+        assert_eq!(text(&fed(&[b"\x1b[>4;2m"]).replay()), "^[[>4;2m");
+        assert_eq!(text(&fed(&[b"\x1b[>4;2m\x1b[>4;0m"]).replay()), "");
+        assert_eq!(text(&fed(&[b"\x1b[>4;2m\x1b[>4n"]).replay()), "");
+        assert_eq!(text(&fed(&[b"\x1b[>4;2m\x1b[>m"]).replay()), "");
+        // Other XTMODKEYS resources are not tracked.
+        assert_eq!(text(&fed(&[b"\x1b[>1;2m"]).replay()), "");
+    }
+
+    #[test]
+    fn mode_text_inside_strings_is_not_a_mode() {
+        let modes = fed(&[
+            b"\x1b]0;[?1049h title\x07",
+            b"\x1bPq[?1003h\x1b\\",
+            b"\x1b_Ga=q;[?2004h\x1b\\",
+            b"\x1b]2;bell-less\x1b\\",
+        ]);
+        assert_eq!(text(&modes.replay()), "");
+    }
+
+    #[test]
+    fn a_cancelled_or_overlong_sequence_does_nothing() {
+        let mut long = b"\x1b[?".to_vec();
+        long.extend(std::iter::repeat_n(b'1', 200));
+        long.extend_from_slice(b";1049h");
+        let modes = fed(&[b"\x1b[?10\x1849h", b"\x1b[?10\x1b[0m49h", &long]);
+        assert_eq!(text(&modes.replay()), "");
+    }
+
+    #[test]
+    fn untracked_and_query_sequences_are_ignored() {
+        let modes = fed(&[b"\x1b[?7l\x1b[?12h\x1b[?u\x1b[?1049$p\x1b[4h\x1b[1049h\x1b[u"]);
+        assert_eq!(text(&modes.replay()), "");
+    }
+
+    #[test]
+    fn a_kitty_stack_is_bounded() {
+        let mut modes = TermModes::new();
+        for _ in 0..10_000 {
+            modes.feed(b"\x1b[>1u");
+        }
+        assert!(modes.replay().len() < 1024);
+    }
+}
