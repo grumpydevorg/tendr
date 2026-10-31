@@ -1,4 +1,4 @@
-//! Append + read path tests — spec §3.2–3.5, §5 (docs/plans/specs/event-protocol.md).
+//! Append + read path tests — spec §3.2–3.5, §5 (docs/architecture/07-event-protocol.md).
 
 use std::path::Path;
 
@@ -149,7 +149,7 @@ fn oversize_data_spills_to_content_addressed_blob() {
         preview.len()
     );
 
-    // The event line itself parses and is well under the 32 KiB cap.
+    // The event line itself parses and stays small: well under 32 KiB.
     let segs = segment_files(&session_dir);
     let lines = read_lines(&segs[0]);
     assert_eq!(lines.len(), 1);

@@ -2,9 +2,8 @@
 //! acknowledgement means.
 //!
 //! This module is pure domain logic with no I/O of its own. The sidecar owns one
-//! [`InputArbiter`] per run; the design is specified in
-//! `docs/plans/active/00_cloud-pty-control.md` ("Controller state and the single
-//! input writer").
+//! [`InputArbiter`] per run; how it is used is described in
+//! `docs/architecture/04-pty-lane.md` ("The PTY and the input writer").
 //!
 //! # States and transitions
 //!

@@ -1,28 +1,25 @@
 ---
 id: interactive-agent-turns
-depends_on: []
-links:
-  - agent-hook-routing.md
-  - ../active/00_cloud-pty-control.md
-  - ../specs/event-protocol.md
-  - ../specs/decision-process-sitter-not-framework.md
-  - ../specs/tender-as-block-runtime.md
-  - ../specs/ecosystem-landscape.md
+depends_on: [agent-hook-routing]
 ---
 
-# Interactive agent turns — drive a live agent's turns under a Tendr PTY
+# Interactive agent turns: drive a live agent's turns under a Tendr PTY
+
+**Status:** not started. Ready: a guide topic, plus one generic exit-on-match
+option for `tendr events --follow`.
 
 Some agent features exist only in an interactive session. A caller (another
-agent, a script) needs to send that session a prompt, learn when the turn has
-finished, failed or stopped on a question, and find what it produced, without
-scraping a screen. Measured on 2026-10-08, Tendr can already do this with no
-code change: the agent's own lifecycle hooks publish into the session's event
-log, and the caller reads turn state from events.
+agent or a script) needs to send that session a prompt and learn when the turn
+finished, failed or stopped on a question. It also needs to find the result
+without reading the screen. Tendr can already do this with no code change: the
+agent's own lifecycle hooks publish into the session's event log, and the caller
+reads turn state from events.
 
-This plan records the measurement and an adversarial review of it, places the
-workflow beside herdr and the agent's own background mode, and proposes one
-small generic addition. It supplies the measured Claude Code recipe that
-[agent-hook-routing](agent-hook-routing.md) needs alongside its Hermes example.
+This plan records the measurement and its review, compares the workflow with
+herdr and the agent's own background mode, and proposes one small generic
+addition. It supplies the measured Claude Code recipe that
+[agent-hook-routing](agent-hook-routing.md) publishes alongside its Hermes
+example.
 
 ## The consumer, and what already serves it
 
@@ -250,14 +247,11 @@ into it. A herdr pane running `tendr attach` is a viewer, not a state source.
 
 ## Boundary: process sitter, not agent framework
 
-The [2026-04-03 decision](../specs/decision-process-sitter-not-framework.md)
-rejects native LLM protocols. Its premise that agent CLIs are one-shot
-(its "Rationale" and "How LLM Orchestration Works Today" sections) no longer describes them:
-interactive-only features, Claude Code's background mode, and omp's RPC mode are
-all long-lived. The rejection itself still holds, and the refined stance already
-lives in [tender-as-block-runtime](../specs/tender-as-block-runtime.md), which
-says the original decision "holds for that specific question" and puts
-interpreting events such as "Claude Code semantics" in consumer territory.
+The process-sitter decision (see [decisions](../../decisions.md)) rejects
+native LLM protocols. Its premise that agent CLIs are one-shot no longer
+holds: interactive-only features, Claude Code's background mode, and omp's RPC
+mode are all long-lived. The rejection itself still holds. Interpreting events
+such as "Claude Code semantics" stays in consumer territory.
 
 An adversarial review on 2026-10-08 (GPT-6 Astra and Claude Fable 5.1,
 independently, then a rebuttal round) rejected both extremes:
@@ -312,9 +306,10 @@ omp's own session machinery and is not proposed.
 3. **Submission without a sleep.** The text–pause–CR rule is an inference about
    one TUI. The proper fix is the cloud PTY plan's slice 4 mode-aware keys and
    bracketed paste. Do not add a core "submit" verb ahead of that.
-4. **Decision spec amendment (owner's call).** Correct the one-shot premise in
-   the 2026-04-03 decision, add the boundary row "does not decide when an agent
-   turn is done", and link to tender-as-block-runtime. Amend; do not supersede.
+4. **Decision amendment (owner's call).** In [decisions](../../decisions.md),
+   correct the one-shot premise of the process-sitter decision and add the
+   boundary "does not decide when an agent turn is done". Amend; do not
+   supersede.
 5. **herdr.** No Tendr change. Raise an agent kind whose state comes from a
    Tendr session's `hook.*` events with herdr only if the viewer layout gets
    used.

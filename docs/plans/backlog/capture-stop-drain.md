@@ -1,12 +1,11 @@
 ---
 id: capture-stop-drain
-depends_on: [sidecar-lifecycle-guard]
-links:
-  - ../completed/2026-09-25-sidecar-lifecycle-guard.md
-  - ../../architecture/03-run-lifecycle.md
+depends_on: []
 ---
 
 # Keep draining output when a mid-run log write fails
+
+**Status:** not started. Ready: a small sidecar fix.
 
 When a write to `output.log` fails mid-run (disk full, EIO), `capture_stream`
 and `capture_stream_with_tee` in `src/sidecar.rs` return `Err` and **stop

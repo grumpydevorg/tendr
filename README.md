@@ -1,79 +1,78 @@
 # Tendr
 
-**Agents remember what a tool call returned. Tendr keeps the process behind it alive.**
+Tendr keeps shells, REPLs and long-running jobs alive between tool calls,
+on your machine or on another host over SSH.
 
-Coding agents have transcript memory: they can recall stdout, stderr, and exit codes from prior tool calls. But each shell tool call still runs as a fresh process. The transcript survives; the shell, REPL, database connection, dev server, or remote job usually does not.
-
-Tendr supervises those processes as durable, named sessions. Your agent, or you, can reconnect later and continue from the same live runtime state.
-
-## Why Tendr
-
-- **The process, not just the transcript** — cwd, venvs, REPL variables, loaded tables, and open connections persist between every `exec`.
-- **Walk away, come back** — sessions are durable and named; disconnect and resume hours or days later, state intact.
-- **Runs where the work is** — drive a session on a remote box with `--host`; the same commands, over SSH.
-- **Logs survive** — output lives on disk, not the agent's context. Crash- and compaction-proof.
-- **Shells, REPLs, databases** — Bash, Python, IPython, DuckDB, and PowerShell stay warm, with structured output agents can parse.
-- **Shareable** — no agent owns a session, so Claude, Codex, or you can drive the same one.
-
-## Quickstart
+A coding agent runs each shell command as a new process. When the call
+returns, the shell is gone, and with it the working directory, the activated
+virtual environment, the loaded data and any open connection. Tendr runs the
+process instead and gives it a name. The agent, another agent or a person can
+send it more commands later and read its output from disk.
 
 ```bash
-tendr start --stdin dev -- bash      # a durable, supervised shell
+tendr start dev --stdin -- bash      # start a named shell session
 tendr exec  dev -- cd repo
 tendr exec  dev -- . .venv/bin/activate
-tendr exec  dev -- pytest -x         # cwd + venv still active
-tendr log   dev --tail 50            # on disk, survives crashes
-printf 'y\n' | tendr push dev        # answer an interactive prompt
+tendr exec  dev -- pytest -x         # runs in repo/, with the venv active
+tendr log   dev --tail 50            # output is kept on disk
+tendr kill  dev
 ```
 
-The *shell* lives inside Tendr and outlives every call. The same model works over SSH (`tendr --host box …`) and across REPL/DB lanes — `python3 -i`, `ipython`, `duckdb`, `pwsh` — where imported modules, loaded data, and open connections persist across every `exec`.
+## What it does
 
-→ **[Full guide](docs/guide.md)** for the REPL lanes, remote sessions, and every command.
+- **Keeps state between commands.** `tendr exec` runs a command inside the
+  same shell, Python, IPython, DuckDB or PowerShell process, and returns its
+  output and exit code as JSON.
+- **Supervises long jobs.** A job keeps running if the caller exits or its
+  terminal closes. `wait`, `status`, `log` and `events` report on it later.
+- **Works on other hosts.** `tendr --host user@box …` runs the same commands
+  on a remote machine over SSH.
+- **Hosts interactive programs.** A PTY session runs a full-screen program.
+  You can attach to it, and a script can type into it with `push`.
+- **Keeps a record.** Each session has an output log and an event log on disk.
+  `tendr query` runs SQL over the event logs with DuckDB.
+
+Tendr does not run an agent, render a terminal, or sandbox anything. It starts
+processes, keeps them running, and records what they do.
 
 ## Install
 
 ```bash
 cargo binstall tendr   # prebuilt binary from the GitHub release
-cargo install tendr    # or build it from crates.io
+cargo install tendr    # build from crates.io
+nix run github:grumpydevorg/tendr -- --version
 ```
 
-Release archives (`tendr-<target>.tar.gz`, Linux musl, macOS and Windows on x86-64 and ARM64)
-carry keyless SLSA build provenance: `gh attestation verify <archive> --repo grumpydevorg/tendr`.
+The release archives (`tendr-<target>.tar.gz`) cover Linux (musl), macOS and
+Windows on x86-64 and ARM64. Each has a build attestation:
+`gh attestation verify <archive> --repo grumpydevorg/tendr`.
 
-From source:
+To build from source, run `cargo build --release` in a clone. The binary is
+`target/release/tendr`.
 
-```bash
-git clone https://github.com/grumpydevorg/tendr
-cd tendr && cargo build --release   # → target/release/tendr
-```
+The Nix package `packages.<system>.tendr` builds for `aarch64-darwin`,
+`x86_64-linux` and `aarch64-linux`. Building it runs the test suite.
 
-### Nix
+### Agent skill
 
-```bash
-nix build github:grumpydevorg/tendr#tendr   # or  nix build .#tendr  in a clone
-nix run  github:grumpydevorg/tendr -- --version
-```
+Tendr includes a short skill file, `using-tendr`, that tells an agent when to
+use tendr and to run `tendr guide` for details. Install it with
+`tendr skill install`. The Nix package also provides it at
+`share/agent-skills/using-tendr/SKILL.md`. Both come from the same file in the
+binary, so the skill always matches the installed version.
 
-The flake exposes `packages.<system>.tendr` for `aarch64-darwin`, `x86_64-linux` and
-`aarch64-linux`, and `checks.<system>.tendr` is that same package — so building it runs the test
-suite. It builds with nixpkgs' own rustc; `rust-toolchain.toml` remains the source of truth for
-devenv and rustup, which are the paths that reach Windows.
+## Documentation
 
-The package also **ships the `using-tendr` agent skill**, installed alongside the binary at
+| Document | Read it to |
+|---|---|
+| [Guide](docs/guide.md) (also `tendr guide`) | use tendr |
+| [Analytics recipes](docs/analytics-recipes.md) | query the event log with SQL |
+| [Architecture](docs/architecture/README.md) | understand how it works |
+| [Decisions](docs/decisions.md) | understand why it works that way |
+| [Design principles](docs/design-principles.md) | judge a new feature |
+| [Roadmap](docs/ROADMAP.md) | see the planned work |
+| [Changelog](CHANGELOG.md) | see what changed in each release |
 
-```
-$out/share/agent-skills/using-tendr/SKILL.md
-```
+## License
 
-from the same `src/embedded/SKILL.md` the binary embeds, so the packaged copy and the binary can
-never describe different versions of tendr. A Nix-managed workstation links its agents' skill
-directories straight at that path and never writes the file. Without Nix, `tendr skill install`
-remains the way to put it in `~/.claude/skills/using-tendr/SKILL.md`.
-
-## Docs
-
-**[Documentation](docs/README.md)** · [Guide](docs/guide.md) · [Roadmap](docs/ROADMAP.md) · [Analytics recipes](docs/analytics-recipes.md) · [Architecture](docs/architecture/README.md)
-
-## What Tendr is not
-
-Not an AI agent, LLM framework, terminal UI, or security sandbox. It supervises sessions and owns process lifecycle — you bring the reasoning, the rendering, and the isolation.
+MIT or Apache-2.0, at your option.

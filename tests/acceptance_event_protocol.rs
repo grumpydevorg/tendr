@@ -1,4 +1,4 @@
-//! End-to-end acceptance criteria from docs/plans/active/01_event-emit-primitive.md.
+//! End-to-end acceptance tests for docs/architecture/07-event-protocol.md.
 //! Companion coverage: cli_events_lifecycle.rs (WAL crash injection),
 //! cli_events_reconcile.rs (healing), cli_emit.rs (exit codes, lost+found),
 //! events_log.rs (2×1000 concurrent writers at the append layer).
@@ -259,7 +259,7 @@ fn duckdb_reads_events_as_typed_rows() {
     assert!(rows[0]["run_id"].is_string());
 }
 
-// --- Slice 3 acceptance (docs/plans/completed/2026-07-08-event-exec-wrap-integration.md) ---
+// --- exec/wrap integration (docs/architecture/07-event-protocol.md §2, §6) ---
 
 /// An exec payload running `tendr emit` lands in the exec block (frame
 /// env propagation), and after the block the session shell is unpolluted —

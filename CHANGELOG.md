@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed
+
+- **The documentation is rewritten and reorganized.** Each kind of fact has
+  one place: the guide says how to use tendr, `docs/architecture/` how it
+  works, the new `docs/decisions.md` why, and `docs/plans/` holds open work
+  only, indexed by `docs/ROADMAP.md`. Finished plans and old design specs are
+  removed; Git keeps them. The event-log and PTY-recording formats move to
+  `docs/architecture/`. The repository's copy of the `using-tendr` skill and
+  its `install.sh` are removed: `tendr skill install` and the Nix package
+  install the skill from the file the binary embeds.
+- **Documentation drift fails the tests.** `tests/docs.rs` checks that every
+  command, flag and guide topic the current docs show exists, that
+  `docs/plans/` holds only open plans, and that the roadmap lists exactly
+  those plans.
+- The crate description is now "Keep shells, REPLs and long-running jobs
+  alive between tool calls, locally or over SSH".
+
 ## v0.4.0 — PTY control, connect deadline
 
 Breaking: attaching needs the new attach protocol, PTY `attach`/`push` exit

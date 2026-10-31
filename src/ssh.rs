@@ -186,7 +186,7 @@ pub fn exec_ssh(host: &str, tendr_args: &[String], allocate_tty: bool) -> Result
 
 /// The remote argv for frame-transport exec — constant by construction:
 /// nothing user-controlled rides in argv, so there is no shell-quoting
-/// layer to traverse (2026-07-08-remote-exec-host-parity.md slice 2). The frame
+/// layer to traverse. The frame
 /// itself travels on the SSH stdin channel as opaque bytes.
 fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Command, SshError> {
     validate_destination(host)?;

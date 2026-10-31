@@ -100,7 +100,7 @@ struct SideChannelResult {
 }
 
 /// Execute one exec request read as a JSON frame from stdin
-/// (`--frame-from-stdin`, 2026-07-08-remote-exec-host-parity.md slice 2). The
+/// (`--frame-from-stdin`; docs/architecture/06-transport-boundaries.md). The
 /// frame is the whole request; a malformed or wrong-version frame is a
 /// usage error (exit 2) before any side effect. After decoding this is
 /// exactly `cmd_exec` — same exec lock, same session semantics.

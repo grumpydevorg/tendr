@@ -1,17 +1,15 @@
 ---
 id: log-delimiter-cr-framing
 depends_on: []
-links:
-  - ../specs/tender-agent-process-sitter.md
 ---
 
-# CR-Aware Pipe Framing — Live Progress Without a PTY
+# CR-aware pipe framing: live progress without a PTY
+
+**Status:** not started. Ready.
 
 Give pipe sessions a typed, generic way to split records on a lone carriage
-return, so `\r`-framed progress meters are visible in `output.log` while the child
-is still running — without a PTY, without command-specific policy in Tendr.
-
-> **Status: not started. Written 2026-07-27 from a live incident.**
+return. A `\r`-framed progress meter then shows in `output.log` while the child
+runs, without a PTY and without command-specific rules in Tendr.
 
 ## Why
 
@@ -25,10 +23,9 @@ The cause is `capture_stream` (`src/sidecar.rs`), which reads with
 update with `\r`. The bytes arrive and the record does eventually land, but not
 until a newline appears or the child exits.
 
-**This is the documented contract, not a defect.** The spec says the log is "a
-line-oriented observability log, not a byte-exact replay stream. Partial lines are
-buffered until newline"
-([spec, Log Format](../specs/tender-agent-process-sitter.md)). Nothing is lost —
+**This is the documented contract, not a defect.** The log is a line-oriented
+observability log, not a byte-exact replay stream, and it buffers partial lines
+until a newline (see [decisions](../../decisions.md)). Nothing is lost —
 the operator is blind. Those are different failures and the second one is the one
 that hurt.
 
@@ -349,13 +346,8 @@ reads as *for humans*, not *required to see progress*.
   choose for a progress-emitting child.
 - Add the partial-line rule to `docs/guide.md` where long-running work is
   discussed — the log holds partial lines until a delimiter.
-- Add one line to `.claude/skills/using-tendr/SKILL.md`: check `tendr log <name>`
+- Add one line to `src/embedded/SKILL.md`: check `tendr log <name>`
   within 60 s of starting a long session; an empty log means you are blind.
-- Fix while there: the topic list in `tendr guide`'s CLI help
-  (`src/main.rs:415`) is hand-maintained and has drifted from `TOPICS`
-  (`src/commands/guide.rs`). It omits `install`, which works, and will omit
-  `cgroup` once the in-flight `docs/guide-cgroup-memory` branch lands. Derive the
-  help text from `TOPICS` rather than restating it.
 
 ## Rollout
 

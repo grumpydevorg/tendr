@@ -1,6 +1,6 @@
 //! Boundary descriptor model — parsing (`kind:label`), serde round-trip,
-//! and the `BoundaryContext` ancestry shape. See
-//! docs/plans/active/01_boundary-metadata.md.
+//! and the `BoundaryContext` ancestry shape. See docs/guide.md
+//! ("Record where a session runs").
 
 use tendr::model::boundary::{Boundary, BoundaryContext, BoundaryKind};
 

@@ -1,26 +1,25 @@
 ---
 id: polling-consolidation
 depends_on: []
-links:
-  - ../completed/2026-07-13-dependency-first-scan-barrier.md
 ---
 
-# Test Polling Consolidation — one `poll_until` primitive, centralized deadline policy
+# Test polling consolidation: one `poll_until` primitive
 
-Queue position moved behind cloud PTY control and remote frame transport on
-2026-09-14. This cleanup is not a prerequisite for either feature.
+**Status:** steps 1 and 2 shipped (`080ad25`): `poll_until`, `Observation`,
+`WaitTimeout` and the domain wrappers are in `tests/harness/mod.rs`. Step 3
+remains: migrate the duplicated loops in the test files to the wrappers. This
+work does not block cloud PTY control or remote frame transport.
 
-The fudge-sleep campaign (#52–#62) left ~33 legitimate `thread::sleep` calls in
-`tests/`, all the same shape: probe a condition, return on success, fail on a
-deadline, sleep an interval, repeat. They are spread across ~17 files, each
-re-deriving its own deadline arithmetic, interval, and panic message. This slice
-centralizes that machinery behind one primitive plus named domain wrappers.
+About 33 polling loops in `tests/` share one shape: probe a condition, return on
+success, fail on a deadline, sleep an interval, repeat. Each file derives its own
+deadline, interval and panic message. This plan moves them onto one primitive
+plus named domain wrappers.
 
-**The win is centralized deadline policy and consistently useful timeout
-diagnostics — not a smaller `grep` count.** Today a timeout in one loop panics
-with a bespoke message (or none); another times out silently; a third checks the
-deadline before the first probe, a fourth after. One primitive makes every wait
-report *what it was still waiting for* and *how long it waited*, uniformly.
+The aim is one deadline policy and useful timeout messages, not a smaller
+`grep` count. Today one loop panics with its own message, another times out
+silently, and some check the deadline before the first probe while others check
+it after. With one primitive, every wait reports what it was waiting for and how
+long it waited.
 
 ## Invariants (pinned before implementation)
 
@@ -168,14 +167,9 @@ revisit blocking reads with OS read deadlines later.
 
 ## Migration plan
 
-1. Land `harness::poll_until` + `Observation` + `WaitTimeout`. Put its tests in a
-   **dedicated integration-test file** (`tests/poll_until.rs`), **not** in
-   `tests/harness/mod.rs` — that module is compiled into every integration-test
-   binary, so a `#[test]` there is duplicated dozens of times. Cases:
-   immediate-first-probe (no leading sleep), deadline-trips-and-records-last-state,
-   final-sleep-clamped-to-remaining.
-2. Re-express the domain wrappers on top of it (Class A). Keep every timeout /
-   interval identical; keep proof-carrying returns.
+1. **Shipped (`080ad25`).** `harness::poll_until`, `Observation` and
+   `WaitTimeout`, tested in `tests/poll_until.rs`.
+2. **Shipped (`080ad25`).** Domain wrappers re-expressed on `poll_until`.
 3. Migrate the duplicated meta / event / path / PID / lock loops across the ~17
    files to the wrappers, file by file, stress-passing each.
 4. **Deferred:** Class B (Condvar/mpsc for `ReadyFollower` + PTY readers) is not

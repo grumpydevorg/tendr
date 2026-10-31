@@ -80,7 +80,7 @@ fn guide_python_section_is_relevant() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Python"))
-        .stdout(predicate::str::contains("namespace persists"))
+        .stdout(predicate::str::contains("persist between calls"))
         .stdout(predicate::str::contains("Reach remote hosts").not());
 }
 
@@ -107,6 +107,42 @@ fn guide_install_section_is_relevant() {
         .stdout(predicate::str::contains("Install and build"))
         .stdout(predicate::str::contains("cargo install tendr"))
         .stdout(predicate::str::contains("cargo-zigbuild"));
+}
+
+#[test]
+fn guide_boundary_section_is_relevant() {
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .args(["guide", "boundary"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--boundary-parent"))
+        .stdout(predicate::str::contains("Query the event log").not());
+}
+
+#[test]
+fn guide_cgroup_section_is_relevant() {
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .args(["guide", "cgroup"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tendr.slice"))
+        .stdout(predicate::str::contains("Record where a session runs").not());
+}
+
+#[test]
+fn guide_herdr_section_is_relevant() {
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .args(["guide", "herdr"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("herdr pane read"))
+        .stdout(predicate::str::contains("## Exit codes").not());
 }
 
 #[test]

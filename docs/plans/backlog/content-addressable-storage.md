@@ -1,19 +1,16 @@
 ---
 id: content-addressable-storage
-depends_on:
-  - event-emit-primitive
-links:
-  - ../specs/event-protocol.md
-  - ../specs/tender-as-block-runtime.md
+depends_on: []
 ---
 
-# Content-Addressable Storage Extensions
+# Content-addressable storage extensions
 
-> **Status: consumer-gated.** The useful primitive already shipped in the
-> event protocol: oversized event payloads spill into per-session
-> `events/blobs/<sha256>` and are exposed as `data_ref`. Session-local retention
-> remains owned by `prune`. Do not build a global CAS, refcounts, replay cache,
-> or new `block` record vocabulary speculatively.
+**Status:** not started. Waiting for a consumer that meets the trigger below.
+
+Oversized event payloads already spill into per-session
+`events/blobs/<sha256>` and appear as `data_ref`. `prune` owns session-local
+retention. Do not build a global store, reference counts, a replay cache or a
+new `block` record vocabulary until a consumer needs them.
 
 ## Reconsideration trigger
 
@@ -30,10 +27,10 @@ The consumer must supply representative data and an ownership model for
 retention. Cross-session deduplication is not a local layout tweak: it breaks
 the current rule that deleting a session deletes all of its events and blobs.
 
-## Constraints that survive the older design
+## Constraints
 
-- The event envelope and `data_ref` schema remain owned by
-  [event-protocol.md](../specs/event-protocol.md).
+- The event envelope and `data_ref` schema remain owned by the
+  [event protocol](../../architecture/07-event-protocol.md).
 - Blob keys are SHA-256 of the exact serialized payload bytes.
 - Writes remain temp-file plus atomic rename; readers verify size/hash when
   integrity matters.
@@ -42,6 +39,4 @@ the current rule that deleting a session deletes all of its events and blobs.
 - Until a consumer proves otherwise, session-local blobs plus `prune` are the
   complete design.
 
-The previous global-CAS, ULID/`parent_block_id`, daemon, refcount, and
-`tendr block output` sketches were superseded by the shipped event protocol
-and remain available in git history if a future consumer needs their rationale.
+Earlier global-store sketches are in Git history.

@@ -1,5 +1,5 @@
 //! Contract tests for the PTY recording codec (`tendr::recording`).
-//! Wire-format authority: `docs/plans/specs/pty-recording-format.md`.
+//! Wire-format authority: `docs/architecture/08-pty-recording-format.md`.
 
 use std::num::NonZeroU32;
 

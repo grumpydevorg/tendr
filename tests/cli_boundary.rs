@@ -1,6 +1,6 @@
 //! `tendr start --boundary` / `--boundary-parent` — the boundary descriptor
 //! is recorded on the session's LaunchSpec and surfaced by `status`.
-//! See docs/plans/active/01_boundary-metadata.md.
+//! See docs/guide.md ("Record where a session runs").
 
 mod harness;
 

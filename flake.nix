@@ -1,5 +1,5 @@
 {
-  description = "tendr - agent process sitter: supervised runs, not processes";
+  description = "tendr: keep shells, REPLs and long-running jobs alive between tool calls";
 
   inputs = {
     # Deliberately unpinned to anything clever. A consumer that already has a
@@ -108,6 +108,14 @@
           # tests/sidecar_failure.rs the fault hooks TENDR_TEST_FAIL,
           # TENDR_TEST_PANIC and TENDR_TEST_FAULT_GATE.
           checkType = "debug";
+
+          # tests/docs.rs checks README.md, docs/ and docs/plans/, which the
+          # source set above leaves out so that editing them does not rebuild the
+          # package. CI runs those tests from a full checkout.
+          checkFlags = [
+            "--skip"
+            "docs_"
+          ];
 
           # src/bin/ holds three helper executables that exist only for the
           # integration tests to spawn, and cargo auto-discovers them as

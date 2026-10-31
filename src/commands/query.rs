@@ -42,7 +42,7 @@ pub struct QueryOptions {
 /// value into a NULL in that column (not an error), and the reader itself skips
 /// an unparseable or torn line (`ignore_errors` + `WHERE j IS NOT NULL` in
 /// `build_view_sql`) so it is neither an error nor a phantom counted row.
-/// Envelope contract: event-protocol.md §1.
+/// Envelope contract: docs/architecture/07-event-protocol.md §1.
 const VIEW_PROJECTION: &str = "\
     TRY_CAST(j->>'v' AS INT) AS v, \
     j->>'id' AS id, \

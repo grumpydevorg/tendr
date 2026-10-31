@@ -689,8 +689,8 @@ fn host_flag_forwards_exec_target() {
     );
 }
 
-// -- Slice 1 (2026-07-08-remote-exec-host-parity.md): local-only verbs exit 2
-//    with a pre-filled ssh fallback, before any connection --
+// -- Local-only verbs exit 2 with a pre-filled ssh fallback, before any
+//    connection --
 
 /// A poison ssh shim: running it is the failure the slice exists to
 /// prevent, so it exits loudly. Returns the PATH dir.
@@ -944,7 +944,7 @@ fn host_events_keeps_generic_rejection() {
     );
 }
 
-// -- Slice 2 (2026-07-08-remote-exec-host-parity.md): remote exec via frame-from-stdin --
+// -- Remote exec via frame-from-stdin --
 
 /// A fake ssh that drops everything up to and including the "tendr"
 /// argv token, then executes the real tendr binary with the remainder —

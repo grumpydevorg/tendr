@@ -3,9 +3,9 @@
 //! The guide's single source of truth is `docs/guide.md`, embedded at build
 //! time. `tendr guide` prints the whole document; `tendr guide <topic>` slices
 //! out one section by mapping the topic to a heading and returning everything
-//! from that heading down to the next same-or-higher-level heading. Zero doc
-//! duplication in Rust — the Markdown is the content, this module is only the
-//! index and the slicer.
+//! from that heading down to the next same-or-higher-level heading. The
+//! Markdown holds all the content; this module holds only the topic index and
+//! the slicer.
 
 /// The usage guide, embedded from the repo's source of truth.
 const GUIDE: &str = include_str!("../../docs/guide.md");
@@ -193,8 +193,8 @@ mod tests {
         let duckdb = slice_section(GUIDE, "DuckDB").unwrap();
         let python = slice_section(GUIDE, "Python /").unwrap();
         assert!(duckdb.contains("duckdb :memory:"));
-        assert!(!duckdb.contains("namespace persists"));
-        assert!(python.contains("namespace persists"));
+        assert!(!duckdb.contains("persist between calls"));
+        assert!(python.contains("persist between calls"));
     }
 
     #[test]

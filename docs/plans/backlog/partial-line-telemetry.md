@@ -1,18 +1,16 @@
 ---
 id: partial-line-telemetry
 depends_on: []
-links:
-  - log-delimiter-cr-framing.md
-  - ../specs/sidecar-control-protocol.md
 ---
 
-# Partial-Line Telemetry — Make a Silent Session Explain Itself
+# Partial-line telemetry: make a silent session explain itself
 
-Expose how much output a session has buffered without emitting, and how long it has
-been since the last record, so an empty `output.log` reports its own cause.
+**Status:** not started. Ready, except for one open question: how the sidecar
+passes the counters to the CLI.
 
-> **Status: not started. Written 2026-07-27, split out of
-> [log-delimiter-cr-framing](log-delimiter-cr-framing.md).**
+Expose how much output a session has buffered but not yet written as a record,
+and how long since the last record. An empty `output.log` then reports its own
+cause. Split from [log-delimiter-cr-framing](log-delimiter-cr-framing.md).
 
 ## Why
 
@@ -77,11 +75,10 @@ Three options:
    flooding a partial line are all identical under mtime. Use it for
    `last_completed_record_at` and nothing more.
 3. **Sidecar control protocol.**
-   [The spec](../specs/sidecar-control-protocol.md) exists but is explicitly *"not
-   scheduled, not blocking"*, and its own migration trigger is a feature needing
-   *"portable correlated request/response"*. This is one-way push of a scalar. **It
-   does not meet that trigger** and must not be used to justify building the
-   protocol.
+   The [sidecar control protocol](sidecar-control-protocol.md) design is not
+   scheduled. Its own trigger is a feature that needs portable correlated
+   request/response. This is a one-way push of a scalar. **It does not meet that
+   trigger** and must not be used to justify building the protocol.
 
 **Do not put these counters in `meta.json`.** That file is the durable lifecycle
 record, rewritten on state transitions and read by reconciliation; rewriting it

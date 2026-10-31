@@ -16,7 +16,7 @@
 //! (the sidecar queues it for its effects thread), so a stalled disk cannot
 //! hold up capture. The recorded process and its viewers are unaffected. Wire
 //! format:
-//! `docs/plans/specs/pty-recording-format.md`.
+//! `docs/architecture/08-pty-recording-format.md`.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};

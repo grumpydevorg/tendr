@@ -1,9 +1,10 @@
 # System Context
 
-Tendr is a transactional CLI over a durable per-session record and a
-per-session sidecar. The sidecar normally owns process lifecycle and log
-capture; after it is gone, CLI reconciliation may heal or infer terminal
-state. The CLI creates or queries sessions, writes control requests, and exits.
+Tendr has two kinds of process: a short-lived CLI and one sidecar per run.
+The CLI creates or queries sessions, writes control requests, and exits. The
+sidecar owns the child process and captures its output. When a sidecar is
+gone, the CLI's reconciliation step records what happened (see
+[03-run-lifecycle.md](03-run-lifecycle.md)).
 
 ```mermaid
 flowchart TD
@@ -34,14 +35,21 @@ flowchart TD
     CLI --> OS
 ```
 
-Responsibility split:
+Who does what:
 
-- The CLI is transactional. It parses arguments, resolves namespaces, writes control requests, and reads persisted state.
-- The sidecar is the normal lifecycle authority. It holds the session lock, spawns the child, writes run-state transitions, captures output, and classifies exit; reconciliation is the narrowly scoped CLI exception.
-- The durable session record has three authorities: `meta.json` for the current run snapshot, `output.log` for child output, and `events/*.jsonl` for lifecycle/provenance history.
-- SSH is only a transport wrapper. It forwards selected CLI commands to a remote Tendr binary; it does not define a second lifecycle model.
+- **CLI.** Parses arguments, resolves namespaces, writes control requests, and
+  reads persisted state. It exits when the command is done.
+- **Sidecar.** Holds the session lock, spawns the child, writes run-state
+  transitions, captures output, and classifies the exit. It is the normal
+  writer of lifecycle state. CLI reconciliation is the one exception.
+- **Session record.** Three files or folders hold the facts:
+  - `meta.json`: the current run snapshot.
+  - `output.log`: child output.
+  - `events/*.jsonl`: lifecycle and provenance history.
+- **SSH.** `--host` runs the same tendr binary on another host for an
+  allowlisted set of commands. It adds no second lifecycle model.
 
-What this diagram omits:
+Covered elsewhere:
 
-- exact session-file names, which are covered in [02-session-storage.md](02-session-storage.md)
-- exact state transitions, which are covered in [03-run-lifecycle.md](03-run-lifecycle.md)
+- session file names: [02-session-storage.md](02-session-storage.md)
+- state transitions: [03-run-lifecycle.md](03-run-lifecycle.md)

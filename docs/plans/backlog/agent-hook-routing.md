@@ -1,35 +1,24 @@
 ---
 id: agent-hook-routing
 depends_on: []
-links:
-  - ../specs/event-protocol.md
-  - ../specs/ecosystem-landscape.md
-  - boo-integration.md
-  - interactive-agent-turns.md
 ---
 
-# Agent Hook Routing — teach agents to publish into the event stream
+# Agent hook routing: publish agent hooks into the event log
 
-A small, docs-and-glue item: extend the shipped `using-tendr` skill with one
-section showing hook-capable agents how to route their lifecycle hooks into
-Tendr's event stream, so the events become consumable by analytics, UIs, and
-terminal adapters.
+**Status:** not started. Ready: a docs-only change to `docs/guide.md`.
 
-> Collapses the two stale cards this replaces — `skill-agent-block-runtime`
-> (an umbrella whose "teach agents the Tendr CLI" core already shipped as the
-> maintained `using-tendr` skill) and `hermes-block-runtime-integration` (a
-> pre-`event-protocol.md`, zero-code, self-superseded integration doc). The one
-> live idea survives: **agent hooks → `tendr emit` / `tendr wrap --event
-> hook.*` → event stream → Boo/Ghostty/UI/analytics consumers.**
+Goal: add one `tendr guide` topic that shows hook-capable agents how to send
+their lifecycle hooks into a session's event log. Analytics, UIs and terminal
+adapters can then read those events. The flow is: agent hook → `tendr emit` or
+`tendr wrap --event hook.*` → event log → consumers such as Boo, Ghostty, a UI
+or analytics.
 
 ## Why
 
-The event protocol shipped, and `hook.` is deliberately an **unreserved** kind
-prefix (event-protocol.md §1) — the conventional namespace for external
-lifecycle-hook events (Claude Code, CI, other agents). What's missing is the
-short, correct recipe telling an agent author how to publish there. The
-`using-tendr` skill is the right home; it already exists and is actively
-maintained.
+`hook.` is an unreserved event kind prefix (see
+[event protocol](../../architecture/07-event-protocol.md) §1). It is the
+conventional namespace for external lifecycle-hook events from Claude Code, CI
+or other agents. What is missing is a short, correct recipe for agent authors.
 
 ## Scope
 
@@ -66,8 +55,8 @@ protocol names/schema only:
 3. **Consumer note.** State plainly that Boo / Ghostty / a future egui view /
    `tendr query` analytics are **consumers** of `hook.*` events, not core
    Tendr — routing/rendering lives in those adapters (see
-   [boo-integration](boo-integration.md), and the Lane B/D split in
-   [ecosystem-landscape.md](../specs/ecosystem-landscape.md)). Core stays narrow.
+   [boo-integration](boo-integration.md) and [decisions](../../decisions.md)).
+   Core stays narrow.
 
 ## Non-goals
 

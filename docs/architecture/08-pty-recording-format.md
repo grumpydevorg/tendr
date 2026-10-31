@@ -1,21 +1,29 @@
----
-id: pty-recording-format
-status: v1 (slice 1 of cloud-pty-control)
-links:
-  - ../active/00_cloud-pty-control.md
----
+# PTY Recording Format, Version 1
 
-# PTY recording format — version 1
+This file defines the byte format of a PTY recording. The `tendr::recording`
+rustdoc describes the Rust API and does not repeat the layout. The golden
+fixture `tests/fixtures/recording/v1-segment0.hex` guards compatibility. A
+change that alters its bytes is a format change and needs a new version
+number.
 
-**This document is the wire-format authority.** The `tendr::recording` rustdoc
-describes the Rust API and links here; it does not restate the layout. The golden
-fixture `tests/fixtures/recording/v1-segment0.hex` guards compatibility: a change
-that alters its bytes is a format change and needs a new version number.
+A recording is the exact, ordered record of what the sidecar observed and
+applied on one run's PTY: output bytes, geometry, and, if input recording is
+on, accepted input bytes. It is separate from `output.log`, which is a lossy
+readable transcript, and from the event log. Why both exist:
+[../decisions.md](../decisions.md).
 
-A recording is the exact, ordered record of what a Tendr PTY owner observed and
-applied for one run: output bytes, geometry, and (only when enabled at launch)
-accepted input bytes. It is separate from `output.log` (a lossy readable
-transcript) and from the lifecycle event log.
+## Storage
+
+The sidecar stores each run's recording in `<session>/recording/<run_id>/`
+as `seg-<index:08>.tndrrec`, one file per segment (`src/recorder.rs`).
+
+- On Unix the directories are `0700` and segment files `0600`.
+- Each segment is first written as a temporary file holding its header. It
+  is synced, then renamed into place, before any record is appended.
+- The sidecar starts a new segment at 64 MiB and stops recording at 1 GiB
+  in total ([04-pty-lane.md](04-pty-lane.md#recording)).
+- The sidecar never records input, so `input_recorded` is always 0 in its
+  segments. The format still defines `INPUT` records.
 
 ## Conventions
 
@@ -24,8 +32,6 @@ transcript) and from the lifecycle event log.
   value `0xFFFFFFFF`, final XOR `0xFFFFFFFF`. Check value: `"123456789"` →
   `0xE3069283`. Implementations must also pass the RFC 3720 appendix B.4 vectors.
 - A **recording** is an ordered list of **segments** for one run, numbered from 0.
-  File naming, manifests, rotation, and retention belong to the recording store,
-  not to this format.
 
 ## Segment header
 
