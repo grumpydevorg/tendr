@@ -1,0 +1,50 @@
+#!/bin/bash
+# Mac side: drive a Ghostty window through Ghostty's AppleScript dictionary, so
+# keys reach a real Ghostty → ssh -t → tendr attach path without focus or a
+# human. Ghostty 1.4 or later.
+#
+#   gt open '<command>'          # new window running <command>; prints its terminal id
+#   gt key <id> <key> [mods]     # one key press: Ghostty key names (backslash,
+#                                # bracketRight, enter, d), mods comma-separated
+#                                # (control, shift, option, command)
+#   gt text <id> '<text>'        # paste text (bracketed if the terminal asked for it)
+#   gt mouse <id> <x> <y>        # move the mouse to pixel x,y in the terminal
+#   gt close <id>
+#
+# Ghostty asks once for permission to be controlled by the calling app.
+set -euo pipefail
+cmd=${1:?usage: gt open|key|text|mouse|close ...}
+shift
+term='first terminal whose id is (item 1 of argv)'
+case $cmd in
+  open)
+    osascript - "${1:?command}" <<'EOF'
+on run argv
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set command of cfg to item 1 of argv
+    set wait after command of cfg to true
+    set w to new window with configuration cfg
+    return id of focused terminal of selected tab of w
+  end tell
+end run
+EOF
+    ;;
+  key)
+    if [ $# -ge 3 ]; then
+      osascript -e 'on run argv' -e "tell application \"Ghostty\" to send key (item 2 of argv) modifiers (item 3 of argv) to $term" -e 'end run' "$@"
+    else
+      osascript -e 'on run argv' -e "tell application \"Ghostty\" to send key (item 2 of argv) to $term" -e 'end run' "$@"
+    fi
+    ;;
+  text)
+    osascript -e 'on run argv' -e "tell application \"Ghostty\" to input text (item 2 of argv) to $term" -e 'end run' "$@"
+    ;;
+  mouse)
+    osascript -e 'on run argv' -e "tell application \"Ghostty\" to send mouse position x ((item 2 of argv) as real) y ((item 3 of argv) as real) to $term" -e 'end run' "$@"
+    ;;
+  close)
+    osascript -e 'on run argv' -e "tell application \"Ghostty\" to close $term" -e 'end run' "$@"
+    ;;
+  *) echo "gt: unknown command $cmd" >&2; exit 2 ;;
+esac

@@ -5,10 +5,10 @@ Scripts for steps 5 and 9 of the
 Claude Code behaves in a tendr PTY session on a VM, and check attach, takeover
 and half-open SSH connections from a Mac.
 
-They were written on an exe.dev VM on 2026-09-26 for a development build of the
-PTY takeover branch (PR #68), before attach moved to exit codes 80–85. They ran
-only a practice pass with `keyprobe` in place of Claude, and have not run on
-tendr 0.4.0. Expect to fix them as you go.
+They were written on an exe.dev VM on 2026-09-26 and first used in full for
+step 5 on 2026-11-01, with tendr 0.4.1, Claude Code 2.1.316 and Ghostty 1.4.0.
+The scripts step 5 did not use (`smoke.sh`, the half-open pair on the VM's own
+sshd, `nested-ssh.sh`) have not run since attach moved to exit codes 80–85.
 
 ## Set up the VM
 
@@ -23,8 +23,9 @@ The VM needs Debian or Ubuntu with systemd, `python3` and passwordless `sudo`.
       scripts on the Mac.
    2. Install tendr into `/usr/local/bin`.
    3. `./install-claude.sh`: installs Claude Code, stops if its checksum does
-      not match, and points `acc`'s Claude at exe.dev's LLM gateway, so no
-      credential is stored on the VM.
+      not match, and points the Claude of `acc` and of the login user at
+      exe.dev's LLM gateway, so no credential is stored on the VM. It also
+      settles Claude's first-run screens for `~/slice1/work` and `~/work`.
    4. `./install-helpers.sh`: installs the test children, `tsnap`, `iptables`,
       `jq` and `tmux`.
 
@@ -34,6 +35,7 @@ Run `sync-vm.sh` again after changing a script.
 
 | Script | Runs on | Does |
 |---|---|---|
+| `gt` | Mac | Drives a Ghostty window through Ghostty's AppleScript dictionary: open one running a command, send keys, paste text, move the mouse, close it |
 | `vmx` | Mac | Runs a command on the VM without a terminal, with a timeout |
 | `sync-vm.sh` | Mac | Copies the scripts to `~/slice1` on the VM |
 | `launch.sh` | VM | Starts Claude (or a stand-in) in a PTY session, watches it detached, then attaches from a tmux pane and sends one prompt |

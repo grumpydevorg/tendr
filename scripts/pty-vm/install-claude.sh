@@ -17,10 +17,14 @@ echo "claude $ver sha256 OK $got"
 sudo install -m 0755 claude-bin /usr/local/bin/claude
 command -v tendr >/dev/null || { echo "install-claude.sh: install tendr first" >&2; exit 1; }
 
-# Claude config for acc: exe.dev gateway, no credential on the VM, no auto-update.
-sudo -u acc -H bash -c '
+# Claude config for acc and for the login user (who attaches over exe.dev's own
+# `ssh -t <vm>.exe.xyz`): exe.dev gateway, no credential on the VM, no
+# auto-update, and the first-run screens (theme, folder trust) already settled
+# for ~/slice1/work and ~/work, so a prompt is not typed into them.
+setup_user() {
+  sudo -u "$1" -H bash -c '
 set -e
-mkdir -p ~/.claude ~/work
+mkdir -p ~/.claude ~/work ~/slice1/work
 cat > ~/.claude/settings.json <<EOF
 {
   "apiKeyHelper": "printf exe-gateway",
@@ -33,6 +37,21 @@ cat > ~/.claude/settings.json <<EOF
 }
 EOF
 chmod 600 ~/.claude/settings.json
+claude --version >/dev/null  # creates ~/.claude.json
+python3 - "$(claude --version | cut -d" " -f1)" <<PY
+import json, os, sys
+path = os.path.expanduser("~/.claude.json")
+d = json.load(open(path))
+d.update(hasCompletedOnboarding=True, theme="dark", lastOnboardingVersion=sys.argv[1])
+for w in ("~/slice1/work", "~/work"):
+    p = d.setdefault("projects", {}).setdefault(os.path.expanduser(w), {})
+    p.update(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)
+json.dump(d, open(path, "w"), indent=2)
+PY
+chmod 600 ~/.claude.json
 '
-sudo -u acc -H tendr --version
-sudo -u acc -H claude --version
+  sudo -u "$1" -H tendr --version
+  sudo -u "$1" -H claude --version
+}
+setup_user acc
+setup_user "$(id -un)"

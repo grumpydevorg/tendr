@@ -13,8 +13,8 @@
 # PROMPT (default a one-word prompt; empty skips), PROMPT_TIMEOUT (120),
 # CLAUDE_ARGS (extra args for claude). Output: ~/slice1/out/$S/.
 #
-# Before a real run, settle Claude's first-run screens (theme, folder trust for
-# ~/slice1/work) for the chosen account, or the prompt step types into them.
+# install-claude.sh settles Claude's first-run screens (theme, folder trust for
+# ~/slice1/work); without that, the prompt step types into them.
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
 
