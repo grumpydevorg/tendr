@@ -42,8 +42,12 @@
   the PTY, macOS discarded the unread output after about 0.65 s, leaving an
   empty log and recording for a run recorded as `ExitedOk`. Under heavy load
   this lost about one run in five. The sidecar now keeps the terminal open
-  until it has read everything the child left, then lets it close. Linux kept
-  such output and is unaffected.
+  until it has read everything the child left, then lets it close; a graceful
+  `kill` or `--timeout` keeps it too. A forced stop (`kill --force`, or a
+  sidecar failure before capture starts) gives the terminal up at once, so
+  the child's exit never waits on output nothing will read; there its last
+  unread output can still be lost under load. Linux kept such output and is
+  unaffected.
 - **`kill` ends a PTY session whose output was stopped with `^S` on macOS.**
   A shell that wrote and exited while its output was stopped could not finish
   exiting, and even `kill --force` left the session `Running`. A stop now

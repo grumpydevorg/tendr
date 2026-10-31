@@ -280,10 +280,10 @@ impl Platform for UnixPlatform {
 
     fn child_stdout(child: &mut SupervisedChild) -> Option<Box<dyn io::Read + Send>> {
         if child.is_pty {
-            child
-                .pty_reader
-                .take()
-                .map(|r| Box::new(r) as Box<dyn io::Read + Send>)
+            child.pty_reader.take().map(|r| {
+                r.mark_running();
+                Box::new(r) as Box<dyn io::Read + Send>
+            })
         } else {
             child
                 .child
@@ -335,11 +335,11 @@ impl Platform for UnixPlatform {
     }
 
     fn kill_child(handle: &ChildKillHandle, force: bool) -> io::Result<()> {
-        // Release the terminal first, so the child's exit never waits on
-        // capture: no reader runs on a failure path, and a reader cannot drain
-        // output stopped by ^S.
+        // Before signalling, so the child's exit never waits on output nothing
+        // will read: restart output stopped by ^S, and give the terminal up if
+        // no reader is running (a failure path) or the stop is forced.
         if let Some(hold) = &handle.pty_hold {
-            hold.release_for_stop();
+            hold.release_for_stop(force);
         }
         kill_process(&handle.identity, force, handle.pty_hold.is_some())
     }
@@ -839,8 +839,10 @@ pub fn set_nonblocking(fd: &impl rustix::fd::AsFd) -> io::Result<()> {
 /// Holding the slave means the child's close is never the last one, so on
 /// macOS the child's exit waits in the kernel, without a time limit, until
 /// this reader has drained the master. A stop (`kill_child`) therefore
-/// releases the hold first, and restarts output stopped by `^S`, so no exit
-/// waits on a reader that is not running or cannot drain. Once the slave is
+/// restarts output stopped by `^S`, and gives the hold up at once when it is
+/// forced or no reader is running, so no exit waits on a reader that cannot
+/// drain. A graceful stop with this reader running keeps the hold, so what
+/// the child writes as it stops is captured. Once the slave is
 /// released, end of stream comes as before: when every other holder
 /// (descendants that inherited the terminal) has closed it.
 pub struct PtyReader {
@@ -849,6 +851,8 @@ pub struct PtyReader {
 }
 
 /// What a holding [`PtyReader`] needs to release its hold once drained.
+/// Dropping it releases the hold, so a reader that ends early (an error, a
+/// panic) never leaves the child's exit waiting.
 struct DrainWatch {
     hold: SlaveHold,
     /// Read end of a pipe whose write end closes once the child has exited.
@@ -857,36 +861,67 @@ struct DrainWatch {
     exit_seen: bool,
 }
 
+impl Drop for DrainWatch {
+    fn drop(&mut self) {
+        self.hold.release();
+        self.hold
+            .0
+            .reader_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The sidecar's descriptor for a PTY's slave side, shared by the reader,
-/// which releases it once drained, and the stop path, which releases it at
-/// once. Whichever comes first closes it.
+/// which releases it once drained, and the stop path, which may release it
+/// at once. Whichever comes first closes it.
 #[derive(Clone)]
-struct SlaveHold(std::sync::Arc<std::sync::Mutex<Option<OwnedFd>>>);
+struct SlaveHold(std::sync::Arc<HoldState>);
+
+struct HoldState {
+    slave: std::sync::Mutex<Option<OwnedFd>>,
+    /// Capture is reading the master, so it will drain what the child leaves.
+    reader_running: std::sync::atomic::AtomicBool,
+}
 
 impl SlaveHold {
     fn new(slave: OwnedFd) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(slave))))
+        Self(std::sync::Arc::new(HoldState {
+            slave: std::sync::Mutex::new(Some(slave)),
+            reader_running: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
 
-    fn take(&self) -> Option<OwnedFd> {
+    fn slave(&self) -> std::sync::MutexGuard<'_, Option<OwnedFd>> {
         self.0
+            .slave
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
     }
 
     /// Close the slave descriptor, if still held.
     fn release(&self) {
-        drop(self.take());
+        drop(self.slave().take());
     }
 
-    /// Release for a stop: first restart output stopped by `^S` (`TCOON`),
-    /// which nothing can drain while stopped, then close the descriptor. A
-    /// no-op once released: the child has then exited and been drained.
-    fn release_for_stop(&self) {
-        if let Some(slave) = self.take() {
-            // Best effort: the stop goes ahead either way.
-            let _ = rustix::termios::tcflow(&slave, rustix::termios::Action::OOn);
+    /// Prepare for a stop. Restart output stopped by `^S` (`TCOON`), which
+    /// nothing can drain while stopped; then, if the stop is forced or no
+    /// reader is running, close the descriptor so the child's exit does not
+    /// wait for a drain. A no-op once released: the child has then exited
+    /// and been drained.
+    fn release_for_stop(&self, force: bool) {
+        let mut slave = self.slave();
+        let Some(fd) = slave.as_ref() else {
+            return;
+        };
+        // Best effort: the stop goes ahead either way.
+        let _ = rustix::termios::tcflow(fd, rustix::termios::Action::OOn);
+        if force
+            || !self
+                .0
+                .reader_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            drop(slave.take());
         }
     }
 }
@@ -910,6 +945,18 @@ impl PtyReader {
         }
     }
 
+    /// Capture has taken this reader: from now on a graceful stop keeps the
+    /// hold, since this reader will drain what the child leaves.
+    fn mark_running(&self) {
+        if let Some(drain) = &self.drain {
+            drain
+                .hold
+                .0
+                .reader_running
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Called when a read would block: wait until the master may be readable,
     /// or, while the slave is held, until the child exits. A read that would
     /// block after the exit was seen means the master is drained, so the slave
@@ -923,7 +970,7 @@ impl PtyReader {
             return Ok(());
         };
         if drain.exit_seen {
-            drain.hold.release();
+            // Dropping the watch releases the hold.
             self.drain = None;
             return Ok(());
         }

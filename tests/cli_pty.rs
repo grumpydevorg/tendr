@@ -148,10 +148,11 @@ fn pty_capture_ends_with_the_terminal_not_the_child() {
 /// A `^S` sent to a PTY session stops its output. On macOS a child that
 /// writes and exits while it is stopped cannot finish exiting until the
 /// output drains, which nothing can do while it is stopped; on Linux the
-/// write itself blocks. Either way `kill --force` must end the run: the stop
-/// restarts output and releases the sidecar's hold on the terminal. Both a
-/// child exec'd directly and a shell (which opens `/dev/tty`, holding the
-/// terminal itself) are covered.
+/// write itself blocks. Either way `kill` must end the run: every stop
+/// restarts output, and a forced one also releases the sidecar's hold on the
+/// terminal. A graceful stop keeps the hold, so on macOS capture still gets
+/// what the child wrote. Both a child exec'd directly and a shell (which
+/// opens `/dev/tty`, holding the terminal itself) are covered.
 #[test]
 fn kill_ends_a_pty_run_whose_output_is_stopped() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -160,9 +161,11 @@ fn kill_ends_a_pty_run_whose_output_is_stopped() {
     let direct = r#"$| = 1; select(undef, undef, undef, 0.05) until -e $ARGV[0];
         print "pending\n"; open(my $f, ">", $ARGV[1]) or die; close $f"#;
     let shell = r#"while [ ! -e "$1" ]; do sleep 0.05; done; echo pending; : > "$2""#;
-    for (session, program) in [
-        ("xoff-direct", ["perl", "-e", direct]),
-        ("xoff-shell", ["sh", "-c", shell]),
+    for (session, program, force) in [
+        ("xoff-direct", ["perl", "-e", direct], true),
+        ("xoff-shell", ["sh", "-c", shell], true),
+        ("xoff-direct-graceful", ["perl", "-e", direct], false),
+        ("xoff-shell-graceful", ["sh", "-c", shell], false),
     ] {
         let go = root.path().join(format!("{session}.go"));
         let written = root.path().join(format!("{session}.written"));
@@ -195,11 +198,54 @@ fn kill_ends_a_pty_run_whose_output_is_stopped() {
         std::thread::sleep(Duration::from_millis(300));
 
         // Already ended by itself is fine too; only a stuck run fails.
-        let _ = tendr(&root).args(["kill", session, "--force"]).output();
+        let mut kill = tendr(&root);
+        kill.args(["kill", session]);
+        if force {
+            kill.arg("--force");
+        }
+        let _ = kill.output();
         let meta = harness::poll_terminal_ns(&root, "default", session)
-            .unwrap_or_else(|e| panic!("{session}: still not ended after kill --force: {e}"));
+            .unwrap_or_else(|e| panic!("{session}: still not ended after kill: {e}"));
         assert_eq!(meta["status"], "Exited", "{session}: {meta}");
+        if !force && cfg!(target_os = "macos") {
+            let output = tendr(&root)
+                .args(["log", session, "--raw"])
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&output.stdout);
+            assert!(log.contains("pending"), "{session}: {log:?}");
+        }
     }
+}
+
+/// A graceful `kill` keeps the sidecar's hold on the terminal while capture
+/// is running, so what the child writes as it hangs up is still captured by
+/// a reader that is stalled past the child's exit. (Only a forced stop, or a
+/// stop with no reader running, gives the hold up at once.) The pause after
+/// `Running` lets capture start, so the kill finds the reader in place.
+#[test]
+fn graceful_kill_keeps_a_stalled_readers_output() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .env("TENDR_TEST_PTY_READ_DELAY_MS", "3000")
+        .args(["start", "pty-hangup", "--pty", "--", "perl", "-e"])
+        .arg(r#"$| = 1; $SIG{HUP} = sub { print "final line\n"; exit 0 }; sleep 60"#)
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-hangup");
+    harness::wait_running(&root, "pty-hangup");
+    std::thread::sleep(Duration::from_millis(300));
+    tendr(&root).args(["kill", "pty-hangup"]).assert().success();
+    harness::wait_terminal(&root, "pty-hangup");
+
+    let output = tendr(&root)
+        .args(["log", "pty-hangup", "--raw"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(log.contains("final line"), "output.log lost it: {log:?}");
 }
 
 /// The `TERM` a PTY child sees when started with `inherited` in the caller's
