@@ -168,6 +168,7 @@ What a failed post-spawn step does:
 | `child_pid` breadcrumb (`breadcrumb`) | recover, with a warning | Only crash recovery reads it. |
 | PTY I/O setup (`attach_bind`): the recorder, the input writer, and the listener on the socket bound before spawn | end the run | A PTY session never runs without its listener. The listener reaches the PTY only through the input writer. |
 | `output.log` open (`output_log`) | recover: drain the output, warning `output not captured` | The exit is still worth recording, and a child that nobody reads blocks on a full pipe. |
+| `output.log` write during the run (`output_log_write` in tests) | recover: stop logging that stream, keep reading and discard; one warning per stream, written to meta while the run is live | The child must never block on a full pipe, and its exit is still worth recording. |
 | stdin transport (`stdin_transport`) | end the run | A `--stdin` run whose input can never arrive is a failed run. |
 | publishing `Running` (`running_meta`) | end the run | `Running` must be observable. |
 | observing the exit (`child_wait`) | end the run | An exit that cannot be observed cannot be classified. |

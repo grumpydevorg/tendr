@@ -604,6 +604,126 @@ fn output_log_failure_drains_output_and_recovers() {
     );
 }
 
+/// The warning a failed `output.log` write leaves, once per stream.
+fn write_warning(stream: &str) -> String {
+    format!(
+        "{stream} capture: output.log write failed; later output not logged: \
+         injected fault at output_log_write"
+    )
+}
+
+/// Exactly one warning per stream for a failed `output.log` write.
+fn assert_one_write_warning(meta: &serde_json::Value, stream: &str) {
+    let needle = write_warning(stream);
+    let warnings = warnings(meta);
+    let count = warnings.iter().filter(|w| w.contains(&needle)).count();
+    assert_eq!(count, 1, "expected one {needle:?}, got {warnings:?}");
+}
+
+/// A mid-run `output.log` write failure keeps draining the child's output,
+/// so a chatty child still runs to its real exit with a warning.
+#[test]
+fn output_log_write_failure_drains_output_and_recovers() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_root, meta) = recovers(
+        Inject::Fail("output_log_write"),
+        &["--timeout", "20"],
+        &[
+            "sh",
+            "-c",
+            "yes tendr | head -c 2000000; yes tendr | head -c 2000000 >&2",
+        ],
+    );
+    assert_exited_ok(&meta);
+    assert_one_write_warning(&meta, "stdout");
+    assert_one_write_warning(&meta, "stderr");
+}
+
+/// The write-failure warning reaches meta while the child still runs.
+#[test]
+fn output_log_write_failure_warns_while_the_run_is_live() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let gate = root.path().join("fault-gate");
+    std::fs::write(&gate, b"").unwrap();
+    let client = spawn_start(
+        &root,
+        Inject::Fail("output_log_write"),
+        &gate,
+        &[
+            "s1",
+            "--timeout",
+            "20",
+            "--",
+            "sh",
+            "-c",
+            "yes tendr | head -c 2000000; sleep 5",
+        ],
+    );
+    let _ = finish_client(client);
+    let needle = write_warning("stdout");
+    poll_until(Duration::from_secs(4), Duration::from_millis(50), || {
+        let meta = status_of(&root, "s1");
+        assert_eq!(
+            meta["status"], "Running",
+            "the warning must show before exit: {meta}"
+        );
+        if warnings(&meta).iter().any(|w| w.contains(&needle)) {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("status={}", meta["status"]))
+        }
+    })
+    .unwrap_or_else(|e| panic!("no live warning: {e}"));
+    let (meta, _lock) = wait_sidecar_gone(&root, "s1");
+    assert_exited_ok(&meta);
+    assert_one_write_warning(&meta, "stdout");
+}
+
+/// The PTY tee path: the recorder keeps receiving output after the log fails.
+#[cfg(unix)]
+#[test]
+fn pty_output_log_write_failure_keeps_recording_and_recovers() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, meta) = recovers(
+        Inject::Fail("output_log_write"),
+        &["--pty", "--timeout", "20"],
+        &["sh", "-c", "yes tendr | head -c 2000000"],
+    );
+    assert_exited_ok(&meta);
+    assert_one_write_warning(&meta, "stdout");
+    let recording = session_dir(&root, "s1").join("recording");
+    let mut bytes = 0;
+    for run in std::fs::read_dir(&recording).expect("recording dir") {
+        for seg in std::fs::read_dir(run.unwrap().path()).unwrap() {
+            bytes += seg.unwrap().metadata().unwrap().len();
+        }
+    }
+    assert!(bytes > 1_000_000, "recording holds only {bytes} bytes");
+}
+
+/// A line that is not valid UTF-8 is logged lossily, and capture goes on.
+#[cfg(unix)]
+#[test]
+fn invalid_utf8_line_is_logged_and_capture_continues() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, meta) = recovers(
+        Inject::Fail("none"),
+        &["--timeout", "20"],
+        &["sh", "-c", r"printf 'a\377b\r\nafter\n'"],
+    );
+    assert_exited_ok(&meta);
+    let log = std::fs::read_to_string(session_dir(&root, "s1").join("output.log")).unwrap();
+    let lines: Vec<String> = log
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["content"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(lines, ["a\u{FFFD}b", "after"], "{log}");
+}
+
 /// The child exited, so there is nothing to stop: the durable event lets
 /// reconciliation heal meta, a copy goes to lost+found, and hooks still run.
 #[test]

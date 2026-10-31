@@ -221,7 +221,9 @@ A `push` to a pipe session that is not running exits 1.
 - For each chunk of output, capture first hands it to the recorder, then
   writes it to `output.log`, then offers it to the attached viewer's queue.
   The recorder does not wait for its storage, so a viewer can receive bytes
-  before they are on disk.
+  before they are on disk. After a failed `output.log` write, capture skips
+  the log for the rest of the run; the recorder and the viewer still get
+  every chunk.
 - The viewer's queue holds at most 8 MiB. The viewer's own sender thread
   drains it. A viewer that stops reading is disconnected and loses control. It
   never stalls capture or the child.
