@@ -195,3 +195,44 @@ fn wait_exit_code_reflects_healed_state() {
         .assert()
         .code(42);
 }
+
+/// A lost PTY sidecar cannot finish its recording: reconciliation marks the
+/// recording stopped with a reason, and logs `recording.stopped` before the
+/// inferred `run.sidecar_lost`, so a reader never sees a recording that is
+/// still "Recording" on a run that has ended.
+#[test]
+fn sidecar_lost_stops_a_pty_recording() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .args(["start", "p1", "--pty", "--", "sleep", "60"])
+        .assert()
+        .success();
+    wait_running(&root, "p1");
+    let meta = read_meta_json(&root, "p1");
+    assert_eq!(meta["pty"]["recording"]["state"], "Recording");
+
+    let sc_pid = sidecar_pid(&meta);
+    unsafe { libc::kill(sc_pid, libc::SIGKILL) };
+    wait_pid_dead(sc_pid);
+
+    let output = tendr(&root).args(["status", "p1"]).output().unwrap();
+    assert!(output.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["status"], "SidecarLost");
+
+    let recording = &read_meta_json(&root, "p1")["pty"]["recording"];
+    assert_eq!(recording["state"], "Stopped", "{recording}");
+    assert_eq!(recording["reason"], "sidecar_lost", "{recording}");
+
+    let events = read_events(&root, "p1");
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    let stopped = kinds.iter().position(|k| *k == "recording.stopped");
+    let lost = kinds.iter().position(|k| *k == "run.sidecar_lost");
+    assert!(
+        stopped.is_some() && stopped < lost,
+        "recording.stopped must precede run.sidecar_lost: {kinds:?}"
+    );
+    assert_eq!(events[stopped.unwrap()]["data"]["reason"], "sidecar_lost");
+}

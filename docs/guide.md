@@ -209,7 +209,8 @@ under `recording/<run_id>/` in the session directory, but not typed input.
 (size limit, disk failure, or storage falling behind), the session keeps
 running. `status` then shows `Stopped` with the last recorded sequence, Tendr
 logs a `recording.stopped` event, and the run ends with a warning that later
-output was not recorded.
+output was not recorded. If the sidecar itself is lost, the recording shows
+`Stopped` with reason `sidecar_lost`.
 
 The child gets `TERM=xterm-256color` when `TERM` was missing, empty, `dumb`,
 or removed with `--unset-env TERM` for the `tendr start` that launched it, as

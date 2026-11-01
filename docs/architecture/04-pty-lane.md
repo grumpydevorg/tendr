@@ -321,6 +321,11 @@ Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
   sequence), before the run's terminal record, never after it.
 - After a stop the run ends with a warning. The child and viewers keep
   running.
+- A lost sidecar cannot record its stop. When reconciliation infers
+  `SidecarLost`, it marks a recording still `Recording` as `Stopped` with
+  reason `sidecar_lost` and no last sequence, and logs `recording.stopped`
+  from `tendr.cli` before `run.sidecar_lost`. The segments on disk hold what
+  was recorded.
 
 `cargo run --example dump-recording -- <path>` prints a recording as text.
 `<path>` is a segment file, a run's recording directory, or a session

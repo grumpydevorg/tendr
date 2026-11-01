@@ -84,6 +84,9 @@ pub enum RecordingStopReason {
     BacklogFull,
     /// Storage had not caught up when the run ended.
     Stalled,
+    /// The sidecar was lost: reconciliation ended the recording, not the
+    /// recorder. The last recorded sequence is not known.
+    SidecarLost,
 }
 
 impl Default for PtyMeta {

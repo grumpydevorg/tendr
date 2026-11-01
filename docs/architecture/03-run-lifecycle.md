@@ -79,6 +79,9 @@ foreground `run`:
 - `SidecarLost`, when the lock is released with no terminal state. If the
   lost sidecar's child is still alive, reconciliation kills it first (see
   [True crashes](#true-crashes-reconciliation-kills-the-orphan)).
+  A PTY recording still marked `Recording` is marked `Stopped` with reason
+  `sidecar_lost` and no last sequence, and a `recording.stopped` event is
+  logged before `run.sidecar_lost`.
 - A healed terminal state, copied from the sidecar's own terminal event. The
   sidecar's observation and provenance are kept, not re-derived.
 

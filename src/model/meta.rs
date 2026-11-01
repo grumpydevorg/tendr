@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::ids::{EpochTimestamp, Generation, ProcessIdentity, RunId, SessionName};
 use super::provenance::TransitionProvenance;
-use super::pty::{PtyControl, PtyMeta, PtyRecording};
+use super::pty::{PtyControl, PtyMeta, PtyRecording, RecordingState, RecordingStopReason};
 use super::spec::LaunchSpec;
 use super::state::RunStatus;
 
@@ -140,6 +140,24 @@ impl Meta {
         if let Some(ref mut p) = self.pty {
             p.recording = Some(recording);
         }
+    }
+
+    /// Mark a recording that is still `Recording` as `Stopped` for `reason`,
+    /// with no known last sequence. For a recorder that can no longer report
+    /// its own end. Returns whether it changed anything.
+    pub fn stop_live_recording(&mut self, reason: RecordingStopReason) -> bool {
+        let Some(recording) = self.pty.as_mut().and_then(|p| p.recording.as_mut()) else {
+            return false;
+        };
+        if recording.state != RecordingState::Recording {
+            return false;
+        }
+        recording.state = RecordingState::Stopped {
+            last_recorded_sequence: None,
+            last_synced_sequence: None,
+            reason,
+        };
+        true
     }
 
     /// Provenance of the most recent lifecycle transition, if recorded.
