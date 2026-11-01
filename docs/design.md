@@ -215,6 +215,19 @@ hides its window. Source: `src/platform/windows.rs`.
 session is a local session on that host. Upgrade `tendr` on both ends
 together, because a release can change what the two ends send each other.
 
+The request travels as typed data, never as a command line
+(*2026-11-01*). Every `--host` call but `attach` runs one constant remote
+command and sends the request as JSON on ssh stdin
+([remote frame](architecture/06-transport-boundaries.md#the-remote-frame)).
+Quoting arguments for the remote login shell cannot be made safe: POSIX
+quoting means nothing to `cmd.exe`, so on a Windows host a session name like
+`x&calc` ran `calc`, and no one quoting works in `cmd.exe`, PowerShell and
+bash alike. The requests are their own types, not the clap command enum, so a
+CLI change is not a wire change; the version sits on the outer frame. The
+frame ends at the remote tendr CLI, which runs the command as if typed there:
+no network listener, no RPC layer. Values cross verbatim, and tendr does not
+translate workload syntax between shells.
+
 ### No automatic restart
 
 *2026-03.* Tendr never restarts a child that exits (rules 1 and 7). Restarting
