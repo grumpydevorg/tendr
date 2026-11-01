@@ -311,7 +311,14 @@ pub fn cmd_exec(
     outln!("{json}");
 
     if result.timed_out {
-        eprintln!("exec timed out — command may still be running in the shell");
+        if meta.launch_spec().exec_target == tendr::model::spec::ExecTarget::Ndjson {
+            eprintln!(
+                "exec timed out — the request may still be running in the session; its reply \
+                 will arrive in a later exec's `unmatched` (or `tendr log`)"
+            );
+        } else {
+            eprintln!("exec timed out — command may still be running in the shell");
+        }
         std::process::exit(124);
     }
     if result.exit_code != 0 {

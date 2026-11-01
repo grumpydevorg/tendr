@@ -2254,6 +2254,13 @@ fn exec_ndjson_late_reply_lands_in_the_next_exec() {
 
     let slow = ndjson_exec(&root, "dev", 1, r#"{"cmd":"slow","sleep_ms":4000}"#);
     assert_eq!(slow.status.code(), Some(124), "{slow:?}");
+    let warning = String::from_utf8_lossy(&slow.stderr);
+    assert!(
+        warning.contains("request may still be running in the session")
+            && warning.contains("unmatched")
+            && !warning.contains("in the shell"),
+        "{warning}"
+    );
     let slow = json(&slow.stdout);
     assert_eq!(slow["timed_out"], true);
     assert_eq!(slow["stdout"], "");
