@@ -8,7 +8,7 @@ use tendr::log::LogLine;
 use tendr::model::event::{Event, Kind, Uuid7};
 use tendr::model::ids::{Namespace, SessionName, Source};
 use tendr::model::meta::Meta;
-use tendr::model::spec::StdinMode;
+use tendr::model::spec::{ExecTarget, StdinMode};
 use tendr::model::state::RunStatus;
 use tendr::platform::{Current, Platform};
 use tendr::session::{self, SessionDir, SessionRoot};
@@ -22,8 +22,9 @@ pub struct ExecLock {
 
 #[cfg(unix)]
 impl ExecLock {
-    /// Try to acquire exec lock. Fails immediately if another exec holds it.
-    pub fn try_acquire(session: &SessionDir) -> anyhow::Result<Self> {
+    /// Try to acquire the exec lock without waiting. `None` if another exec
+    /// holds it.
+    pub fn try_acquire(session: &SessionDir) -> std::io::Result<Option<Self>> {
         use std::os::unix::io::AsRawFd;
 
         let lock_path = session.path().join("exec.lock");
@@ -36,21 +37,22 @@ impl ExecLock {
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
-                anyhow::bail!("another exec is already running on this session");
+                return Ok(None);
             }
-            return Err(err.into());
+            return Err(err);
         }
 
-        Ok(Self { _file: file })
+        Ok(Some(Self { _file: file }))
     }
 }
 
 #[cfg(windows)]
 impl ExecLock {
-    /// Try to acquire exec lock. Fails immediately if another exec holds it.
-    pub fn try_acquire(session: &SessionDir) -> anyhow::Result<Self> {
+    /// Try to acquire the exec lock without waiting. `None` if another exec
+    /// holds it.
+    pub fn try_acquire(session: &SessionDir) -> std::io::Result<Option<Self>> {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
         use windows_sys::Win32::Storage::FileSystem::{
             LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
         };
@@ -72,10 +74,178 @@ impl ExecLock {
         };
         if ret == 0 {
             let err = std::io::Error::last_os_error();
-            anyhow::bail!("another exec is already running on this session: {err}");
+            // A lock held by another handle fails immediately with this.
+            if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+                return Ok(None);
+            }
+            return Err(err);
         }
 
-        Ok(Self { _file: file })
+        Ok(Some(Self { _file: file }))
+    }
+}
+
+/// The record of an exec whose frame went to the session and has not been
+/// seen to finish: `exec.pending.json`, written (temporary file, then rename)
+/// just before the frame is sent and removed once its result is read.
+///
+/// A timed-out exec leaves it behind, as does one whose client dies. The next
+/// exec on the session checks it under the exec lock: once the frame's
+/// completion signal is in the session dir it removes the record and goes on;
+/// until then it refuses, naming this exec. Sending earlier would put the new
+/// frame on the stdin of a command that may read it as its own input, and its
+/// output after the next exec's log offset. NDJSON execs never write one:
+/// their replies are matched by id.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingExec {
+    token: String,
+    /// When the exec started, RFC 3339 UTC.
+    started_at: String,
+    /// The command, shortened for messages.
+    command: String,
+    /// `output.log` length before the frame was sent; the sentinel targets
+    /// look for its completion from here.
+    log_offset: u64,
+}
+
+const PENDING_EXEC_FILE: &str = "exec.pending.json";
+
+/// How much of the command a pending-exec record keeps.
+const PENDING_COMMAND_BYTES: usize = 120;
+
+impl PendingExec {
+    fn new(cmd: &[String], token: &str, log_offset: u64) -> Self {
+        Self {
+            token: token.to_owned(),
+            started_at: humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string(),
+            command: tendr::annotation::truncate_string(
+                &shell_words::join(cmd),
+                PENDING_COMMAND_BYTES,
+            ),
+            log_offset,
+        }
+    }
+
+    fn path(session: &SessionDir) -> std::path::PathBuf {
+        session.path().join(PENDING_EXEC_FILE)
+    }
+
+    fn load(session: &SessionDir) -> anyhow::Result<Option<Self>> {
+        let path = Self::path(session);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow::anyhow!("cannot read {}: {e}", path.display())),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("unreadable {}: {e}", path.display()))
+    }
+
+    fn save(&self, session: &SessionDir) -> anyhow::Result<()> {
+        let path = Self::path(session);
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(self)?)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    fn clear(session: &SessionDir) {
+        let _ = std::fs::remove_file(Self::path(session));
+    }
+
+    /// Whether this exec's frame has finished in the session: its result
+    /// file exists (removed here, since its exec is gone), or its sentinel
+    /// and, for a POSIX shell, its stderr end marker are in `output.log`.
+    fn is_finished(&self, session: &SessionDir, target: ExecTarget) -> anyhow::Result<bool> {
+        match target {
+            ExecTarget::PythonRepl | ExecTarget::PowerShell => {
+                let result_path = session
+                    .path()
+                    .join("exec-results")
+                    .join(format!("{}.json", self.token));
+                if !result_path.exists() {
+                    return Ok(false);
+                }
+                let _ = std::fs::remove_file(&result_path);
+                Ok(true)
+            }
+            ExecTarget::PosixShell => self.sentinel_logged(session, true),
+            ExecTarget::DuckDb => self.sentinel_logged(session, false),
+            ExecTarget::Ndjson | ExecTarget::None => Ok(true),
+        }
+    }
+
+    fn sentinel_logged(
+        &self,
+        session: &SessionDir,
+        require_err_marker: bool,
+    ) -> anyhow::Result<bool> {
+        let log_path = session.path().join("output.log");
+        let file = match File::open(&log_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(self.log_offset))?;
+
+        let mut sentinel = false;
+        let mut err_marked = !require_err_marker;
+        let mut buf: Vec<u8> = Vec::new();
+        while !(sentinel && err_marked) {
+            buf.clear();
+            if reader.read_until(b'\n', &mut buf)? == 0 {
+                break;
+            }
+            // A torn last line does not parse; the next exec reads it whole.
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                continue;
+            };
+            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+            let Ok(parsed) = serde_json::from_str::<LogLine>(trimmed) else {
+                continue;
+            };
+            let Some(content) = parsed.content_text() else {
+                continue;
+            };
+            if parsed.tag == "O" && exec_frame::parse_sentinel(content, &self.token).is_some() {
+                sentinel = true;
+            } else if require_err_marker
+                && exec_frame::parse_err_marker(content, &self.token).is_some()
+            {
+                err_marked = true;
+            }
+        }
+        if sentinel && !err_marked {
+            // As in wait_sentinel_result: the shell's stderr may no longer
+            // reach the log. Give stragglers the same grace before the next
+            // exec takes its log offset.
+            std::thread::sleep(ERR_MARKER_GRACE);
+        }
+        Ok(sentinel)
+    }
+
+    /// `exec <token>, started <time>: <command>`
+    fn describe(&self) -> String {
+        format!(
+            "exec {}, started {}: {}",
+            self.token, self.started_at, self.command
+        )
+    }
+}
+
+/// `tendr <verb> <session>`, with `--namespace` outside the default one, as
+/// the user would type it.
+fn session_command(verb: &str, name: &SessionName, namespace: &Namespace) -> String {
+    if *namespace == Namespace::default_namespace() {
+        format!("tendr {verb} {}", name.as_str())
+    } else {
+        format!(
+            "tendr {verb} --namespace {} {}",
+            namespace.as_str(),
+            name.as_str()
+        )
     }
 }
 
@@ -187,7 +357,36 @@ pub fn cmd_exec(
         None
     };
 
-    let _lock = ExecLock::try_acquire(&session)?;
+    let exec_target = meta.launch_spec().exec_target;
+    let Some(_lock) = ExecLock::try_acquire(&session)? else {
+        // The record is informational here: it is read without the lock,
+        // and the exec holding the lock may not have written it yet.
+        let running = PendingExec::load(&session)
+            .ok()
+            .flatten()
+            .map(|p| format!(" ({})", p.describe()))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "another exec is already running on this session{running}; wait for it to \
+             return, or start a second session for parallel work"
+        );
+    };
+
+    if let Some(pending) = PendingExec::load(&session)? {
+        if !pending.is_finished(&session, exec_target)? {
+            anyhow::bail!(
+                "an earlier exec on this session has not finished ({}). It timed out, or its \
+                 client stopped, while the command was still running. Nothing was sent: the \
+                 command could read this exec as its own input, and its late output would be \
+                 mixed into this result. Retry once it finishes (`{} -f` shows its output), \
+                 or stop the session with `{}`.",
+                pending.describe(),
+                session_command("log", &session_name, namespace),
+                session_command("kill", &session_name, namespace),
+            );
+        }
+        PendingExec::clear(&session);
+    }
 
     // Validate cmd is non-empty (clap enforces this, but belt-and-suspenders)
     if cmd.is_empty() {
@@ -226,34 +425,13 @@ pub fn cmd_exec(
         ndjson_request,
         timeout,
         block_id,
-    )?;
-
-    // If timed out, the in-shell command may still be running.
-    // Hold the exec lock and drain until the sentinel arrives (or session dies)
-    // to prevent a second exec from injecting into a busy shell.
-    if result.timed_out {
-        use tendr::model::spec::ExecTarget;
-        match meta.launch_spec().exec_target {
-            ExecTarget::PosixShell => {
-                drain_until_sentinel(&session, &token);
-            }
-            ExecTarget::PowerShell | ExecTarget::PythonRepl => {
-                // Frame may still be running. Hold the exec lock until the result
-                // file appears (frame finished) or the session dies, to prevent
-                // a second exec from interleaving.
-                drain_until_side_channel(&session, &token);
-            }
-            ExecTarget::DuckDb => {
-                // DuckDB results flow through stdout — drain sentinel same as shells.
-                drain_until_sentinel(&session, &token);
-            }
-            ExecTarget::Ndjson => {
-                // Nothing to drain: the next exec matches its reply by id, and
-                // a late reply to this one reaches it as an unmatched line.
-            }
-            ExecTarget::None => {} // unreachable after earlier bail
-        }
+    );
+    // A timed-out frame may still be running: its record stays, so the next
+    // exec checks that it has finished before sending anything.
+    if !result.as_ref().is_ok_and(|r| r.timed_out) {
+        PendingExec::clear(&session);
     }
+    let result = result?;
 
     // The authoritative record (spec §6): exec.result with the ExecResult
     // fields; oversize output spills with a structured preview that keeps
@@ -319,14 +497,18 @@ pub fn cmd_exec(
     outln!("{json}");
 
     if result.timed_out {
-        if meta.launch_spec().exec_target == tendr::model::spec::ExecTarget::Ndjson {
+        if exec_target == ExecTarget::Ndjson {
             eprintln!(
                 "exec timed out — request {} may still be running in the session; its reply \
                  will arrive in a later exec's `unmatched` (or `tendr log`)",
                 result.request_id.as_deref().unwrap_or_default()
             );
         } else {
-            eprintln!("exec timed out — command may still be running in the shell");
+            eprintln!(
+                "exec timed out — exec {token} may still be running in the session; later \
+                 execs are refused until it finishes, or until `{}` stops the session",
+                session_command("kill", &session_name, namespace)
+            );
         }
         std::process::exit(124);
     }
@@ -391,8 +573,6 @@ fn run_exec(
     let cursor = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
 
     // 2. Frame the command according to the session's exec target.
-    use tendr::model::spec::ExecTarget;
-
     enum WaitMode {
         /// Shell-style: sentinel in stdout, results in stdout/stderr log lines.
         Sentinel,
@@ -482,6 +662,11 @@ fn run_exec(
             }
         }
     };
+    // Recorded before the frame goes out, so the guard holds even if this
+    // client dies while waiting (see PendingExec).
+    if !matches!(wait_mode, WaitMode::Ndjson) {
+        PendingExec::new(cmd, token, cursor).save(session)?;
+    }
     writer.write_all(framed.as_bytes())?;
     writer.flush()?;
     drop(writer);
@@ -839,31 +1024,6 @@ fn wait_ndjson_result(
     }
 }
 
-/// After a timeout on a PythonRepl exec, hold the exec lock until the result file
-/// appears (meaning the frame finished) or the session dies. Then clean up.
-fn drain_until_side_channel(session: &SessionDir, token: &str) {
-    let result_path = session
-        .path()
-        .join("exec-results")
-        .join(format!("{token}.json"));
-    loop {
-        if result_path.exists() {
-            // Frame finished — clean up and release lock
-            let _ = std::fs::remove_file(&result_path);
-            return;
-        }
-        if let Ok(current) = session::read_meta(session) {
-            if !matches!(current.status(), RunStatus::Running { .. }) {
-                // Session died — clean up any partial files
-                let _ = std::fs::remove_file(&result_path);
-                let _ = std::fs::remove_file(result_path.with_extension("json.tmp"));
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
 /// After the sentinel has been found, re-scan the log for any 'E' (stderr)
 /// lines that arrived after the sentinel.
 ///
@@ -931,52 +1091,6 @@ fn drain_trailing_stderr(session: &SessionDir, cursor: u64) -> String {
     }
 
     stderr_lines.join("\n")
-}
-
-/// After a timeout, drain output.log until the sentinel arrives or the session dies.
-/// This holds the exec lock open to prevent a second exec from injecting into a
-/// shell that is still busy with the timed-out command.
-fn drain_until_sentinel(session: &SessionDir, token: &str) {
-    let log_path = session.path().join("output.log");
-    let Ok(file) = std::fs::File::open(&log_path) else {
-        return;
-    };
-    let mut reader = BufReader::new(file);
-    // Seek to near the end — the sentinel is recent. Leave 64KB margin
-    // in case the command produced output between the timeout and now.
-    let len = reader.seek(SeekFrom::End(0)).unwrap_or(0);
-    let start = len.saturating_sub(65536);
-    let _ = reader.seek(SeekFrom::Start(start));
-
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        match reader.read_line(&mut buf) {
-            Ok(0) => {
-                // Check if session is still alive
-                if let Ok(current) = session::read_meta(session) {
-                    if !matches!(current.status(), RunStatus::Running { .. }) {
-                        return; // Session died — nothing more to drain
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Ok(_) => {
-                let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
-                if let Ok(parsed) = serde_json::from_str::<LogLine>(trimmed) {
-                    if parsed.tag == "O"
-                        && parsed
-                            .content_text()
-                            .and_then(|content| exec_frame::parse_sentinel(content, token))
-                            .is_some()
-                    {
-                        return; // Sentinel found — command finished
-                    }
-                }
-            }
-            Err(_) => return, // IO error — give up
-        }
-    }
 }
 
 /// SHA-256 of `bytes` as lowercase hex (same convention as `events::hex`).
@@ -1159,6 +1273,82 @@ mod tests {
         assert_eq!(result.stdout, "foo");
         assert_eq!(result.stderr, "y");
         assert_eq!(result.exit_code, 3);
+    }
+
+    fn pending(token: &str, log_offset: u64) -> PendingExec {
+        PendingExec::new(&["sleep".to_owned(), "9".to_owned()], token, log_offset)
+    }
+
+    /// A shell frame is finished only once its own sentinel and stderr end
+    /// marker are logged after its offset; another exec's markers don't count.
+    #[test]
+    fn shell_frame_finishes_on_its_own_markers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = session_with_log(
+            &tmp,
+            &[
+                ("O", "__TENDR_EXEC__ old 0 /tmp"),
+                ("E", "__TENDR_EXEC_ERR__ old"),
+                ("O", "__TENDR_EXEC__ other 0 /tmp"),
+                ("E", "__TENDR_EXEC_ERR__ other"),
+                ("E", "__TENDR_EXEC_ERR__ tok"),
+            ],
+        );
+        let log_len = std::fs::metadata(dir.path().join("output.log"))
+            .unwrap()
+            .len();
+        assert!(
+            !pending("tok", 0)
+                .is_finished(&dir, ExecTarget::PosixShell)
+                .unwrap()
+        );
+        assert!(
+            !pending("old", log_len)
+                .is_finished(&dir, ExecTarget::PosixShell)
+                .unwrap()
+        );
+        assert!(
+            pending("old", 0)
+                .is_finished(&dir, ExecTarget::PosixShell)
+                .unwrap()
+        );
+        assert!(
+            pending("other", 0)
+                .is_finished(&dir, ExecTarget::DuckDb)
+                .unwrap()
+        );
+    }
+
+    /// A side-channel frame is finished once its result file exists; nobody
+    /// will read that file, so the check removes it.
+    #[test]
+    fn side_channel_frame_finishes_on_its_result_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = session_with_log(&tmp, &[]);
+        let results = dir.path().join("exec-results");
+        std::fs::create_dir_all(&results).unwrap();
+        let p = pending("tok", 0);
+        assert!(!p.is_finished(&dir, ExecTarget::PythonRepl).unwrap());
+
+        std::fs::write(results.join("tok.json"), "{}").unwrap();
+        assert!(p.is_finished(&dir, ExecTarget::PowerShell).unwrap());
+        assert!(!results.join("tok.json").exists());
+    }
+
+    /// The record round-trips through the session dir, and clearing it twice
+    /// is harmless.
+    #[test]
+    fn pending_record_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = session_with_log(&tmp, &[]);
+        assert!(PendingExec::load(&dir).unwrap().is_none());
+        pending("tok", 7).save(&dir).unwrap();
+        let loaded = PendingExec::load(&dir).unwrap().unwrap();
+        assert_eq!((loaded.token.as_str(), loaded.log_offset), ("tok", 7));
+        assert!(loaded.describe().contains("tok") && loaded.describe().contains("sleep 9"));
+        PendingExec::clear(&dir);
+        PendingExec::clear(&dir);
+        assert!(PendingExec::load(&dir).unwrap().is_none());
     }
 
     /// Independent SHA-256 hex reference (does not go through exec.rs's own helper).
