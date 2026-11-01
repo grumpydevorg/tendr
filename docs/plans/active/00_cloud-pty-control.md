@@ -5,8 +5,7 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 12b and 12c remain. Step 12b needs the VM to verify; step
-12c is local.
+**Status:** step 12c remains; it is local.
 
 ## Goal
 
@@ -28,25 +27,6 @@ back is [PTY replay](../backlog/pty-replay.md).
 
 ## Remaining steps (one PR each)
 
-- **Step 12b. Stop the whole run on Linux** (local; verify on the VM). The
-  sidecar is a child subreaper (`PR_SET_CHILD_SUBREAPER`), so every process
-  the run starts stays its descendant, and it reaps adopted orphans by pid
-  (never `waitpid(-1)`) while the run lasts. At a stop, after the existing
-  sequence (or at once for `--force`), walk `/proc/<sidecar>/task/*/children`
-  (needs `CONFIG_PROC_CHILDREN`), SIGSTOP then SIGKILL each process except
-  on-exit callbacks, and repeat until a walk finds none.
-   - It cannot reach processes started through systemd or D-Bus activation
-     (`systemd-run --user`, `at`), or anything orphaned after the sidecar
-     itself dies. The docs say so.
-   - No cgroup delegation needed: exe.dev starts sidecars in root-owned
-     `/init.scope`, and a logind session scope is root-owned too. A
-     delegated cgroup with `cgroup.kill` is deferred: nothing places a
-     sidecar in one today, and moving it into the user manager ties the run
-     to the user manager's life, which ends at the last logout without
-     lingering.
-   - Tests: each escape kind in the step 9 table ends with the stop, under
-     `kill`, `kill --force` and `--timeout`. On the VM, `treekill/` in the
-     harness repeats the table.
 - **Step 12c. Stop the whole run on macOS** (local). At a stop, list
   same-user processes whose session is the child's, the child's descendants,
   and processes holding the run's terminal; SIGSTOP then SIGKILL, repeated.
@@ -79,12 +59,12 @@ bracketed-paste-safe escape), Claude Code 2.1.316, omp 18.14.0 and Ghostty
 
 What survived a stop, counted 30 s after it began:
 
-| Child | After `tendr kill` | After `--timeout` |
-|---|---|---|
-| Dev server: shell, `http.server`, a forking server with 2 workers, a watcher | 0 of 6 | 0 of 6 |
-| Interactive bash with `sleep &`, `setsid`, `nohup`, `(cmd &)`, `disown` jobs | 4 of 6 (every job but the plain one; bash itself exited) | 5 of 6 |
-| Claude Code: tool shell, background task, a `setsid` tail | 1 of 4 (the `setsid` tail) | 3 of 4 |
-| omp: a `setsid` tail | 1 of 2 | 1 of 2 |
+| Child | After `tendr kill` | After `--timeout` | With #145 (Linux): `kill`, `kill --force`, `--timeout` |
+|---|---|---|---|
+| Dev server: shell, `http.server`, a forking server with 2 workers, a watcher | 0 of 6 | 0 of 6 | 0, not run, 0 |
+| Interactive bash with `sleep &`, `setsid`, `nohup`, `(cmd &)`, `disown` jobs | 4 of 6 (every job but the plain one; bash itself exited) | 5 of 6 | 0, 0 of 7, 0 |
+| Claude Code: tool shell, background task, a `setsid` tail | 1 of 4 (the `setsid` tail) | 3 of 4 | 0, not run, 0 |
+| omp: a `setsid` tail | 1 of 2 | 1 of 2 | 0, not run, 0 |
 
 Claude Code starts each Bash tool shell as a session leader, outside the run's
 process group and session. After a hangup its tasks were gone within 0.5 s;
