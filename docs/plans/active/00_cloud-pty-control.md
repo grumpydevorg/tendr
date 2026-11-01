@@ -5,7 +5,8 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** step 9 remains: remote acceptance on the Linux VM.
+**Status:** steps 11–15 remain: fixes that step 9's acceptance run on the VM
+called for. Step 12 needs the VM to verify; the others are local.
 
 ## Goal
 
@@ -27,61 +28,103 @@ back is [PTY replay](../backlog/pty-replay.md).
 
 ## Remaining steps (one PR each)
 
-- **Step 9. Remote acceptance on the Linux VM.**
-   - Same Claude pid throughout. Attach from Ghostty; half-open the
-     connection two ways, then take over; agent → human → agent.
-   - A blocked child input and a stalled viewer during takeover (time it).
-   - 32 idle half-open reconnects, each with `--takeover`; fd, thread and
-     admission counts equal before and after.
-   - Logout and relogin: log out the last session on a logind host with
-     lingering off, check no hidden SSH session keeps the login count above
-     zero, log in again and attach to the same run and pid. Record whether
-     `KillUserProcesses` ends the sidecar; a socket in `~/.tendr/sockets`
-     cannot prevent that.
-   - Cross-user rejection. It needs two accounts; never mark it passed
-     without them.
-   - Dump the whole recording.
-   - Run the nested `ssh -t` fixtures against the VM:
-     `TENDR_TEST_SSH_HOST=<vm> TENDR_TEST_SSH_TENDR=<path> cargo test --test
-     cli_attach_ssh`.
-   - Run Claude Code, omp, a dev server and a shell with background jobs.
-     For each, before and after `tendr kill`, and separately `--timeout`,
-     snapshot `ps -eo pid,ppid,pgid,sid,comm` and diff. The sid is the run's
-     child pid, and anything left with it (shells, MCP servers, background
-     jobs) outlived the stop. `kill` hangs up a PTY session first;
-     `--timeout` sends SIGKILL at once, so record what it leaves and decide
-     whether it should hang up too.
-     [Run lifecycle, Limits](../../architecture/03-run-lifecycle.md#limits)
-     lists the known cases.
-
-   If descendants survive, choose a fix from this data. The goal is that no
-   process the run started outlives the stop on Linux; on macOS, tendr does
-   the same or states plainly what it cannot reach. On Linux, cgroup v2
-   `cgroup.kill` (5.14 or later) stops every descendant, including those that
-   call `setsid`, but needs a delegated cgroup subtree and a fallback without
-   one. `PR_SET_CHILD_SUBREAPER` works without cgroups but only catches
-   orphans. macOS has neither: the sidecar would list processes before
-   signalling them, which races with new forks, and `proc_pidinfo` already
-   returns EPERM for a process in another session (`src/platform/unix.rs`).
-
-Step 9 uses the VM harness in
-[`scripts/pty-vm/`](../../../scripts/pty-vm/README.md).
-
-## What step 9 must show
-
-| Invariant | Verified by | Limit |
-|-----------|-------------|-------|
-| Old epochs cannot write after an acknowledged takeover | Half-open SSH, queued and partial writes, blocked child, old disconnect, stale run | Bytes already in the kernel cannot be recalled |
-| Terminal bytes stay within the owner's account | Foreign-UID client and server, pre-created path, symlink, bind failure | Needs two test accounts |
-| A surviving run stays attachable after logout | Real last-session logout and relogin, lingering on and off | A process-killing login policy needs its own launch setup |
-| Reconnects do not accumulate stale clients | 32 idle half-open takeovers; fd, thread and admission counts | No reliance on the SSH front end's idle timeout |
-| Detach leaves ordinary Claude input alone | `Ctrl-]`, partial prefix, literal prefix, paste, kitty and `modifyOtherKeys` keys over nested SSH | The prefix is documented, not universally unused |
-| Viewers cannot block capture or control | Stalled reader with sustained output and a concurrent takeover | Storage failure stops the recording, visibly |
-| Query handling supports the measured workflow | Pinned Claude on the VM, attached vs detached | No claim of general detached terminal support |
+- **Step 11. A dead child ends its run** (local). After the child exits,
+  capture waits for end of output, which waits for every process holding the
+  terminal. A `setsid`, `(cmd &)` or `disown` job, or a tool process omp
+  starts (it leaks the terminal on fds 28 and 30), then keeps the run
+  `Running` with the child an unreaped zombie; `tendr kill` waits about 20 s
+  and prints `kill_sent` with exit 0, and `ended_at` records the holder's
+  exit. Repro: `tendr start x --pty -- sh -c "setsid sleep 45 & exec sleep
+  600"`, then `tendr kill x`. Fix: once the child has exited and its output
+  drained, end capture after a bounded wait (2 s), reap, and add a warning
+  naming the pids that still hold the terminal. `kill` does not report
+  success for a run that did not end. (`supervise` in
+  `src/sidecar/supervised_run.rs`; `PtyReader` in `src/platform/unix.rs`;
+  `src/commands/kill.rs`.)
+- **Step 12. Stop the whole run** (local; verify on the VM). Decision, from
+  the step 9 data below:
+   - Linux: the sidecar is a child subreaper (`PR_SET_CHILD_SUBREAPER`), so
+     every process the run starts stays its descendant. At a stop, after the
+     existing graceful sequence (or at once for `--force`), walk
+     `/proc/<sidecar>/task/*/children`, SIGSTOP then SIGKILL each process
+     but the sidecar's own helpers, and repeat until a walk finds none.
+     Reap adopted pids by pid, never `waitpid(-1)`. This needs no cgroup
+     delegation: exe.dev starts sidecars in root-owned `/init.scope`, and a
+     logind session scope is root-owned too. A delegated cgroup with
+     `cgroup.kill` (measured: 6 escapees gone in 5 ms) is worth adding only
+     where the sidecar already sits in one; moving it into the user manager
+     ties the run to the user manager's life, which ends at the last logout
+     without lingering.
+   - macOS: at a stop, list same-user processes whose session is the
+     child's, the child's descendants, and processes holding the run's
+     terminal; SIGSTOP then SIGKILL, repeated. It cannot reach a process
+     that called `setsid`, was orphaned and holds no terminal fd; the docs
+     say so. `proc_pidinfo` and `getsid` worked for same-user processes in
+     another session on macOS 27, so the EPERM noted in
+     `src/platform/unix.rs` needs rechecking.
+   - `--timeout` hangs up first, as `kill` does: Claude Code and a shell
+     cleaned up their children after a hangup but not after SIGKILL.
+   - Tests: each escape kind of the step 9 table ends with the stop, under
+     `kill` and `--timeout`; the VM run repeats the table.
+- **Step 13. Close inherited descriptors** (local). exe.dev's `exe-init`
+  leaks two `/dev/ptmx` masters (fds 23 and 25) into every SSH command, and
+  tendr passed them on to the sidecar and the child. `spawn_sidecar` closes
+  every inherited fd above 2 except the ready pipe.
+- **Step 14. A client taken over while stalled exits 81** (local). An old
+  client that had stopped reading during a flood, was taken over, and resumed
+  after the new client had detached exited 0 with no "another client took
+  over" note (3 of 3 runs). With the new client still attached it exited 81.
+  Repro without SSH: start `flood`, attach A on a PTY nobody reads, after 6 s
+  take over with B, detach B, then drain A. Also: a frozen old client stays
+  alive on the VM after the takeover until it is resumed.
+- **Step 15. Small fixes found in step 9** (local, one PR):
+   - After `SidecarLost`, `meta.json` still says the recording is
+     `Recording`, with no `recording.stopped` event.
+   - A socket bind failure is recorded as `spawn_failed_syscall` though
+     nothing was spawned.
+   - `tendr status` panics with "Broken pipe" when its reader exits early.
+   - Only `~/.tendr/sockets` is checked, not its parent: another user who can
+     write the parent can make the owner's attach and next start fail
+     (denial of service only; no bytes reached them).
+   - Keys typed in the same read as `Ctrl-\ d` are usually dropped: detach
+     goes ahead of queued input, which the sidecar cancels on release. State
+     this in the PTY lane's attach rules, or deliver input queued before the
+     detach first, bounded.
 
 ## Gates
 
 CI's checks; red-first tests; never mark a VM row passed from local tests.
+
+## Step 9 results (2026-11-01)
+
+On the step 5 VM, with tendr main `a04f061` (modes, repaint, `--unset-env`,
+bracketed-paste-safe escape), Claude Code 2.1.316, omp 18.14.0 and Ghostty
+1.4.0.
+
+| Invariant | Result |
+|-----------|--------|
+| Same Claude pid throughout | Pass: pid 17435 through agent push, human typing in Ghostty, agent push, an exe.dev takeover and two reattaches |
+| Old epochs cannot write after an acknowledged takeover | Pass on both half-open paths (SIGSTOP of the Mac's ssh; `iptables` drop on the VM's own sshd): bytes typed into the frozen client never reached the child; the new client had control in about 0.5 s; the old one exited 81 after resuming or healing. Exception: step 14 |
+| Viewers cannot block capture or control | Pass: with `noread` input full and a stalled viewer during a 250–320 KB/s flood, takeover took 0.071 s on the VM (0.79 s from the Mac), and the recording had no sequence or line gaps. Old input still queued at takeover (50 KB) was dropped |
+| Reconnects do not accumulate stale clients | Pass: 32 idle half-open takeovers took the sidecar from 13 fds, 8 threads, 0 clients to 17/10/1 and back to 13/8/0, 3 s after the last takeover, with no SSH timeout involved |
+| A surviving run stays attachable after logout | Pass with `KillUserProcesses=no`, lingering off and on: same run and pid after relogin. With `KillUserProcesses=yes` logind kills the sidecar about 9 ms after the last logout; only a lingering user's `systemd-run --user --scope tendr start …` survives |
+| Terminal bytes stay within the owner's account | Pass with two accounts: every attempt by `intruder` on `acc`'s socket was refused by permissions; with the socket made reachable, the sidecar refused it before the hello (exit 85). Symlinked or foreign `sockets` directories and every bind failure tested (file, symlink, foreign directory, over-long path, EPERM, EROFS) failed the start with no child. Gaps in step 15 |
+| Detach leaves ordinary Claude input alone | Pass from Ghostty in legacy, kitty and `modifyOtherKeys` modes: `Ctrl-]` passes, prefix then a key forwards both, a doubled prefix forwards one, modes come back on reattach. Ghostty turns a pasted `Ctrl-\` into a space, so the paste case ran over nested `ssh -t`, where it arrived intact. The four `tests/cli_attach_ssh.rs` fixtures pass against the VM |
+| Query handling supports the measured workflow | Pass: no stall started detached; modes replayed on attach; each same-size reattach recorded a repaint pair with a 1.7–1.9 KB redraw about 16 ms later. The full recording: 134 output and 12 resize records, sequence 1–146, no gaps, clean end |
+
+What survived a stop, counted 30 s after it began:
+
+| Child | After `tendr kill` | After `--timeout` |
+|---|---|---|
+| Dev server: shell, `http.server`, a forking server with 2 workers, a watcher | 0 of 6 | 0 of 6 |
+| Interactive bash with `sleep &`, `setsid`, `nohup`, `(cmd &)`, `disown` jobs | 4 of 6 (all but the plain job) | 5 of 6 |
+| Claude Code: tool shell, background task, a `setsid` tail | 1 of 4 (the `setsid` tail) | 3 of 4 |
+| omp: a `setsid` tail | 1 of 2 | 1 of 2 |
+
+Claude Code starts each Bash tool shell as a session leader, outside the run's
+process group and session. After a hangup it cleaned up its own tasks; after
+SIGKILL it could not. A `nohup` job survives a graceful kill (it ignores the
+hangup and has its own group), which the run lifecycle's Limits do not list.
 
 ## Measurement (step 5, 2026-11-01)
 
@@ -142,8 +185,8 @@ off with any value, empty included, so `--env` cannot undo it; step 10 added
 ## Open measurements
 
 A half-open loss without ACKs (dropping the Mac's packets with a `pf` rule,
-which needs root) is unmeasured. The deployed host logout policies (exe.dev,
-NixOS) are not validated.
+which needs root) is unmeasured. exe.dev's VM runs logind with
+`KillUserProcesses=no` (step 9); NixOS hosts' logout policy is not checked.
 
 Found while building the harness on an exe.dev VM (2026-09-26):
 

@@ -254,6 +254,18 @@ observed exit means the sidecar reaped the child, and `SpawnFailed` or
     escalation) passes nothing on, and its jobs survive.
   - Processes the shell no longer tracks (`(cmd &)`, `disown`) survive any
     hangup, as they would a closed terminal window.
+  - A `nohup` job ignores the hangup and has its own group, so the group's
+    SIGTERM does not reach it either.
+  - A program can start its children in sessions of their own: Claude Code
+    runs each Bash tool shell as a session leader. After a hangup Claude
+    stops its own tasks; after SIGKILL they survive.
+  - Measured on Linux in the cloud PTY plan's step 9, which also chooses the
+    fix ([plan](../plans/active/00_cloud-pty-control.md)).
+- **A terminal holder keeps a PTY run going.** Capture ends when the
+  terminal does, so while any process outside the stop still holds the
+  terminal, a PTY run whose child has exited stays `Running` with the child
+  unreaped, `kill` returns after about 20 s with `kill_sent`, and the run
+  ends when the last holder exits.
 - **Graceful stop.** `kill` without `--force` sends SIGTERM to the group. It
   escalates to SIGKILL only while the child itself is alive. A descendant
   that ignores SIGTERM can outlive a leader that exits promptly. A PTY leader
