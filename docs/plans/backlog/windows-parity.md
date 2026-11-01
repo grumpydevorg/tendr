@@ -66,14 +66,16 @@ between calls, clean up Tendr's own frame variables, and export
 
 `--pty` fails with "PTY not supported on Windows yet"
 (`src/platform/windows.rs:183`), and `attach` fails with "attach is only
-supported on Unix" (`src/commands/attach.rs:43-46`). Needed:
+supported on Unix" (`src/commands/attach.rs:23-27`, and as the attach
+bridge's remote end in `src/commands/attach/bridge.rs:30-34`). Needed:
 
 - a ConPTY child backend (`CreatePseudoConsole`, `ResizePseudoConsole`), on the
   suspended launcher above;
 - a named-pipe carrier for the existing attach frames;
 - a Windows console frontend (raw mode, VT flags, resize, restore on exit).
-  Remote attach from a Windows client to a Unix host needs it once remote attach
-  moves to `ssh -T`, which remote frame transport owns.
+  A Unix client attaches over `ssh -T` through the attach bridge; a Windows
+  client still uses `ssh -t` until it has this frontend, and then moves to
+  the bridge (remote frame transport, step 3).
 
 ## Acceptance
 

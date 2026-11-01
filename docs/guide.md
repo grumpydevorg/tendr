@@ -286,6 +286,16 @@ concurrent `push` is refused, not interleaved.
   control, until it runs again, and then exits 81.
 - SIGTERM, SIGHUP or SIGINT (closing the window sends SIGHUP) also detach. It
   exits 1 with `tendr: attach ended by SIGTERM` (or the signal received).
+- `tendr --host <host> attach <name>` attaches to a session on another host.
+  Your terminal stays on your machine: raw mode, window resizes and the
+  detach escape work exactly as above, and the session on the remote host
+  keeps the recording and decides who holds the terminal. `ssh` carries
+  only the attach traffic, so any session name works, and the exit codes are
+  those of a local attach. A client whose terminal or connection stops
+  reading does not hold up its own detach, nor another client's
+  `--takeover`. From Windows, attach still runs the remote `tendr attach`
+  under `ssh -t`, so names must be plain (see
+  [Reach remote hosts](#reach-remote-hosts-with---host)).
 
 The escape works with the legacy `Ctrl-\` byte, the kitty keyboard protocol
 (which Claude Code can switch Ghostty, kitty, WezTerm and foot to) and xterm's
@@ -456,7 +466,7 @@ Start work under `--host`, disconnect, and come back later to `log`, `status`,
 |Commands|With `--host`|
 |---|---|
 |`start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `exec`|Run on the remote host. The request travels as data on the SSH stdin, so no remote shell parses it. Through a POSIX login shell, output and exit codes are byte for byte those of the command run there.|
-|`attach`|Runs on the remote host under `ssh -t`. The session and namespace must be plain names: letters, digits, `-` and `_`, starting with a letter. Any other name exits 2.|
+|`attach`|From macOS or Linux, the request travels the same way, and your terminal stays local ([Answer prompts and attach](#answer-prompts-and-attach)). From Windows, it runs on the remote host under `ssh -t`, and the session and namespace must be plain names: letters, digits, `-` and `_`, starting with a letter. Any other name exits 2.|
 |`run`, `wrap`, `prune`, `query`, `guide`, `skill`|Refused with exit 2 and a ready-to-paste fallback for a POSIX shell, such as `try (POSIX shell):  ssh data-box 'tendr run deploy.sh'`.|
 |`events`, `emit`|Refused with exit 1.|
 
@@ -483,10 +493,10 @@ Windows commands and paths. If you wrap a local-only command in `ssh`
 yourself, quote for the remote shell, for example with
 `powershell -NoProfile -Command`.
 
-**Connect deadline.** Every `--host` command except `attach` must authenticate
-and start the remote `tendr` within 30 s, or tendr stops `ssh` and exits 82,
-naming the host. Without it, a lapsed Tailscale SSH check-mode approval waits
-about 30 minutes with no prompt.
+**Connect deadline.** Every `--host` command must authenticate and start the
+remote `tendr` within 30 s, or tendr stops `ssh` and exits 82, naming the
+host (`attach` from Windows has no deadline). Without it, a lapsed Tailscale
+SSH check-mode approval waits about 30 minutes with no prompt.
 
 - Once the remote `tendr` starts, the command runs as long as it needs, so
   `wait --timeout 3600` and `log -f` are unaffected.
@@ -661,10 +671,10 @@ or an I/O error.
 |Command|Code|Meaning|
 |---|---|---|
 |any|2|Usage error from argument parsing|
-|any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); an `attach` name that is not plain; a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request (1 when the remote login shell is PowerShell)|
+|any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); an `attach` name that is not plain, from Windows; a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request (1 when the remote login shell is PowerShell)|
 |`events`, `emit` with `--host`|1|Not supported over SSH|
 |any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 without one from the remote is `ssh` failing to connect|
-|any, with `--host` except `attach`|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s)|
+|any, with `--host` except `attach` from Windows|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s)|
 |`start`|2, 5|The child failed to spawn; the sidecar failed|
 |`run`|the child's|The child's own code, or 2 spawn failed, 3 sidecar lost, 4 dependency failed, 5 sidecar failed, 124 timed out, 137 killed|
 |`wait`|1|`--timeout` passed before the sessions ended|

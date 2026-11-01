@@ -17,9 +17,9 @@
   for byte.
   The remote tendr checks a request before it does anything; one it refuses
   exits 2 with `tendr _remote:` and the reason. A `--cwd` that is not UTF-8
-  is refused before `ssh` starts. `attach` still needs `ssh -t`, so over
-  `--host` it now takes only plain names (`[A-Za-z][A-Za-z0-9_-]{0,254}`)
-  and exits 2 on any other.
+  is refused before `ssh` starts. `attach` from macOS or Linux travels the
+  same way (below); from Windows it still needs `ssh -t`, so there it takes
+  only plain names (`[A-Za-z][A-Za-z0-9_-]{0,254}`) and exits 2 on any other.
 - **Exit codes survive a PowerShell login shell.** Windows PowerShell 5.1 and
   PowerShell 7 as the ssh login shell report any failure as ssh exit 1. The
   remote tendr now runs under `--exit-trailer`: it writes its exit code as
@@ -39,6 +39,19 @@
 
 ### Added
 
+- **`attach --host` keeps your terminal local.** From macOS or Linux it now
+  runs `ssh -T` with the same constant command line as every other `--host`
+  command: the attach request travels in the frame, then the attach protocol
+  runs over ssh's stdin and stdout, and the remote tendr bridges it to the
+  session's attach socket. Raw mode, window resizes and the `Ctrl-\ d`
+  escape run on your machine; the remote session still decides who holds
+  the terminal and keeps the recording. Any session name works, the exit
+  codes are those of a local attach (80, 81, 84, 85), and the connect
+  deadline (exit 82) now covers `attach` too. A client whose terminal or
+  connection stops reading no longer holds up its own detach or resize, nor
+  another client's `--takeover`; once it reads again it exits 81. The remote
+  tendr must be this version or newer. Windows clients still attach under
+  `ssh -t` until they have a local console frontend.
 - **`--unset-env NAME` removes an inherited variable from the child.** It is
   repeatable and works on `start` and `run`. An agent's shell exports `CI`,
   and Claude Code turns colour off for any `CI` value, even an empty one, so

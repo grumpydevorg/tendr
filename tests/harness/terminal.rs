@@ -190,6 +190,17 @@ impl WrappedAttach {
 
     /// Wrap an arbitrary command. `label` names its record files under `root`.
     pub fn spawn_argv(root: &TempDir, label: &str, argv: &[String]) -> Self {
+        Self::spawn_argv_env(root, label, argv, &[])
+    }
+
+    /// [`spawn_argv`](Self::spawn_argv) with `extra_env` set in the terminal,
+    /// such as a `PATH` that finds a fake `ssh` first.
+    pub fn spawn_argv_env(
+        root: &TempDir,
+        label: &str,
+        argv: &[String],
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let dir = root.path().join(format!("wrap-{label}"));
         std::fs::create_dir_all(&dir).unwrap();
         let q = |p: &Path| shell_words::quote(p.to_str().unwrap()).into_owned();
@@ -210,7 +221,8 @@ impl WrappedAttach {
             c = q(&code),
             cmd = shell_words::join(argv),
         );
-        let cli = CliAttach::spawn_argv(root, &["sh".to_owned(), "-c".to_owned(), script]);
+        let cli =
+            CliAttach::spawn_argv_env(root, &["sh".to_owned(), "-c".to_owned(), script], extra_env);
         poll_path_exists(&before, Duration::from_secs(10), Duration::from_millis(20))
             .unwrap_or_else(|e| panic!("wrapper never started: {e}"));
         Self {

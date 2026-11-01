@@ -1,5 +1,8 @@
 //! `tendr attach` through a nested `ssh -t`, as a person attaches from a
-//! laptop: a local terminal runs `ssh -t <host> tendr attach <session>`.
+//! laptop: a local terminal runs `ssh -t <host> tendr attach <session>`. This
+//! is also the path a Windows client's `attach --host` takes. A Unix client's
+//! `attach --host` keeps the terminal local and bridges the attach protocol
+//! over `ssh -T`; `cli_remote_attach.rs` tests that with the portable fake ssh.
 //!
 //! The tests need an sshd and are opt-in. `TENDR_TEST_SSH_HOST` names the ssh
 //! destination; it must accept `BatchMode` logins, for example with a key in

@@ -1,0 +1,411 @@
+//! `attach --host` from a Unix client, end to end through the attach bridge.
+//! The fake ssh (`src/bin/fake_ssh.rs`) writes down its argv, then acts as
+//! the remote login shell and runs the real tendr, whose `_remote` entry
+//! point bridges the attach protocol to the session's socket. Both sides
+//! share one HOME. The local tendr runs in a terminal, as a person's would:
+//! raw mode, resizes and the detach escape are all on its side.
+#![cfg(unix)]
+
+mod harness;
+
+use harness::terminal::{WrappedAttach, tendr_bin};
+use harness::{Observation, SessionGuard, fake_ssh, poll_until, shim_path_env, tendr};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::Duration;
+use tempfile::TempDir;
+
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// The ssh argv of every `--host` operation, attach included.
+const REMOTE_ARGV: [&str; 8] = [
+    "-T",
+    "-o",
+    "ConnectTimeout=10",
+    "box",
+    "tendr",
+    "--hello",
+    "--exit-trailer",
+    "_remote",
+];
+
+/// A session name with shell metacharacters: no plain-name rule applies.
+const HOSTILE_NAME: &str = "x&calc;$(id)`'\u{e9}";
+
+/// A fake ssh that records its argv, then forwards to the real tendr.
+struct Remote {
+    ssh: TempDir,
+    _argv_dir: TempDir,
+    argv: PathBuf,
+}
+
+impl Remote {
+    fn new() -> Self {
+        let argv_dir = TempDir::new().unwrap();
+        let argv = argv_dir.path().join("argv");
+        let ssh = fake_ssh(&format!("args {}\nforward", argv.display()));
+        Self {
+            ssh,
+            _argv_dir: argv_dir,
+            argv,
+        }
+    }
+
+    /// `tendr --host box attach <args>` in a fresh terminal.
+    fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
+        let argv: Vec<String> = [tendr_bin(), "--host".into(), "box".into(), "attach".into()]
+            .into_iter()
+            .chain(args.iter().map(|a| (*a).to_owned()))
+            .collect();
+        let path = shim_path_env(&self.ssh);
+        let tendr = tendr_bin();
+        WrappedAttach::spawn_argv_env(
+            root,
+            label,
+            &argv,
+            &[
+                ("PATH", path.to_str().unwrap()),
+                ("TENDR_TEST_BIN", &tendr),
+                ("TENDR_SSH_CONNECT_TIMEOUT", "30"),
+            ],
+        )
+    }
+
+    /// The last call through this remote ran the constant ssh argv.
+    fn assert_constant_argv(&self) {
+        let recorded = std::fs::read_to_string(&self.argv).unwrap();
+        let argv: Vec<&str> = recorded
+            .lines()
+            .filter_map(|l| l.strip_prefix("ARG:"))
+            .collect();
+        assert_eq!(argv, REMOTE_ARGV);
+    }
+}
+
+fn start_pty(root: &TempDir, session: &str, argv: &[&str]) {
+    let output = tendr(root)
+        .args(["start", session, "--pty", "--stdin", "--"])
+        .args(argv)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "start {session}: {output:?}");
+    harness::wait_running(root, session);
+}
+
+fn control(root: &TempDir, session: &str) -> Option<String> {
+    let meta = root
+        .path()
+        .join(format!(".tendr/sessions/default/{session}/meta.json"));
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(meta).ok()?).ok()?;
+    meta["pty"]["control"].as_str().map(str::to_owned)
+}
+
+fn wait_control(root: &TempDir, session: &str, expected: &str) {
+    poll_until(
+        Duration::from_secs(15),
+        Duration::from_millis(50),
+        || match control(root, session) {
+            Some(c) if c == expected => Observation::Ready(()),
+            other => Observation::Pending(format!("pty.control={other:?}")),
+        },
+    )
+    .unwrap_or_else(|e| panic!("{session} never reached pty.control={expected}: {e}"));
+}
+
+/// Type into the session and see its output, resize it, then detach with the
+/// escape: the terminal comes back as it was and the session keeps running
+/// under agent control. The session's name would not survive a remote shell.
+#[test]
+fn host_attach_types_sees_output_resizes_and_detaches() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, HOSTILE_NAME);
+    start_pty(&root, HOSTILE_NAME, &["sh"]);
+    let remote = Remote::new();
+
+    let mut wrapped = remote.attach(&root, "basic", &[HOSTILE_NAME]);
+    wrapped
+        .cli
+        .type_until_logged(&root, HOSTILE_NAME, "echo host-$((40+2))\n");
+    wrapped.wait_output_contains("host-42");
+    wait_control(&root, HOSTILE_NAME, "HumanControl");
+    remote.assert_constant_argv();
+
+    // SIGWINCH on this side becomes a resize frame on the remote side.
+    wrapped.cli.resize(33, 111);
+    poll_until(Duration::from_secs(15), Duration::from_millis(300), || {
+        wrapped.cli.type_bytes(b"stty size\n");
+        if wrapped.cli.output().contains("33 111") {
+            Observation::Ready(())
+        } else {
+            Observation::Pending("the session has not seen 33 111".into())
+        }
+    })
+    .unwrap_or_else(|e| panic!("the resize never arrived ({e}): {}", wrapped.cli.output()));
+
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(
+        wrapped.wait_exit(Duration::from_secs(15)),
+        0,
+        "{}",
+        wrapped.cli.output()
+    );
+    wrapped.assert_terminal_restored();
+    wait_control(&root, HOSTILE_NAME, "AgentControl");
+}
+
+/// A paced flood: at most 800 KB/s, so a few seconds of stall stay well
+/// inside the sidecar's 8 MiB viewer queue and the client is never dropped
+/// for falling behind, yet fill every buffer between the sidecar and a
+/// terminal that stopped reading.
+const PACED_FLOOD: &str = "stty raw -echo; line=$(printf '%01000d' 0); \
+     while :; do i=0; while [ $i -lt 8 ]; do printf '%s' \"$line\"; i=$((i+1)); done; sleep 0.01; done";
+
+/// A client whose terminal stopped reading still detaches at once: its
+/// detach does not wait behind the output it has not read.
+#[test]
+fn host_detach_is_not_held_up_by_unread_output() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-stall-detach");
+    start_pty(&root, "host-stall-detach", &["sh", "-c", PACED_FLOOD]);
+    let remote = Remote::new();
+
+    let mut wrapped = remote.attach(&root, "stall-detach", &["host-stall-detach"]);
+    wrapped.wait_output_contains("0000000000");
+    wait_control(&root, "host-stall-detach", "HumanControl");
+    wrapped.cli.pause_output();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        control(&root, "host-stall-detach").as_deref(),
+        Some("HumanControl"),
+        "the stalled client still holds control"
+    );
+
+    wrapped.cli.type_bytes(b"\x1cd");
+    wait_control(&root, "host-stall-detach", "AgentControl");
+    let code = wrapped.wait_exit(Duration::from_secs(15));
+    wrapped.cli.resume_output();
+    assert_eq!(code, 0);
+    wrapped.assert_terminal_restored();
+}
+
+/// A second client takes over while the first has stopped reading with
+/// output queued for it: the takeover goes through at once, and the first
+/// learns of it, exiting 81, only when its terminal reads again. Its output
+/// is backed up all the way to the sidecar, so the sidecar cannot send it
+/// `MSG_RETIRED`; the remote side reads the takeover from the event log.
+#[test]
+fn host_takeover_while_the_first_client_is_stalled() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-take");
+    // The paced flood in the background, and an echo of what is typed.
+    let child = format!("({PACED_FLOOD}) & exec cat -v");
+    start_pty(&root, "host-take", &["sh", "-c", &child]);
+    let remote = Remote::new();
+
+    let first = remote.attach(&root, "take-1", &["host-take"]);
+    first.wait_output_contains("0000000000");
+    wait_control(&root, "host-take", "HumanControl");
+    // The terminal stops reading; the flood fills its buffer, ssh's pipe,
+    // the remote side's socket and the sidecar's write to it.
+    first.cli.pause_output();
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        control(&root, "host-take").as_deref(),
+        Some("HumanControl"),
+        "the stalled client still holds control"
+    );
+
+    let mut second = remote.attach(&root, "take-2", &["host-take", "--takeover"]);
+    second
+        .cli
+        .type_until_logged(&root, "host-take", "second-client");
+    assert!(
+        !first.exited(),
+        "a client that is not reading stays blocked"
+    );
+
+    first.cli.resume_output();
+    assert_eq!(
+        first.wait_exit(Duration::from_secs(30)),
+        81,
+        "the stalled client was taken over"
+    );
+    first.assert_terminal_restored();
+    first.wait_output_contains("another client took over this session");
+
+    second.cli.type_bytes(b"\x1cd");
+    assert_eq!(second.wait_exit(Duration::from_secs(15)), 0);
+    second.assert_terminal_restored();
+    wait_control(&root, "host-take", "AgentControl");
+}
+
+/// When a [`fake_sidecar`] replies.
+#[derive(Clone, Copy)]
+enum FakeReply {
+    /// After reading the hello.
+    AfterHello,
+    /// On accepting, before reading anything, then closing.
+    BeforeHello,
+}
+
+/// Point `session`'s breadcrumb at a fake sidecar in `root` that answers
+/// every connection with `reply`.
+fn fake_sidecar(root: &TempDir, session: &str, label: &str, when: FakeReply, reply: Vec<u8>) {
+    use std::io::Write;
+    let sock = root.path().join(format!("{label}.sock"));
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().map_while(Result::ok) {
+            if matches!(when, FakeReply::AfterHello) {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                if tendr::attach_proto::read_msg(&mut stream).is_err() {
+                    continue;
+                }
+            }
+            let _ = stream.write_all(&reply);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    point_breadcrumb_at(root, session, &sock);
+}
+
+fn point_breadcrumb_at(root: &TempDir, session: &str, sock: &std::path::Path) {
+    let dir = root
+        .path()
+        .join(format!(".tendr/sessions/default/{session}"));
+    let tmp = dir.join("a.sock.path.test");
+    std::fs::write(&tmp, sock.to_str().unwrap()).unwrap();
+    std::fs::rename(&tmp, dir.join("a.sock.path")).unwrap();
+}
+
+/// Attach to `args` through the bridge and return its exit code and what its
+/// terminal showed; the terminal is checked restored.
+fn host_attach_exit(root: &TempDir, remote: &Remote, label: &str, args: &[&str]) -> (i32, String) {
+    let wrapped = remote.attach(root, label, args);
+    let code = wrapped.wait_exit(Duration::from_secs(30));
+    wrapped.assert_terminal_restored();
+    (code, wrapped.cli.output())
+}
+
+/// The remote side's checks and the sidecar's refusals keep the exit codes
+/// of a local attach (80, 81, 84, 85, and 1 for a session that cannot be
+/// attached at all), with the remote's message on stderr.
+#[test]
+fn host_attach_keeps_the_exit_codes() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let remote = Remote::new();
+
+    let (code, out) = host_attach_exit(&root, &remote, "missing", &["no-such"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("session not found"), "{out}");
+    remote.assert_constant_argv();
+
+    let _pipe = SessionGuard::new(&root, "host-pipe");
+    tendr(&root)
+        .args(["start", "host-pipe", "--", "sleep", "30"])
+        .output()
+        .unwrap();
+    harness::wait_running(&root, "host-pipe");
+    let (code, out) = host_attach_exit(&root, &remote, "pipe", &["host-pipe"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("not PTY-enabled"), "{out}");
+
+    let _ended = SessionGuard::new(&root, "host-ended");
+    tendr(&root)
+        .args(["start", "host-ended", "--pty", "--", "true"])
+        .output()
+        .unwrap();
+    harness::wait_terminal(&root, "host-ended");
+    let (code, out) = host_attach_exit(&root, &remote, "ended", &["host-ended"]);
+    assert_eq!(code, 81, "{out}");
+
+    // Held by a human: the remote check refuses a plain attach.
+    let _held = SessionGuard::new(&root, "host-held");
+    start_pty(&root, "host-held", &["cat"]);
+    let holder = remote.attach(&root, "holder", &["host-held"]);
+    wait_control(&root, "host-held", "HumanControl");
+    let (code, out) = host_attach_exit(&root, &remote, "held", &["host-held"]);
+    assert_eq!(code, 81, "{out}");
+    assert!(out.contains("human control"), "{out}");
+    holder.signal(libc::SIGTERM);
+    holder.wait_exit(Duration::from_secs(15));
+
+    // A breadcrumb naming a socket nobody listens on.
+    let _dead = SessionGuard::new(&root, "host-dead");
+    start_pty(&root, "host-dead", &["cat"]);
+    let dead = root.path().join("dead.sock");
+    drop(std::os::unix::net::UnixListener::bind(&dead).unwrap());
+    point_breadcrumb_at(&root, "host-dead", &dead);
+    let (code, out) = host_attach_exit(&root, &remote, "dead", &["host-dead"]);
+    assert_eq!(code, 84, "{out}");
+
+    // A sidecar that speaks another protocol, and one that refuses the peer.
+    let _fake = SessionGuard::new(&root, "host-fake");
+    start_pty(&root, "host-fake", &["cat"]);
+    let mut unknown = Vec::new();
+    tendr::attach_proto::write_msg(&mut unknown, 0x7f, b"from the future").unwrap();
+    fake_sidecar(&root, "host-fake", "future", FakeReply::AfterHello, unknown);
+    let (code, out) = host_attach_exit(&root, &remote, "future", &["host-fake"]);
+    assert_eq!(code, 80, "{out}");
+
+    let mut refusal = Vec::new();
+    tendr::attach_proto::write_frame(
+        &mut refusal,
+        &tendr::attach_proto::Frame::Rejected {
+            class: tendr::attach_proto::RejectClass::Identity,
+            reason: "peer identity rejected".to_owned(),
+        },
+    )
+    .unwrap();
+    fake_sidecar(
+        &root,
+        "host-fake",
+        "identity",
+        FakeReply::BeforeHello,
+        refusal,
+    );
+    let (code, out) = host_attach_exit(&root, &remote, "identity", &["host-fake"]);
+    assert_eq!(code, 85, "{out}");
+}
+
+/// The remote side takes the attach protocol only after the hello its
+/// request names; anything else is a protocol failure, and the session keeps
+/// its controller.
+#[test]
+fn remote_attach_requires_its_hello() {
+    use tendr::attach_proto::{Frame, Mode, write_frame};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-hello");
+    start_pty(&root, "host-hello", &["cat"]);
+
+    let json = br#"{"v":1,"op":"attach","params":{"session":"host-hello","namespace":null,"takeover":false,"escape":"ctrl-backslash"}}"#;
+    let mut request = u32::try_from(json.len()).unwrap().to_be_bytes().to_vec();
+    request.extend_from_slice(json);
+    let mut wrong_mode = request.clone();
+    write_frame(&mut wrong_mode, &Frame::Hello(Mode::Takeover)).unwrap();
+    let mut not_a_hello = request.clone();
+    write_frame(&mut not_a_hello, &Frame::Data(b"x".to_vec())).unwrap();
+    for (what, stdin) in [
+        ("no hello", request),
+        ("another mode", wrong_mode),
+        ("not a hello", not_a_hello),
+    ] {
+        let output = tendr(&root)
+            .arg("_remote")
+            .write_stdin(stdin)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(80), "{what}: {output:?}");
+        assert!(output.stdout.is_empty(), "{what}: no frame is sent");
+    }
+    assert_eq!(
+        control(&root, "host-hello").as_deref(),
+        Some("AgentControl")
+    );
+}

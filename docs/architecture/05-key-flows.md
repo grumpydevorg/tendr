@@ -210,22 +210,24 @@ Notes:
 sequenceDiagram
     participant Human
     participant CLI as tendr attach
-    participant SSH as ssh -t
+    participant SSH as ssh -T
+    participant Bridge as remote tendr _remote
     participant Socket as attach socket
     participant Sidecar
     participant PTY as PTY master
 
     alt local
         Human->>CLI: attach <session>
-    else remote
-        Human->>SSH: tendr --host box attach <session>
-        SSH->>CLI: remote tendr attach <session>
+        CLI->>Socket: connect using a.sock.path, MSG_HELLO (mode attach)
+    else remote (Unix client)
+        Human->>CLI: tendr --host box attach <session>
+        CLI->>SSH: remote frame (attach request), MSG_HELLO
+        SSH->>Bridge: the same bytes on stdin
+        Bridge->>Socket: connect using a.sock.path, MSG_HELLO
     end
-    CLI->>Socket: connect using a.sock.path
-    CLI->>Socket: MSG_HELLO (mode attach)
     Sidecar->>Sidecar: switch PTY control to HumanControl
     Sidecar->>Socket: MSG_ACCEPTED
-    CLI->>Socket: MSG_RESIZE / MSG_REPAINT / MSG_DATA / MSG_DETACH
+    CLI->>Socket: MSG_RESIZE / MSG_REPAINT / MSG_DATA / MSG_DETACH (via the bridge when remote)
     Sidecar->>PTY: relay input and resize
     PTY->>Sidecar: terminal output
     Sidecar->>Socket: MSG_DATA back to attached client
@@ -234,9 +236,12 @@ sequenceDiagram
 
 Notes:
 
-- Remote attach still talks to the sidecar on the far host. SSH only carries
-  the terminal.
-- `attach` uses `ssh -t`. Other remote commands use `ssh -T`.
+- Remote attach still talks to the sidecar on the far host. From a Unix
+  client the terminal stays local: ssh carries the attach protocol, and the
+  remote tendr only bridges it to the socket
+  ([06-transport-boundaries.md](06-transport-boundaries.md#the-attach-bridge)).
+- A Windows client still attaches under `ssh -t`, with the remote
+  `tendr attach` driving a remote terminal.
 - Handshake, refusals and exit codes: [04-pty-lane.md](04-pty-lane.md).
 
 ## `run`

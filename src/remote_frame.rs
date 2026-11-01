@@ -4,16 +4,19 @@
 //!
 //! ```text
 //! 4-byte big-endian length N | N bytes of UTF-8 JSON | push only: the body, to EOF
+//!                                                    | attach only: attach protocol frames
 //! ```
 //!
 //! The JSON is `{"v": 1, "op": <operation>, "params": {…}}`: the request
 //! types of [`crate::remote_op`] under a version. Unknown fields are ignored;
-//! an unknown version or operation is refused. `attach` is not carried: it
-//! runs under `ssh -t` until the attach bridge lands.
+//! an unknown version or operation is refused.
 //!
 //! [`serve`] (`tendr _remote`) reads the frame, checks everything it can
 //! before anything runs, then dispatches the request as if typed on this
-//! host. A refused request prints `tendr _remote: <why>` and exits 2.
+//! host. `attach` is the exception: its terminal is the client's, so the
+//! remote tendr bridges the attach protocol that follows the request to the
+//! session's attach socket (`commands::cmd_attach_bridge`). A refused request
+//! prints `tendr _remote: <why>` and exits 2.
 
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -121,7 +124,15 @@ pub fn serve() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
-    remote_op::dispatch(operation)
+    match operation {
+        // The client keeps the terminal: raw mode, resizes and the detach
+        // escape. Only the session's attach socket is on this host.
+        RemoteOperation::Attach(r) => {
+            let namespace = crate::resolve_namespace(r.namespace)?;
+            crate::commands::cmd_attach_bridge(&r.session, &namespace, r.takeover)
+        }
+        operation => remote_op::dispatch(operation),
+    }
 }
 
 /// Read and check one frame's header from `input`, leaving any body unread.
@@ -191,9 +202,7 @@ fn validate(operation: &RemoteOperation) -> Result<(), String> {
             r.sessions.iter().try_for_each(|s| session(s))
         }
         RemoteOperation::Watch(r) => namespace(&r.namespace),
-        RemoteOperation::Attach(_) => {
-            Err("attach is not carried by the remote frame: it runs over ssh -t".to_owned())
-        }
+        RemoteOperation::Attach(r) => namespace(&r.namespace).and_then(|()| session(&r.session)),
     }
 }
 
@@ -250,7 +259,7 @@ mod tests {
         let hostile = "& | $ ; ( ) \" ' ` \r\n \u{e9} C:\\Program Files\\x";
         let env = format!("K={hostile}");
         let boundary = format!("host:{hostile}");
-        let cases: [&[&str]; 8] = [
+        let cases: [&[&str]; 9] = [
             &[
                 "start",
                 "--namespace",
@@ -290,6 +299,15 @@ mod tests {
             &["kill", "-f", "s"],
             &["wait", "-t", "4", "--any", "a", "b"],
             &["watch", "--events", "--logs", "--annotations", "--from-now"],
+            &[
+                "attach",
+                "--namespace",
+                "n$(id)",
+                "--takeover",
+                "--escape",
+                "none",
+                "x&calc",
+            ],
         ];
         for args in cases {
             let original = op(args);
@@ -413,13 +431,32 @@ mod tests {
         assert_eq!(operation, op(&["list", "--namespace", "n"]));
     }
 
+    /// Attach names travel as data like any other, and are checked as any
+    /// other: the plain-name rule of a Windows client's `ssh -t` command line
+    /// does not apply.
     #[test]
-    fn attach_is_not_carried() {
+    fn attach_is_carried_and_checked() {
+        let operation = decode(
+            br#"{"v":1,"op":"attach","params":{"session":"0x1F&b'$(id)","namespace":"9n|x","takeover":true,"escape":"none"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            operation,
+            op(&[
+                "attach",
+                "--namespace",
+                "9n|x",
+                "--takeover",
+                "--escape",
+                "none",
+                "0x1F&b'$(id)"
+            ])
+        );
         assert!(matches!(
             decode(
-                br#"{"v":1,"op":"attach","params":{"session":"s","namespace":null,"takeover":false,"escape":"none"}}"#
+                br#"{"v":1,"op":"attach","params":{"session":"bad/name","namespace":null,"takeover":false,"escape":"none"}}"#
             ),
-            Err(FrameError::Invalid(msg)) if msg.contains("ssh -t")
+            Err(FrameError::Invalid(msg)) if msg.contains("session name")
         ));
     }
 
