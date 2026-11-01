@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 
@@ -142,6 +142,9 @@ impl Platform for WindowsPlatform {
         }
         if !env.is_empty() {
             cmd.envs(env);
+        }
+        if let Some(module_path) = windows_powershell_module_path(&argv[0], env_remove, env) {
+            cmd.env(PS_MODULE_PATH, module_path);
         }
 
         // CREATE_NEW_PROCESS_GROUP: required for GenerateConsoleCtrlEvent targeting.
@@ -1019,5 +1022,237 @@ fn process_status(id: &ProcessIdentity) -> ProcessStatus {
             Some(code) if code == ERROR_ACCESS_DENIED as i32 => ProcessStatus::Inaccessible,
             _ => ProcessStatus::OsError(e.kind()),
         },
+    }
+}
+
+// --- Windows PowerShell module path ---
+
+const PS_MODULE_PATH: &str = "PSModulePath";
+
+/// The `PSModulePath` to give a Windows PowerShell (`powershell.exe`, 5.1)
+/// child: tendr's own value without PowerShell 7's module directories.
+///
+/// pwsh 7 puts its own directories on `PSModulePath` (`$PSHOME\Modules`,
+/// `Documents\PowerShell\Modules`, `Program Files\PowerShell\Modules`) and
+/// every process it starts inherits them. Windows PowerShell finds pwsh 7's
+/// modules there before its own and loads them. On windows-11-arm, pwsh 7's
+/// PSReadLine then usually fails to load at startup and the console
+/// swallows the first line of stdin unrun, so a session's first `exec`
+/// never finishes. pwsh 7 removes these directories when it starts
+/// `powershell.exe` itself (`ModuleIntrinsics.GetWindowsPowerShellModulePath`),
+/// but a `powershell.exe` started by tendr is not its direct child, so tendr
+/// applies pwsh's rule.
+///
+/// `None` leaves the inherited value alone: the child is not Windows
+/// PowerShell, the launch spec sets or unsets `PSModulePath` itself, tendr
+/// has none, or it holds no pwsh 7 directory.
+fn windows_powershell_module_path(
+    program: &str,
+    env_remove: &BTreeSet<String>,
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
+    if !is_windows_powershell(program) {
+        return None;
+    }
+    let is_module_path = |name: &String| name.eq_ignore_ascii_case(PS_MODULE_PATH);
+    if env.keys().any(is_module_path) || env_remove.iter().any(is_module_path) {
+        return None;
+    }
+    let current = std::env::var(PS_MODULE_PATH).ok()?;
+    let pwsh_dirs: Vec<PathBuf> = [
+        known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Documents),
+        known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|dir| dir.join("PowerShell").join("Modules"))
+    .collect();
+    strip_pwsh_module_dirs(&current, &pwsh_dirs, |dir| dir.join("pwsh.dll").is_file())
+}
+
+/// Whether `program` (a session's `argv[0]`) starts Windows PowerShell:
+/// `powershell` or `powershell.exe`, bare or with a directory, in any case.
+fn is_windows_powershell(program: &str) -> bool {
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("powershell.exe")
+}
+
+/// `module_path` without pwsh 7's entries, by pwsh's own rule: an entry that
+/// is one of `pwsh_dirs` (compared without case or trailing separators), or
+/// whose parent directory is a pwsh installation (`is_pwsh_home`), is
+/// dropped. The rest keep their order; entries are trimmed and empty ones
+/// dropped. `None` when no entry is pwsh 7's.
+fn strip_pwsh_module_dirs(
+    module_path: &str,
+    pwsh_dirs: &[PathBuf],
+    is_pwsh_home: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    let key = |path: &str| path.trim_end_matches(['\\', '/']).to_lowercase();
+    let pwsh_keys: Vec<String> = pwsh_dirs
+        .iter()
+        .filter_map(|dir| dir.to_str())
+        .map(key)
+        .collect();
+    let is_pwsh_entry = |entry: &str| {
+        pwsh_keys.contains(&key(entry))
+            || Path::new(entry)
+                .parent()
+                .is_some_and(|dir| !dir.as_os_str().is_empty() && is_pwsh_home(dir))
+    };
+    let entries: Vec<&str> = module_path
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let kept: Vec<&str> = entries
+        .iter()
+        .copied()
+        .filter(|entry| !is_pwsh_entry(entry))
+        .collect();
+    (kept.len() < entries.len()).then(|| kept.join(";"))
+}
+
+/// A known folder's path for the current user (`SHGetKnownFolderPath`), as
+/// recorded and without checking that it exists (pwsh's `DoNotVerify`), or
+/// `None` if the shell cannot resolve it.
+fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath};
+
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: `id` points to a valid GUID; KF_FLAG_DONT_VERIFY and a null
+    // token ask for the current user's folder without touching it (so an
+    // offline redirected Documents cannot stall a spawn); `raw` is a valid
+    // out-pointer.
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            id,
+            KF_FLAG_DONT_VERIFY as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    let path = (hr >= 0 && !raw.is_null()).then(|| {
+        // SAFETY: on success `raw` is a NUL-terminated UTF-16 string.
+        let len = (0..).take_while(|&i| unsafe { *raw.add(i) } != 0).count();
+        // SAFETY: the `len` units before the NUL were just read.
+        let wide = unsafe { std::slice::from_raw_parts(raw, len) };
+        PathBuf::from(std::ffi::OsString::from_wide(wide))
+    });
+    // SAFETY: the buffer is CoTaskMem-allocated and must be freed whether or
+    // not the call succeeded; CoTaskMemFree accepts null.
+    unsafe { CoTaskMemFree(raw.cast_const().cast()) };
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_powershell_is_recognised_by_file_name() {
+        for program in [
+            "powershell",
+            "PowerShell.EXE",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "C:/Windows/SysWOW64/WindowsPowerShell/v1.0/powershell",
+        ] {
+            assert!(is_windows_powershell(program), "{program}");
+        }
+        for program in [
+            "pwsh",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            "powershell_ise.exe",
+            r"C:\powershell\cmd.exe",
+            "powershell.cmd",
+        ] {
+            assert!(!is_windows_powershell(program), "{program}");
+        }
+    }
+
+    /// The value pwsh 7.6 hands its children on a GitHub windows runner, and
+    /// what Windows PowerShell must see instead.
+    #[test]
+    fn pwsh_module_dirs_are_removed_and_the_rest_kept_in_order() {
+        let inherited = r"C:\Users\u\Documents\PowerShell\Modules;C:\Program Files\PowerShell\Modules;c:\program files\powershell\7\Modules;C:\\Modules\az_15.6.1;C:\Users\packer\Documents\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules;C:\Program Files\Microsoft SQL Server\130\Tools\PowerShell\Modules\";
+        let pwsh_dirs = [
+            PathBuf::from(r"C:\Users\u\Documents\PowerShell\Modules"),
+            PathBuf::from(r"C:\Program Files\PowerShell\Modules"),
+        ];
+        let is_pwsh_home = |dir: &Path| {
+            dir.as_os_str()
+                .eq_ignore_ascii_case(r"c:\program files\powershell\7")
+        };
+        assert_eq!(
+            strip_pwsh_module_dirs(inherited, &pwsh_dirs, is_pwsh_home).as_deref(),
+            Some(
+                r"C:\\Modules\az_15.6.1;C:\Users\packer\Documents\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules;C:\Program Files\Microsoft SQL Server\130\Tools\PowerShell\Modules\"
+            )
+        );
+    }
+
+    #[test]
+    fn pwsh_dirs_match_without_case_or_trailing_separator() {
+        let pwsh_dirs = [PathBuf::from(r"C:\Users\Ünï\Documents\PowerShell\Modules")];
+        assert_eq!(
+            strip_pwsh_module_dirs(
+                r" c:\users\üNÏ\documents\powershell\modules\ ;;D:\mods",
+                &pwsh_dirs,
+                |_| false
+            )
+            .as_deref(),
+            Some(r"D:\mods")
+        );
+    }
+
+    #[test]
+    fn a_drive_root_entry_is_kept() {
+        assert_eq!(
+            strip_pwsh_module_dirs(r"C:\;D:\pwsh\Modules;E:\", &[], |_| true).as_deref(),
+            Some(r"C:\;E:\")
+        );
+    }
+
+    #[test]
+    fn a_value_without_pwsh_dirs_is_left_alone() {
+        let windows_powershell = r"C:\Users\u\Documents\WindowsPowerShell\Modules;;C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules";
+        assert_eq!(
+            strip_pwsh_module_dirs(windows_powershell, &[], |_| false),
+            None
+        );
+    }
+
+    /// An explicit `--env` or `--unset-env` for PSModulePath, in any case,
+    /// wins; so does a child that is not Windows PowerShell.
+    #[test]
+    fn the_launch_spec_and_other_programs_are_left_alone() {
+        let set = BTreeMap::from([("psmodulepath".to_owned(), r"D:\mine".to_owned())]);
+        let unset = BTreeSet::from(["PSMODULEPATH".to_owned()]);
+        assert_eq!(
+            windows_powershell_module_path("powershell", &BTreeSet::new(), &set),
+            None
+        );
+        assert_eq!(
+            windows_powershell_module_path("powershell", &unset, &BTreeMap::new()),
+            None
+        );
+        assert_eq!(
+            windows_powershell_module_path("pwsh", &BTreeSet::new(), &BTreeMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn known_folders_resolve() {
+        let docs = known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Documents)
+            .expect("the Documents folder");
+        assert!(docs.is_absolute(), "{}", docs.display());
+        let program_files = known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)
+            .expect("the Program Files folder");
+        assert_eq!(
+            Some(program_files.as_os_str()),
+            std::env::var_os("ProgramFiles").as_deref()
+        );
     }
 }

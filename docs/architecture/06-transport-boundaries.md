@@ -189,12 +189,15 @@ before the remote tendr starts.
 Windows OpenSSH hands the remote command to cmd.exe by default, or to the
 shell set in `HKLM:\SOFTWARE\OpenSSH\DefaultShell`. CI's `windows-openssh` job
 runs `tests/cli_remote_windows_ssh.rs` on the x64 and ARM64 lanes against a
-real sshd on the runner, once under cmd.exe and once under Windows PowerShell
-5.1. The tests send session names, child argv, `--cwd`, `--env` values,
+real sshd on the runner, once each under cmd.exe, Windows PowerShell 5.1 and
+pwsh 7. The tests send session names, child argv, `--cwd`, `--env` values,
 `log --since`, `push` bytes and an `exec` payload full of shell syntax, and
 check that the remote tendr received them verbatim, that the shell ran none of
 them, and that exit codes (0, 1, 2 for a refused request, 42) come back
-exactly. They also check that a run outlives the ssh session that started it.
+exactly. They also check that a run outlives the ssh session that started it,
+and that a Windows PowerShell session sees none of the pwsh 7 module
+directories a pwsh 7 login shell passes down
+(guide, [PowerShell](../guide.md#powershell)).
 Locally they are opt-in; the file's header lists the setup.
 
 ## In-process logic

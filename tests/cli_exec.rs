@@ -1188,6 +1188,14 @@ fn exec_duckdb_path_with_spaces() {
 // from stdout, exit codes propagate, state persists across exec calls, and
 // cwd_after tracks Set-Location.
 
+/// `--timeout` for an exec into a fresh Windows PowerShell 5.1 session. Its
+/// first command from a module it has not loaded yet makes 5.1 analyse the
+/// installed modules when it has no module analysis cache: 22-38 s on
+/// GitHub's windows-11-arm runner whether cmd.exe or tendr starts it, under
+/// 0.5 s on x64 (run 41308875674).
+#[cfg(windows)]
+const PS_EXEC_TIMEOUT: &str = "90";
+
 #[cfg(windows)]
 fn powershell_start_args(session: &str) -> Vec<String> {
     // Plain `powershell -NoProfile` enters interactive REPL mode and reads
@@ -1227,7 +1235,14 @@ fn exec_powershell_clean_stdout() {
     harness::wait_running(&root, "ps");
 
     let output = harness::tendr(&root)
-        .args(["exec", "ps", "--timeout", "15", "--", "echo hello-world"])
+        .args([
+            "exec",
+            "ps",
+            "--timeout",
+            PS_EXEC_TIMEOUT,
+            "--",
+            "echo hello-world",
+        ])
         .output()
         .unwrap();
 
@@ -1269,7 +1284,14 @@ fn exec_powershell_arbitrary_expression() {
     harness::wait_running(&root, "ps");
 
     let output = harness::tendr(&root)
-        .args(["exec", "ps", "--timeout", "15", "--", "$x = 1; $x + 1"])
+        .args([
+            "exec",
+            "ps",
+            "--timeout",
+            PS_EXEC_TIMEOUT,
+            "--",
+            "$x = 1; $x + 1",
+        ])
         .output()
         .unwrap();
 
@@ -1302,7 +1324,7 @@ fn exec_powershell_pipeline() {
             "exec",
             "ps",
             "--timeout",
-            "15",
+            PS_EXEC_TIMEOUT,
             "--",
             "1..3 | ForEach-Object { $_ * 10 }",
         ])
@@ -1345,7 +1367,7 @@ fn exec_powershell_state_persists_across_calls() {
             "exec",
             "ps",
             "--timeout",
-            "15",
+            PS_EXEC_TIMEOUT,
             "--",
             "$global:tendr_test_var = 42",
         ])
@@ -1358,7 +1380,7 @@ fn exec_powershell_state_persists_across_calls() {
             "exec",
             "ps",
             "--timeout",
-            "15",
+            PS_EXEC_TIMEOUT,
             "--",
             "$global:tendr_test_var",
         ])
@@ -1390,7 +1412,14 @@ fn exec_powershell_stderr_separated() {
     harness::wait_running(&root, "ps");
 
     let output = harness::tendr(&root)
-        .args(["exec", "ps", "--timeout", "15", "--", "Write-Error 'oops'"])
+        .args([
+            "exec",
+            "ps",
+            "--timeout",
+            PS_EXEC_TIMEOUT,
+            "--",
+            "Write-Error 'oops'",
+        ])
         .output()
         .unwrap();
 
@@ -1424,7 +1453,14 @@ fn exec_powershell_cwd_after() {
 
     // Change directory to C:\
     let output = harness::tendr(&root)
-        .args(["exec", "ps", "--timeout", "15", "--", "Set-Location C:\\"])
+        .args([
+            "exec",
+            "ps",
+            "--timeout",
+            PS_EXEC_TIMEOUT,
+            "--",
+            "Set-Location C:\\",
+        ])
         .output()
         .unwrap();
 

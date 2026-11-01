@@ -166,6 +166,23 @@ tendr exec  py -- 'print(df.describe())'                   # df is still loaded
   Use `ConvertTo-Json`, `ConvertTo-Csv` or `Out-String`, and format the result
   on the calling side.
 
+On Windows, a `powershell` (Windows PowerShell 5.1) child does not get pwsh 7's
+module directories. pwsh 7 adds its own to `PSModulePath`, and everything it
+starts inherits them, `tendr start` under a pwsh 7 prompt or ssh login shell
+included. Windows PowerShell would then load pwsh 7's modules in place of its
+own; on ARM64 that swallowed the first `exec`. So tendr drops from the child's
+`PSModulePath` what pwsh 7 drops when it starts `powershell.exe` itself:
+`Documents\PowerShell\Modules`, `Program Files\PowerShell\Modules` and the
+`Modules` directory of any pwsh installation. The rest keeps its order.
+`--env PSModulePath=…` or `--unset-env PSModulePath` replaces this. A
+`powershell` that the child starts itself, such as `cmd /c powershell`,
+inherits whatever the child passes on.
+
+Windows PowerShell can take tens of seconds over the first command it has to
+find in a module it has not loaded, while it analyses the installed modules:
+22–38 s on GitHub's windows-11-arm runner, under a second on x64. Give the
+first `exec` in a new `powershell` session a `--timeout` that allows for it.
+
 ### Line-oriented JSON processes (NDJSON)
 
 `--exec-target ndjson` drives a program that reads one JSON object per stdin
@@ -294,7 +311,8 @@ the recording on disk is complete.
 The child gets `TERM=xterm-256color` when `TERM` was missing, empty, `dumb`,
 or removed with `--unset-env TERM` for the `tendr start` that launched it, as
 in an agent's tool shell or `ssh -T`. Otherwise `TERM` passes through, and
-`--env TERM=…` always wins. Other variables pass through unchanged. An agent's
+`--env TERM=…` always wins. Other variables pass through unchanged, apart from
+`PSModulePath` for Windows PowerShell ([PowerShell](#powershell)). An agent's
 shell exports `CI=true` and `NO_COLOR=1`, and Claude Code turns colour off for
 any `CI` value, even an empty one, so `--env CI=` cannot undo it. Remove them
 with `--unset-env CI --unset-env NO_COLOR`.
@@ -457,9 +475,9 @@ default ssh shell: `cmd.exe`, PowerShell and POSIX shells only ever run a fixed
 `tendr` command, so they cannot act on a value. A PowerShell login shell
 reports any failure as ssh exit 1, so the remote `tendr` also sends its exit
 code as its last stderr line, which tendr reads and hides: exit codes come
-through PowerShell too. CI checks values, output and exit codes against a
-real Windows OpenSSH server on x64 and ARM64, under `cmd.exe` and Windows
-PowerShell 5.1.
+through PowerShell too. CI checks values, output, exit codes and `exec`
+against a real Windows OpenSSH server on x64 and ARM64, under `cmd.exe`,
+Windows PowerShell 5.1 and pwsh 7 login shells.
 Values are carried exactly, not translated, so a Windows session takes
 Windows commands and paths. If you wrap a local-only command in `ssh`
 yourself, quote for the remote shell, for example with
@@ -683,6 +701,7 @@ exits 1 on failure.
 |`TENDR_EXIT_REASON`|tendr, for `--on-exit` only|`ExitedOk`, `ExitedError { code: N }`, `Killed`, `KilledForced`, `TimedOut` or `SidecarFailed`|
 |`TENDR_BLOCK_ID`|`tendr wrap`, and `exec` in a POSIX shell, for the command they run|ID that links events emitted inside the command to its wrap or exec event|
 |`TENDR_PARENT_EVENT_ID`|`tendr wrap`, for its command|ID of the wrap event|
+|`PSModulePath`|tendr, on Windows, for a child or `tendr wrap` command that is Windows PowerShell (`powershell`)|The inherited value without pwsh 7's module directories; see [PowerShell](#powershell)|
 |`TENDR_SSH_CONNECT_TIMEOUT`|you|Connect deadline for `--host` commands, in seconds. Default 30; `0` turns it off.|
 
 `wrap` and `emit` read `TENDR_SESSION`, `TENDR_NAMESPACE`, `TENDR_RUN_ID` and

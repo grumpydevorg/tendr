@@ -67,8 +67,8 @@ jobs:
         run: cargo test --locked --doc --no-fail-fast
 
   # `--host` against a real Windows OpenSSH server on this runner, under the
-  # default cmd.exe login shell and then PowerShell (tests/
-  # cli_remote_windows_ssh.rs). Runner facts this relies on: Server 2025
+  # default cmd.exe login shell, then Windows PowerShell 5.1, then pwsh 7
+  # (tests/cli_remote_windows_ssh.rs). Runner facts this relies on: Server 2025
   # (windows-latest) ships sshd with `AllowGroups administrators "openssh
   # users"`; windows-11-arm has no sshd capability (installing it takes 15+
   # min), so the pinned portable Win32-OpenSSH release is used. Key auth fails for
@@ -169,12 +169,28 @@ jobs:
           New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -PropertyType String -Force `
             -Value "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" | Out-Null
           $v = ssh $env:TENDR_TEST_WIN_SSH_HOST '$PSVersionTable.PSVersion.ToString()'
-          if ($LASTEXITCODE -or "$v" -notmatch '^\d+\.\d+') { throw "the PowerShell login shell is not in effect: $v" }
+          if ($LASTEXITCODE -or "$v" -notmatch '^5\.') { throw "the PowerShell 5.1 login shell is not in effect: $v" }
           "login shell: PowerShell $v"
       - name: Tests, PowerShell login shell
         if: ${{ !cancelled() && steps.powershell.outcome == 'success' }}
         env:
           TENDR_TEST_WIN_SSH_SHELL: powershell
+        run: cargo test --locked --test cli_remote_windows_ssh -- --test-threads=1 --nocapture
+      - name: Switch the login shell to pwsh 7
+        id: pwsh
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) { New-Item 'HKLM:\SOFTWARE\OpenSSH' | Out-Null }
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -PropertyType String -Force `
+            -Value "$env:ProgramFiles\PowerShell\7\pwsh.exe" | Out-Null
+          $v = ssh $env:TENDR_TEST_WIN_SSH_HOST '$PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -or "$v" -notmatch '^7\.') { throw "the pwsh 7 login shell is not in effect: $v" }
+          "login shell: pwsh $v"
+      - name: Tests, pwsh 7 login shell
+        if: ${{ !cancelled() && steps.pwsh.outcome == 'success' }}
+        env:
+          TENDR_TEST_WIN_SSH_SHELL: pwsh
         run: cargo test --locked --test cli_remote_windows_ssh -- --test-threads=1 --nocapture
 
   lint:

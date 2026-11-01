@@ -1,7 +1,8 @@
 //! `--host` against a real Windows OpenSSH server, under whichever login
-//! shell it is configured with (cmd.exe by default, or PowerShell through
-//! `HKLM:\SOFTWARE\OpenSSH\DefaultShell`). Every value a user types must reach
-//! the remote tendr verbatim and must never be run by that shell.
+//! shell it is configured with (cmd.exe by default, or Windows PowerShell 5.1
+//! or pwsh 7 through `HKLM:\SOFTWARE\OpenSSH\DefaultShell`). Every value a
+//! user types must reach the remote tendr verbatim and must never be run by
+//! that shell.
 //!
 //! The tests are opt-in; CI's `windows-openssh` job sets them up on the
 //! Windows x64 and ARM64 lanes. Without `TENDR_TEST_WIN_SSH_HOST` each test
@@ -553,8 +554,11 @@ fn push_wait_kill_and_exit_codes_round_trip() {
     failures.assert_none(&remote, "push_wait_kill_and_exit_codes_round_trip");
 }
 
-/// `exec` into a PowerShell session: the payload, shell syntax and non-ASCII
-/// included, runs in the session and its output comes back exactly.
+/// `exec` into a Windows PowerShell session: the payload, shell syntax and
+/// non-ASCII included, runs in the session and its output comes back
+/// exactly. The session sees no pwsh 7 module directory on `PSModulePath`,
+/// even when pwsh 7 is the login shell that started tendr: Windows
+/// PowerShell loading pwsh 7's modules swallowed the first exec on ARM64.
 #[test]
 fn exec_runs_in_a_powershell_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -594,6 +598,48 @@ fn exec_runs_in_a_powershell_session() {
                 ),
                 Err(e) => failures.0.push(format!(
                     "exec output is not JSON ({e}): {}",
+                    describe(&output)
+                )),
+            }
+            let output = remote.tendr(&[
+                "exec",
+                "ps",
+                "--namespace",
+                &ns,
+                "--timeout",
+                "30",
+                "--",
+                "Write-Output $env:PSModulePath",
+            ]);
+            match serde_json::from_slice::<Value>(&output.stdout) {
+                Ok(result) => {
+                    let module_path = result["stdout"].as_str().unwrap_or_default().trim();
+                    // pwsh 7's user and shared directories, and any pwsh
+                    // installation's own `Modules`.
+                    let pwsh_dirs: Vec<&str> = module_path
+                        .split(';')
+                        .filter(|entry| {
+                            let lower = entry.trim_end_matches(['\\', '/']).to_lowercase();
+                            lower.ends_with(r"\documents\powershell\modules")
+                                || lower.ends_with(r"\program files\powershell\modules")
+                                || std::path::Path::new(entry)
+                                    .parent()
+                                    .is_some_and(|dir| dir.join("pwsh.dll").is_file())
+                        })
+                        .collect();
+                    failures.check(
+                        output.status.success() && !module_path.is_empty() && pwsh_dirs.is_empty(),
+                        || {
+                            format!(
+                                "Windows PowerShell sees pwsh 7 module directories \
+                                 {pwsh_dirs:?}: {}",
+                                describe(&output)
+                            )
+                        },
+                    );
+                }
+                Err(e) => failures.0.push(format!(
+                    "PSModulePath exec output is not JSON ({e}): {}",
                     describe(&output)
                 )),
             }
