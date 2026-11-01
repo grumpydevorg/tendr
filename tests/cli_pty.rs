@@ -246,8 +246,8 @@ fn a_terminal_holder_does_not_keep_an_exited_pty_run_going() {
 
 /// `kill` of a PTY run whose terminal is still held by a process outside the
 /// child's session ends the run once the child is gone, and reports that end:
-/// `Killed`, promptly, with `ended_at` near the kill. On Linux the stop ends
-/// the holder too, before the end is recorded, so the terminal closes and
+/// `Killed`, promptly, with `ended_at` near the kill. The stop ends the
+/// holder too, before the end is recorded, so the terminal closes and
 /// capture ends with no holder warning.
 #[test]
 fn kill_ends_a_pty_run_whose_terminal_is_held() {
@@ -302,19 +302,17 @@ fn kill_ends_a_pty_run_whose_terminal_is_held() {
         "ended_at {ended_at} is long after the kill at {killed_at}: {meta}"
     );
     let holder = read_pid(&holder).expect("holder pid");
-    if cfg!(target_os = "linux") {
-        // SAFETY: signal 0 only probes; the pid is the test's own holder.
-        let alive = unsafe { libc::kill(holder, 0) } == 0 && !is_zombie(holder);
-        assert!(!alive, "holder {holder} outlived the stop: {meta}");
-        let warned = meta["warnings"].as_array().is_some_and(|w| {
-            w.iter()
-                .any(|w| w.as_str().is_some_and(|w| w.contains("terminal")))
-        });
-        assert!(
-            !warned,
-            "a holder warning after the stop ended the holder: {meta}"
-        );
-    }
+    // SAFETY: signal 0 only probes; the pid is the test's own holder.
+    let alive = unsafe { libc::kill(holder, 0) } == 0 && !is_zombie(holder);
+    assert!(!alive, "holder {holder} outlived the stop: {meta}");
+    let warned = meta["warnings"].as_array().is_some_and(|w| {
+        w.iter()
+            .any(|w| w.as_str().is_some_and(|w| w.contains("terminal")))
+    });
+    assert!(
+        !warned,
+        "a holder warning after the stop ended the holder: {meta}"
+    );
 }
 
 /// Whether `pid` is a zombie, per `ps`.

@@ -389,9 +389,12 @@ impl Platform for UnixPlatform {
         #[cfg(target_os = "linux")]
         {
             // A child reaped while a stop reads the children files can make
-            // the kernel skip entries there, so no pass during a stop.
-            let Ok(_walk) = TREE_WALK.try_lock() else {
-                return;
+            // the kernel skip entries there, so no pass during a stop. A
+            // stop that panicked holds nothing.
+            let _walk = match TREE_WALK.try_lock() {
+                Ok(walk) => walk,
+                Err(std::sync::TryLockError::Poisoned(walk)) => walk.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return,
             };
             for pid in children(std::process::id()) {
                 if pid == child.pid.get() {
@@ -408,16 +411,15 @@ impl Platform for UnixPlatform {
         let _ = child;
     }
 
-    fn stop_run_tree(handle: &ChildKillHandle, force: bool) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            stop_descendants(handle.identity.pid.get(), force)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (handle, force);
-            Ok(())
-        }
+    fn stop_run(handle: &ChildKillHandle, force: bool) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let tree = RunTree::before_stop(handle);
+        let child = Self::kill_child(handle, force);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let rest = stop_tree(&tree, force);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let rest = Ok(());
+        child.and(rest)
     }
 
     fn kill_orphan(id: &ProcessIdentity, force: bool) -> io::Result<()> {
@@ -891,8 +893,9 @@ fn kill_process(id: &ProcessIdentity, force: bool, hang_up_first: bool) -> io::R
             return Err(io::Error::new(kind, "failed to probe process status"));
         }
         // AliveVerified: identity confirmed, signal normally
-        // Inaccessible: can't verify identity (EPERM from proc_pidinfo on macOS
-        // when child is in a different session), but kill(2) will still work.
+        // Inaccessible: can't verify identity (EPERM reading another user's
+        // process; a same-user one in another session reads fine, macOS 27
+        // included), but kill(2) may still work.
         // Degraded PID reuse safety -- acceptable because the sidecar wrote the
         // identity moments ago and PID reuse within that window is negligible.
         ProcessStatus::AliveVerified | ProcessStatus::Inaccessible => {}
@@ -1009,39 +1012,370 @@ fn is_sidecar(pid: u32) -> bool {
 }
 
 /// Held by a stop's search and by each reaping pass, which then skips.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 static TREE_WALK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// How long a graceful [`stop_descendants`] gives the run's other processes
-/// to exit on SIGTERM. Short of the PTY holder grace (2 s), so a terminal
-/// holder that exits on it, or is then killed, closes the terminal before
-/// capture would be cut short.
-#[cfg(target_os = "linux")]
+/// How long a graceful [`stop_tree`] gives the run's other processes to exit
+/// on SIGTERM. Short of the PTY holder grace (2 s), so a terminal holder
+/// that exits on it, or is then killed, closes the terminal before capture
+/// would be cut short.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const TREE_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How long [`stop_descendants`] goes on killing before giving up on
-/// processes that do not die, such as one in uninterruptible sleep, which
-/// dies only once it wakes.
-#[cfg(target_os = "linux")]
+/// How long [`stop_tree`] goes on killing before giving up on processes
+/// that do not die, such as one in uninterruptible sleep, which dies only
+/// once it wakes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const TREE_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// End every live descendant of this process except `child` (whose own
-/// descendants are included). The sidecar is a child subreaper, so what the
-/// run orphans stays its descendant. Another tendr sidecar, a session
-/// started from inside the run, is left alone with its whole tree.
+/// What a stop looks for besides the child, which `kill_child` deals with.
 ///
-/// Unless `force`, those found first get SIGTERM (except the members of
-/// `child`'s process group, which the stop has already signalled), then
+/// On Linux the sidecar is a child subreaper, so every process the run
+/// started stays its descendant. On macOS orphans go to launchd, so the run
+/// is the same user's processes in the child's session or the sidecar's (a
+/// pipe run's), the sidecar's descendants, those holding the run's
+/// terminal, and the descendants of all these. The child's exit as session
+/// leader revokes the terminal from its holders and orphans what it leaves,
+/// after which neither can be told apart, so [`RunTree::before_stop`] lists
+/// the run first, and later searches include whatever of that list still
+/// runs. A process that left the session and has no parent in the run and
+/// no terminal descriptor cannot be found. Later searches do not look for
+/// terminal holders, so a holder that started after the census is found
+/// only through its session or its parent.
+///
+/// Another tendr sidecar, a session started from inside the run, is left
+/// alone with its whole tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct RunTree {
+    child: u32,
+    /// The run as listed before the stop.
+    #[cfg(target_os = "macos")]
+    known: Vec<ProcessIdentity>,
+}
+
+#[cfg(target_os = "linux")]
+impl RunTree {
+    fn before_stop(handle: &ChildKillHandle) -> Self {
+        Self {
+            child: handle.identity.pid.get(),
+        }
+    }
+
+    /// The live descendants of this process, except the child (whose own
+    /// descendants are included) and those in `skip` (whose descendants
+    /// are). Calls `found` on each as it is found, before its children are
+    /// listed.
+    fn live(&self, skip: &BTreeSet<u32>, mut found: impl FnMut(u32)) -> BTreeSet<u32> {
+        let mut live = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let mut queue = children(std::process::id());
+        while let Some(pid) = queue.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if pid != self.child {
+                if is_sidecar(pid) || !is_live(pid) {
+                    continue;
+                }
+                if !skip.contains(&pid) {
+                    live.insert(pid);
+                    found(pid);
+                }
+            }
+            queue.extend(children(pid));
+        }
+        live
+    }
+
+    fn in_child_group(&self, pid: u32) -> bool {
+        rustix::process::Pid::from_raw(pid as i32)
+            .and_then(|pid| rustix::process::getpgid(Some(pid)).ok())
+            .is_some_and(|pgid| pgid.as_raw_nonzero().get() as u32 == self.child)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl RunTree {
+    fn before_stop(handle: &ChildKillHandle) -> Self {
+        let mut tree = Self {
+            child: handle.identity.pid.get(),
+            known: Vec::new(),
+        };
+        let terminal = handle.pty_hold.as_ref().and_then(|hold| hold.0.device);
+        tree.known = tree
+            .search(terminal, &BTreeSet::new(), |_| {})
+            .into_iter()
+            .filter_map(|pid| process_identity(pid).ok())
+            .collect();
+        tree
+    }
+
+    /// The run's live processes but the child and those in `skip` (whose
+    /// descendants are included). Calls `found` on each, parents first as
+    /// far as one listing allows.
+    fn live(&self, skip: &BTreeSet<u32>, found: impl FnMut(u32)) -> BTreeSet<u32> {
+        self.search(None, skip, found)
+    }
+
+    /// [`RunTree::live`], also counting the holders of `terminal`.
+    fn search(
+        &self,
+        terminal: Option<rustix::fs::Dev>,
+        skip: &BTreeSet<u32>,
+        mut found: impl FnMut(u32),
+    ) -> BTreeSet<u32> {
+        let me = std::process::id();
+        // The sidecar's own session holds a pipe run, but only if the
+        // sidecar leads it; otherwise it would be a login session.
+        // SAFETY: getsid(0), getpid and getuid only read this process's ids.
+        let (own_session, uid) = unsafe {
+            let session = libc::getsid(0);
+            (
+                (session == libc::getpid()).then_some(session),
+                libc::getuid(),
+            )
+        };
+        let mut children: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+        let mut ours = BTreeSet::new();
+        let mut queue = Vec::new();
+        for pid in all_pids() {
+            let Some(info) = bsd_info(pid) else {
+                continue;
+            };
+            if pid == me || info.pbi_status == libc::SZOMB {
+                continue;
+            }
+            children.entry(info.pbi_ppid).or_default().push(pid);
+            if info.pbi_uid != uid {
+                continue;
+            }
+            ours.insert(pid);
+            let started = info.pbi_start_tvsec * 1_000_000_000 + info.pbi_start_tvusec * 1_000;
+            // SAFETY: getsid only reads the process's session id.
+            let session = unsafe { libc::getsid(pid as libc::pid_t) };
+            if session == self.child as libc::pid_t
+                || Some(session) == own_session
+                || self
+                    .known
+                    .iter()
+                    .any(|known| known.pid.get() == pid && known.start_time_ns == started)
+                || terminal.is_some_and(|device| holds_terminal(pid, device))
+            {
+                queue.push(pid);
+            }
+        }
+        if let Some(mine) = children.get(&me) {
+            queue.extend(mine);
+        }
+        let mut live = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        while let Some(pid) = queue.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if pid != self.child {
+                if is_sidecar(pid) {
+                    continue;
+                }
+                if ours.contains(&pid) && !skip.contains(&pid) {
+                    live.insert(pid);
+                    found(pid);
+                }
+            }
+            if let Some(below) = children.get(&pid) {
+                queue.extend(below);
+            }
+        }
+        live
+    }
+
+    fn in_child_group(&self, pid: u32) -> bool {
+        bsd_info(pid).is_some_and(|info| info.pbi_pgid == self.child)
+    }
+}
+
+/// Every pid on the system, from `proc_listallpids`.
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<u32> {
+    // SAFETY: a null buffer asks only for the count.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let Ok(count) = usize::try_from(count) else {
+        return Vec::new();
+    };
+    // Room for processes started since the count.
+    let mut pids: Vec<libc::c_int> = vec![0; count + 64];
+    let bytes = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice())).unwrap_or(0);
+    // SAFETY: the buffer holds `bytes` bytes of c_int.
+    let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    pids.truncate(usize::try_from(filled).unwrap_or(0));
+    pids.into_iter()
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .filter(|&pid| pid > 0)
+        .collect()
+}
+
+/// A process's BSD info, or `None` if it is gone, a zombie or unreadable.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    // SAFETY: proc_bsdinfo is plain data; zeroed is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a proc_bsdinfo of `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(info)
+}
+
+/// `struct proc_fileinfo` (`sys/proc_info.h`).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcFileInfo {
+    fi_openflags: u32,
+    fi_status: u32,
+    fi_offset: libc::off_t,
+    fi_type: i32,
+    fi_guardflags: u32,
+}
+
+/// `struct vnode_fdinfowithpath` (`sys/proc_info.h`).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeFdInfoWithPath {
+    pfi: ProcFileInfo,
+    pvip: libc::vnode_info_path,
+}
+
+/// `PROC_PIDFDVNODEPATHINFO` (`sys/proc_info.h`).
+#[cfg(target_os = "macos")]
+const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+/// Whether process `pid` has the terminal device `device` open, by its
+/// descriptors (`PROC_PIDLISTFDS`, `PROC_PIDFDVNODEPATHINFO`).
+#[cfg(target_os = "macos")]
+fn holds_terminal(pid: u32, device: rustix::fs::Dev) -> bool {
+    let pid = pid as libc::c_int;
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer asks only for the size.
+    let bytes =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let Ok(bytes) = usize::try_from(bytes) else {
+        return false;
+    };
+    // Room for descriptors opened since.
+    let room = bytes / entry + 16;
+    let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(room);
+    let capacity = libc::c_int::try_from(room * entry).unwrap_or(0);
+    // SAFETY: the buffer has room for `capacity` bytes of proc_fdinfo.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast(),
+            capacity,
+        )
+    };
+    let Ok(got) = usize::try_from(got) else {
+        return false;
+    };
+    // SAFETY: proc_pidinfo wrote `got` bytes of whole entries.
+    unsafe { fds.set_len((got / entry).min(room)) };
+    fds.iter()
+        .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
+        .any(|fd| {
+            // SAFETY: plain data; zeroed is a valid value.
+            let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<VnodeFdInfoWithPath>() as libc::c_int;
+            // SAFETY: the buffer is a vnode_fdinfowithpath of `size` bytes.
+            let got = unsafe {
+                libc::proc_pidfdinfo(
+                    pid,
+                    fd.proc_fd,
+                    PROC_PIDFDVNODEPATHINFO,
+                    (&raw mut info).cast(),
+                    size,
+                )
+            };
+            let stat = &info.pvip.vip_vi.vi_stat;
+            got == size
+                && stat.vst_mode & libc::S_IFMT == libc::S_IFCHR
+                && stat.vst_rdev as rustix::fs::Dev == device
+        })
+}
+
+/// Whether `pid` is a tendr sidecar, by its first argument
+/// (`KERN_PROCARGS2`).
+#[cfg(target_os = "macos")]
+fn is_sidecar(pid: u32) -> bool {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    // SAFETY: a null buffer asks only for the size.
+    let asked = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if asked != 0 {
+        return false;
+    }
+    let mut args = vec![0u8; size];
+    // SAFETY: the buffer holds `size` bytes.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            args.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return false;
+    }
+    args.truncate(size);
+    // argc, the executable's path, NUL padding, then argc arguments.
+    let Some((argc, rest)) = args.split_first_chunk::<{ std::mem::size_of::<libc::c_int>() }>()
+    else {
+        return false;
+    };
+    let argc = libc::c_int::from_ne_bytes(*argc);
+    let Some(path_end) = rest.iter().position(|&b| b == 0) else {
+        return false;
+    };
+    let Some(argv_start) = rest[path_end..].iter().position(|&b| b != 0) else {
+        return false;
+    };
+    argc >= 2
+        && rest[path_end + argv_start..].split(|&b| b == 0).nth(1) == Some(SIDECAR_ARG.as_bytes())
+}
+
+/// End every live process of the run but the child (see [`RunTree`]).
+///
+/// Unless `force`, those found first get SIGTERM (except the members of the
+/// child's process group, which the stop has already signalled), then
 /// SIGCONT so a stopped job can act on it, and up to [`TREE_TERM_GRACE`] to
 /// exit; a process they start meanwhile, such as a cleanup helper, is not
-/// signalled. Then each process is sent SIGSTOP as it is found, before its
-/// children are listed, so it cannot start more unseen, and all found are
-/// sent SIGKILL. A process started before its parent stopped, or left to
-/// this process by a dying parent, is found by a later search. The kernel
-/// may skip a child in a list it is changing, so this ends only after two
-/// searches in a row find none.
-#[cfg(target_os = "linux")]
-fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
+/// signalled. Then each process is sent SIGSTOP as it is found, and the
+/// search repeats until it finds nothing new: a process that forked between
+/// a search and its SIGSTOP leaves a child below its stopped parent, which
+/// the next search finds. Only then are all of them sent SIGKILL, so no such
+/// child is orphaned unseen. The Linux kernel may skip a child in a list it
+/// is changing, so this ends only after two rounds in a row find none.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_tree(tree: &RunTree, force: bool) -> io::Result<()> {
     use rustix::process::Signal;
 
     let _walk = TREE_WALK
@@ -1051,15 +1385,9 @@ fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
     // signalled again, though their children still are.
     let mut refused = BTreeSet::new();
     if !force {
-        let group = rustix::process::Pid::from_raw(child as i32);
-        let in_group = |pid: u32| {
-            rustix::process::Pid::from_raw(pid as i32)
-                .and_then(|pid| rustix::process::getpgid(Some(pid)).ok())
-                .is_some_and(|pgid| Some(pgid) == group)
-        };
         let deadline = std::time::Instant::now() + TREE_TERM_GRACE;
-        for pid in live_descendants(child, &refused, |_| {}) {
-            if !in_group(pid)
+        for pid in tree.live(&refused, |_| {}) {
+            if !tree.in_child_group(pid)
                 && send_signal_direct(pid as i32, Signal::TERM)
                     .is_err_and(|e| e.raw_os_error() == Some(libc::EPERM))
             {
@@ -1068,9 +1396,7 @@ fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
             }
             let _ = send_signal_direct(pid as i32, Signal::CONT);
         }
-        while std::time::Instant::now() < deadline
-            && !live_descendants(child, &refused, |_| {}).is_empty()
-        {
+        while std::time::Instant::now() < deadline && !tree.live(&refused, |_| {}).is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
@@ -1078,14 +1404,28 @@ fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
     let deadline = std::time::Instant::now() + TREE_STOP_LIMIT;
     let mut empty_searches = 0;
     while empty_searches < 2 {
-        let found = live_descendants(child, &refused, |pid| {
-            let _ = send_signal_direct(pid as i32, Signal::STOP);
-        });
-        if found.is_empty() {
+        // Stop what a search finds, and search again until one finds nothing
+        // new: a process that forked between a search and its SIGSTOP has a
+        // child the next search finds, still below its stopped parent. Only
+        // then kill them all, so no such child is orphaned unseen.
+        let mut stopped = BTreeSet::new();
+        loop {
+            let found = tree.live(&refused, |pid| {
+                if !stopped.contains(&pid) {
+                    let _ = send_signal_direct(pid as i32, Signal::STOP);
+                }
+            });
+            let before = stopped.len();
+            stopped.extend(found);
+            if stopped.len() == before || std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        if stopped.is_empty() {
             empty_searches += 1;
         } else {
             empty_searches = 0;
-            for &pid in &found {
+            for &pid in &stopped {
                 if send_signal_direct(pid as i32, Signal::KILL)
                     .is_err_and(|e| e.raw_os_error() == Some(libc::EPERM))
                 {
@@ -1093,7 +1433,7 @@ fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
                 }
             }
             if std::time::Instant::now() >= deadline {
-                refused.extend(found);
+                refused.extend(stopped);
                 break;
             }
         }
@@ -1107,33 +1447,6 @@ fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
         "processes the run started outlived the stop: pids {}",
         pids.join(", ")
     )))
-}
-
-/// The live descendants of this process, except `child` (whose own
-/// descendants are included) and those in `skip` (whose descendants are).
-/// Another tendr sidecar and its descendants are not included. Calls
-/// `found` on each as it is found, before its children are listed.
-#[cfg(target_os = "linux")]
-fn live_descendants(child: u32, skip: &BTreeSet<u32>, mut found: impl FnMut(u32)) -> BTreeSet<u32> {
-    let mut live = BTreeSet::new();
-    let mut seen = BTreeSet::new();
-    let mut queue = children(std::process::id());
-    while let Some(pid) = queue.pop() {
-        if !seen.insert(pid) {
-            continue;
-        }
-        if pid != child {
-            if is_sidecar(pid) || !is_live(pid) {
-                continue;
-            }
-            if !skip.contains(&pid) {
-                live.insert(pid);
-                found(pid);
-            }
-        }
-        queue.extend(children(pid));
-    }
-    live
 }
 
 /// Send a signal to a process group (kill(-pgid, sig)).
@@ -1260,14 +1573,14 @@ struct HoldState {
     /// Capture ended at [`HOLDER_GRACE`], with the terminal still open.
     cut_short: std::sync::atomic::AtomicBool,
     /// The slave's device number, to find the processes that hold it.
-    #[cfg(target_os = "linux")]
-    device: Option<u64>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    device: Option<rustix::fs::Dev>,
 }
 
 impl SlaveHold {
     fn new(slave: OwnedFd) -> Self {
         Self(std::sync::Arc::new(HoldState {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             device: rustix::fs::fstat(&slave).ok().map(|stat| stat.st_rdev),
             slave: std::sync::Mutex::new(Some(slave)),
             reader_running: std::sync::atomic::AtomicBool::new(false),
@@ -1801,10 +2114,11 @@ mod tests {
     }
 
     #[test]
-    fn process_status_inaccessible_on_cross_session_child() {
-        // Spawn a child in a new session (setsid), then probe from parent.
-        // On macOS, proc_pidinfo returns EPERM for processes in other sessions.
-        // On Linux, /proc/<pid>/stat is world-readable so this returns AliveVerified.
+    fn a_same_user_process_in_another_session_is_readable() {
+        // A same-user process in a session of its own: the walk on macOS
+        // reads such processes' identity and session with proc_pidinfo and
+        // getsid. Neither refuses it with EPERM (checked on macOS 27); on
+        // Linux /proc/<pid>/stat is world-readable.
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
@@ -1826,39 +2140,53 @@ mod tests {
         let mut child = cmd.spawn().unwrap();
         let child_pid = child.id();
 
-        // Small delay for process to be queryable
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let child_id = match process_identity(child_pid) {
-            Ok(id) => id,
-            Err(_) => {
-                // On macOS, proc_pidinfo may already EPERM here.
-                // Verify that process_status on a fabricated identity returns Inaccessible.
-                let fabricated = fake_identity(child_pid, 0);
-                let status = process_status(&fabricated);
-                assert!(
-                    status == ProcessStatus::Inaccessible || status == ProcessStatus::Missing,
-                    "expected Inaccessible or Missing for cross-session child, got {status:?}"
-                );
-                // Clean up
-                let _ = child.kill();
-                let _ = child.wait();
-                return;
-            }
-        };
-
-        let status = process_status(&child_id);
-
-        // macOS: Inaccessible (EPERM from proc_pidinfo across sessions)
-        // Linux: AliveVerified (/proc/<pid>/stat is readable)
-        assert!(
-            status == ProcessStatus::AliveVerified || status == ProcessStatus::Inaccessible,
-            "expected AliveVerified or Inaccessible, got {status:?}"
-        );
-
-        // Clean up
+        let identity = process_identity(child_pid);
+        // SAFETY: getsid only reads the process's session id.
+        let sid = unsafe { libc::getsid(child_pid as libc::pid_t) };
+        let getsid_error = io::Error::last_os_error();
         let _ = child.kill();
         let _ = child.wait();
+
+        let identity = identity.expect("identity of a same-user process in another session");
+        assert_eq!(identity.pid.get(), child_pid);
+        assert_eq!(sid, child_pid as libc::pid_t, "getsid: {getsid_error}");
+    }
+
+    /// A stop leaves another session's sidecar alone, known by its first
+    /// argument. A process run as `sh _sidecar` has that argument.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn is_sidecar_knows_a_process_by_its_first_argument() {
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // The trailing `:` keeps the shell from exec'ing `sleep` in its place.
+        std::fs::write(dir.path().join(SIDECAR_ARG), "sleep 10; :\n").unwrap();
+        let mut child = Command::new("sh")
+            .arg(SIDECAR_ARG)
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let found = poll_is_sidecar(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(found, "sh {SIDECAR_ARG} not taken for a sidecar");
+        assert!(
+            !is_sidecar(std::process::id()),
+            "the test process taken for a sidecar"
+        );
+    }
+
+    /// `is_sidecar(pid)`, retried briefly while the spawned shell starts.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn poll_is_sidecar(pid: u32) -> bool {
+        (0..50).any(|_| {
+            is_sidecar(pid) || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                false
+            }
+        })
     }
 
     /// A PTY leader that exits on its hangup stays a zombie until its parent

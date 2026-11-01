@@ -267,9 +267,9 @@ A `push` to a pipe session that is not running exits 1.
   the child has exited and its output has been read (the holder grace, timed
   from when the sidecar closes its descriptor, below). Capture then ends, the
   child is reaped and its exit recorded, and on Linux a run warning names
-  the pids that still hold the terminal (found through `/proc/*/fd`). On
-  Linux a stop ends every process the run started before the end is
-  recorded, holders included, so after a stop the terminal closes and
+  the pids that still hold the terminal (found through `/proc/*/fd`). A
+  stop ends every process the run started that it can find before the end
+  is recorded, holders included, so after a stop the terminal closes and
   capture ends without the grace (run lifecycle,
   [Stopping a run](03-run-lifecycle.md#stopping-a-run)). On macOS the
   session leader's exit revokes the terminal from every process, so capture
@@ -343,7 +343,8 @@ Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
   PTY a row short. Both records carry `REPAINT` and one correlation. Claude
   Code draws nothing on a same-size attach, on a same-size `TIOCSWINSZ`, or
   on SIGWINCH at an unchanged size, but redraws fully on each of the pair
-  (cloud PTY plan, step 5). A sidecar that predates the frame ignores it.
+  ([measured](../../scripts/pty-vm/README.md#claude-code-in-a-tendr-pty) on
+  an exe.dev VM). A sidecar that predates the frame ignores it.
 - Input is not recorded.
 - Sequencing never waits for storage. One recorder thread appends, rotates
   segments at 64 MiB, publishes each segment atomically, and syncs at most

@@ -42,9 +42,11 @@ pub enum ProcessStatus {
     Missing,
     /// PID exists but identity differs -- PID was recycled.
     IdentityMismatch,
-    /// PID exists but OS denied access (EPERM) -- different session on macOS.
-    /// Can still signal (kill(2) only needs appropriate permissions, not
-    /// proc_pidinfo access), but PID reuse safety is degraded.
+    /// PID exists but the OS denied reading it (EPERM): another user's
+    /// process. A same-user process in another session is readable
+    /// (`proc_pidinfo` and `getsid` on macOS 27, `/proc` on Linux). Signals
+    /// go through only with the privilege to send them; PID reuse safety is
+    /// degraded.
     Inaccessible,
     /// Unexpected OS error.
     OsError(std::io::ErrorKind),
@@ -181,7 +183,7 @@ pub trait Platform {
     fn kill_child(handle: &Self::ChildKillHandle, force: bool) -> io::Result<()>;
 
     /// Make this process the parent of every process its children orphan,
-    /// so that [`Platform::stop_run_tree`] can still find them: on Linux a
+    /// so that [`Platform::stop_run`] can still find them: on Linux a
     /// child subreaper (`PR_SET_CHILD_SUBREAPER`), refused with an error
     /// where the kernel has no children lists to find them by. Call it
     /// before spawning the child. Returns `false` where the platform has no
@@ -196,20 +198,29 @@ pub trait Platform {
     /// which their spawner reaps.
     fn reap_orphans(child: &ProcessIdentity);
 
-    /// After a stop by [`Platform::kill_child`]: end every process the run
+    /// Stop the whole run: the child by [`Platform::kill_child`] (a child
+    /// already gone counts as stopped), then every other process the run
     /// started that is still running, wherever it went (another process
     /// group, its own session, orphaned). Unless `force`, each first gets
     /// SIGTERM, SIGCONT and up to a second to exit. Those left are stopped
     /// before they are killed, so they cannot start more, and the search
     /// repeats until it finds none. Another tendr sidecar, a session started
-    /// inside the run, is left alone with its tree. Signals only descendants
-    /// of this process, apart from `handle`'s child, which `kill_child`
-    /// deals with, so the caller must not run it while this process has
-    /// children other than the run's. Errors name the processes it could
-    /// not end. Linux only; elsewhere a no-op. On Windows the kill-on-close
-    /// Job Object, which only the sidecar holds, ends the rest of the tree
-    /// when the sidecar exits.
-    fn stop_run_tree(handle: &Self::ChildKillHandle, force: bool) -> io::Result<()>;
+    /// inside the run, is left alone with its tree. The caller must not run
+    /// it while this process has children other than the run's. Errors name
+    /// the processes it could not end.
+    ///
+    /// - Linux: the run is every descendant of this process, a child
+    ///   subreaper.
+    /// - macOS: the run is the same user's processes in the child's session
+    ///   or this one, this process's descendants, the holders of the run's
+    ///   terminal, and their descendants, listed before the child is
+    ///   signalled and again after. It misses a process that left the
+    ///   session, lost its parent and holds no terminal descriptor.
+    /// - Windows: only `kill_child`. The kill-on-close Job Object, which
+    ///   only the sidecar holds, ends the rest of the tree when the sidecar
+    ///   exits.
+    /// - Other Unix systems: only `kill_child`.
+    fn stop_run(handle: &Self::ChildKillHandle, force: bool) -> io::Result<()>;
 
     /// Kill an orphaned process by persisted identity (no live handle).
     ///

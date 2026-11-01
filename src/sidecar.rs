@@ -144,7 +144,8 @@ struct AttachTee {
 
 /// A repaint restores the PTY's size once the child's output has been quiet
 /// this long after the shrink: Claude Code re-sends its mouse modes 0.25 ms
-/// after a resize and redraws 19 ms after it (plan 00, step 5).
+/// after a resize and redraws 19 ms after it (`scripts/pty-vm/README.md`,
+/// "Claude Code in a tendr PTY").
 #[cfg(unix)]
 const REPAINT_QUIET: std::time::Duration = std::time::Duration::from_millis(50);
 /// The longest a repaint keeps the PTY shrunk.
@@ -349,11 +350,11 @@ impl StopGate {
         Some(f())
     }
 
-    /// [`stop_run`], unless the run has ended; a failure becomes a run
-    /// warning.
+    /// [`Platform::stop_run`], unless the run has ended; a failure becomes
+    /// a run warning.
     fn stop(&self, kill_handle: &<Current as Platform>::ChildKillHandle, force: bool) {
         self.enter(|| {
-            if let Err(e) = stop_run(kill_handle, force) {
+            if let Err(e) = Current::stop_run(kill_handle, force) {
                 lock(&self.0.0)
                     .warnings
                     .push(format!("stopping the run: {e}"));
@@ -362,8 +363,8 @@ impl StopGate {
     }
 
     /// End the run: refuse new stops and reaping, and wait for those under
-    /// way. Each is bounded: a stop by its grace periods and
-    /// [`Platform::stop_run_tree`]'s limit. Returns the stops' warnings.
+    /// way. Each is bounded by its grace periods and the tree search's
+    /// limit (see [`Platform::stop_run`]). Returns the stops' warnings.
     fn close(&self) -> Vec<String> {
         let (state, changed) = &*self.0;
         let mut state = lock(state);
@@ -375,16 +376,6 @@ impl StopGate {
         }
         std::mem::take(&mut state.warnings)
     }
-}
-
-/// Stop the whole run: the child and its process group by `kill_child`,
-/// then every other process the run started by `stop_run_tree`, gracefully
-/// unless `force`. The tree is stopped even if the child's kill failed, for
-/// one because the child had already exited. Returns the first error.
-fn stop_run(kill_handle: &<Current as Platform>::ChildKillHandle, force: bool) -> io::Result<()> {
-    let child = Current::kill_child(kill_handle, force);
-    let tree = Current::stop_run_tree(kill_handle, force);
-    child.and(tree)
 }
 
 /// Spawn a timeout thread that stops the run after `timeout_s` seconds,

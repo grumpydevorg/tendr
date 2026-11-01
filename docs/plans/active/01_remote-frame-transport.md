@@ -6,10 +6,10 @@ depends_on: []
 # Remote frame transport: make `--host` cross-platform
 
 **Status:** not started, apart from the `--host` destination guard (v0.2.1).
-Steps 0a and 1–7 remain. Step 5's Unix attach bridge is the part the
-[cloud PTY](00_cloud-pty-control.md) workflow needs first. It needs steps 0a
-and 2 (the fake-SSH harness and the codec), so it may land before steps 3
-and 4.
+Steps 0a and 1–7 remain. Step 5's Unix attach bridge is the part the cloud
+PTY workflow ([VM scripts and results](../../../scripts/pty-vm/README.md))
+needs first. It needs steps 0a and 2 (the fake-SSH harness and the codec), so
+it may land before steps 3 and 4.
 
 Goal: every `--host` command travels as a typed request over SSH stdin, as
 `exec` already does. No user- or host-derived value is rebuilt into a remote
