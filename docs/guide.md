@@ -19,7 +19,7 @@ See also the [README](../README.md) (install),
 |namespace|A group of sessions. The default is `default`. A session name is unique within its namespace.|
 |pipe session|A session started with `--stdin`. `exec` and `push` write to the child's stdin.|
 |PTY session|A session started with `--pty`. The child gets a terminal; you can `attach` to it.|
-|exec target|How `exec` talks to the child: `posix-shell`, `powershell`, `python-repl`, `duckdb` or `none`.|
+|exec target|How `exec` talks to the child: `posix-shell`, `powershell`, `python-repl`, `duckdb`, `ndjson` or `none`.|
 |event log|The structured JSONL record of every run, exec and annotation in a session.|
 
 A session's state is on disk under `~/.tendr`: `meta.json` holds its state and
@@ -179,9 +179,10 @@ tendr exec  dev -- '{"cmd":"read","bytes":4,"timeout_ms":1000}'
 ```
 
 - The command is exactly one argument, a JSON object. Tendr adds a fresh
-  string `id` and writes the object as one line. An object that already has
-  an `id`, anything that is not an object, or more than one argument exits 2
-  and sends nothing.
+  string `id` and writes the object as one line. It re-serializes the object,
+  so key order may change and numbers beyond 64-bit integer or double range
+  lose precision. An object that already has an `id`, anything that is not an
+  object, or more than one argument exits 2 and sends nothing.
 - The program must copy the request's `id` into its reply. The first stdout
   line that is a JSON object with that `id` is the result's `stdout`,
   verbatim. `exit_code` is 1 if the reply has `"ok": false` or a non-null

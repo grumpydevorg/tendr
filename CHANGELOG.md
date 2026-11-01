@@ -56,10 +56,10 @@
   `"ok": false` or a non-null `error` exits 1. A request that is not one
   object, or that has its own `id`, exits 2 and sends nothing. A timed-out
   NDJSON `exec` exits 124 at once and the next one can start, since replies
-  are matched by `id`. The target is never inferred, needs `--stdin` and
-  refuses `--pty`; `tendr guide ndjson` covers it. Other targets' `exec`
-  results are unchanged. Using it over `--host` needs this version on the
-  remote host.
+  are matched by `id`. The target is never inferred and needs a pipe session
+  (`--stdin`); `exec` refuses it on a PTY session. `tendr guide ndjson`
+  covers it. Other targets' `exec` results are unchanged. Using it over
+  `--host` needs this version on the remote host.
 
 ### Changed
 

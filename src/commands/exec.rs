@@ -773,20 +773,17 @@ fn wait_ndjson_result(
     reader.seek(SeekFrom::Start(cursor))?;
 
     let mut grace_ends: Option<Instant> = None;
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        if reply.is_none() && deadline.is_some_and(|dl| Instant::now() >= dl) {
-            return Ok(result(None, unmatched, &stderr_lines));
-        }
-
         buf.clear();
-        let bytes = reader.read_line(&mut buf)?;
-        if bytes > 0 && !buf.ends_with('\n') {
+        // Bytes, not a String: a torn read can end mid-character.
+        let bytes = reader.read_until(b'\n', &mut buf)?;
+        if bytes > 0 && !buf.ends_with(b"\n") {
             // A line the sidecar is still writing: read it again once whole,
             // since the reply must not be lost to a torn read.
             reader.seek(SeekFrom::Current(-(bytes as i64)))?;
         }
-        if bytes == 0 || !buf.ends_with('\n') {
+        if bytes == 0 || !buf.ends_with(b"\n") {
             if reply.is_some() {
                 let ends = *grace_ends.get_or_insert_with(|| Instant::now() + NDJSON_STDERR_GRACE);
                 if Instant::now() >= ends {
@@ -794,6 +791,11 @@ fn wait_ndjson_result(
                 }
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
+            }
+            // The deadline is checked only once everything logged so far has
+            // been read, so a reply already on disk is never reported late.
+            if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                return Ok(result(None, unmatched, &stderr_lines));
             }
             let current = session::read_meta(session)?;
             if !matches!(current.status(), RunStatus::Running { .. }) {
@@ -803,7 +805,10 @@ fn wait_ndjson_result(
             continue;
         }
 
-        let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
         let Some(parsed) = serde_json::from_str::<LogLine>(trimmed).ok() else {
             continue;
         };
