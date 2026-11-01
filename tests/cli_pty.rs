@@ -105,14 +105,15 @@ fn pty_output_survives_a_reader_stalled_past_the_childs_exit() {
     );
 }
 
-/// The PTY capture ends when the terminal does, not when the child exits, and
-/// the sidecar's own hold on the terminal changes neither. A background job
-/// hung up by its session leader's exit ends with it, so capture does not wait
-/// for the job's 30 s. One that ignores the hangup and keeps the terminal is
-/// captured until it closes it on Linux; on macOS the leader's exit ends the
+/// The PTY capture ends when the terminal does, or at most 2 s after the
+/// child has exited and its output has been read, and the sidecar's own hold
+/// on the terminal changes neither. A background job hung up by its session
+/// leader's exit ends with it, so capture does not wait for the job's 30 s.
+/// One that ignores the hangup and keeps the terminal is captured on Linux
+/// while it writes within those 2 s; on macOS the leader's exit ends the
 /// session's use of the terminal, so its later output is not captured.
 #[test]
-fn pty_capture_ends_with_the_terminal_not_the_child() {
+fn pty_capture_reads_a_held_terminal_for_up_to_2_s_after_the_child() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
@@ -144,6 +145,225 @@ fn pty_capture_ends_with_the_terminal_not_the_child() {
     } else {
         assert!(log.contains("late"), "{log:?}");
     }
+}
+
+/// Puts the program after it (its first argument is a pid file) in a new
+/// session of its own, as `setsid` does (macOS has no `setsid` command), then
+/// writes its pid to the pid file. The pid file therefore appears only once
+/// the program is outside the child's session and process group, where no
+/// hangup or group signal reaches it. It keeps the terminal descriptors it
+/// inherited.
+const IN_OWN_SESSION: &str = r#"perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; my $p = shift; open(my $f, ">", "$p.tmp") or die; print $f "$$\n"; close $f; rename("$p.tmp", $p) or die; exec @ARGV or die'"#;
+
+/// Shell code that waits until the pid file `"$1"` exists.
+const AWAIT_HOLDER: &str = r#"while [ ! -e "$1" ]; do sleep 0.05; done"#;
+
+/// Kills the process whose pid a test's child wrote to the file, when
+/// dropped, so a holder that outlives its run never outlives the test.
+struct KillPidFile(std::path::PathBuf);
+
+impl Drop for KillPidFile {
+    fn drop(&mut self) {
+        if let Some(pid) = read_pid(&self.0) {
+            // SAFETY: the pid is the test's own holder process.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+fn read_pid(path: &std::path::Path) -> Option<libc::pid_t> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn epoch_secs(value: &serde_json::Value) -> u64 {
+    value
+        .as_str()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("not epoch seconds: {value}"))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// On Linux, the run carries a warning naming `holder` among the processes
+/// that still held its terminal. macOS revokes the terminal when the child,
+/// its session leader, exits, so nothing holds it there.
+fn assert_holder_named(meta: &serde_json::Value, holder: libc::pid_t) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let pid = holder.to_string();
+    let named = meta["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().filter_map(|w| w.as_str()).any(|w| {
+            w.contains("terminal") && w.split(|c: char| !c.is_ascii_digit()).any(|n| n == pid)
+        })
+    });
+    assert!(named, "no warning names holder {holder}: {meta}");
+}
+
+/// A process that keeps the terminal after the child has exited (here one
+/// that left the child's session) does not keep the run going. Capture ends
+/// about 2 s after the child's exit; the child is reaped and its own exit
+/// recorded, with `ended_at` near that exit, not the holder's.
+#[test]
+fn a_terminal_holder_does_not_keep_an_exited_pty_run_going() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let holder = root.path().join("holder.pid");
+    let exited = root.path().join("exited");
+    let _holder = KillPidFile(holder.clone());
+
+    let script =
+        format!(r#"{IN_OWN_SESSION} "$1" sleep 30 & {AWAIT_HOLDER}; date +%s > "$2"; exit 3"#);
+    tendr(&root)
+        .args([
+            "start", "pty-held", "--pty", "--", "sh", "-c", &script, "sh",
+        ])
+        .args([&holder, &exited])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-held");
+    let meta = harness::wait_terminal(&root, "pty-held");
+
+    assert_eq!(meta["reason"], "ExitedError", "{meta}");
+    assert_eq!(meta["code"], 3, "{meta}");
+    let exited_at: u64 = std::fs::read_to_string(&exited)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let ended_at = epoch_secs(&meta["ended_at"]);
+    assert!(
+        ended_at <= exited_at + 4,
+        "ended_at {ended_at} is long after the child's exit at {exited_at}: {meta}"
+    );
+    assert_holder_named(&meta, read_pid(&holder).expect("holder pid"));
+}
+
+/// `kill` of a PTY run whose terminal is still held by a process outside the
+/// child's session ends the run once the child is gone, and reports that end:
+/// `Killed`, promptly, with `ended_at` near the kill.
+#[test]
+fn kill_ends_a_pty_run_whose_terminal_is_held() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let holder = root.path().join("holder.pid");
+    let _holder = KillPidFile(holder.clone());
+
+    let script = format!(r#"{IN_OWN_SESSION} "$1" sleep 30 & {AWAIT_HOLDER}; exec sleep 600"#);
+    tendr(&root)
+        .args([
+            "start",
+            "pty-held-kill",
+            "--pty",
+            "--",
+            "sh",
+            "-c",
+            &script,
+            "sh",
+        ])
+        .arg(&holder)
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-held-kill");
+    harness::wait_running(&root, "pty-held-kill");
+    harness::poll_path_exists(&holder, Duration::from_secs(10), Duration::from_millis(20))
+        .unwrap_or_else(|e| panic!("the holder never started: {e}"));
+
+    let killed_at = now_secs();
+    let started = Instant::now();
+    let out = tendr(&root)
+        .args(["kill", "pty-held-kill"])
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: serde_json::Value = serde_json::from_str(&stdout).expect("kill prints meta");
+    assert_eq!(meta["status"], "Exited", "{meta}");
+    assert_eq!(meta["reason"], "Killed", "{meta}");
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "kill took {elapsed:?}: {meta}"
+    );
+    let ended_at = epoch_secs(&meta["ended_at"]);
+    assert!(
+        ended_at <= killed_at + 5,
+        "ended_at {ended_at} is long after the kill at {killed_at}: {meta}"
+    );
+    assert_holder_named(&meta, read_pid(&holder).expect("holder pid"));
+}
+
+/// A holder that keeps writing to the terminal after the child has exited
+/// cannot stretch the run either: capture ends about 2 s after the child's
+/// exit, and the holder's later output is not captured.
+#[test]
+fn a_writing_terminal_holder_does_not_keep_an_exited_pty_run_going() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let holder = root.path().join("holder.pid");
+    let _holder = KillPidFile(holder.clone());
+
+    // Writes `tick N` every 100 ms for 10 s.
+    let ticker = "sh -c 'i=0; while [ $i -lt 100 ]; do i=$((i+1)); echo tick $i; sleep 0.1; done'";
+    let script = format!(r#"{IN_OWN_SESSION} "$1" {ticker} & {AWAIT_HOLDER}; exit 0"#);
+    let started = Instant::now();
+    tendr(&root)
+        .args([
+            "start",
+            "pty-ticking",
+            "--pty",
+            "--",
+            "sh",
+            "-c",
+            &script,
+            "sh",
+        ])
+        .arg(&holder)
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty-ticking");
+    let meta = harness::wait_terminal(&root, "pty-ticking");
+    let elapsed = started.elapsed();
+
+    assert_eq!(meta["reason"], "ExitedOk", "{meta}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the run took {elapsed:?} to end: {meta}"
+    );
+    let output = tendr(&root)
+        .args(["log", "pty-ticking", "--raw"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stdout);
+    let ticks: Vec<u32> = log
+        .split("tick ")
+        .skip(1)
+        .filter_map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .collect();
+    // Tick 45 comes 4.5 s after the holder started.
+    assert!(
+        ticks.iter().all(|&n| n < 45),
+        "late ticks were captured: {ticks:?}"
+    );
+    if cfg!(target_os = "linux") {
+        assert!(
+            !ticks.is_empty(),
+            "the holder's output within the grace was not captured: {log:?}"
+        );
+    }
+    assert_holder_named(&meta, read_pid(&holder).expect("holder pid"));
 }
 
 /// A `^S` sent to a PTY session stops its output. On macOS a child that

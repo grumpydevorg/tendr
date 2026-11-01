@@ -161,9 +161,9 @@ sequenceDiagram
         CLI->>Session: poll meta.json until terminal
     else sidecar gone or unresponsive
         CLI->>OS: kill orphan by persisted ProcessIdentity
-        CLI->>Session: poll meta.json for terminal write
+        CLI->>Session: poll meta.json, reconciling once the lock is free
     end
-    CLI-->>Caller: print terminal meta or kill_sent
+    CLI-->>Caller: print terminal meta, or fail if the run has not ended
 ```
 
 Notes:
@@ -174,13 +174,19 @@ Notes:
   `kill_acted` when it acts on a graceful request. The sidecar classifies the
   exit as `TimedOut`, `KilledForced` or `Killed` from its timeout state and
   these two files.
-- The CLI waits up to 9 s for a live sidecar: up to 1 s for a PTY child's
-  hangup, 5 s of graceful stop, and 3 s to write terminal state. If the
-  sidecar does not act in time, the CLI kills the child itself and waits up
-  to 5 s more.
+- The CLI waits up to 11 s for a live sidecar: up to 1 s for a PTY child's
+  hangup, 5 s of graceful stop, up to 2 s of a PTY's holder grace (capture
+  ends at most 2 s after the child exits while another process holds the
+  terminal), and 3 s to write terminal state. If the sidecar does not act in
+  time, the CLI kills the child itself and waits up to 5 s more. Once no
+  sidecar holds the session, it records the end as `SidecarLost`, as
+  `status` would. A run that is still live after that fails the `kill`
+  (exit 1).
 - A run still in `Starting` (waiting on `--after`) has no child. `kill` sends
   the sidecar a request, and the dependency wait ends as
-  `DependencyFailed`.
+  `DependencyFailed`. If the sidecar does not act within 8 s, `kill` fails
+  (exit 1). If no sidecar holds the session, `kill` records `SidecarLost`
+  at once, stopping any child in the `child_pid` breadcrumb.
 
 ## `attach` (local and remote)
 

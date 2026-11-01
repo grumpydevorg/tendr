@@ -68,12 +68,17 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
                     outln!("{json}");
                     return Ok(());
                 }
-                // Sidecar didn't act — fall through to report
+                return Err(not_ended(name));
             }
-            outln!(
-                "{}",
-                serde_json::json!({"session": name, "result": "no_child"})
-            );
+            // No sidecar: record the end as `status` would, stopping a child
+            // the lost sidecar may have spawned.
+            let mut m = meta;
+            tendr::reconcile::reconcile_sidecar_gone(&session, &mut m)?;
+            if !m.status().is_terminal() {
+                return Err(not_ended(name));
+            }
+            let json = serde_json::to_string_pretty(&m)?;
+            outln!("{json}");
             return Ok(());
         }
     };
@@ -95,9 +100,11 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
     let sidecar_alive = session::is_locked(&session).unwrap_or(false);
 
     if sidecar_alive {
-        // 9s total: up to 1s for a PTY child's hangup, 5s grace for graceful
-        // stop, and 3s buffer for terminal state write.
-        if let Some(m) = signal_kill_request(&session, &meta, force, 90)? {
+        // 11 s total: up to 1 s for a PTY child's hangup, 5 s grace for a
+        // graceful stop, up to 2 s for a PTY's holder grace (capture ends at
+        // most 2 s after the child exits, while another process holds the
+        // terminal), and 3 s buffer for the terminal state write.
+        if let Some(m) = signal_kill_request(&session, &meta, force, 110)? {
             let json = serde_json::to_string_pretty(&m)?;
             outln!("{json}");
             return Ok(());
@@ -115,10 +122,12 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
         return Err(e.into());
     }
 
-    // Wait for sidecar to write terminal state (up to 5 seconds)
+    // Wait up to 5 s for the end to be recorded: by the sidecar, or, once no
+    // sidecar holds the session, by reconciliation, as `status` would.
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(m) = session::read_meta(&session) {
+        if let Ok(mut m) = session::read_meta(&session) {
+            tendr::reconcile::reconcile_sidecar_gone(&session, &mut m)?;
             if m.status().is_terminal() {
                 super::wait::await_release(&session, name, "kill");
                 let json = serde_json::to_string_pretty(&m)?;
@@ -128,10 +137,13 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
         }
     }
 
-    // Sidecar didn't write terminal state in time -- report what we know
-    outln!(
-        "{}",
-        serde_json::json!({"session": name, "result": "kill_sent", "force": force})
-    );
-    Ok(())
+    Err(not_ended(name))
+}
+
+/// The run is still recorded as live after every wait: the kill was sent,
+/// but that is not success.
+fn not_ended(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "kill sent, but session {name} has not ended: its sidecar did not record the end"
+    )
 }

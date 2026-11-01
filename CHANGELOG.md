@@ -24,8 +24,9 @@
   SIGKILL. A timed-out child can now exit up to about 6 s after the deadline.
   The run is still recorded as `TimedOut`. A process in the group that
   ignores SIGTERM can now outlive the timeout, which the old SIGKILL to the
-  group reached; while it holds the terminal or stdout the run does not end.
-  The run lifecycle's Limits describe this terminal holder.
+  group reached. While it holds a pipe run's stdout or stderr the run does
+  not end; a PTY run ends at most 2 s after its child (see below). The run
+  lifecycle's Limits describe both holders.
 
 ### Fixed
 
@@ -72,6 +73,20 @@
   used to detach `tendr attach` mid-paste and lose the rest of it. While the
   program in the session has bracketed paste on, as shells and Claude Code
   do, bytes inside a paste are now sent to it as pasted.
+- **A PTY run ends when its child does.** A process the child left in another
+  session, such as a `setsid` job or a tool shell started by Claude Code or
+  omp, kept the terminal open. On Linux the run then stayed `Running`, with
+  the child an unreaped zombie, until that process exited. Now capture reads
+  its output for at most 2 s after the child has exited, then the child's
+  exit is recorded, with a run warning that names the pids still holding the
+  terminal. The process is left running; its later writes to the terminal
+  fail once the sidecar has exited.
+- **`kill` no longer reports success for a run that did not end.** It used to
+  print `kill_sent` and exit 0 when the run was still `Running`. Now it exits 1
+  with an error. The same goes for a `Starting` run (waiting on `--after`)
+  whose sidecar does not act on the kill: `kill` used to print `no_child` and
+  exit 0. When the sidecar is gone, `kill` records the run as `SidecarLost`,
+  as `status` would, for a `Running` or a `Starting` run.
 
 ## v0.4.1 — capture fixes
 
