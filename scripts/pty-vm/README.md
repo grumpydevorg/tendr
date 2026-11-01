@@ -206,6 +206,10 @@ Found while building the harness on an exe.dev VM (2026-09-26):
 - For a VM-side half-open test, run a real OpenSSH server on the VM (the
   harness used `127.0.0.1:2222`, reached with `ssh -J <vm>.exe.xyz -p 2222`)
   and drop that connection's packets with `iptables`.
+- Turn SSH connection sharing off for every attach a test breaks or kills
+  (`-o ControlMaster=no -o ControlPath=none`). Through a shared connection,
+  killing the local `ssh -t` left the VM's `tendr attach` running until a
+  `--takeover` cleared it.
 
 References:
 
