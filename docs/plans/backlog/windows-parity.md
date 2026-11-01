@@ -75,21 +75,6 @@ supported on Unix" (`src/commands/attach.rs:43-46`). Needed:
   Remote attach from a Windows client to a Unix host needs it once remote attach
   moves to `ssh -T`, which remote frame transport owns.
 
-### pwsh 7 exec hangs on ARM64
-
-With pwsh 7 as the OpenSSH login shell on windows-11-arm, a remote `exec` hung
-in all three CI runs that tried it; the last one is
-[run 41287789101](https://github.com/grumpydevorg/tendr/actions/runs/41287789101/job/124792522200).
-The session was a `powershell -NoProfile` started over the same login shell.
-The remote `tendr --hello exec --frame-from-stdin` stayed alive after the
-frame's 30 s timeout had passed, still holding the session's `exec.lock`.
-Later execs then failed with "another exec is already running on this session
-… (os error 33)". It is not the transport: ssh carried stdin byte-exact in the
-same setup, and the remote took the lock, so it had decoded the frame. x64
-with pwsh 7, and both lanes with cmd.exe and powershell.exe 5.1, were fine.
-Untested hypothesis: the session's `powershell.exe` (5.1) child inherits
-pwsh 7's environment (`PSModulePath` among it).
-
 ## Acceptance
 
 Native Windows tests show:

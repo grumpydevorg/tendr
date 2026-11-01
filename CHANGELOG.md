@@ -110,6 +110,17 @@
   `exec --frame-from-stdin`, and all three for `attach`. An ssh that lets its
   ProxyCommand inherit its own stdio still passes those on.
 
+- **Windows PowerShell sessions no longer load pwsh 7's modules.** pwsh 7
+  adds its own module directories to `PSModulePath`, so a `powershell`
+  session started under pwsh 7 (a pwsh 7 prompt or ssh login shell) loaded
+  pwsh 7's modules in place of Windows PowerShell's own. On Windows ARM64
+  that usually lost the first line sent to the session: its first `exec`
+  never ran, and the exec held the session's exec lock until the session
+  ended, so every later `exec` failed with "another exec is already running".
+  Tendr now removes pwsh 7's directories from a `powershell` child's
+  `PSModulePath`, as pwsh 7 does when it starts `powershell.exe` itself.
+  `--env PSModulePath=…` or `--unset-env PSModulePath` still decides.
+
 - **On Windows, tendr works without `HOME`.** It needed `HOME` for its
   state root and for `skill install --global`, and failed with `HOME not
   set` where it was unset. Windows itself does not set `HOME` (Windows
