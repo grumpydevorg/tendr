@@ -190,15 +190,41 @@ tendr exec  dev -- '{"cmd":"read","bytes":4,"timeout_ms":1000}'
 - Every other stdout line seen while waiting is kept, in order, in
   `unmatched`: a late reply to an `exec` that timed out, or output the program
   sent on its own. The program's stderr is `stderr`.
+- `request_id` is the `id` tendr added to the request. It is present on every
+  NDJSON result, including a timeout, so you can still address the request.
 
 ```json
-{"session":"dev","stdout":"{\"id\":\"…\",\"ok\":true,…}","stderr":"","exit_code":0,"cwd_after":"","timed_out":false,"truncated":false,"unmatched":[]}
+{"session":"dev","stdout":"{\"id\":\"…\",\"ok\":true,…}","stderr":"","exit_code":0,"cwd_after":"","timed_out":false,"truncated":false,"unmatched":[],"request_id":"…"}
 ```
 
 A timed-out `exec` exits 124 at once, unlike the other targets, and the next
 `exec` can start while the program is still busy. It still gets its own
 reply, because replies are matched by `id`. Lines the program writes while no
 `exec` is waiting are only in the log (`tendr log dev`).
+
+Tendr has no cancel of its own; to stop a timed-out request, send the
+program's own cancel request naming `request_id`. For example, on a `sio
+stdio` session named `serial`:
+
+```bash
+tendr exec serial -- '{"cmd":"cancel","target":"<request_id>"}'
+```
+
+This is an ordinary NDJSON request. What follows is sio's behaviour (sio
+0.4.0, [SKILL.md, "Waiting and cancelling"](https://github.com/grumpydevorg/sio)),
+not tendr's:
+
+- A cancel skips sio's queue and stops the `read`, `readline` or `expect`
+  running when it arrives, within about 100 ms. With `target`, it stops it
+  only if the running request's id equals `target`.
+- The stopped request replies with `end:"cancelled"` and
+  `consumes_input:false`; its bytes stay buffered. That reply arrives while
+  the cancel's `exec` waits, so it lands in that exec's `unmatched`.
+- The cancel's own reply is `{"ok":true,"result":{"cancelled":true|false}}`
+  (exit 0 either way), in queue order. `false` means the target was not
+  running.
+- An untargeted `{"cmd":"cancel"}` is safe only when one caller owns the
+  session.
 
 ## Answer prompts and attach
 
