@@ -22,6 +22,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("python", "Python /"),
     ("duckdb", "DuckDB"),
     ("powershell", "PowerShell"),
+    ("ndjson", "NDJSON"),
     ("boundary", "--boundary"),
     ("cgroup", "Cap a session's memory"),
     ("herdr", "inside herdr"),

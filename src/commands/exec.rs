@@ -88,6 +88,10 @@ struct ExecResult {
     cwd_after: String,
     timed_out: bool,
     truncated: bool,
+    /// NDJSON target only: stdout lines seen while waiting that were not the
+    /// reply (late replies to a timed-out exec, unsolicited output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unmatched: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -163,6 +167,22 @@ pub fn cmd_exec(
         anyhow::bail!("session was not started with --stdin");
     }
 
+    // The NDJSON request is checked before any side effect: a bad one is a
+    // usage error, like a malformed exec frame.
+    let token = exec_frame::generate_token();
+    let ndjson_request = if meta.launch_spec().exec_target == tendr::model::spec::ExecTarget::Ndjson
+    {
+        match exec_frame::ndjson_frame(&cmd, &token) {
+            Ok(line) => Some(line),
+            Err(e) => {
+                eprintln!("tendr exec: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
     let _lock = ExecLock::try_acquire(&session)?;
 
     // Validate cmd is non-empty (clap enforces this, but belt-and-suspenders)
@@ -194,8 +214,15 @@ pub fn cmd_exec(
         parent_id,
     );
 
-    let token = exec_frame::generate_token();
-    let result = run_exec(&session, &meta, &cmd, &token, timeout, block_id)?;
+    let result = run_exec(
+        &session,
+        &meta,
+        &cmd,
+        &token,
+        ndjson_request,
+        timeout,
+        block_id,
+    )?;
 
     // If timed out, the in-shell command may still be running.
     // Hold the exec lock and drain until the sentinel arrives (or session dies)
@@ -216,6 +243,10 @@ pub fn cmd_exec(
                 // DuckDB results flow through stdout — drain sentinel same as shells.
                 drain_until_sentinel(&session, &token);
             }
+            ExecTarget::Ndjson => {
+                // Nothing to drain: the next exec matches its reply by id, and
+                // a late reply to this one reaches it as an unmatched line.
+            }
             ExecTarget::None => {} // unreachable after earlier bail
         }
     }
@@ -226,7 +257,7 @@ pub fn cmd_exec(
     let result_event = {
         use tendr::annotation;
 
-        let result_data = serde_json::json!({
+        let mut result_data = serde_json::json!({
             "exit_code": result.exit_code,
             "cwd_after": &result.cwd_after,
             "timed_out": result.timed_out,
@@ -234,7 +265,7 @@ pub fn cmd_exec(
             "stdout": &result.stdout,
             "truncated": false,
         });
-        let result_preview = serde_json::json!({
+        let mut result_preview = serde_json::json!({
             "exit_code": result.exit_code,
             "cwd_after": &result.cwd_after,
             "timed_out": result.timed_out,
@@ -242,6 +273,10 @@ pub fn cmd_exec(
             "stdout_preview": annotation::truncate_string(&result.stdout, 2048),
             "truncated": true,
         });
+        if let Some(unmatched) = &result.unmatched {
+            result_data["unmatched"] = serde_json::json!(unmatched);
+            result_preview["unmatched_count"] = serde_json::json!(unmatched.len());
+        }
         emit_exec_event(
             &mut event_writer,
             &meta,
@@ -328,6 +363,7 @@ fn run_exec(
     meta: &tendr::model::meta::Meta,
     cmd: &[String],
     token: &str,
+    ndjson_request: Option<String>,
     timeout: Option<u64>,
     block_id: Uuid7,
 ) -> anyhow::Result<ExecResult> {
@@ -351,6 +387,8 @@ fn run_exec(
         SentinelWithStderrCheck,
         /// Python-style: poll for a result file written atomically by the frame.
         SideChannel,
+        /// NDJSON: the stdout line whose `id` is the token is the reply.
+        Ndjson,
     }
 
     let (framed, wait_mode) = match meta.launch_spec().exec_target {
@@ -395,6 +433,11 @@ fn run_exec(
                 WaitMode::SentinelWithStderrCheck,
             )
         }
+        ExecTarget::Ndjson => (
+            ndjson_request
+                .ok_or_else(|| anyhow::anyhow!("internal: ndjson request was not built"))?,
+            WaitMode::Ndjson,
+        ),
         ExecTarget::None => {
             anyhow::bail!(
                 "session has no exec target — restart with --exec-target if this is a shell"
@@ -430,6 +473,7 @@ fn run_exec(
     // 4. Wait for result
     match wait_mode {
         WaitMode::SideChannel => wait_side_channel_result(session, &session_name, token, deadline),
+        WaitMode::Ndjson => wait_ndjson_result(session, &session_name, token, cursor, deadline),
         WaitMode::Sentinel => {
             wait_sentinel_result(session, &session_name, token, cursor, deadline, true)
         }
@@ -502,6 +546,7 @@ fn wait_sentinel_result(
             cwd_after,
             timed_out,
             truncated: false,
+            unmatched: None,
         }
     };
 
@@ -632,6 +677,7 @@ fn wait_side_channel_result(
                     cwd_after: String::new(),
                     timed_out: true,
                     truncated: false,
+                    unmatched: None,
                 });
             }
         }
@@ -658,6 +704,7 @@ fn wait_side_channel_result(
                 cwd_after: sc.cwd,
                 timed_out: false,
                 truncated: false,
+                unmatched: None,
             });
         }
 
@@ -667,6 +714,103 @@ fn wait_side_channel_result(
             anyhow::bail!("session exited while waiting for exec result");
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// How long NDJSON exec keeps reading after the reply for stderr the child
+/// wrote before it: the sidecar logs each pipe from its own thread, so such
+/// stderr can be logged just after the reply.
+const NDJSON_STDERR_GRACE: Duration = Duration::from_millis(20);
+
+/// Scan output.log for the NDJSON reply to `token`: the first stdout line
+/// that is a JSON object whose `id` is the token. Every other stdout line is
+/// kept in `unmatched`, so a late reply to a timed-out exec is reported, not
+/// taken as this exec's reply. Stderr lines are the result's stderr.
+fn wait_ndjson_result(
+    session: &SessionDir,
+    session_name: &str,
+    token: &str,
+    cursor: u64,
+    deadline: Option<Instant>,
+) -> anyhow::Result<ExecResult> {
+    let log_path = session.path().join("output.log");
+    let mut reply: Option<(String, i32)> = None;
+    let mut unmatched: Vec<String> = Vec::new();
+    let mut stderr_lines: Vec<String> = Vec::new();
+
+    let result = |reply: Option<(String, i32)>, unmatched: Vec<String>, stderr: &[String]| {
+        let (stdout, exit_code, timed_out) = match reply {
+            Some((line, code)) => (line, code, false),
+            None => (String::new(), -1, true),
+        };
+        ExecResult {
+            session: session_name.to_string(),
+            stdout,
+            stderr: stderr.join("\n"),
+            exit_code,
+            cwd_after: String::new(),
+            timed_out,
+            truncated: false,
+            unmatched: Some(unmatched),
+        }
+    };
+
+    while !log_path.exists() {
+        if deadline.is_some_and(|dl| Instant::now() >= dl) {
+            return Ok(result(None, unmatched, &stderr_lines));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut reader = BufReader::new(std::fs::File::open(&log_path)?);
+    reader.seek(SeekFrom::Start(cursor))?;
+
+    let mut grace_ends: Option<Instant> = None;
+    let mut buf = String::new();
+    loop {
+        if reply.is_none() && deadline.is_some_and(|dl| Instant::now() >= dl) {
+            return Ok(result(None, unmatched, &stderr_lines));
+        }
+
+        buf.clear();
+        let bytes = reader.read_line(&mut buf)?;
+        if bytes > 0 && !buf.ends_with('\n') {
+            // A line the sidecar is still writing: read it again once whole,
+            // since the reply must not be lost to a torn read.
+            reader.seek(SeekFrom::Current(-(bytes as i64)))?;
+        }
+        if bytes == 0 || !buf.ends_with('\n') {
+            if reply.is_some() {
+                let ends = *grace_ends.get_or_insert_with(|| Instant::now() + NDJSON_STDERR_GRACE);
+                if Instant::now() >= ends {
+                    return Ok(result(reply, unmatched, &stderr_lines));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let current = session::read_meta(session)?;
+            if !matches!(current.status(), RunStatus::Running { .. }) {
+                anyhow::bail!("session exited while waiting for exec result");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+
+        let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
+        let Some(parsed) = serde_json::from_str::<LogLine>(trimmed).ok() else {
+            continue;
+        };
+        let Some(content) = parsed.content_text() else {
+            continue; // annotations and other structured lines
+        };
+        match parsed.tag.as_str() {
+            "O" => match exec_frame::parse_ndjson_reply(content, token) {
+                Some(code) if reply.is_none() => reply = Some((content.to_owned(), code)),
+                _ => unmatched.push(content.to_owned()),
+            },
+            "E" => stderr_lines.push(content.to_owned()),
+            _ => {}
+        }
     }
 }
 
@@ -1010,6 +1154,7 @@ mod tests {
             cwd_after: "/tmp".to_owned(),
             timed_out: false,
             truncated: false,
+            unmatched: None,
         }
     }
 

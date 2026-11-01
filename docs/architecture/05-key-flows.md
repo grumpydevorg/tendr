@@ -75,8 +75,8 @@ sequenceDiagram
 ```
 
 `exec` requires a running session started with `--stdin` and an exec target.
-On a PTY session only the `python-repl` target is allowed; DuckDB needs a
-pipe session.
+On a PTY session only the `python-repl` target is allowed; DuckDB and NDJSON
+need a pipe session.
 
 ### How `exec` finds the result
 
@@ -89,6 +89,7 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
 | DuckDB | `output.log` | stdout sentinel, then up to 100 ms for trailing stderr |
 | Python REPL | `exec-results/<token>.json` | the result file appears |
 | PowerShell | `exec-results/<token>.json` | the result file appears |
+| NDJSON | `output.log` | a stdout line that is a JSON object with `"id": "<token>"`, then 20 ms for trailing stderr |
 
 - **Sentinel framing (POSIX shell, DuckDB).** The frame prints a sentinel
   line with the token after the command. `exec` scans `output.log` from the
@@ -110,6 +111,14 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
   to `exec-results/<token>.json` (temporary file, then rename). `exec` polls
   for the file, reads it, and deletes it. A Python traceback is appended to
   stderr.
+- **Request id (NDJSON).** The command is one JSON object; `exec` adds
+  `"id": "<token>"` and writes it as one line. A request that is not one
+  object, or already has an `id`, exits 2 before the exec lock or any event.
+  `exec` scans `output.log` from the offset it recorded before sending. The
+  first stdout line that parses as a JSON object with that `id` is the
+  reply; every other stdout line goes to `unmatched`, and stderr lines to
+  `stderr`. A reply with `"ok": false` or a non-null `error` sets the exit
+  code to 1. The `exec.result` event carries `unmatched` too.
 
 ### Timeouts
 
@@ -117,6 +126,11 @@ A timed-out exec prints its result and exits 124. It keeps holding
 `exec.lock` until the shell or REPL finishes the frame (the sentinel or
 result file appears) or the session ends. So a second exec cannot
 interleave into a busy session.
+
+An NDJSON exec is the exception: it exits 124 at once and frees the lock.
+The next exec may then send its request while the program is still on the
+timed-out one. Matching by `id` keeps the two replies apart: a late reply
+logged while the next exec waits lands in that exec's `unmatched`.
 
 ### Events and annotation
 

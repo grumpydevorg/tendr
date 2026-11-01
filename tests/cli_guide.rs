@@ -97,6 +97,19 @@ fn guide_duckdb_section_is_relevant() {
 }
 
 #[test]
+fn guide_ndjson_section_is_relevant() {
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .args(["guide", "ndjson"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--exec-target ndjson"))
+        .stdout(predicate::str::contains("unmatched"))
+        .stdout(predicate::str::contains("Answer prompts and attach").not());
+}
+
+#[test]
 fn guide_install_section_is_relevant() {
     let root = TempDir::new().unwrap();
 

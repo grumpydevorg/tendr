@@ -2013,7 +2013,6 @@ fn windows_ignored_exec_set_is_exactly_tracked() {
 
 // ── exec framing markers (#92, #95) ─────────────────────────────────────
 
-#[cfg(unix)]
 use harness::DeadlineAssertExt;
 
 /// Start a POSIX shell session and return a guard that stops it.
@@ -2113,4 +2112,311 @@ fn exec_survives_redirected_shell_stderr() {
         "the CLI must warn that stderr may be incomplete: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// ---------------------------------------------------------------------------
+// NDJSON target. The child is `test_callback ndjson-echo`: one JSON reply per
+// request line, in order, echoing the id tendr adds.
+// ---------------------------------------------------------------------------
+
+/// The keys of every exec result before the NDJSON target, in output order.
+const EXEC_RESULT_KEYS: [&str; 7] = [
+    "session",
+    "stdout",
+    "stderr",
+    "exit_code",
+    "cwd_after",
+    "timed_out",
+    "truncated",
+];
+
+/// The top-level keys of a pretty-printed exec result, in output order.
+fn result_keys(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("  \""))
+        .filter_map(|l| l.split_once('"').map(|(key, _)| key.to_owned()))
+        .collect()
+}
+
+fn ndjson_session<'a>(root: &'a tempfile::TempDir, name: &str) -> harness::SessionGuard<'a> {
+    harness::tendr(root)
+        .args(["start", name, "--stdin", "--exec-target", "ndjson", "--"])
+        .arg(harness::test_callback_bin())
+        .arg("ndjson-echo")
+        .assert()
+        .success();
+    let guard = harness::SessionGuard::new(root, name);
+    harness::wait_running(root, name);
+    guard
+}
+
+/// `tendr exec <name> --timeout <secs> -- <request>`, run to completion.
+fn ndjson_exec(
+    root: &tempfile::TempDir,
+    name: &str,
+    timeout: u64,
+    request: &str,
+) -> std::process::Output {
+    let timeout = timeout.to_string();
+    harness::tendr(root)
+        .args(["exec", name, "--timeout", &timeout, "--", request])
+        .assert_within_deadline()
+        .get_output()
+        .clone()
+}
+
+fn json(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes)
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(bytes)))
+}
+
+/// The reply carrying the id tendr added is the result's stdout, verbatim;
+/// other stdout lines are `unmatched` and stderr is `stderr`.
+#[test]
+fn exec_ndjson_returns_the_matching_reply() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let _session = ndjson_session(&root, "dev");
+
+    // The child sleeps after its stderr line, so the sidecar has logged it
+    // before the reply.
+    let output = ndjson_exec(
+        &root,
+        "dev",
+        10,
+        r#"{"cmd":"read","push":"telemetry 1","stderr":"diag","sleep_ms":200}"#,
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let mut keys = EXEC_RESULT_KEYS.map(str::to_owned).to_vec();
+    keys.push("unmatched".to_owned());
+    assert_eq!(result_keys(&output.stdout), keys);
+
+    let result = json(&output.stdout);
+    assert_eq!(result["session"], "dev");
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["timed_out"], false);
+    assert_eq!(result["cwd_after"], "");
+    assert_eq!(result["stderr"], "diag");
+    assert_eq!(result["unmatched"], serde_json::json!(["telemetry 1"]));
+
+    let stdout = result["stdout"].as_str().unwrap();
+    assert!(!stdout.contains('\n'), "one line: {stdout:?}");
+    let reply: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert_eq!(reply["cmd"], "read");
+    assert_eq!(reply["ok"], true);
+    assert!(
+        reply["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "tendr sets a string id: {reply}"
+    );
+}
+
+/// `"ok": false` or a non-null `error` in the reply is exit code 1; the
+/// session keeps running.
+#[test]
+fn exec_ndjson_failure_reply_exits_1() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let _session = ndjson_session(&root, "dev");
+
+    for request in [
+        r#"{"cmd":"open","ok":false}"#,
+        r#"{"cmd":"open","error":{"code":"busy"}}"#,
+    ] {
+        let output = ndjson_exec(&root, "dev", 10, request);
+        assert_eq!(output.status.code(), Some(1), "{request}: {output:?}");
+        let result = json(&output.stdout);
+        assert_eq!(result["exit_code"], 1, "{result}");
+        assert_eq!(result["timed_out"], false, "{result}");
+        let reply: serde_json::Value =
+            serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
+        assert_eq!(reply["cmd"], "open");
+    }
+
+    let status = json(
+        &harness::tendr(&root)
+            .args(["status", "dev"])
+            .output()
+            .unwrap()
+            .stdout,
+    );
+    assert_eq!(status["status"], "Running");
+}
+
+/// The exec lock is free once a timed-out exec exits, while the child still
+/// works on its request. The child's late reply must not be taken as the next
+/// exec's reply: the next exec returns its own, with the late one unmatched.
+#[test]
+fn exec_ndjson_late_reply_lands_in_the_next_exec() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let _session = ndjson_session(&root, "dev");
+
+    let slow = ndjson_exec(&root, "dev", 1, r#"{"cmd":"slow","sleep_ms":4000}"#);
+    assert_eq!(slow.status.code(), Some(124), "{slow:?}");
+    let slow = json(&slow.stdout);
+    assert_eq!(slow["timed_out"], true);
+    assert_eq!(slow["stdout"], "");
+    assert_eq!(slow["unmatched"], serde_json::json!([]));
+
+    let next = ndjson_exec(&root, "dev", 20, r#"{"cmd":"fast"}"#);
+    assert_eq!(next.status.code(), Some(0), "{next:?}");
+    let next = json(&next.stdout);
+    let reply: serde_json::Value = serde_json::from_str(next["stdout"].as_str().unwrap()).unwrap();
+    assert_eq!(reply["cmd"], "fast", "{next}");
+
+    let unmatched = next["unmatched"].as_array().unwrap();
+    assert_eq!(unmatched.len(), 1, "{next}");
+    let late: serde_json::Value = serde_json::from_str(unmatched[0].as_str().unwrap()).unwrap();
+    assert_eq!(late["cmd"], "slow", "{next}");
+    assert!(late["id"].is_string());
+    assert_ne!(late["id"], reply["id"]);
+}
+
+/// Anything but one JSON object without an `id` is a usage error (exit 2)
+/// before any side effect: nothing reaches the child and no exec event is
+/// written.
+#[test]
+fn exec_ndjson_rejects_bad_requests_with_exit_2() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let _session = ndjson_session(&root, "dev");
+
+    let cases: [(&[&str], &str); 5] = [
+        (&["not json"], "not valid JSON"),
+        (&["[1,2]"], "must be a JSON object, not an array"),
+        (&["\"text\""], "must be a JSON object, not a string"),
+        (&["{}", "{}"], "exactly one argument"),
+        (
+            &[r#"{"cmd":"read","id":"mine"}"#],
+            "must not have an \"id\"",
+        ),
+    ];
+    for (args, message) in cases {
+        let output = harness::tendr(&root)
+            .args(["exec", "dev", "--timeout", "10", "--"])
+            .args(args)
+            .assert_within_deadline()
+            .get_output()
+            .clone();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("tendr exec: ") && stderr.contains(message),
+            "{args:?}: {stderr}"
+        );
+    }
+    let started = harness::read_events(&root, "dev")
+        .iter()
+        .filter(|e| e["kind"] == "exec.started")
+        .count();
+    assert_eq!(started, 0, "a refused request writes no exec event");
+
+    let output = ndjson_exec(&root, "dev", 10, r#"{"cmd":"ping"}"#);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        json(&output.stdout)["unmatched"],
+        serde_json::json!([]),
+        "nothing was sent to the child"
+    );
+}
+
+/// A child that exits before replying fails the exec with a clear message.
+#[test]
+fn exec_ndjson_child_exit_before_reply_fails() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let _session = ndjson_session(&root, "dev");
+
+    let output = ndjson_exec(&root, "dev", 20, r#"{"cmd":"quit","exit":3}"#);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("session exited while waiting"),
+        "{output:?}"
+    );
+}
+
+/// The NDJSON target needs pipe transport: a PTY session refuses exec.
+// PTY sessions are exercised on Unix only (tests/cli_pty.rs).
+#[cfg(unix)]
+#[test]
+fn exec_ndjson_refuses_pty_sessions() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    harness::tendr(&root)
+        .args([
+            "start",
+            "pty",
+            "--stdin",
+            "--pty",
+            "--exec-target",
+            "ndjson",
+            "--",
+        ])
+        .arg(harness::test_callback_bin())
+        .arg("ndjson-echo")
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "pty");
+    harness::wait_running(&root, "pty");
+
+    harness::tendr(&root)
+        .args(["exec", "pty", "--", r#"{"cmd":"read"}"#])
+        .assert_within_deadline()
+        .failure()
+        .stderr(predicates::str::contains("not supported on PTY"));
+}
+
+/// The NDJSON target is never inferred from argv[0]; meta records it as
+/// `Ndjson` when asked for.
+#[test]
+fn exec_ndjson_target_is_explicit_only() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let _session = ndjson_session(&root, "dev");
+    let status = json(
+        &harness::tendr(&root)
+            .args(["status", "dev"])
+            .output()
+            .unwrap()
+            .stdout,
+    );
+    assert_eq!(status["launch_spec"]["exec_target"], "Ndjson");
+
+    harness::tendr(&root)
+        .args(["start", "plain", "--stdin", "--"])
+        .arg(harness::test_callback_bin())
+        .arg("ndjson-echo")
+        .assert()
+        .success();
+    let _plain = harness::SessionGuard::new(&root, "plain");
+    harness::wait_running(&root, "plain");
+    harness::tendr(&root)
+        .args(["exec", "plain", "--", r#"{"cmd":"read"}"#])
+        .assert_within_deadline()
+        .failure()
+        .stderr(predicates::str::contains("no exec target"));
+}
+
+/// The other targets' exec result keeps exactly its keys, in order: the
+/// NDJSON `unmatched` field never appears there.
+#[test]
+fn exec_result_shape_of_other_targets_is_unchanged() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    harness::tendr(&root)
+        .args(native_shell_start_args("shell"))
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "shell");
+    harness::wait_running(&root, "shell");
+
+    let output = harness::tendr(&root)
+        .args(exec_argv("shell", native_echo("shape")))
+        .assert_within_deadline()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(result_keys(&output.stdout), EXEC_RESULT_KEYS);
 }

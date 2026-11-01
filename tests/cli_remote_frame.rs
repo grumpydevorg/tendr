@@ -606,6 +606,52 @@ fn host_push_reaches_a_pty_session() {
     });
 }
 
+// -- exec: the NDJSON target over `--host` --
+
+/// `start --exec-target ndjson` reaches the remote meta.json, and `exec`
+/// through the exec frame gets the reply to its own id; a request with its
+/// own `id` is refused with exit 2 as it is locally.
+#[test]
+fn host_ndjson_exec_matches_its_reply() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let remote = Remote::new();
+    let output = remote
+        .tendr(&root)
+        .args(["start", "--stdin", "--exec-target", "ndjson", "dev", "--"])
+        .arg(harness::test_callback_bin())
+        .arg("ndjson-echo")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{:?}", outcome(&output));
+    remote.assert_constant_argv();
+    let _session = SessionGuard::new(&root, "dev");
+    wait_running(&root, "dev");
+    let meta = read_json(&meta_path(&root, "default", "dev"));
+    assert_eq!(meta["launch_spec"]["exec_target"], "Ndjson");
+
+    let output = remote
+        .tendr(&root)
+        .args(["exec", "dev", "--timeout", "20", "--", r#"{"cmd":"read"}"#])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{:?}", outcome(&output));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reply: serde_json::Value =
+        serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
+    assert_eq!(reply["cmd"], "read", "{result}");
+    assert_eq!(result["unmatched"], serde_json::json!([]), "{result}");
+
+    let output = remote
+        .tendr(&root)
+        .args(["exec", "dev", "--", r#"{"cmd":"read","id":"mine"}"#])
+        .output()
+        .unwrap();
+    let (code, _, stderr) = outcome(&output);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("must not have an \"id\""), "{stderr}");
+}
+
 // -- `tendr _remote`: bad requests fail with exit 2 and change nothing --
 
 /// A frame: the 4-byte big-endian length, then `json`.
