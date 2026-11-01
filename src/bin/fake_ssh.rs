@@ -18,9 +18,9 @@
 //!                   start <exe> (this fixture's built binary) sleeping <secs>,
 //!                   given our stderr and null stdin and stdout, as a
 //!                   ProxyCommand that ignores the hangup is. On Windows it
-//!                   also holds every inheritable handle our caller passed
-//!                   down, so a caller timing tendr must give tendr files,
-//!                   not pipes.
+//!                   also inherits every inheritable handle we hold, our
+//!                   stdin and stdout among them, as the ProxyCommand of an
+//!                   ssh without a handle allow-list does.
 //! close-stderr      close our stderr
 //! sleep <secs>      sleep
 //! exit <code>       exit with <code>
