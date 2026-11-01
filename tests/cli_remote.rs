@@ -792,17 +792,24 @@ fn poison_ssh() -> TempDir {
     fake_ssh("err SSH_MUST_NOT_RUN\\n\nexit 99")
 }
 
-/// Extract the `try:` line's fallback and re-split it twice — once as the
+/// What introduces the copy-paste fallback: POSIX-quoted text, labelled so.
+const FALLBACK_LABEL: &str = "try (POSIX shell):";
+
+/// The fallback after `try (POSIX shell):`, re-split twice — once as the
 /// local shell would (yielding `ssh <host> <remote-string>`), once as the
 /// remote login shell would — returning the remote tendr argv. This pins
 /// that the printed fallback is copy-paste correct, not just plausible.
 fn parse_fallback_argv(stderr: &str, host: &str) -> Vec<String> {
     let try_line = stderr
         .lines()
-        .find(|l| l.trim_start().starts_with("try:"))
-        .unwrap_or_else(|| panic!("no try: line in stderr: {stderr}"));
-    let cmd = try_line.trim_start().strip_prefix("try:").unwrap().trim();
-    let local = shell_words::split(cmd).expect("try: line parses as shell words");
+        .find(|l| l.trim_start().starts_with(FALLBACK_LABEL))
+        .unwrap_or_else(|| panic!("no fallback line in stderr: {stderr}"));
+    let cmd = try_line
+        .trim_start()
+        .strip_prefix(FALLBACK_LABEL)
+        .unwrap()
+        .trim();
+    let local = shell_words::split(cmd).expect("the fallback parses as shell words");
     assert_eq!(local[0], "ssh", "fallback is an ssh command: {cmd}");
     assert_eq!(local[1], host, "fallback targets the requested host");
     assert_eq!(

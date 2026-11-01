@@ -2,11 +2,15 @@
 //!
 //! `--host` forwards the remote-capable commands (the binary's
 //! `RemoteOperation`) to a remote `tendr`, which runs the *same* local
-//! lifecycle on the far side. Ordinary commands are POSIX-shell-quoted into an
-//! `ssh -T` argv; `exec` instead rides the [`exec_frame`](crate::exec_frame)
-//! over SSH stdin so no user value ever reaches the remote argv. Destinations
-//! are validated ([`validate_destination`]) to fail closed against
-//! option-shaped hosts.
+//! lifecycle on the far side. The remote command line is constant: every
+//! operation but `attach` runs `tendr [--hello] _remote` and sends the request
+//! on ssh's stdin ([`exec_ssh_remote`]), and `exec` runs
+//! `tendr [--hello] exec --frame-from-stdin` with its own
+//! [`exec_frame`](crate::exec_frame) ([`exec_ssh_frame`]). So no user value
+//! reaches the remote login shell, whatever shell that is. `attach` still runs
+//! under `ssh -t` with a rebuilt command line, limited to plain names
+//! ([`exec_ssh_attach`]). Destinations are validated
+//! ([`validate_destination`]) to fail closed against option-shaped hosts.
 
 use std::io;
 use std::process::{Command, Stdio};
@@ -39,6 +43,12 @@ pub enum SshError {
     #[error("invalid --host destination {0:?}: must not be empty or begin with '-'")]
     InvalidDestination(String),
 
+    /// An `attach` argument that is neither a plain name ([`is_plain_name`])
+    /// nor one of attach's flags: the remote login shell could act on it.
+    /// Rejected before ssh is ever spawned.
+    #[error("refusing to send {0:?} to the remote shell: attach takes plain names only")]
+    UnsafeAttachArgument(String),
+
     /// ssh did not get through authentication and start the remote tendr
     /// (no [`HELLO_LINE`]) within the connect deadline, and was killed.
     #[error(
@@ -70,8 +80,8 @@ impl SshError {
 /// bracketed IPv6 (`[::1]`) — never begin with `-`, so a single non-empty /
 /// leading-dash check preserves every legitimate form while closing the vector.
 ///
-/// Enforced at the CLI boundary (exit 2) AND re-checked inside `exec_ssh` /
-/// `exec_ssh_frame`, so no non-CLI caller can bypass the guard.
+/// Enforced at the CLI boundary (exit 2) AND re-checked by every command
+/// builder here, so no non-CLI caller can bypass the guard.
 pub fn validate_destination(host: &str) -> Result<(), SshError> {
     if host.is_empty() || host.starts_with('-') {
         return Err(SshError::InvalidDestination(host.to_owned()));
@@ -79,118 +89,115 @@ pub fn validate_destination(host: &str) -> Result<(), SshError> {
     Ok(())
 }
 
-/// Build the SSH command line for remote tendr invocation.
-///
-/// SSH sends everything after the destination as a single string to the
-/// remote login shell. To preserve argument boundaries (spaces, quotes,
-/// shell metacharacters), each tendr argument is individually
-/// shell-quoted using `shell_words::quote()` (POSIX quoting).
-///
-/// The resulting local argv is:
-///
-/// ```text
-/// ssh -T -o ConnectTimeout=10 <host> tendr --hello 'arg1' 'arg2' ...
-/// ```
-///
-/// SSH concatenates "tendr", "'arg1'", "'arg2'" with spaces and sends
-/// the result to the remote login shell, which re-splits it into argv.
-/// `--hello` asks the remote tendr to announce itself on stderr first
-/// ([`HELLO_LINE`]), which ends the connect deadline. An `attach` (with a
-/// TTY, `allocate_tty`) has no hello: its stderr shares the terminal.
-///
-/// No `--` separator is used between the host and the remote command.
-/// SSH does not treat `--` as an option terminator — it would be sent
-/// literally to the remote shell as part of the command string.
-///
-/// **Scope:** POSIX remote login shells only (bash, zsh, sh, etc.).
-/// Windows remote hosts (PowerShell, cmd.exe) need a different quoting
-/// strategy and are deferred to a follow-on slice.
-pub fn build_ssh_command(
-    host: &str,
-    tendr_args: &[String],
-    allocate_tty: bool,
-) -> Result<Command, SshError> {
-    // Fail closed: the builder validates the destination, so no caller can
-    // obtain a spawnable Command for an option-shaped/empty host — not just the
-    // CLI path. See `validate_destination`.
+/// Whether `value` is a plain name: `[A-Za-z0-9][A-Za-z0-9_-]{0,254}`. No
+/// POSIX shell, cmd.exe or PowerShell treats any of these characters
+/// specially, so a plain name can go on a remote command line as it is.
+pub fn is_plain_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && value.len() <= 255
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The flags an `attach` command line may carry besides plain names.
+const ATTACH_FLAGS: [&str; 3] = ["--namespace", "--takeover", "--escape"];
+
+/// Build `ssh -t -o ConnectTimeout=10 <host> tendr <args>` for `attach`,
+/// which needs a remote terminal and so cannot take its request on stdin
+/// until the attach bridge lands. Every arg must be a plain name or an attach
+/// flag; anything else is refused, so the remote shell sees no
+/// metacharacter. No hello: the remote stderr shares the terminal.
+fn build_ssh_attach_command(host: &str, args: &[String]) -> Result<Command, SshError> {
     validate_destination(host)?;
+    if let Some(unsafe_arg) = args
+        .iter()
+        .find(|a| !is_plain_name(a) && !ATTACH_FLAGS.contains(&a.as_str()))
+    {
+        return Err(SshError::UnsafeAttachArgument(unsafe_arg.clone()));
+    }
     let mut cmd = Command::new("ssh");
-    let tty_flag = if allocate_tty { "-t" } else { "-T" };
-    cmd.args([tty_flag, "-o", "ConnectTimeout=10", host]);
-
-    // Each tendr arg becomes a separate ssh argv entry, individually
-    // quoted for the remote shell. SSH concatenates all args after the
-    // host with spaces to form the remote command string.
-    cmd.arg("tendr");
-    let hello = sends_hello(allocate_tty);
-    if hello {
-        cmd.arg("--hello");
-    }
-    for arg in tendr_args {
-        cmd.arg(shell_words::quote(arg).into_owned());
-    }
-
-    cmd.stdin(Stdio::inherit())
+    cmd.args(["-t", "-o", "ConnectTimeout=10", host, "tendr"])
+        .args(args)
+        .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(if hello {
-            Stdio::piped()
-        } else {
-            Stdio::inherit()
-        });
+        .stderr(Stdio::inherit());
     Ok(cmd)
 }
 
-/// Whether a call carries `--hello` and so runs under the connect deadline:
-/// not for `attach` (its stderr shares the TTY), and not with the deadline
-/// off (`TENDR_SSH_CONNECT_TIMEOUT=0`), which is how an older remote tendr
-/// that does not know `--hello` is still reached.
-fn sends_hello(allocate_tty: bool) -> bool {
-    !allocate_tty && connect_deadline().is_some()
-}
-
-/// Execute a remote tendr command via SSH, streaming stdout/stderr
-/// directly to the local stdout/stderr.
+/// Run `tendr <args>` (an `attach`) on `host` under `ssh -t`, see
+/// [`build_ssh_attach_command`]. Returns the remote exit code.
 ///
-/// Returns the remote tendr exit code on success.
-/// Returns `SshError::TransportFailed` for SSH connection failures (exit 255),
-/// `SshError::ConnectDeadline` if the remote tendr never said hello in time,
-/// or `SshError::InvalidDestination` for an option-shaped/empty host.
-pub fn exec_ssh(host: &str, tendr_args: &[String], allocate_tty: bool) -> Result<i32, SshError> {
-    let mut child = build_ssh_command(host, tendr_args, allocate_tty)?
+/// # Errors
+/// `SshError::InvalidDestination`, `SshError::UnsafeAttachArgument` before
+/// ssh starts; `SshError::TransportFailed` on ssh exit 255;
+/// `SshError::SpawnFailed`/`Abnormal`.
+pub fn exec_ssh_attach(host: &str, args: &[String]) -> Result<i32, SshError> {
+    let status = build_ssh_attach_command(host, args)?
         .spawn()
+        .and_then(|mut child| child.wait())
         .map_err(SshError::SpawnFailed)?;
-
-    let status = match connect_deadline().filter(|_| sends_hello(allocate_tty)) {
-        Some(deadline) => wait_after_hello(host, &mut child, deadline)?,
-        None => child.wait().map_err(SshError::SpawnFailed)?,
-    };
     exit_code(status)
 }
 
-/// The remote argv for frame-transport exec — constant by construction:
-/// nothing user-controlled rides in argv, so there is no shell-quoting
-/// layer to traverse. The frame
-/// itself travels on the SSH stdin channel as opaque bytes.
-fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Command, SshError> {
+/// The remote tendr entry point of a framed call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    /// `exec --frame-from-stdin`: the exec frame.
+    Exec,
+    /// `_remote`: every other operation but attach.
+    Remote,
+}
+
+impl Entry {
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::Exec => &["exec", "--frame-from-stdin"],
+            Self::Remote => &["_remote"],
+        }
+    }
+}
+
+/// What a framed call writes to ssh's stdin.
+enum Input {
+    /// Local stdin itself, which already is the frame.
+    Inherit,
+    /// These bytes, then end of input.
+    Frame(Vec<u8>),
+    /// These bytes, then local stdin until it ends (push).
+    FrameThenStdin(Vec<u8>),
+}
+
+/// The argv of a framed call — constant by construction:
+/// `ssh -T -o ConnectTimeout=10 <host> tendr [--hello] <entry>`. Nothing
+/// user-controlled rides in it, so there is no shell-quoting layer to
+/// traverse; the request travels on ssh's stdin as opaque bytes. `--hello`
+/// asks the remote tendr to announce itself on stderr first ([`HELLO_LINE`]),
+/// which ends the connect deadline; it is left out when the deadline is off
+/// (`TENDR_SSH_CONNECT_TIMEOUT=0`), which is how a remote exec too old to
+/// know it is still reached. Stderr is always relayed, so an old remote
+/// tendr's parse error can be explained ([`wait_framed`]).
+///
+/// No `--` separator is used between the host and the remote command: ssh
+/// does not treat `--` after the destination as an option terminator.
+fn build_ssh_frame_command(
+    host: &str,
+    entry: Entry,
+    inherit_stdin: bool,
+) -> Result<Command, SshError> {
     validate_destination(host)?;
-    let hello = sends_hello(false);
     let mut cmd = Command::new("ssh");
     cmd.args(["-T", "-o", "ConnectTimeout=10", host, "tendr"]);
-    if hello {
+    if connect_deadline().is_some() {
         cmd.arg("--hello");
     }
-    cmd.args(["exec", "--frame-from-stdin"]);
+    cmd.args(entry.args());
     cmd.stdin(if inherit_stdin {
         Stdio::inherit()
     } else {
         Stdio::piped()
     })
     .stdout(Stdio::inherit())
-    .stderr(if hello {
-        Stdio::piped()
-    } else {
-        Stdio::inherit()
-    });
+    .stderr(Stdio::piped());
     Ok(cmd)
 }
 
@@ -199,39 +206,67 @@ fn build_ssh_exec_frame_command(host: &str, inherit_stdin: bool) -> Result<Comma
 /// `--frame-from-stdin` passthrough form — the caller's stdin already
 /// is the frame).
 ///
-/// A failed write to the remote's stdin is deliberately ignored: it
-/// means the remote died early (EPIPE), and the remote's exit status is
-/// the authoritative outcome either way.
+/// # Errors
+/// As for [`exec_ssh_remote`].
+pub fn exec_ssh_frame(host: &str, frame: Option<Vec<u8>>) -> Result<i32, SshError> {
+    let input = frame.map_or(Input::Inherit, Input::Frame);
+    run_framed(host, Entry::Exec, input)
+}
+
+/// Run one request on `host`'s tendr through its `_remote` entry point:
+/// write `frame` (the encoded request) to ssh's stdin, then, with `body`,
+/// copy local stdin after it as it arrives, until it ends (push). Remote
+/// stdout and stderr stream through; returns the remote exit code.
+///
+/// A failed write to the remote's stdin is deliberately ignored: it means the
+/// remote died early (EPIPE), and the remote's exit status is the
+/// authoritative outcome either way.
 ///
 /// # Errors
-/// `SshError::TransportFailed` on ssh exit 255 (which shadows a remote
-/// command genuinely exiting 255 — an inherent ssh limitation),
-/// `SshError::ConnectDeadline`, `SshError::SpawnFailed`/`Abnormal` as for
-/// `exec_ssh`.
-pub fn exec_ssh_frame(host: &str, frame: Option<Vec<u8>>) -> Result<i32, SshError> {
-    let mut child = build_ssh_exec_frame_command(host, frame.is_none())?
+/// `SshError::InvalidDestination` before ssh starts; `SshError::TransportFailed`
+/// on ssh exit 255 (which shadows a remote command genuinely exiting 255 — an
+/// inherent ssh limitation); `SshError::ConnectDeadline` if the remote tendr
+/// never said hello in time; `SshError::SpawnFailed`/`Abnormal`.
+pub fn exec_ssh_remote(host: &str, frame: Vec<u8>, body: bool) -> Result<i32, SshError> {
+    let input = if body {
+        Input::FrameThenStdin(frame)
+    } else {
+        Input::Frame(frame)
+    };
+    run_framed(host, Entry::Remote, input)
+}
+
+fn run_framed(host: &str, entry: Entry, input: Input) -> Result<i32, SshError> {
+    let mut child = build_ssh_frame_command(host, entry, matches!(input, Input::Inherit))?
         .spawn()
         .map_err(SshError::SpawnFailed)?;
 
-    // The frame is written on its own thread: a remote that is still
-    // authenticating does not read it, and a large frame would block the
-    // write, and with it the connect deadline, on a full pipe. Once ssh is
-    // gone the write fails with EPIPE, so the join never hangs.
-    let writer = frame.and_then(|bytes| {
+    // The input is written on its own thread: a remote that is still
+    // authenticating does not read it, and a large frame (or a push body)
+    // would block the write, and with it the connect deadline, on a full
+    // pipe. Dropping ssh's stdin at the end closes the channel: the remote
+    // sees EOF.
+    let (frame, body) = match input {
+        Input::Inherit => (None, false),
+        Input::Frame(frame) => (Some(frame), false),
+        Input::FrameThenStdin(frame) => (Some(frame), true),
+    };
+    let writer = frame.and_then(|frame| {
         child.stdin.take().map(|mut stdin| {
             std::thread::spawn(move || {
                 use std::io::Write;
-                let _ = stdin.write_all(&bytes);
-                // Dropping stdin closes the channel — the remote sees EOF.
+                if stdin.write_all(&frame).is_ok() && body {
+                    let _ = io::copy(&mut io::stdin().lock(), &mut stdin);
+                }
             })
         })
     });
 
-    let status = match connect_deadline().filter(|_| sends_hello(false)) {
-        Some(deadline) => wait_after_hello(host, &mut child, deadline)?,
-        None => child.wait().map_err(SshError::SpawnFailed)?,
-    };
-    if let Some(writer) = writer {
+    let status = wait_framed(host, entry, &mut child, connect_deadline())?;
+    // Once ssh is gone a frame write fails with EPIPE, so that join never
+    // hangs. A body copy can be blocked reading local stdin, which ssh's exit
+    // does not end: it is left to the process exit.
+    if let Some(writer) = writer.filter(|_| !body) {
         let _ = writer.join();
     }
     exit_code(status)
@@ -263,8 +298,9 @@ fn connect_deadline() -> Option<Duration> {
     }
 }
 
-/// Wait for `child` (an ssh to a remote `tendr --hello …`) to exit, stopping
-/// it if the remote tendr has not said hello within `deadline`.
+/// Wait for `child` (an ssh to a remote `tendr [--hello] <entry>`) to exit,
+/// stopping it if a `deadline` is set and the remote tendr has not said hello
+/// within it.
 ///
 /// ssh's own `ConnectTimeout` ends at key exchange; authentication can then
 /// stall indefinitely (a lapsed Tailscale SSH check-mode approval waits about
@@ -274,30 +310,34 @@ fn connect_deadline() -> Option<Duration> {
 /// passed through in order; stdout stays inherited, so the order *between*
 /// the two streams is no longer exact.
 ///
+/// A remote tendr too old for the call fails with clap's parse error (exit
+/// 2), which is passed on with advice on what to do.
+///
 /// Time a human spends at an ssh prompt (passphrase, host key) counts against
 /// the deadline: those prompts use the terminal, not stderr.
-fn wait_after_hello(
+fn wait_framed(
     host: &str,
+    entry: Entry,
     child: &mut std::process::Child,
-    deadline: Duration,
+    deadline: Option<Duration>,
 ) -> Result<std::process::ExitStatus, SshError> {
     let stderr = child
         .stderr
         .take()
-        .expect("stderr is piped for a --hello call");
+        .expect("stderr is piped for a framed call");
     let (events_tx, events) = mpsc::channel();
     std::thread::spawn(move || relay_stderr(stderr, events_tx));
 
     let started = Instant::now();
     let mut hello = false;
-    let mut old_tendr = None;
+    let mut verdict = None;
     loop {
         // Only the hello proves ssh got through. An end of stream before it
         // proves nothing: a process can close its stderr and keep running.
         while let Ok(event) = events.try_recv() {
             match event {
                 Relay::Hello => hello = true,
-                Relay::Done { old_tendr: seen } => old_tendr = Some(seen),
+                Relay::Done { old_tendr } => verdict = Some(old_tendr),
             }
         }
         if let Some(status) = child.try_wait().map_err(SshError::SpawnFailed)? {
@@ -307,23 +347,19 @@ fn wait_after_hello(
             // ssh's SIGHUP holds the call open, as it held the terminal
             // before). Without a hello, a leftover holder must not hold the
             // call open: wait briefly for the rest, then report the status.
-            if old_tendr.is_none() {
-                old_tendr = if hello {
+            if verdict.is_none() {
+                verdict = if hello {
                     wait_relay(&events, None)
                 } else {
                     wait_relay(&events, Some(Duration::from_secs(1)))
                 };
             }
-            if old_tendr == Some(true) {
-                eprintln!(
-                    "tendr on {host} does not know --hello, so it predates the \
-                     connect deadline: upgrade tendr on {host}, or set \
-                     TENDR_SSH_CONNECT_TIMEOUT=0 to reach it without one"
-                );
+            if let Some(Some(old)) = verdict.filter(|_| status.code() == Some(2)) {
+                eprintln!("{}", old.advice(host, entry));
             }
             return Ok(status);
         }
-        if !hello && started.elapsed() >= deadline {
+        if let Some(deadline) = deadline.filter(|d| !hello && started.elapsed() >= *d) {
             stop(child);
             // The relay is not waited for: a lingering ProxyCommand may hold
             // stderr open, and only an unfinished pre-hello line is lost.
@@ -336,18 +372,58 @@ fn wait_after_hello(
     }
 }
 
+/// How a remote tendr showed it is too old for the call, by its parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OldTendr {
+    /// It does not know `--hello` (before the connect deadline).
+    NoHello,
+    /// It does not know `_remote` (before the frame transport).
+    NoRemote,
+}
+
+impl OldTendr {
+    /// The parse error in a stderr line, if it is one of these.
+    fn detect(line: &[u8]) -> Option<Self> {
+        let line = String::from_utf8_lossy(line);
+        if line.contains("unrecognized subcommand '_remote'") {
+            Some(Self::NoRemote)
+        } else if line.contains("'--hello'") {
+            Some(Self::NoHello)
+        } else {
+            None
+        }
+    }
+
+    /// What the caller should do. An exec reaches a tendr without `--hello`
+    /// once the deadline is off; every other operation needs a tendr that
+    /// knows `_remote`.
+    fn advice(self, host: &str, entry: Entry) -> String {
+        match (self, entry) {
+            (Self::NoHello, Entry::Exec) => format!(
+                "tendr on {host} does not know --hello, so it predates the \
+                 connect deadline: upgrade tendr on {host}, or set \
+                 TENDR_SSH_CONNECT_TIMEOUT=0 to reach it without one"
+            ),
+            _ => format!(
+                "tendr on {host} is too old for this client: upgrade it to {} or later",
+                env!("CARGO_PKG_VERSION")
+            ),
+        }
+    }
+}
+
 /// What the stderr relay reports.
 enum Relay {
     /// The remote tendr's hello arrived.
     Hello,
-    /// Stderr ended; whether the remote rejected `--hello` (a tendr too old
-    /// to know it).
-    Done { old_tendr: bool },
+    /// Stderr ended; whether, before any hello, the remote rejected the call
+    /// as a tendr too old for it.
+    Done { old_tendr: Option<OldTendr> },
 }
 
 /// Wait for the relay to finish, at most `limit` (forever with `None`).
 /// Returns its verdict on an old remote tendr, or `None` if it did not finish.
-fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option<bool> {
+fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option<Option<OldTendr>> {
     let until = limit.map(|limit| Instant::now() + limit);
     loop {
         let event = match until {
@@ -385,7 +461,7 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Copy a `--hello` call's stderr to ours, dropping the hello and reporting
+/// Copy a framed call's stderr to ours, dropping the hello and reporting
 /// it. The hello ends a line but need not start one: anything a login shell's
 /// rc file wrote without a newline just before tendr ran is glued in front,
 /// and is passed through. Reports [`Relay::Done`] when stderr ends.
@@ -394,7 +470,7 @@ fn relay_stderr(stderr: std::process::ChildStderr, events: mpsc::Sender<Relay>) 
 
     let mut reader = io::BufReader::new(stderr);
     let mut out = io::stderr();
-    let mut old_tendr = false;
+    let mut old_tendr = None;
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -415,7 +491,7 @@ fn relay_stderr(stderr: std::process::ChildStderr, events: mpsc::Sender<Relay>) 
             let _ = events.send(Relay::Hello);
             break;
         }
-        old_tendr |= String::from_utf8_lossy(&line).contains("'--hello'");
+        old_tendr = old_tendr.or_else(|| OldTendr::detect(&line));
         let _ = out.write_all(&line);
     }
     // After the hello the stream is the command's own: copy it as it comes.
@@ -430,16 +506,18 @@ fn relay_stderr(stderr: std::process::ChildStderr, events: mpsc::Sender<Relay>) 
 mod tests {
     use super::*;
 
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
     /// The frame-transport argv is constant: the payload never appears.
     #[test]
     fn exec_frame_argv_is_constant() {
-        let cmd = build_ssh_exec_frame_command("user@box", false).unwrap();
-        let argv: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let cmd = build_ssh_frame_command("user@box", Entry::Exec, false).unwrap();
         assert_eq!(
-            argv,
+            argv(&cmd),
             [
                 "-T",
                 "-o",
@@ -451,6 +529,114 @@ mod tests {
                 "--frame-from-stdin"
             ]
         );
+    }
+
+    /// Every operation but exec and attach runs this one argv; the request
+    /// is not an input to it.
+    #[test]
+    fn remote_frame_argv_is_constant() {
+        let cmd = build_ssh_frame_command("user@box", Entry::Remote, false).unwrap();
+        assert_eq!(
+            argv(&cmd),
+            [
+                "-T",
+                "-o",
+                "ConnectTimeout=10",
+                "user@box",
+                "tendr",
+                "--hello",
+                "_remote"
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_argv_is_the_plain_args_under_a_tty() {
+        let args: Vec<String> = ["attach", "s-1", "--namespace", "n_2", "--takeover"]
+            .map(str::to_owned)
+            .to_vec();
+        let cmd = build_ssh_attach_command("user@box", &args).unwrap();
+        assert_eq!(
+            argv(&cmd),
+            [
+                "-t",
+                "-o",
+                "ConnectTimeout=10",
+                "user@box",
+                "tendr",
+                "attach",
+                "s-1",
+                "--namespace",
+                "n_2",
+                "--takeover"
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_refuses_anything_but_plain_args() {
+        for bad in [
+            "x&calc",
+            "a b",
+            "$(id)",
+            "'q'",
+            "-x",
+            "--hello",
+            "caf\u{e9}",
+            "",
+        ] {
+            let args = vec!["attach".to_owned(), bad.to_owned()];
+            assert!(
+                matches!(
+                    build_ssh_attach_command("user@box", &args),
+                    Err(SshError::UnsafeAttachArgument(a)) if a == bad
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_names_are_alphanumeric_dash_and_underscore() {
+        let long = "a".repeat(255);
+        for ok in ["a", "Z9", "build-1", "a_b-C", long.as_str()] {
+            assert!(is_plain_name(ok), "{ok:?}");
+        }
+        let too_long = "a".repeat(256);
+        for bad in [
+            "",
+            "-a",
+            "_a",
+            "a.b",
+            "a/b",
+            "a b",
+            "a&b",
+            "a|b",
+            "a;b",
+            "a$b",
+            "a`b",
+            "a'b",
+            "a\"b",
+            "a%b",
+            "a^b",
+            "\u{e9}",
+            too_long.as_str(),
+        ] {
+            assert!(!is_plain_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn old_tendr_is_recognised_by_its_parse_error() {
+        assert_eq!(
+            OldTendr::detect(b"error: unrecognized subcommand '_remote'\n"),
+            Some(OldTendr::NoRemote)
+        );
+        assert_eq!(
+            OldTendr::detect(b"error: unexpected argument '--hello' found\n"),
+            Some(OldTendr::NoHello)
+        );
+        assert_eq!(OldTendr::detect(b"session not found: x\n"), None);
     }
 
     #[test]
@@ -491,93 +677,16 @@ mod tests {
 
     #[test]
     fn builders_fail_closed_on_invalid_destination() {
-        // Neither builder can hand out a spawnable Command for an option-shaped
-        // or empty host — so no non-CLI caller can bypass the guard.
-        let no_args: Vec<String> = vec![];
-        assert!(build_ssh_command("-oProxyCommand=x", &no_args, false).is_err());
-        assert!(build_ssh_command("", &no_args, false).is_err());
-        assert!(build_ssh_exec_frame_command("-oProxyCommand=x", false).is_err());
-        assert!(build_ssh_exec_frame_command("", false).is_err());
-        // Valid destinations still build.
-        assert!(build_ssh_command("user@box", &no_args, false).is_ok());
-        assert!(build_ssh_exec_frame_command("user@box", false).is_ok());
-    }
-
-    /// Helper: extract the args that `build_ssh_command` would pass to the ssh binary.
-    fn ssh_argv(host: &str, tendr_args: &[&str]) -> Vec<String> {
-        let args: Vec<String> = tendr_args.iter().map(|s| s.to_string()).collect();
-        let cmd = build_ssh_command(host, &args, false).unwrap();
-        cmd.get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
-    }
-
-    #[test]
-    fn simple_command() {
-        let args = ssh_argv("user@box", &["status", "my-session"]);
-        assert_eq!(args[0], "-T");
-        assert_eq!(args[1], "-o");
-        assert_eq!(args[2], "ConnectTimeout=10");
-        assert_eq!(args[3], "user@box");
-        assert_eq!(args[4], "tendr");
-        assert_eq!(args[5], "--hello");
-        assert_eq!(args[6], "status");
-        assert_eq!(args[7], "my-session");
-        assert!(
-            !args.contains(&"--".to_string()),
-            "no -- in ssh argv: {args:?}"
-        );
-    }
-
-    #[test]
-    fn args_with_spaces_are_quoted() {
-        let args: Vec<String> = vec![
-            "start".to_string(),
-            "job".to_string(),
-            "--".to_string(),
-            "echo".to_string(),
-            "hello world".to_string(),
-        ];
-        let cmd = build_ssh_command("user@box", &args, false).unwrap();
-        let argv: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let remote_args = &argv[4..];
-        let remote_cmd = remote_args.join(" ");
-        let parsed = shell_words::split(&remote_cmd).unwrap();
-        assert_eq!(
-            parsed,
-            vec![
-                "tendr",
-                "--hello",
-                "start",
-                "job",
-                "--",
-                "echo",
-                "hello world"
-            ]
-        );
-    }
-
-    #[test]
-    fn args_with_shell_metacharacters_are_quoted() {
-        let args: Vec<String> = vec![
-            "start".to_string(),
-            "job".to_string(),
-            "--".to_string(),
-            "bash".to_string(),
-            "-c".to_string(),
-            "echo $HOME && ls".to_string(),
-        ];
-        let cmd = build_ssh_command("user@box", &args, false).unwrap();
-        let argv: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let remote_args = &argv[4..];
-        let remote_cmd = remote_args.join(" ");
-        let parsed = shell_words::split(&remote_cmd).unwrap();
-        assert_eq!(parsed[7], "echo $HOME && ls");
+        // No builder hands out a spawnable Command for an option-shaped or
+        // empty host — so no non-CLI caller can bypass the guard.
+        let attach = vec!["attach".to_owned(), "s".to_owned()];
+        for entry in [Entry::Exec, Entry::Remote] {
+            assert!(build_ssh_frame_command("-oProxyCommand=x", entry, false).is_err());
+            assert!(build_ssh_frame_command("", entry, false).is_err());
+            assert!(build_ssh_frame_command("user@box", entry, false).is_ok());
+        }
+        assert!(build_ssh_attach_command("-oProxyCommand=x", &attach).is_err());
+        assert!(build_ssh_attach_command("", &attach).is_err());
+        assert!(build_ssh_attach_command("user@box", &attach).is_ok());
     }
 }

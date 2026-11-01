@@ -6,6 +6,7 @@ use tendr::model::event::EventTimestamp;
 use tendr::model::ids::{Namespace, Source};
 
 mod commands;
+mod remote_frame;
 mod remote_op;
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -59,8 +60,9 @@ struct Cli {
     /// Route command through SSH to a remote host (e.g. user@box).
     ///
     /// Supported remotely: start, status, list, log, push, kill, wait,
-    /// watch, attach, and exec (the payload rides the frame transport,
-    /// not a shell). Every other command is local-only.
+    /// watch, attach and exec. The request travels to the remote tendr as
+    /// data, never through a shell; the remote tendr must be this version
+    /// or newer. Every other command is local-only.
     // allow_hyphen_values so an option-shaped destination (`-oProxyCommand=…`)
     // is captured as the value and rejected by our own validate_destination
     // (clear error, exit 2) rather than mis-parsed by clap as a flag.
@@ -473,6 +475,9 @@ enum Commands {
         #[arg(long)]
         session_dir: PathBuf,
     },
+    /// Internal: run one `--host` request read from stdin (not for direct use)
+    #[command(name = "_remote", hide = true)]
+    Remote,
 }
 
 /// Subcommands of `tendr skill`.
@@ -759,9 +764,11 @@ fn main() {
                     let mut full = vec!["tendr".to_string()];
                     full.extend(args);
                     let remote_cmd = shell_words::join(&full);
+                    // POSIX quoting: the text is for a POSIX shell on both
+                    // ends, and is labelled so.
                     eprintln!(
                         "error: '{}' is local-only and does not support --host\n\
-                         try:  ssh {} {}",
+                         try (POSIX shell):  ssh {} {}",
                         local.command,
                         shell_words::quote(host),
                         shell_words::quote(&remote_cmd)
@@ -772,7 +779,28 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        match tendr::ssh::exec_ssh(host, &operation.legacy_argv(), operation.allocates_tty()) {
+        let sent = match operation {
+            // attach still needs `ssh -t`, so it cannot take its request on
+            // stdin: it sends a command line of plain names instead.
+            remote_op::RemoteOperation::Attach(request) => match request.ssh_argv() {
+                Ok(args) => tendr::ssh::exec_ssh_attach(host, &args),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
+            operation => match remote_frame::encode(&operation) {
+                Ok(frame) => {
+                    let body = matches!(operation, remote_op::RemoteOperation::Push(_));
+                    tendr::ssh::exec_ssh_remote(host, frame, body)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
+        };
+        match sent {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("{e}");
@@ -936,6 +964,7 @@ fn main() {
             SkillAction::Path { global } => commands::cmd_skill_path(global),
         },
         Commands::Sidecar { session_dir } => commands::cmd_sidecar(session_dir),
+        Commands::Remote => remote_frame::serve(),
         // The remote-capable commands run through the same typed layer as
         // `--host`. Named, not a catch-all, so a new command must be classified.
         remote @ (Commands::Start { .. }

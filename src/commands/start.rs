@@ -106,24 +106,11 @@ pub(crate) fn launch_session(
     launch_spec.namespace = Some(namespace.as_str().to_string());
     launch_spec.cwd = cwd.map(Path::to_path_buf);
     for entry in env_vars {
-        let (key, value) = entry
-            .split_once('=')
-            .with_context(|| format!("invalid --env format: expected KEY=VALUE, got: {entry}"))?;
-        anyhow::ensure!(
-            !key.is_empty(),
-            "invalid --env format: key cannot be empty, got: {entry}"
-        );
+        let (key, value) = parse_env_entry(entry)?;
         launch_spec.env.insert(key.to_string(), value.to_string());
     }
     for name in unset_env {
-        anyhow::ensure!(
-            !name.is_empty(),
-            "invalid --unset-env: name cannot be empty"
-        );
-        anyhow::ensure!(
-            !name.contains('='),
-            "invalid --unset-env: name cannot contain '=', got: {name}"
-        );
+        check_unset_env_name(name)?;
         launch_spec.unset_env.insert(name.clone());
     }
     launch_spec.on_exit = on_exit.to_vec();
@@ -182,6 +169,32 @@ pub(crate) fn launch_session(
 
     let meta = spawn_and_wait_ready_inner(&session, &launch_spec)?;
     Ok((meta, session))
+}
+
+/// Split a `--env` entry into its key and value. The rule `start` applies
+/// at launch, and the remote frame before anything runs.
+pub(crate) fn parse_env_entry(entry: &str) -> anyhow::Result<(&str, &str)> {
+    let (key, value) = entry
+        .split_once('=')
+        .with_context(|| format!("invalid --env format: expected KEY=VALUE, got: {entry}"))?;
+    anyhow::ensure!(
+        !key.is_empty(),
+        "invalid --env format: key cannot be empty, got: {entry}"
+    );
+    Ok((key, value))
+}
+
+/// Check a `--unset-env` name, as [`parse_env_entry`] checks `--env`.
+pub(crate) fn check_unset_env_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty(),
+        "invalid --unset-env: name cannot be empty"
+    );
+    anyhow::ensure!(
+        !name.contains('='),
+        "invalid --unset-env: name cannot contain '=', got: {name}"
+    );
+    Ok(())
 }
 
 /// Handle `--replace`: kill any existing session and remove its directory.

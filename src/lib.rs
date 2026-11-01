@@ -18,9 +18,9 @@
 //!   is the append-only child-output record, and the segmented [`events`] log
 //!   is lifecycle/provenance history. Views are derived from those authorities;
 //!   see [`session`] and [`log`].
-//! - **Transport is a wrapper, not a second model.** `--host` forwards an
-//!   allowlisted subset of commands to a remote `tendr` over SSH; the remote
-//!   runs the *same* local lifecycle. See [`ssh`].
+//! - **Transport is a wrapper, not a second model.** `--host` sends the
+//!   remote-capable commands to a remote `tendr` over SSH as data on its
+//!   stdin; the remote runs the *same* local lifecycle. See [`ssh`].
 //!
 //! ## Module map
 //!
@@ -48,7 +48,7 @@
 //!   explicit stop).
 //! - [`recording`] — the exact PTY recording codec (versioned binary segments)
 //!   and a plain-text dump for inspecting recordings.
-//! - [`ssh`] — the remote transport wrapper and its command allowlist.
+//! - [`ssh`] — the remote transport: constant ssh command lines, requests on stdin.
 //! - [`reconcile`] — reconciling recorded state against observed OS reality.
 //!
 //! ## Design doctrine & architecture
