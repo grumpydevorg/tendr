@@ -220,10 +220,11 @@ not tendr's:
 - The stopped request replies with `end:"cancelled"` and
   `consumes_input:false`; its bytes stay buffered.
 - The cancel's own reply is `{"ok":true,"result":{"cancelled":true|false}}`
-  (sio main f91bf29). A cancel that stops a wait replies `true` right after
-  that wait's `cancelled` reply. A cancel that stops nothing (wrong or stale
-  `target`, or nothing running) replies `false` at once, ahead of the
-  replies to running and queued requests.
+  (sio main 635b65b). A cancel that stops a wait replies `true` after that
+  wait's `cancelled` reply, in request order, so requests queued before the
+  cancel reply first and can delay it. Only a cancel that stops nothing
+  (wrong or stale `target`, or nothing running) skips the queue: it replies
+  `false` at once, ahead of the replies to running and queued requests.
 - An untargeted `{"cmd":"cancel"}` is safe only when one caller owns the
   session.
 - Requests queued behind a running one are capped at 16 MiB (sio main
