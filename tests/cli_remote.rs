@@ -103,13 +103,14 @@ fn host_flag_is_accepted_by_parser() {
 
 /// The ssh argv of every `--host` operation but attach and exec: constant,
 /// so nothing the user typed reaches the remote login shell.
-const REMOTE_ARGV: [&str; 7] = [
+const REMOTE_ARGV: [&str; 8] = [
     "-T",
     "-o",
     "ConnectTimeout=10",
     "box",
     "tendr",
     "--hello",
+    "--exit-trailer",
     "_remote",
 ];
 
@@ -445,8 +446,7 @@ fn host_call_runs_past_the_deadline_once_the_remote_tendr_says_hello() {
 }
 
 /// `TENDR_SSH_CONNECT_TIMEOUT=0` turns the deadline off and with it the
-/// `--hello` flag: the call waits as long as ssh takes, and an exec still
-/// reaches a remote tendr too old to know `--hello`.
+/// `--hello` flag: the call waits as long as ssh takes.
 #[test]
 fn host_connect_deadline_of_zero_waits_without_hello() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -478,35 +478,111 @@ fn host_connect_deadline_that_cannot_be_represented_falls_back() {
     );
 }
 
-/// A remote tendr too old to know `--hello` fails fast with clap's parse
-/// error (exit 2); the caller is told why and what to do. An exec can still
-/// reach it without the deadline; the other operations need a newer tendr.
+/// What a call to a remote tendr too old for it is told to do.
+const UPGRADE: &str = concat!(
+    "tendr on box is too old for this client: upgrade it to ",
+    env!("CARGO_PKG_VERSION"),
+    " or later"
+);
+
+/// A remote tendr too old to know `--hello` or `--exit-trailer` fails fast
+/// with clap's parse error; the caller is told to upgrade it, for exec too.
+/// Under a PowerShell login shell ssh reports that as exit 1, not 2.
 #[test]
-fn host_call_to_a_tendr_without_hello_says_to_upgrade_it() {
+fn host_call_to_a_tendr_without_hello_or_trailer_says_to_upgrade_it() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = fake_ssh("err error: unexpected argument '--hello' found\\n\nexit 2");
-    for (args, advice) in [
-        (&["exec", "shell", "--", "true"][..], "upgrade tendr on box"),
-        (
-            &["list"][..],
-            concat!(
-                "tendr on box is too old for this client: upgrade it to ",
-                env!("CARGO_PKG_VERSION"),
-                " or later"
-            ),
-        ),
-    ] {
-        let output = host_call(&tmp, "5", args);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    for (flag, ssh_exit) in [("--hello", 2), ("--exit-trailer", 2), ("--exit-trailer", 1)] {
+        let tmp = fake_ssh(&format!(
+            "err error: unexpected argument '{flag}' found\\n\nexit {ssh_exit}"
+        ));
+        for args in [&["exec", "shell", "--", "true"][..], &["list"][..]] {
+            for deadline in ["5", "0"] {
+                let output = host_call(&tmp, deadline, args);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let what = format!("{flag} {ssh_exit} {args:?} {deadline}");
 
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
-        assert!(
-            stderr.contains("unexpected argument '--hello'"),
-            "{args:?}: {stderr}"
-        );
-        assert!(stderr.contains(advice), "{args:?}: {stderr}");
+                assert_eq!(output.status.code(), Some(ssh_exit), "{what}: {stderr}");
+                assert!(
+                    stderr.contains(&format!("unexpected argument '{flag}'")),
+                    "{what}: {stderr}"
+                );
+                assert!(stderr.contains(UPGRADE), "{what}: {stderr}");
+            }
+        }
     }
+}
+
+// -- The exit trailer: a remote exit code that survives a PowerShell shell --
+
+/// A PowerShell login shell reports any failure as ssh exit 1. The remote
+/// tendr's last stderr line, `tendr-exit <code>`, carries the real code:
+/// the call exits with it and the line is not shown, with the deadline on or
+/// off, for a framed operation and for exec.
+#[test]
+fn host_call_exits_with_the_trailer_code_and_hides_it() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    for deadline in ["5", "0"] {
+        let hello = if deadline == "0" {
+            String::new()
+        } else {
+            format!("err {}\\n\n", tendr::ssh::HELLO_LINE)
+        };
+        let tmp = fake_ssh(&format!(
+            "{hello}err remote said\\n\nout result\\n\nerr tendr-exit 42\\n\nexit 1"
+        ));
+        for args in [&["wait", "job"][..], &["exec", "shell", "--", "true"][..]] {
+            let output = host_call(&tmp, deadline, args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(
+                output.status.code(),
+                Some(42),
+                "{deadline} {args:?}: {stderr}"
+            );
+            assert_eq!(stderr, "remote said\n", "{deadline} {args:?}");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "result\n");
+        }
+    }
+}
+
+/// Only the last line counts: a `tendr-exit` line with more stderr after it
+/// is the remote's own output, passed on, and ssh's status stands.
+#[test]
+fn host_call_passes_on_a_trailer_shaped_line_mid_stream() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = fake_ssh(&format!(
+        "err {}\\n\nerr tendr-exit 3\\n\nerr later\\n\nexit 7",
+        tendr::ssh::HELLO_LINE
+    ));
+    let output = host_call(&tmp, "5", &["status", "job"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
+    assert_eq!(stderr, "tendr-exit 3\nlater\n");
+}
+
+/// A trailer of 255 is the remote's exit code, not ssh failing to connect;
+/// ssh's 255 without a trailer still is.
+#[test]
+fn host_call_trailer_255_is_a_remote_exit() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = fake_ssh(&format!(
+        "err {}\\n\nerr tendr-exit 255\\n\nexit 255",
+        tendr::ssh::HELLO_LINE
+    ));
+    let output = host_call(&tmp, "5", &["status", "job"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(255), "{stderr}");
+    assert!(!stderr.contains("transport"), "{stderr}");
+
+    let tmp = fake_ssh(&format!("err {}\\n\nexit 255", tendr::ssh::HELLO_LINE));
+    let output = host_call(&tmp, "5", &["status", "job"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("transport"), "{stderr}");
 }
 
 /// What a tendr from before the frame transport prints for `_remote`.
@@ -1283,6 +1359,7 @@ fn host_exec_remote_argv_carries_no_payload() {
             "box",
             "tendr",
             "--hello",
+            "--exit-trailer",
             "exec",
             "--frame-from-stdin"
         ],

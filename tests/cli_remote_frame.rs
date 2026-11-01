@@ -22,13 +22,14 @@ use tempfile::TempDir;
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// The ssh argv of every framed `--host` call.
-const REMOTE_ARGV: [&str; 7] = [
+const REMOTE_ARGV: [&str; 8] = [
     "-T",
     "-o",
     "ConnectTimeout=10",
     "box",
     "tendr",
     "--hello",
+    "--exit-trailer",
     "_remote",
 ];
 
@@ -800,4 +801,108 @@ fn remote_entry_ignores_unknown_fields() {
     let local = tendr(&root).args(["kill", "ghost"]).output().unwrap();
     assert_eq!(outcome(&output), outcome(&local));
     assert_eq!(output.status.code(), Some(0));
+}
+
+// -- `--exit-trailer`: the remote end of the exit trailer --
+
+/// Run `tendr --exit-trailer <args>` here and return its outcome.
+fn with_trailer(root: &TempDir, args: &[&str]) -> (Option<i32>, String, String) {
+    let output = tendr(root)
+        .arg("--exit-trailer")
+        .args(args)
+        .write_stdin("")
+        .timeout(Duration::from_secs(60))
+        .output()
+        .unwrap();
+    outcome(&output)
+}
+
+/// The command runs as without the flag, then its exit code is written as
+/// the last stderr line, and the process exits with it too.
+#[test]
+fn exit_trailer_is_the_last_stderr_line_and_matches_the_exit_code() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    tendr(&root)
+        .args(["start", "failed", "--", "false"])
+        .assert()
+        .success();
+    let _failed = SessionGuard::new(&root, "failed");
+    tendr(&root)
+        .args(["start", "running", "--", "sleep", "30"])
+        .assert()
+        .success();
+    let _running = SessionGuard::new(&root, "running");
+
+    let cases: [(&[&str], i32); 4] = [
+        (&["wait", "failed"], 42),
+        (&["wait", "running", "--timeout", "1"], 1),
+        (&["start", "--after", "ghost", "lost", "--", "true"], 1),
+        (&["status", "ghost"], 1),
+    ];
+    for (args, code) in cases {
+        let local = tendr(&root)
+            .args(args)
+            .write_stdin("")
+            .timeout(Duration::from_secs(60))
+            .output()
+            .unwrap();
+        let (got, stdout, stderr) = with_trailer(&root, args);
+        assert_eq!(got, Some(code), "{args:?}: {stderr}");
+        assert_eq!(local.status.code(), Some(code), "{args:?}");
+        assert_eq!(
+            stderr,
+            format!(
+                "{}tendr-exit {code}\n",
+                String::from_utf8_lossy(&local.stderr)
+            ),
+            "{args:?}"
+        );
+        if args[0] != "wait" {
+            assert_eq!(stdout, String::from_utf8_lossy(&local.stdout), "{args:?}");
+        }
+    }
+}
+
+/// With `--hello` too, the hello is written once, first, and the trailer
+/// last.
+#[test]
+fn exit_trailer_keeps_the_hello_first_and_single() {
+    let root = TempDir::new().unwrap();
+    let output = tendr(&root)
+        .args(["--hello", "--exit-trailer", "status", "missing"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!(
+            "{}\nsession not found: missing\ntendr-exit 1\n",
+            tendr::ssh::HELLO_LINE
+        )
+    );
+}
+
+/// The wrapper leaves stdin to the command: a push body reaches the session
+/// whole.
+#[test]
+fn exit_trailer_leaves_stdin_to_the_command() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let (_session, out) = start_copier(&root, "wrapped");
+    let body: Vec<u8> = (0..=255u8).cycle().take(200_000).collect();
+
+    let output = tendr(&root)
+        .args(["--exit-trailer", "push", "wrapped"])
+        .write_stdin(body.clone())
+        .timeout(Duration::from_secs(60))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{:?}", outcome(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "tendr-exit 0\n");
+    wait_for(STREAM_DEADLINE, "every pushed byte", || {
+        std::fs::metadata(&out).is_ok_and(|m| m.len() >= body.len() as u64)
+    });
+    assert!(std::fs::read(&out).unwrap() == body, "bytes differ");
 }

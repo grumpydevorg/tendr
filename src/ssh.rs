@@ -553,6 +553,7 @@ mod tests {
                 "user@box",
                 "tendr",
                 "--hello",
+                "--exit-trailer",
                 "exec",
                 "--frame-from-stdin"
             ]
@@ -573,6 +574,7 @@ mod tests {
                 "user@box",
                 "tendr",
                 "--hello",
+                "--exit-trailer",
                 "_remote"
             ]
         );
@@ -660,22 +662,113 @@ mod tests {
 
     #[test]
     fn old_tendr_is_recognised_by_its_parse_error() {
-        assert_eq!(
-            OldTendr::detect(b"error: unrecognized subcommand '_remote'\n"),
-            Some(OldTendr::NoRemote)
-        );
-        assert_eq!(
-            OldTendr::detect(b"error: unexpected argument '--hello' found\n"),
-            Some(OldTendr::NoHello)
-        );
-        assert_eq!(OldTendr::detect(b"session not found: x\n"), None);
-        for quoted in [
+        for line in [
+            "error: unrecognized subcommand '_remote'\n",
+            "error: unexpected argument '--hello' found\n",
+            "error: unexpected argument '--exit-trailer' found\n",
+        ] {
+            assert!(is_old_tendr_error(line.as_bytes()), "{line}");
+        }
+        for line in [
+            "session not found: x\n",
             "session not found: '--hello'\n",
             "invalid --since: '--hello'\n",
+            "invalid --since: '--exit-trailer'\n",
             "session not found: unrecognized subcommand '_remote'\n",
         ] {
-            assert_eq!(OldTendr::detect(quoted.as_bytes()), None, "{quoted}");
+            assert!(!is_old_tendr_error(line.as_bytes()), "{line}");
         }
+    }
+
+    /// Feed `chunks` through a trailer filter; what it wrote, and the code of
+    /// the trailer it stripped.
+    fn filtered(chunks: &[&[u8]]) -> (String, Option<i32>) {
+        let mut filter = TrailerFilter::new(Vec::new());
+        for chunk in chunks {
+            filter.write(chunk);
+        }
+        let (out, code) = filter.finish();
+        (String::from_utf8(out).unwrap(), code)
+    }
+
+    #[test]
+    fn the_last_line_trailer_is_stripped_and_read() {
+        assert_eq!(
+            filtered(&[b"out\n", b"tendr-exit 42\n"]),
+            ("out\n".to_owned(), Some(42))
+        );
+        assert_eq!(
+            filtered(&[b"out\ntendr-ex", b"it 4", b"2\n"]),
+            ("out\n".to_owned(), Some(42)),
+            "split across reads"
+        );
+        assert_eq!(
+            filtered(&[b"tendr-exit -1073741819\r\n"]),
+            (String::new(), Some(-1_073_741_819)),
+            "a Windows status, CRLF"
+        );
+        assert_eq!(filtered(&[b"tendr-exit 0\n"]), (String::new(), Some(0)));
+    }
+
+    #[test]
+    fn a_trailer_shaped_line_mid_stream_is_passed_through() {
+        assert_eq!(
+            filtered(&[b"tendr-exit 3\n", b"later\n"]),
+            ("tendr-exit 3\nlater\n".to_owned(), None)
+        );
+        assert_eq!(
+            filtered(&[b"tendr-exit 3\ntendr-exit 4\n"]),
+            ("tendr-exit 3\n".to_owned(), Some(4)),
+            "only the last one counts"
+        );
+        assert_eq!(
+            filtered(&[b"tendr-exit 3\n", b"partial"]),
+            ("tendr-exit 3\npartial".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn without_a_trailer_everything_is_passed_through() {
+        for (chunks, expected) in [
+            (&[&b"a"[..], b"b\n"][..], "ab\n"),
+            (&[b"tendr-exit 42"], "tendr-exit 42"),
+            (&[b"tendr-exit 42 x\n"], "tendr-exit 42 x\n"),
+            (&[b"tendr-exit \n"], "tendr-exit \n"),
+            (&[b"tendr-exit 99999999999\n"], "tendr-exit 99999999999\n"),
+            (&[b"xtendr-exit 1\n"], "xtendr-exit 1\n"),
+            (&[b""], ""),
+        ] {
+            assert_eq!(filtered(chunks), (expected.to_owned(), None), "{chunks:?}");
+        }
+    }
+
+    /// A partial line goes out as soon as it cannot be a trailer, so progress
+    /// output without a newline still streams.
+    #[test]
+    fn a_partial_line_is_not_held_back() {
+        let mut filter = TrailerFilter::new(Vec::new());
+        filter.write(b"progress 50%");
+        assert_eq!(filter.out, b"progress 50%");
+        filter.write(b"\ntendr-");
+        assert_eq!(filter.out, b"progress 50%\n", "a possible trailer waits");
+        filter.write(b"x");
+        assert_eq!(filter.out, b"progress 50%\ntendr-x");
+    }
+
+    #[test]
+    fn the_trailer_decides_the_exit_code() {
+        assert_eq!(exit_code(Some(1), Some(42)).unwrap(), 42);
+        assert_eq!(
+            exit_code(Some(255), Some(255)).unwrap(),
+            255,
+            "a remote 255"
+        );
+        assert!(matches!(
+            exit_code(Some(255), None),
+            Err(SshError::TransportFailed)
+        ));
+        assert_eq!(exit_code(Some(3), None).unwrap(), 3);
+        assert!(matches!(exit_code(None, None), Err(SshError::Abnormal)));
     }
 
     #[test]
