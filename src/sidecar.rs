@@ -2854,7 +2854,7 @@ mod tests {
     /// client too is cut off only once the takeover is recorded.
     #[test]
     fn a_client_told_after_a_busy_write_is_cut_off_only_once_recorded() {
-        retire_behind_a_busy_writer(Some(std::time::Duration::from_millis(50)));
+        retire_behind_a_busy_writer(Some(std::time::Duration::from_millis(150)));
     }
 
     /// Retire a viewer whose output sender holds the framed writer for `busy`
@@ -2918,7 +2918,7 @@ mod tests {
         // Unstall before asserting anything: the stalled record holds the
         // process-wide meta lock, which would hang every later test.
         // The record's acknowledgement ends it, not the grace: that starts
-        // when the lock attempts end (at 50 or 200 ms) and lasts
+        // when the lock attempts end (at 150 or 200 ms) and lasts
         // TAKEOVER_RECORD_GRACE (2 s), so it expires at least 1.4 s from here.
         unstall_meta_json(dir.path(), &meta);
         client.set_nonblocking(false).unwrap();
