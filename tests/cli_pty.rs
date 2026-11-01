@@ -3061,6 +3061,96 @@ fn a_resize_with_a_zero_dimension_is_ignored() {
     );
 }
 
+/// The window-size records of a session's recording, in order.
+fn recorded_resizes(
+    recording: &tendr::recording::DecodedRecording,
+) -> Vec<(Geometry, tendr::recording::ResizeCause)> {
+    recording
+        .records
+        .iter()
+        .filter_map(|r| match r.kind {
+            tendr::recording::RecordKind::Resize { geometry, cause } => Some((geometry, cause)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn reattach_at_the_same_size_records_a_tagged_repaint_pair() {
+    use tendr::recording::ResizeCause;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-repaint");
+    start_cat(&root, "pty-repaint");
+
+    // The CLI's terminal is 24x80, the size the session starts at.
+    let mut cli = CliAttach::spawn(&root, &["pty-repaint"]);
+    cli.type_until_logged(&root, "pty-repaint", "attached\n");
+    let resizes = poll_until(Duration::from_secs(5), Duration::from_millis(50), || {
+        let resizes = recorded_resizes(&decode_session_recording(&root, "pty-repaint"));
+        if resizes.len() >= 3 {
+            Observation::Ready(resizes)
+        } else {
+            Observation::Pending(format!("resizes so far: {resizes:?}"))
+        }
+    })
+    .unwrap_or_else(|e| panic!("no repaint pair recorded: {e}"));
+
+    let size = |rows, cols| Geometry::new(rows, cols).unwrap();
+    let [
+        (attached, ResizeCause::User),
+        (shrunk, first),
+        (restored, second),
+    ] = resizes[..]
+    else {
+        panic!("expected the attach's size then a repaint pair: {resizes:?}");
+    };
+    assert_eq!(
+        (attached, shrunk, restored),
+        (size(24, 80), size(23, 80), size(24, 80))
+    );
+    assert!(
+        matches!(first, ResizeCause::Repaint { .. }) && first == second,
+        "both repaint records share one correlation: {resizes:?}"
+    );
+}
+
+#[test]
+fn reattach_at_a_new_size_records_only_a_user_resize() {
+    use tendr::attach_proto::MSG_REPAINT;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let sock = start_cat(&root, "pty-no-repaint");
+    let _kill = harness::SessionGuard::new(&root, "pty-no-repaint");
+
+    let mut human = attach_as_human(&sock);
+    write_msg(
+        &mut human,
+        MSG_RESIZE,
+        &resize_payload(Geometry::new(30, 100).unwrap()),
+    );
+    write_msg(&mut human, MSG_REPAINT, &[]);
+    write_msg(&mut human, MSG_DATA, b"after-repaint\n");
+    wait_log_contains(&root, "pty-no-repaint", "after-repaint");
+    // Longer than a repaint's wait for quiet output, so one would be recorded.
+    std::thread::sleep(Duration::from_millis(700));
+    write_msg(&mut human, MSG_DETACH, &[]);
+    drop(human);
+    tendr(&root)
+        .args(["kill", "pty-no-repaint", "--force"])
+        .output()
+        .unwrap();
+    harness::wait_terminal(&root, "pty-no-repaint");
+
+    assert_eq!(
+        recorded_resizes(&decode_session_recording(&root, "pty-no-repaint")),
+        [(
+            Geometry::new(30, 100).unwrap(),
+            tendr::recording::ResizeCause::User
+        )]
+    );
+}
+
 #[test]
 fn a_recording_size_limit_stops_recording_but_not_the_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

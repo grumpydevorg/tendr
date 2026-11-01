@@ -179,7 +179,9 @@ concurrent `push` is refused, not interleaved.
 - Window resizes follow your terminal, and your terminal settings are restored
   however the attach ends. The modes the session turned on, such as the
   alternate screen, mouse reports and keyboard protocols, are turned off when
-  you leave and on again when you attach.
+  you leave and on again when you attach. Attaching at the session's own size
+  briefly shrinks it by one row and restores it, so a full-screen program
+  such as Claude Code redraws; scrollback is not restored.
 - `attach` is refused while another client holds the terminal. `--takeover`
   disconnects that client and drops any input it or an in-flight `push` had
   queued. Use it to reconnect after a dropped SSH connection.

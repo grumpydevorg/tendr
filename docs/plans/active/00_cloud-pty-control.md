@@ -5,10 +5,10 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 6b, 8 and 9 remain. Step 5's measurement (below) settled
-step 6's design; 6a, restoring the terminal's modes, shipped, and so did step
-10, `--unset-env`. Step 8 needs any sshd (`TENDR_TEST_SSH_HOST`); step 9 the
-VM.
+**Status:** steps 8 and 9 remain. Step 5's measurement (below) settled step
+6's design, and step 6 shipped: attach restores the terminal's modes and
+nudges a redraw. Step 10, `--unset-env`, shipped too. Step 8 needs any sshd
+(`TENDR_TEST_SSH_HOST`); step 9 the VM.
 
 ## Goal
 
@@ -21,7 +21,8 @@ SSH connection does not end the run; a dead sidecar or a VM reboot does.
 What shipped is described in [PTY lane](../../architecture/04-pty-lane.md) and
 [PTY recording format](../../architecture/08-pty-recording-format.md),
 including how attach turns the session's terminal modes on and off again
-([output and viewers](../../architecture/04-pty-lane.md#output-and-viewers)).
+([output and viewers](../../architecture/04-pty-lane.md#output-and-viewers))
+and the repaint nudge ([recording](../../architecture/04-pty-lane.md#recording)).
 Exit codes are in the [guide](../../guide.md#exit-codes). The typed `ssh -T`
 attach bridge and resumable viewers are step 5 of
 [remote frame transport](01_remote-frame-transport.md). Playing a recording
@@ -29,22 +30,6 @@ back is [PTY replay](../backlog/pty-replay.md).
 
 ## Remaining steps (one PR each)
 
-- **Step 6b. Repaint nudge** (local; design from the
-  [measurement](#measurement-step-5-2026-11-01)). New `MSG_REPAINT`, sent
-  once by the client after its first resize, authorized like input. When that
-  attach did not change the size, the attach handler shrinks the PTY by one
-  row and later restores it, as two separate writer controls so neither
-  blocks input or a takeover. Both are recorded as `ResizeCause::Repaint
-  { correlation }` after the attach's `user` resize. The restore applies only
-  if the PTY is still at the shrunk size; a user resize or takeover in
-  between cancels it. The first output after a shrink is Claude re-sending
-  its mouse modes (0.25 ms), and the redraw follows 19 ms later, so the
-  restore waits until output has been quiet for 50 ms, at most 500 ms; the VM
-  check must show Claude redraws on that pair. A repaint does not restore
-  history. Old sidecars ignore the frame. Tests:
-  `reattach_at_the_same_size_records_a_tagged_repaint_pair`,
-  `reattach_at_a_new_size_records_only_a_user_resize`,
-  `a_repaint_is_authorized_like_input`.
 - **Step 8. Nested `ssh -t` fixtures, opt-in** (sshd; `TENDR_TEST_SSH_HOST`).
    `tests/cli_attach_ssh.rs`: detach on `Ctrl-\ d`, `Ctrl-]` passthrough,
    paste with prefixes, terminal restore, takeover over a stopped first
@@ -124,7 +109,10 @@ was Ghostty 1.4.0 on macOS, attached over `ssh -t <vm>.exe.xyz` and driven by
   `TIOCSWINSZ` (the kernel sends no SIGWINCH) nor `kill -WINCH` at an
   unchanged size. Rows−1 and then restore each give a full redraw (about
   2 KB, 19 ms and 9 ms after the resize). Attaching at a new size also redraws
-  fully. Step 6b uses the shrink-and-restore pair.
+  fully. Step 6b uses the shrink-and-restore pair. Checked on the VM after
+  6b, reattaching from Ghostty at 47×175: the shrink to 46 rows and the
+  restore 91 ms later each drew a full 1.9 KB frame; the first attach, at a
+  new size, got no repaint.
 - **Detach leaves the terminal in Claude's modes.** After `Ctrl-\ d` the
   alternate screen, mouse tracking (1000, 1002, 1003, 1006), focus events,
   bracketed paste, kitty keyboard flags and `modifyOtherKeys` stay on. In

@@ -30,6 +30,10 @@ pub const MSG_RETIRED: u8 = 0x07;
 /// counts bytes written to the PTY and `received` counts bytes the sidecar read.
 /// See [`PushOutcome`].
 pub const MSG_INPUT_DONE: u8 = 0x08;
+/// Client → sidecar, once after its first resize: redraw the child if the
+/// attach did not change the PTY's size. No payload. A sidecar that predates it
+/// ignores it as an unknown type, so it needs no version bump.
+pub const MSG_REPAINT: u8 = 0x09;
 
 /// The attach protocol version carried in [`MSG_HELLO`].
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -201,6 +205,8 @@ pub enum Frame {
     Resize(Geometry),
     /// Client → sidecar: the end of this connection's input.
     Detach,
+    /// Client → sidecar: make the child redraw after an attach at its size.
+    Repaint,
     /// Sidecar → client: control granted at this epoch.
     Accepted(ControllerEpoch),
     /// Sidecar → client: control refused, with why.
@@ -247,6 +253,8 @@ impl Frame {
                 Self::Resize(parse_resize(&payload).ok_or(ProtocolError::Malformed("resize"))?)
             }
             MSG_DETACH => Self::Detach,
+            MSG_REPAINT if payload.is_empty() => Self::Repaint,
+            MSG_REPAINT => return Err(ProtocolError::Malformed("repaint")),
             MSG_HELLO => match payload.as_slice() {
                 [PROTOCOL_VERSION, mode] => Self::Hello(Mode::try_from(*mode)?),
                 _ => return Err(ProtocolError::UnsupportedHello),
@@ -277,6 +285,7 @@ pub fn write_frame(w: &mut impl Write, frame: &Frame) -> io::Result<()> {
         Frame::Data(bytes) => write_msg(w, MSG_DATA, bytes),
         Frame::Resize(size) => write_msg(w, MSG_RESIZE, &resize_payload(*size)),
         Frame::Detach => write_msg(w, MSG_DETACH, &[]),
+        Frame::Repaint => write_msg(w, MSG_REPAINT, &[]),
         Frame::Accepted(epoch) => write_msg(w, MSG_ACCEPTED, &epoch.get().to_be_bytes()),
         Frame::Rejected { class, reason } => {
             let mut payload = Vec::with_capacity(1 + reason.len());
@@ -427,6 +436,7 @@ mod tests {
             Frame::Data(b"abc".to_vec()),
             Frame::Resize(Geometry::new(24, 80).unwrap()),
             Frame::Detach,
+            Frame::Repaint,
             Frame::Accepted(ControllerEpoch::new(7)),
             Frame::Rejected {
                 class: RejectClass::Control,

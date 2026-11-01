@@ -287,6 +287,17 @@ Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
 - The input writer applies each resize while holding the recorder's
   sequencer. So output that follows a new size is always recorded after it.
 - A resize frame with a zero dimension does not parse and is ignored.
+- Repaint nudge: after its first resize the client sends `MSG_REPAINT` once.
+  If that resize left the PTY's size unchanged (a new size already makes the
+  child redraw) and the client still holds control, the input writer shrinks
+  the PTY by one row. The attach handler then waits until the child's output
+  has been quiet for 50 ms, at most 500 ms, and asks the writer to restore
+  the size. The restore applies only if the client still holds control and
+  the PTY is still at the shrunk size, so a resize or takeover in between
+  wins. Both records carry `REPAINT` and one correlation. Claude Code draws
+  nothing on a same-size attach, on a same-size `TIOCSWINSZ`, or on SIGWINCH
+  at an unchanged size, but redraws fully on each of the pair (cloud PTY plan,
+  step 5). A sidecar that predates the frame ignores it.
 - Input is not recorded.
 - Sequencing never waits for storage. One recorder thread appends, rotates
   segments at 64 MiB, publishes each segment atomically, and syncs at most

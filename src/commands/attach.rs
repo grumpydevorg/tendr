@@ -272,6 +272,9 @@ mod unix_relay {
         let mut size = terminal_size();
         if let Some(size) = size {
             outbox.push_control(Frame::Resize(size));
+            // An attach at the session's size makes the child draw nothing,
+            // so ask the sidecar to nudge it into redrawing.
+            outbox.push_control(Frame::Repaint);
         }
 
         let size_poll = size_poll_interval();
