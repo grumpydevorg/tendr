@@ -211,20 +211,21 @@ tendr exec serial -- '{"cmd":"cancel","target":"<request_id>"}'
 ```
 
 This is an ordinary NDJSON request. What follows is sio's behaviour (sio
-0.4.0, [SKILL.md, "Waiting and cancelling"](https://github.com/grumpydevorg/sio)),
+0.4.0, [SKILL.md, "Waiting and cancelling"](https://github.com/grumpydevorg/sio/blob/main/skills/sio/SKILL.md)),
 not tendr's:
 
 - A cancel skips sio's queue and stops the `read`, `readline` or `expect`
   running when it arrives, within about 100 ms. With `target`, it stops it
   only if the running request's id equals `target`.
 - The stopped request replies with `end:"cancelled"` and
-  `consumes_input:false`; its bytes stay buffered. That reply arrives while
-  the cancel's `exec` waits, so it lands in that exec's `unmatched`.
-- The cancel's own reply is `{"ok":true,"result":{"cancelled":true|false}}`
-  (exit 0 either way), in queue order. `false` means the target was not
-  running.
+  `consumes_input:false`; its bytes stay buffered.
+- The cancel's own reply is `{"ok":true,"result":{"cancelled":true|false}}`,
+  in queue order. `false` means the target was not running.
 - An untargeted `{"cmd":"cancel"}` is safe only when one caller owns the
   session.
+
+On tendr's side, the cancel `exec` exits 0 either way, and the stopped
+request's reply, which arrives while it waits, lands in its `unmatched`.
 
 ## Answer prompts and attach
 
