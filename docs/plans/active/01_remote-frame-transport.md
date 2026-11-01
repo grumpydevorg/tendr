@@ -6,11 +6,9 @@ depends_on: []
 # Remote frame transport: make `--host` cross-platform
 
 **Status:** step 1 (typed `RemoteOperation` + shared `dispatch`) is done; step 0a
-is in #149. Steps 2–4, 6 and 7 remain, and step 5 comes later. Step 5's Unix
-attach bridge is the part the cloud PTY workflow
-([VM scripts and results](../../../scripts/pty-vm/README.md)) needs first. It
-needs steps 0a and 2 (the fake-SSH harness and the codec), so it may land before
-steps 3 and 4.
+is in #149. Steps 2–4, 6 and 7 are in progress. Step 5 (the attach bridge,
+which the cloud PTY workflow needs; see the
+[VM scripts and results](../../../scripts/pty-vm/README.md)) comes after them.
 
 Goal: every `--host` command travels as a typed request over SSH stdin, as
 `exec` already does. No user- or host-derived value is rebuilt into a remote
@@ -86,7 +84,7 @@ are stable protocol/domain DTOs.
 ### 2. Wire format — one hidden, constant entry point
 
 ```
-ssh -T host tendr --hello _remote
+ssh -T host tendr [--hello] _remote
 ```
 
 Nothing host- or user-derived appears after the SSH destination. The stream is:
@@ -206,9 +204,10 @@ network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
      the `ssh -t` path during transition if that case matters. The ConPTY
      backend and console frontend themselves are in
      [windows-parity](../backlog/windows-parity.md#no-pty-or-attach).
-6. Delete general POSIX remote-argv reconstruction (`RemoteOperation::legacy_argv`).
-   From here `attach` accepts only plain session names and fixed flag values,
-   since it is the one op still on `ssh -t` until step 5. Keep shell quoting only for
+6. Delete general POSIX remote-argv reconstruction: every `legacy_argv` arm
+   but attach's. From here `attach` accepts only plain session names and fixed
+   flag values, since it is the one op still on `ssh -t` until step 5. Keep
+   shell quoting only for
    the human-facing copy/paste **fallback text** (verified: `local_fallback_args`
    is only `eprintln!`'d, never spawned) — label it "(POSIX shell)" so users don't
    paste POSIX-quoted text at a Windows host.
