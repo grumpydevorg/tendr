@@ -285,9 +285,10 @@ make all
 The keys are `session=NAME`, `namespace`, `timeout`, `on-exit` (repeatable),
 `stdin=pipe`, `cwd`, `env=KEY=VALUE` (repeatable), `replace` and `detach`.
 Each matches the flag of the same name; `--foreground` overrides `detach`.
-Command-line values win: `--on-exit` replaces every `on-exit` directive, and
-`--env` entries apply after `env` directives. An unknown directive, or a second
-copy of a non-repeatable one, is an error.
+Command-line values win: `--on-exit` replaces every `on-exit` directive,
+`--env` entries apply after `env` directives, and `--unset-env NAME` drops an
+`env` directive for that name. An unknown directive, or a second copy of a
+non-repeatable one, is an error.
 
 **Annotations.** Inside a session, `tendr wrap` runs a command and records it
 in the session's event log:
