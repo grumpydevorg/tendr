@@ -269,12 +269,21 @@ tendr run --detach ./job.sh      # run a script as a session
 after 5 s. A PTY session first gets SIGHUP and up to 1 s to act on it, as when
 a terminal window closes, so an interactive shell also hangs up its background
 jobs. `--timeout` stops the same way, so a timed-out child exits up to about
-6 s after the deadline. A process in the group that ignores SIGTERM can
-outlive the timeout. While it holds a pipe run's stdout or stderr, the run
-does not end; a PTY run ends at most 2 s after its child (below, and the run
-lifecycle's [Limits](architecture/03-run-lifecycle.md#limits)).
-`kill --force` sends SIGKILL at once. A shell cannot pass SIGKILL on, so its
-background jobs keep running.
+6 s after the deadline. `kill --force` sends SIGKILL at once.
+
+On Linux a stop then ends every other process the run started, wherever it
+went: a shell's background jobs, `nohup` and `disown` jobs, `setsid`
+processes, and tool shells that Claude Code starts in sessions of their own.
+`kill` and `--timeout` send each SIGTERM and give it up to 1 s to exit;
+then, and at once for `kill --force`, each one left is stopped and killed.
+The run's end is recorded after that, so `kill` returns with them gone.
+A stop cannot reach processes started through another manager, such as
+`systemd-run --user`, `at` or an already running `tmux` server, nor a setuid
+program (run lifecycle,
+[Limits](architecture/03-run-lifecycle.md#limits)). On macOS a stop reaches
+only the process group: a member that ignores SIGTERM can outlive a leader
+that exits, a shell cannot pass SIGKILL on, so its background jobs keep
+running, and a process in its own session survives the stop.
 
 A PTY run ends with its child, even if a process the child started still holds
 the terminal, such as a `setsid` job. Once the child has exited, tendr captures
@@ -282,7 +291,7 @@ that process's output for up to 2 s more, then records the child's exit. On
 Linux a run warning names the pids that still hold the terminal. The process
 is left running; its later writes to the terminal fail once the sidecar has
 exited. A pipe run still waits until every process holding its output pipes
-has exited.
+has exited. On Linux a stop ends such processes too.
 
 `kill` succeeds only when the run has ended. If the sidecar has not recorded
 the end after about 20 s, `kill` exits 1. If the sidecar is gone, `kill` stops

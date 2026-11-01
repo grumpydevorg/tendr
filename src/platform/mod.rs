@@ -180,6 +180,33 @@ pub trait Platform {
     /// or `child_try_wait` afterward.
     fn kill_child(handle: &Self::ChildKillHandle, force: bool) -> io::Result<()>;
 
+    /// Make this process the parent of every process its children orphan,
+    /// so that [`Platform::stop_run_tree`] can still find them: on Linux a
+    /// child subreaper (`PR_SET_CHILD_SUBREAPER`). Call it before spawning
+    /// the child. Returns `false` where the platform has no such mechanism;
+    /// the caller then has no orphans to reap.
+    fn adopt_orphans() -> io::Result<bool>;
+
+    /// Reap the orphans this process adopted (see
+    /// [`Platform::adopt_orphans`]) that have exited. Waits on each by pid,
+    /// never on any child, and leaves `child`, the supervised child, to
+    /// `child_wait`. The caller must not run it while this process has other
+    /// children of its own, which their spawner reaps.
+    fn reap_orphans(child: &ProcessIdentity);
+
+    /// After a stop by [`Platform::kill_child`]: end every process the run
+    /// started that is still running, wherever it went (another process
+    /// group, its own session, orphaned). Unless `force`, each first gets
+    /// SIGTERM and up to a second to exit. Those left are stopped before
+    /// they are killed, so they cannot start more, and the search repeats
+    /// until it finds none. Signals only descendants of this process, apart
+    /// from `handle`'s child, which `kill_child` deals with, so the caller
+    /// must not run it while this process has children other than the
+    /// run's. Linux only; elsewhere a no-op. On Windows the kill-on-close
+    /// Job Object, which only the sidecar holds, ends the rest of the tree
+    /// when the sidecar exits.
+    fn stop_run_tree(handle: &Self::ChildKillHandle, force: bool) -> io::Result<()>;
+
     /// Kill an orphaned process by persisted identity (no live handle).
     ///
     /// Used when the sidecar has crashed and we only have ProcessIdentity

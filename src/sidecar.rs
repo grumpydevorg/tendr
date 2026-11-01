@@ -24,7 +24,9 @@ use crate::attach_proto::RejectClass;
 use crate::events::{self, EventDraft, EventWriter};
 use crate::model::dep_fail::DepFailReason;
 use crate::model::event::{Kind, Uuid7};
-use crate::model::ids::{EpochTimestamp, Generation, Namespace, RunId, SessionName, Source};
+use crate::model::ids::{
+    EpochTimestamp, Generation, Namespace, ProcessIdentity, RunId, SessionName, Source,
+};
 use crate::model::meta::Meta;
 #[cfg(unix)]
 use crate::model::pty::PtyControl;
@@ -303,7 +305,73 @@ fn pty_term(spec: &LaunchSpec) -> String {
     }
 }
 
-/// Spawn a timeout thread that stops the child after `timeout_s` seconds,
+/// Orders the run's stops, and the reaping of the orphans it leaves, before
+/// the run's end. A stop or a reaping pass runs only while the run has not
+/// ended, and ending it ([`StopGate::close`]) waits for those under way. So
+/// a stop has ended every process the run started before the end is
+/// recorded, and neither touches the sidecar's later children: the
+/// `--on-exit` hooks, which run after the end.
+#[derive(Clone, Default)]
+struct StopGate(Arc<(Mutex<GateState>, std::sync::Condvar)>);
+
+#[derive(Default)]
+struct GateState {
+    ended: bool,
+    /// Stops and reaping passes under way.
+    active: usize,
+}
+
+/// Leaves the gate when dropped, so a panic cannot hold the run's end.
+struct GatePass<'a>(&'a StopGate);
+
+impl Drop for GatePass<'_> {
+    fn drop(&mut self) {
+        let (state, changed) = &*(self.0).0;
+        lock(state).active -= 1;
+        changed.notify_all();
+    }
+}
+
+impl StopGate {
+    /// Run `f` unless the run has ended. `None` if it has.
+    fn enter<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        {
+            let mut state = lock(&self.0.0);
+            if state.ended {
+                return None;
+            }
+            state.active += 1;
+        }
+        let _pass = GatePass(self);
+        Some(f())
+    }
+
+    /// End the run: refuse new stops and reaping, and wait for those under
+    /// way. Each is bounded: a stop by its grace periods and
+    /// [`Platform::stop_run_tree`]'s limit.
+    fn close(&self) {
+        let (state, changed) = &*self.0;
+        let mut state = lock(state);
+        state.ended = true;
+        while state.active > 0 {
+            state = changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// Stop the whole run: the child and its process group by `kill_child`,
+/// then every other process the run started by `stop_run_tree`, gracefully
+/// unless `force`. The tree is stopped even if the child's kill failed, for
+/// one because the child had already exited. Returns the first error.
+fn stop_run(kill_handle: &<Current as Platform>::ChildKillHandle, force: bool) -> io::Result<()> {
+    let child = Current::kill_child(kill_handle, force);
+    let tree = Current::stop_run_tree(kill_handle, force);
+    child.and(tree)
+}
+
+/// Spawn a timeout thread that stops the run after `timeout_s` seconds,
 /// with the same graceful sequence as `tendr kill`.
 /// Returns the `timed_out` flag. The caller passes a `cancel` flag to prevent the kill
 /// after the child exits naturally.
@@ -316,6 +384,7 @@ fn setup_timeout(
     kill_handle: <Current as Platform>::ChildKillHandle,
     timeout_s: u64,
     cancel: Arc<AtomicBool>,
+    stops: StopGate,
 ) -> Arc<AtomicBool> {
     let timed_out = Arc::new(AtomicBool::new(false));
     let timed_out_clone = Arc::clone(&timed_out);
@@ -340,20 +409,21 @@ fn setup_timeout(
         // run gets SIGTERM, and SIGKILL follows if it does not exit. The
         // live kill handle keeps the stop tree-aware (Job Object on Windows,
         // process group on Unix).
-        let _ = Current::kill_child(&kill_handle, false);
+        let _ = stops.enter(|| stop_run(&kill_handle, false));
     });
     timed_out
 }
 
 /// Spawn a thread that watches for a `kill_request` file from the CLI.
 /// When found, validates the run_id matches (preventing stale requests from
-/// killing a replacement run), then calls kill_child with the live
+/// killing a replacement run), then stops the run with the live
 /// ChildKillHandle for tree-aware kill.
 fn setup_kill_watcher(
     session_dir: &Path,
     kill_handle: <Current as Platform>::ChildKillHandle,
     run_id: RunId,
     cancel: Arc<AtomicBool>,
+    stops: StopGate,
 ) {
     let kill_request_path = session_dir.join("kill_request");
     let kill_acted_path = session_dir.join("kill_acted");
@@ -394,10 +464,28 @@ fn setup_kill_watcher(
                 }
 
                 // Use the live kill handle for tree-aware kill.
-                let _ = Current::kill_child(&kill_handle, force);
+                let _ = stops.enter(|| stop_run(&kill_handle, force));
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+}
+
+/// How often the sidecar reaps the orphans it adopted while the run lasts.
+const ORPHAN_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Spawn a thread that reaps the orphans the sidecar adopts (see
+/// [`Platform::adopt_orphans`]) while the run lasts, so those that exit do
+/// not stay zombies. Each pass waits by pid, leaving `child` to
+/// `child_wait`.
+fn setup_orphan_reaper(child: ProcessIdentity, cancel: Arc<AtomicBool>, stops: StopGate) {
+    std::thread::spawn(move || {
+        while !cancel.load(Ordering::Relaxed) {
+            if stops.enter(|| Current::reap_orphans(&child)).is_none() {
+                return;
+            }
+            std::thread::sleep(ORPHAN_REAP_INTERVAL);
         }
     });
 }
@@ -1286,6 +1374,14 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
     #[cfg(not(unix))]
     let attach: Option<AttachEndpoint> = None;
 
+    // Before the child exists, so nothing it orphans escapes the sidecar,
+    // where a stop can find it.
+    let adopts_orphans = Current::adopt_orphans().unwrap_or_else(|e| {
+        meta.add_warning(format!(
+            "a stop may miss processes the child leaves behind: cannot adopt them ({e})"
+        ));
+        false
+    });
     let spawned = if meta.launch_spec().io_mode == IoMode::Pty {
         Current::spawn_child_pty(
             meta.launch_spec().argv(),
@@ -1316,7 +1412,16 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
 
     // From here the guard owns the child: no exit below can leave it
     // unsupervised (see supervised_run.rs).
-    let run = SupervisedRun::adopt(child, session, lock, meta, lifecycle, ready.take(), attach);
+    let run = SupervisedRun::adopt(
+        child,
+        session,
+        lock,
+        meta,
+        lifecycle,
+        ready.take(),
+        attach,
+        adopts_orphans,
+    );
     let mut run = run.publish_running()?;
     let how = run.supervise()?;
     run.finish(how)
