@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Security
+
+- **`--host` no longer passes your values through the remote login shell.**
+  Before, `start`, `status`, `list`, `log`, `push`, `kill`, `wait` and `watch`
+  rebuilt their arguments into a POSIX-quoted command line for the remote
+  shell. A Windows host whose ssh shell is `cmd.exe` or PowerShell does not
+  honour POSIX quoting, so a session name, namespace, `--cwd`, `--env` value,
+  `--on-exit` callback, child argument, `--boundary` label or `log --since`
+  value such as `x&calc` could run a command there. Now the remote command
+  line is always `tendr [--hello] _remote`, and the request travels on ssh's
+  stdin as a length-prefixed JSON frame, so values arrive as data on any
+  shell. A `push` body follows the frame on the same stdin, byte for byte.
+  The remote tendr checks a request before it does anything; one it refuses
+  exits 2 with `tendr _remote:` and the reason. A `--cwd` that is not UTF-8
+  is refused before `ssh` starts. `attach` still needs `ssh -t`, so over
+  `--host` it now takes only plain names (`[A-Za-z0-9][A-Za-z0-9_-]{0,254}`)
+  and exits 2 on any other.
+- **Compatibility.** A client from this version needs this version or newer
+  on the remote host for every `--host` command but `exec`; an older remote
+  fails with clap's `unrecognized subcommand '_remote'`, and the client says
+  to upgrade it. `exec` is unchanged. Older clients still work against a
+  remote of this version. The printed fallback for a local-only command is
+  now labelled `try (POSIX shell):`.
+
 ### Added
 
 - **`--unset-env NAME` removes an inherited variable from the child.** It is

@@ -46,8 +46,10 @@ Who does what:
   - `meta.json`: the current run snapshot.
   - `output.log`: child output.
   - `events/*.jsonl`: lifecycle and provenance history.
-- **SSH.** `--host` runs the same tendr binary on another host for an
-  allowlisted set of commands. It adds no second lifecycle model.
+- **SSH.** `--host` runs the same tendr binary on another host for the
+  remote-capable commands, sending each request as data on ssh stdin
+  ([06-transport-boundaries.md](06-transport-boundaries.md#ssh-transport)).
+  It adds no second lifecycle model.
 
 Covered elsewhere:
 
