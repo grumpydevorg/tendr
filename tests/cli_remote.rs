@@ -1,31 +1,16 @@
 // Remote SSH transport tests. The `ssh` they reach is the portable fake in
-// `src/bin/fake_ssh.rs`, put on a temp PATH by `fake_ssh`.
+// `src/bin/fake_ssh.rs`, put on a temp PATH by `harness::fake_ssh`. The
+// end-to-end frame tests, through the real `tendr _remote`, are in
+// `cli_remote_frame.rs`.
 
 mod harness;
 
+use harness::{fake_ssh, shim_path_env};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
-
-/// A PATH dir holding only a fake `ssh` that runs `actions` (one per line;
-/// the list is in `src/bin/fake_ssh.rs`). Keep the TempDir alive while the
-/// PATH is in use.
-fn fake_ssh(actions: &str) -> TempDir {
-    let tmp = TempDir::new().unwrap();
-    let ssh = tmp
-        .path()
-        .join(format!("ssh{}", std::env::consts::EXE_SUFFIX));
-    let bin = assert_cmd::cargo::cargo_bin("fake_ssh");
-    // A hard link never holds the executable open for writing, so a fork in
-    // a parallel test cannot make exec fail with ETXTBSY; copy across devices.
-    if std::fs::hard_link(&bin, &ssh).is_err() {
-        std::fs::copy(&bin, &ssh).unwrap();
-    }
-    std::fs::write(tmp.path().join("fake-ssh-actions"), actions).unwrap();
-    tmp
-}
 
 /// A fake ssh that prints each of its args as `ARG:<value>` on stdout.
 fn fake_ssh_echo() -> TempDir {
@@ -116,75 +101,222 @@ fn host_flag_is_accepted_by_parser() {
     );
 }
 
+/// The ssh argv of every `--host` operation but attach and exec: constant,
+/// so nothing the user typed reaches the remote login shell.
+const REMOTE_ARGV: [&str; 7] = [
+    "-T",
+    "-o",
+    "ConnectTimeout=10",
+    "box",
+    "tendr",
+    "--hello",
+    "_remote",
+];
+
+/// A value that a POSIX shell, cmd.exe or PowerShell would act on.
+const HOSTILE: &str = "x&calc|whoami;$(id)`id`'\"(a) b\r\n\u{e9} C:\\Users\\o'neil";
+
+/// The ssh argv a fake ssh with the `args` action printed.
+fn printed_args(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("ARG:"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every operation, with a hostile value in every place a value can go, runs
+/// the same ssh argv: the request itself travels on ssh's stdin.
 #[test]
-fn host_flag_invokes_ssh_with_correct_remote_command() {
+fn every_host_operation_sends_the_same_constant_argv() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = fake_ssh_echo();
+    let tmp = fake_ssh("args");
+    let h = HOSTILE;
+    let env = format!("K={h}");
+    let boundary = format!("host:{h}");
+    let cases: [&[&str]; 8] = [
+        &[
+            "start",
+            "--namespace",
+            h,
+            "--stdin",
+            "--pty",
+            "--replace",
+            "--timeout",
+            "5",
+            "--cwd",
+            h,
+            "--env",
+            &env,
+            "--unset-env",
+            h,
+            "--on-exit",
+            h,
+            "--after",
+            h,
+            "--any-exit",
+            "--exec-target",
+            "powershell",
+            "--boundary",
+            &boundary,
+            "--boundary-parent",
+            &boundary,
+            h,
+            "--",
+            h,
+            h,
+        ],
+        &["status", "--namespace", h, h],
+        &["list", "--namespace", h],
+        &[
+            "log",
+            "--namespace",
+            h,
+            "--tail",
+            "3",
+            "--follow",
+            "--since",
+            h,
+            "--raw",
+            h,
+        ],
+        &["push", "--namespace", h, h],
+        &["kill", "--namespace", h, "--force", h],
+        &["wait", "--namespace", h, "--timeout", "5", "--any", h, h],
+        &[
+            "watch",
+            "--namespace",
+            h,
+            "--events",
+            "--logs",
+            "--annotations",
+            "--from-now",
+        ],
+    ];
+    for args in cases {
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+            .args(["--host", "box"])
+            .args(args)
+            .env("PATH", tmp.path())
+            .env_remove("TENDR_SSH_CONNECT_TIMEOUT")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(
+            printed_args(&output.stdout),
+            REMOTE_ARGV,
+            "{}: {}",
+            args[0],
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
 
+/// What crosses ssh's stdin: a 4-byte big-endian length, that many bytes of
+/// JSON (`v`, `op`, `params`), and for push the body, byte for byte.
+#[test]
+fn host_request_travels_on_stdin_as_a_length_prefixed_frame() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let captured = TempDir::new().unwrap();
+    let captured = captured.path().join("stdin");
+    let tmp = fake_ssh(&format!("stdin {}\nexit 0", captured.display()));
+    let body: Vec<u8> = (0..=255u8).cycle().take(3000).collect();
+    let cases: [(&[&str], serde_json::Value, &[u8]); 3] = [
+        (
+            &["status", "--namespace", "n", "x&calc"],
+            serde_json::json!({
+                "v": 1, "op": "status",
+                "params": {"session": "x&calc", "namespace": "n"}
+            }),
+            b"",
+        ),
+        (
+            &["log", "--since", "$(id)", "s"],
+            serde_json::json!({
+                "v": 1, "op": "log",
+                "params": {
+                    "session": "s", "namespace": null, "tail": null,
+                    "follow": false, "since": "$(id)", "raw": false
+                }
+            }),
+            b"",
+        ),
+        (
+            &["push", "s"],
+            serde_json::json!({
+                "v": 1, "op": "push",
+                "params": {"session": "s", "namespace": null}
+            }),
+            &body,
+        ),
+    ];
+    for (args, header, body) in cases {
+        let output = assert_cmd::Command::cargo_bin("tendr")
+            .unwrap()
+            .args(["--host", "box"])
+            .args(args)
+            .env("PATH", tmp.path())
+            .write_stdin(body)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let sent = std::fs::read(&captured).unwrap();
+        let len = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
+        let json: serde_json::Value = serde_json::from_slice(&sent[4..4 + len]).unwrap();
+        assert_eq!(json, header, "{args:?}");
+        assert_eq!(
+            &sent[4 + len..],
+            body,
+            "{args:?}: the body follows the header"
+        );
+    }
+}
+
+/// A cwd that is not UTF-8 cannot travel in JSON. It is refused before ssh
+/// starts, rather than sent altered.
+#[cfg(unix)]
+#[test]
+fn host_start_with_a_non_utf8_cwd_is_refused_before_ssh() {
+    use std::os::unix::ffi::OsStrExt;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = poison_ssh();
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args(["--host", "user@box", "list"])
+        .args(["--host", "box", "start", "--cwd"])
+        .arg(std::ffi::OsStr::from_bytes(b"/tmp/not-utf8-\xff"))
+        .args(["job", "--", "true"])
         .env("PATH", tmp.path())
         .output()
         .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let args: Vec<&str> = stdout
-        .lines()
-        .filter_map(|l| l.strip_prefix("ARG:"))
-        .collect();
-    // Should see: -T, -o, ConnectTimeout=10, user@box, tendr, --hello, list
-    let remote: Vec<&str> = args
-        .iter()
-        .skip_while(|a| **a != "tendr")
-        .copied()
-        .collect();
-    assert_eq!(
-        remote,
-        ["tendr", "--hello", "list"],
-        "the remote tendr is asked to announce itself first: {args:?}"
-    );
-    // No "--" should be passed to ssh
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(!stderr.contains("SSH_MUST_NOT_RUN"), "{stderr}");
     assert!(
-        !args.contains(&"--"),
-        "should not contain -- in ssh args: {args:?}"
+        stderr.contains("--cwd") && stderr.contains("UTF-8"),
+        "{stderr}"
     );
-}
-
-/// Helper: extract the remote command from the fake ssh output.
-///
-/// `fake_ssh_echo()` prints each arg as `ARG:<value>`. The remote
-/// command args are everything after the host (arg index 4+, since
-/// the first 4 are: -T, -o, ConnectTimeout=10, <host>).
-///
-/// SSH concatenates these with spaces to form the remote command string.
-/// We do the same and then `shell_words::split()` to simulate what the
-/// remote POSIX shell would produce as argv.
-fn parse_remote_argv(stdout: &str) -> Vec<String> {
-    let args: Vec<&str> = stdout
-        .lines()
-        .filter_map(|l| l.strip_prefix("ARG:"))
-        .collect();
-    // Skip: -T, -o, ConnectTimeout=10, <host>
-    let remote_parts = &args[4..];
-    let remote_cmd = remote_parts.join(" ");
-    shell_words::split(&remote_cmd).expect("remote command should be valid POSIX shell syntax")
 }
 
 // -- Connect deadline: a --host call that never reaches the remote tendr --
 
 /// Run `tendr --host box <args>` against `tmp`'s fake ssh with a connect
 /// deadline of `deadline` (the `TENDR_SSH_CONNECT_TIMEOUT` value).
-fn host_call(tmp: &TempDir, deadline: &str, args: &[&str]) -> (std::process::Output, Duration) {
-    let started = Instant::now();
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+fn host_call(tmp: &TempDir, deadline: &str, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .args(["--host", "box"])
         .args(args)
         .env("PATH", tmp.path())
         .env("TENDR_SSH_CONNECT_TIMEOUT", deadline)
         .output()
-        .unwrap();
-    (output, started.elapsed())
+        .unwrap()
 }
 
 /// An ssh that never reaches the remote tendr (a Tailscale SSH check-mode
@@ -212,6 +344,7 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
             .args(args)
             .env("PATH", tmp.path())
             .env("TENDR_SSH_CONNECT_TIMEOUT", "1")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -300,7 +433,7 @@ fn host_call_runs_past_the_deadline_once_the_remote_tendr_says_hello() {
          exit 0",
         tendr::ssh::HELLO_LINE
     ));
-    let (output, _) = host_call(&tmp, "2", &["wait", "job"]);
+    let output = host_call(&tmp, "2", &["wait", "job"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(0), "{stderr}");
@@ -312,14 +445,15 @@ fn host_call_runs_past_the_deadline_once_the_remote_tendr_says_hello() {
 }
 
 /// `TENDR_SSH_CONNECT_TIMEOUT=0` turns the deadline off and with it the
-/// `--hello` flag, so an older remote tendr that does not know it still works.
+/// `--hello` flag: the call waits as long as ssh takes, and an exec still
+/// reaches a remote tendr too old to know `--hello`.
 #[test]
-fn host_connect_deadline_of_zero_waits_and_works_with_an_older_remote() {
+fn host_connect_deadline_of_zero_waits_without_hello() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let tmp = fake_ssh("reject-hello\nsleep 2\nout slow but fine\\n\nexit 0");
     for args in [&["list"][..], &["exec", "shell", "--", "true"][..]] {
-        let (output, _) = host_call(&tmp, "0", args);
+        let output = host_call(&tmp, "0", args);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(0), "{args:?}: {stderr}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "slow but fine\n");
@@ -335,7 +469,7 @@ fn host_connect_deadline_that_cannot_be_represented_falls_back() {
         "err {}\\n\nout ok\\n\nexit 0",
         tendr::ssh::HELLO_LINE
     ));
-    let (output, _) = host_call(&tmp, "1e30", &["list"]);
+    let output = host_call(&tmp, "1e30", &["list"]);
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -345,18 +479,67 @@ fn host_connect_deadline_that_cannot_be_represented_falls_back() {
 }
 
 /// A remote tendr too old to know `--hello` fails fast with clap's parse
-/// error (exit 2); the caller is told why and what to do.
+/// error (exit 2); the caller is told why and what to do. An exec can still
+/// reach it without the deadline; the other operations need a newer tendr.
 #[test]
 fn host_call_to_a_tendr_without_hello_says_to_upgrade_it() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let tmp = fake_ssh("err error: unexpected argument '--hello' found\\n\nexit 2");
-    let (output, _) = host_call(&tmp, "5", &["list"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    for (args, advice) in [
+        (&["exec", "shell", "--", "true"][..], "upgrade tendr on box"),
+        (
+            &["list"][..],
+            concat!(
+                "tendr on box is too old for this client: upgrade it to ",
+                env!("CARGO_PKG_VERSION"),
+                " or later"
+            ),
+        ),
+    ] {
+        let output = host_call(&tmp, "5", args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("unexpected argument '--hello'"), "{stderr}");
-    assert!(stderr.contains("upgrade tendr on box"), "{stderr}");
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("unexpected argument '--hello'"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains(advice), "{args:?}: {stderr}");
+    }
+}
+
+/// What a tendr from before the frame transport prints for `_remote`.
+const NO_REMOTE_ENTRY: &str = "error: unrecognized subcommand '_remote'\\n\\n  \
+     tip: a similar subcommand exists: 'emit'\\n\\nUsage: tendr [OPTIONS] <COMMAND>\\n\\n\
+     For more information, try '--help'.\\n";
+
+/// A remote tendr that knows `--hello` but not the frame entry point: clap's
+/// error is passed on, and the caller is told to upgrade it, with the
+/// deadline on or off.
+#[test]
+fn host_call_to_a_tendr_without_the_frame_entry_says_to_upgrade_it() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = fake_ssh(&format!("err {NO_REMOTE_ENTRY}\nexit 2"));
+    for deadline in ["5", "0"] {
+        let output = host_call(&tmp, deadline, &["status", "job"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(2), "{deadline}: {stderr}");
+        assert!(
+            stderr.contains("unrecognized subcommand '_remote'"),
+            "{deadline}: {stderr}"
+        );
+        assert!(
+            stderr.contains(concat!(
+                "tendr on box is too old for this client: upgrade it to ",
+                env!("CARGO_PKG_VERSION"),
+                " or later"
+            )),
+            "{deadline}: {stderr}"
+        );
+    }
 }
 
 /// What the remote end does: `tendr --hello …` writes the hello as its very
@@ -500,43 +683,6 @@ fn host_flag_ssh_not_found_gives_clear_error() {
     );
 }
 
-// -- Task 8: Namespace forwarding --
-
-#[test]
-fn host_flag_forwards_namespace_and_strips_host() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let tmp = fake_ssh_echo();
-
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args([
-            "--host",
-            "user@box",
-            "status",
-            "my-session",
-            "--namespace",
-            "prod",
-        ])
-        .env("PATH", tmp.path())
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed = parse_remote_argv(&stdout);
-    assert!(
-        parsed.contains(&"--namespace".to_string()),
-        "should forward --namespace: {parsed:?}"
-    );
-    assert!(
-        parsed.contains(&"prod".to_string()),
-        "should forward prod: {parsed:?}"
-    );
-    assert!(
-        !parsed.contains(&"--host".to_string()),
-        "--host should NOT be in remote command: {parsed:?}"
-    );
-}
-
 // -- Task 9: Stderr passthrough --
 
 #[test]
@@ -559,132 +705,7 @@ fn host_flag_passes_through_stderr() {
     assert_eq!(output.status.code(), Some(1));
 }
 
-// -- Task 10: Trailing args, quoting, child --host --
-
-#[test]
-fn host_flag_forwards_start_with_trailing_args() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let tmp = fake_ssh_echo();
-
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args([
-            "--host",
-            "user@box",
-            "start",
-            "job",
-            "--timeout",
-            "30",
-            "--",
-            "sleep",
-            "60",
-        ])
-        .env("PATH", tmp.path())
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed = parse_remote_argv(&stdout);
-
-    assert_eq!(parsed[0], "tendr");
-    assert!(parsed.contains(&"start".to_string()), "parsed: {parsed:?}");
-    assert!(parsed.contains(&"job".to_string()), "parsed: {parsed:?}");
-    assert!(
-        parsed.contains(&"--timeout".to_string()),
-        "parsed: {parsed:?}"
-    );
-    assert!(parsed.contains(&"30".to_string()), "parsed: {parsed:?}");
-    assert!(parsed.contains(&"sleep".to_string()), "parsed: {parsed:?}");
-    assert!(parsed.contains(&"60".to_string()), "parsed: {parsed:?}");
-    assert!(
-        !parsed.contains(&"--host".to_string()),
-        "parsed: {parsed:?}"
-    );
-}
-
-#[test]
-fn host_flag_quotes_child_args_with_spaces() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let tmp = fake_ssh_echo();
-
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args([
-            "--host",
-            "user@box",
-            "start",
-            "job",
-            "--",
-            "echo",
-            "hello world",
-            "foo;bar",
-            "$HOME",
-        ])
-        .env("PATH", tmp.path())
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed = parse_remote_argv(&stdout);
-
-    assert_eq!(parsed[0], "tendr");
-    assert!(
-        parsed.contains(&"hello world".to_string()),
-        "space-containing arg must survive round-trip: {parsed:?}"
-    );
-    assert!(
-        parsed.contains(&"foo;bar".to_string()),
-        "semicolon-containing arg must survive: {parsed:?}"
-    );
-    assert!(
-        parsed.contains(&"$HOME".to_string()),
-        "dollar sign must survive (not expanded): {parsed:?}"
-    );
-}
-
-#[test]
-fn host_flag_does_not_eat_child_host_arg() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let tmp = fake_ssh_echo();
-
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args([
-            "--host",
-            "user@box",
-            "start",
-            "job",
-            "--",
-            "myprog",
-            "--host",
-            "other-host",
-        ])
-        .env("PATH", tmp.path())
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed = parse_remote_argv(&stdout);
-
-    let host_indices: Vec<usize> = parsed
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.as_str() == "--host")
-        .map(|(i, _)| i)
-        .collect();
-    assert!(
-        !host_indices.is_empty(),
-        "child's --host must be preserved in remote command: {parsed:?}"
-    );
-    for &i in &host_indices {
-        if i + 1 < parsed.len() && parsed[i + 1] == "other-host" {
-            return;
-        }
-    }
-    panic!("child's --host other-host must be preserved: {parsed:?}");
-}
-
-// -- Task 9 (PTY): SSH -t for attach --
+// -- attach: still `ssh -t` with a rebuilt argv, so plain names only --
 
 #[test]
 fn host_flag_attach_uses_tty_allocation() {
@@ -692,70 +713,74 @@ fn host_flag_attach_uses_tty_allocation() {
     let tmp = fake_ssh_echo();
 
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args(["--host", "user@box", "attach", "my-session"])
-        .env("PATH", tmp.path())
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let args: Vec<&str> = stdout
-        .lines()
-        .filter_map(|l| l.strip_prefix("ARG:"))
-        .collect();
-    assert!(
-        args.contains(&"-t"),
-        "attach should use -t for TTY: {args:?}"
-    );
-    assert!(!args.contains(&"-T"), "attach should not use -T: {args:?}");
-}
-
-// -- Task 6 (exec-target): --exec-target forwarding --
-
-#[test]
-fn host_flag_forwards_exec_target() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let tmp = fake_ssh_echo();
-
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .args([
             "--host",
             "user@box",
-            "start",
-            "shell",
-            "--stdin",
-            "--exec-target",
-            "posix-shell",
-            "--",
-            "bash",
+            "attach",
+            "--namespace",
+            "ns_1",
+            "--takeover",
+            "--escape",
+            "none",
+            "My-session_2",
         ])
         .env("PATH", tmp.path())
         .output()
         .unwrap();
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed = parse_remote_argv(&stdout);
+    assert_eq!(
+        printed_args(&output.stdout),
+        [
+            "-t",
+            "-o",
+            "ConnectTimeout=10",
+            "user@box",
+            "tendr",
+            "attach",
+            "My-session_2",
+            "--namespace",
+            "ns_1",
+            "--takeover",
+            "--escape",
+            "none"
+        ]
+    );
+}
 
-    assert_eq!(parsed[0], "tendr");
-    assert!(parsed.contains(&"start".to_string()), "parsed: {parsed:?}");
-    assert!(parsed.contains(&"shell".to_string()), "parsed: {parsed:?}");
-    assert!(
-        parsed.contains(&"--stdin".to_string()),
-        "parsed: {parsed:?}"
-    );
-    assert!(
-        parsed.contains(&"--exec-target".to_string()),
-        "--exec-target should be forwarded: {parsed:?}"
-    );
-    assert!(
-        parsed.contains(&"posix-shell".to_string()),
-        "posix-shell value should be forwarded: {parsed:?}"
-    );
-    assert!(parsed.contains(&"bash".to_string()), "parsed: {parsed:?}");
-    assert!(
-        !parsed.contains(&"--host".to_string()),
-        "parsed: {parsed:?}"
-    );
+/// attach still rebuilds its remote command, so it takes only names that no
+/// shell acts on, and refuses the rest before ssh starts.
+#[test]
+fn host_attach_takes_only_plain_names() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = poison_ssh();
+    let long = "a".repeat(256);
+    for args in [
+        &["attach", "x&calc"][..],
+        &["attach", "x;id"],
+        &["attach", "x$(id)"],
+        &["attach", "it's"],
+        &["attach", "caf\u{e9}"],
+        &["attach", "_lead"],
+        &["attach", &long],
+        &["attach", "--namespace", "n&s", "s"],
+        &["attach", "--namespace", "n|s", "s"],
+    ] {
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+            .args(["--host", "box"])
+            .args(args)
+            .env("PATH", tmp.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(!stderr.contains("SSH_MUST_NOT_RUN"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("attach over --host takes plain names"),
+            "{args:?}: {stderr}"
+        );
+    }
 }
 
 // -- Local-only verbs exit 2 with a pre-filled ssh fallback, before any
@@ -1014,13 +1039,6 @@ fn fake_ssh_frame_shim() -> TempDir {
     fake_ssh("forward")
 }
 
-/// The fake ssh's dir in front of the inherited PATH.
-fn shim_path_env(tmp: &TempDir) -> std::ffi::OsString {
-    let inherited = std::env::var_os("PATH").unwrap_or_default();
-    let dirs = std::iter::once(tmp.path().to_path_buf()).chain(std::env::split_paths(&inherited));
-    std::env::join_paths(dirs).unwrap()
-}
-
 // The exec sessions behind the fake ssh are each platform's native shell, as
 // in `cli_exec.rs`: bash on Unix, PowerShell on Windows.
 
@@ -1224,16 +1242,23 @@ fn host_exec_remote_argv_carries_no_payload() {
         .output()
         .unwrap();
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let args = parse_remote_argv(&stdout);
     assert_eq!(
-        args,
-        vec!["tendr", "--hello", "exec", "--frame-from-stdin"],
+        printed_args(&output.stdout),
+        [
+            "-T",
+            "-o",
+            "ConnectTimeout=10",
+            "box",
+            "tendr",
+            "--hello",
+            "exec",
+            "--frame-from-stdin"
+        ],
         "remote argv is constant — nothing user-controlled"
     );
     assert!(
-        !stdout.contains(payload),
-        "payload must not appear in argv: {stdout}"
+        !String::from_utf8_lossy(&output.stdout).contains(payload),
+        "payload must not appear in argv"
     );
 }
 
@@ -1297,97 +1322,6 @@ fn host_exec_frame_stdin_reaches_ssh_unchanged() {
 }
 
 #[test]
-fn start_boundary_is_reconstructed_for_ssh() {
-    // --boundary / --boundary-parent must survive the local→remote arg
-    // reconstruction so a `--host` start declares the same boundary remotely.
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let tmp = fake_ssh_echo();
-
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args([
-            "--host",
-            "user@box",
-            "start",
-            "job",
-            "--boundary",
-            "container:img:latest",
-            "--boundary-parent",
-            "host:data-box",
-            "--",
-            "echo",
-            "hi",
-        ])
-        .env("PATH", tmp.path())
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let args: Vec<&str> = stdout
-        .lines()
-        .filter_map(|l| l.strip_prefix("ARG:"))
-        .collect();
-
-    assert!(args.contains(&"--boundary"), "missing --boundary: {args:?}");
-    assert!(
-        args.contains(&"container:img:latest"),
-        "missing boundary value: {args:?}"
-    );
-    assert!(
-        args.contains(&"--boundary-parent"),
-        "missing --boundary-parent: {args:?}"
-    );
-    assert!(
-        args.contains(&"host:data-box"),
-        "missing boundary-parent value: {args:?}"
-    );
-    // The trailing command must still be present and after the boundary flags.
-    assert!(args.contains(&"echo"), "missing trailing cmd: {args:?}");
-}
-
-#[test]
-fn start_unset_env_is_reconstructed_for_ssh() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let tmp = fake_ssh_echo();
-
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args([
-            "--host",
-            "user@box",
-            "start",
-            "job",
-            "--unset-env",
-            "CI",
-            "--unset-env",
-            "NO_COLOR",
-            "--",
-            "echo",
-            "hi",
-        ])
-        .env("PATH", tmp.path())
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let args: Vec<&str> = stdout
-        .lines()
-        .filter_map(|l| l.strip_prefix("ARG:"))
-        .collect();
-    for name in ["CI", "NO_COLOR"] {
-        assert!(
-            args.windows(2).any(|w| w == ["--unset-env", name]),
-            "missing --unset-env {name}: {args:?}"
-        );
-    }
-    let sep = args.iter().position(|a| *a == "--").expect("missing --");
-    assert!(
-        args.iter().rposition(|a| *a == "--unset-env").unwrap() < sep,
-        "--unset-env must precede the child command: {args:?}"
-    );
-}
-
-#[test]
 fn host_run_fallback_keeps_unset_env() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1421,7 +1355,7 @@ fn host_run_fallback_keeps_unset_env() {
 fn host_rejects_option_shaped_destination_general() {
     // A `-`-prefixed --host destination must be rejected at the CLI boundary
     // (exit 2) BEFORE ssh is spawned, so the fake ssh (which prints ARG: lines)
-    // is never invoked. Guards the general reconstructed-argv path.
+    // is never invoked. Guards the frame path.
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = fake_ssh_echo();
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
