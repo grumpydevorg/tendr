@@ -19,7 +19,7 @@ See also the [README](../README.md) (install),
 |namespace|A group of sessions. The default is `default`. A session name is unique within its namespace.|
 |pipe session|A session started with `--stdin`. `exec` and `push` write to the child's stdin.|
 |PTY session|A session started with `--pty`. The child gets a terminal; you can `attach` to it.|
-|exec target|How `exec` talks to the child: `posix-shell`, `powershell`, `python-repl`, `duckdb` or `none`.|
+|exec target|How `exec` talks to the child: `posix-shell`, `powershell`, `python-repl`, `duckdb`, `ndjson` or `none`.|
 |event log|The structured JSONL record of every run, exec and annotation in a session.|
 
 A session's state is on disk under `~/.tendr`: `meta.json` holds its state and
@@ -165,6 +165,40 @@ tendr exec  py -- 'print(df.describe())'                   # df is still loaded
 - `Format-*` cmdlets fail inside `exec` because there is no interactive host.
   Use `ConvertTo-Json`, `ConvertTo-Csv` or `Out-String`, and format the result
   on the calling side.
+
+### Line-oriented JSON processes (NDJSON)
+
+`--exec-target ndjson` drives a program that reads one JSON object per stdin
+line and writes one JSON reply line per request on stdout, such as
+`sio stdio`. Tendr never infers this target, and it needs `--stdin` without
+`--pty`.
+
+```bash
+tendr start --stdin --exec-target ndjson dev -- sio stdio
+tendr exec  dev -- '{"cmd":"read","bytes":4,"timeout_ms":1000}'
+```
+
+- The command is exactly one argument, a JSON object. Tendr adds a fresh
+  string `id` and writes the object as one line. It re-serializes the object,
+  so key order may change and numbers beyond 64-bit integer or double range
+  lose precision. An object that already has an `id`, anything that is not an
+  object, or more than one argument exits 2 and sends nothing.
+- The program must copy the request's `id` into its reply. The first stdout
+  line that is a JSON object with that `id` is the result's `stdout`,
+  verbatim. `exit_code` is 1 if the reply has `"ok": false` or a non-null
+  `error`, else 0. `cwd_after` is empty.
+- Every other stdout line seen while waiting is kept, in order, in
+  `unmatched`: a late reply to an `exec` that timed out, or output the program
+  sent on its own. The program's stderr is `stderr`.
+
+```json
+{"session":"dev","stdout":"{\"id\":\"…\",\"ok\":true,…}","stderr":"","exit_code":0,"cwd_after":"","timed_out":false,"truncated":false,"unmatched":[]}
+```
+
+A timed-out `exec` exits 124 at once, unlike the other targets, and the next
+`exec` can start while the program is still busy. It still gets its own
+reply, because replies are matched by `id`. Lines the program writes while no
+`exec` is waiting are only in the log (`tendr log dev`).
 
 ## Answer prompts and attach
 
@@ -584,7 +618,7 @@ or an I/O error.
 |`wait`|2, 3, 4, 5|Spawn failed, sidecar lost, dependency failed, sidecar failed|
 |`wait`|42|The child exited non-zero (any code)|
 |`wait`|124, 137|A dependency timed out; killed while waiting on a dependency|
-|`exec`|the command's|The command's own exit code; 124 if `--timeout` passed; 2 for a malformed `--frame-from-stdin` frame|
+|`exec`|the command's|The command's own exit code (an NDJSON reply's is 1 for `"ok": false` or a non-null `error`); 124 if `--timeout` passed; 2 for a malformed `--frame-from-stdin` frame or an invalid NDJSON request|
 |`events`|44, 65|`--from-cursor` names history that is gone; `--strict` found unparseable lines|
 |`emit`|2, 3, 5, 6|Invalid `--parent`; no session given and none in `TENDR_SESSION`, or an invalid `TENDR_NAMESPACE`/`TENDR_SESSION`; corrupt session; invalid kind or source|
 |`wrap`|the child's|The wrapped command's code; 6 for an `--event` with a reserved prefix|

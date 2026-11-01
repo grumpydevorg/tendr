@@ -22,6 +22,9 @@ enum CliExecTarget {
     /// DuckDB SQL
     #[value(name = "duckdb")]
     DuckDb,
+    /// Line-oriented JSON process: one JSON object per line, replies matched by id
+    #[value(name = "ndjson")]
+    Ndjson,
     /// Exec not supported
     #[value(name = "none")]
     None,
@@ -45,6 +48,7 @@ impl From<CliExecTarget> for tendr::model::spec::ExecTarget {
             CliExecTarget::PowerShell => Self::PowerShell,
             CliExecTarget::PythonRepl => Self::PythonRepl,
             CliExecTarget::DuckDb => Self::DuckDb,
+            CliExecTarget::Ndjson => Self::Ndjson,
             CliExecTarget::None => Self::None,
         }
     }

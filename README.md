@@ -21,8 +21,9 @@ tendr kill  dev
 ## What it does
 
 - **Keeps state between commands.** `tendr exec` runs a command inside the
-  same shell, Python, IPython, DuckDB or PowerShell process, and returns its
-  output and exit code as JSON.
+  same shell, Python, IPython, DuckDB or PowerShell process, or sends one
+  request to a line-oriented JSON process, and returns its output and exit
+  code as JSON.
 - **Supervises long jobs.** A job keeps running if the caller exits or its
   terminal closes. `wait`, `status`, `log` and `events` report on it later.
 - **Works on other hosts.** `tendr --host user@box …` runs the same commands

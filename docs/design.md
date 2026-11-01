@@ -295,5 +295,5 @@ endpoint, and local sshd lanes. The injection-style strings in the remote
 tests (`tests/cli_remote*.rs`) are adversarial data, not attack tooling:
 they are sent as framed data to those endpoints, and marker-file regression
 tests assert that a hostile session name creates nothing and runs nothing
-remotely. Branch work (`feat/ndjson-exec-target`) extends the same framing
-with request-id matched replies; it has not landed on `main`.
+remotely. The `ndjson` exec target extends the same framing with
+request-id matched replies.

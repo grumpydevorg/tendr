@@ -48,6 +48,18 @@
   the flag hashes as before, so idempotent starts still match runs from older
   versions. Using it over `--host` needs this version on the remote host; a
   `run` over `--host` goes through the printed `ssh` fallback.
+- **`--exec-target ndjson` drives a line-oriented JSON process.** `exec`
+  takes one JSON object, adds a fresh string `id`, and writes it as one line
+  to the child's stdin. The stdout line whose `id` matches is the result's
+  `stdout`; every other stdout line seen meanwhile, such as a late reply to an
+  `exec` that timed out, is listed in a new `unmatched` field. A reply with
+  `"ok": false` or a non-null `error` exits 1. A request that is not one
+  object, or that has its own `id`, exits 2 and sends nothing. A timed-out
+  NDJSON `exec` exits 124 at once and the next one can start, since replies
+  are matched by `id`. The target is never inferred and needs a pipe session
+  (`--stdin`); `exec` refuses it on a PTY session. `tendr guide ndjson`
+  covers it. Other targets' `exec` results are unchanged. Using it over
+  `--host` needs this version on the remote host.
 
 ### Changed
 

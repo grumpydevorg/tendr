@@ -1,6 +1,6 @@
 ---
 name: using-tendr
-description: Use when an agent needs durable shells, REPLs, Python/IPython/DuckDB/PowerShell sessions, long-running commands, remote --host work, logs, watch/wait, or process state across tool calls. Not for ordinary one-shot file edits/searches.
+description: Use when an agent needs durable shells, REPLs, Python/IPython/DuckDB/PowerShell sessions, line-oriented JSON (NDJSON) processes, long-running commands, remote --host work, logs, watch/wait, or process state across tool calls. Not for ordinary one-shot file edits/searches.
 ---
 
 # Using Tendr
@@ -25,5 +25,6 @@ tendr guide herdr
 tendr guide python
 tendr guide duckdb
 tendr guide powershell
+tendr guide ndjson
 tendr guide boundary
 ```

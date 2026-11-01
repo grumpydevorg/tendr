@@ -125,6 +125,67 @@ pub fn parse_err_marker<'a>(line: &'a str, expected_token: &str) -> Option<&'a s
         .strip_suffix(EXEC_ERR_MARKER)
 }
 
+/// Why an `exec` command cannot become an NDJSON request.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum NdjsonRequestError {
+    #[error("ndjson exec takes exactly one argument, a JSON object; got {0}")]
+    ArgCount(usize),
+    #[error("ndjson exec argument is not valid JSON: {0}")]
+    Json(String),
+    #[error("ndjson exec argument must be a JSON object, not {0}")]
+    NotObject(&'static str),
+    #[error("ndjson exec argument must not have an \"id\" member: tendr sets the id")]
+    HasId,
+}
+
+/// Build the request line for the NDJSON target: the one JSON object in
+/// `argv` with `"id": token` added, compact, plus a newline. Tendr owns the
+/// id, so an object that already has one is refused. The object is
+/// re-serialized, so key order and number spelling may change.
+pub fn ndjson_frame(argv: &[String], token: &str) -> Result<String, NdjsonRequestError> {
+    let [arg] = argv else {
+        return Err(NdjsonRequestError::ArgCount(argv.len()));
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(arg).map_err(|e| NdjsonRequestError::Json(e.to_string()))?;
+    let serde_json::Value::Object(mut object) = value else {
+        return Err(NdjsonRequestError::NotObject(json_kind(&value)));
+    };
+    if object.contains_key("id") {
+        return Err(NdjsonRequestError::HasId);
+    }
+    object.insert("id".to_owned(), serde_json::Value::String(token.to_owned()));
+    let mut line = serde_json::Value::Object(object).to_string();
+    line.push('\n');
+    Ok(line)
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// If `line` is the NDJSON reply to `token` (a JSON object whose `id` is the
+/// string `token`), its exit code: 1 when it reports failure (`"ok": false`
+/// or a non-null `"error"`), else 0. None for any other line.
+pub fn parse_ndjson_reply(line: &str, token: &str) -> Option<i32> {
+    let serde_json::Value::Object(reply) = serde_json::from_str(line).ok()? else {
+        return None;
+    };
+    if reply.get("id").and_then(serde_json::Value::as_str) != Some(token) {
+        return None;
+    }
+    let failed = reply.get("ok") == Some(&serde_json::Value::Bool(false))
+        || reply.get("error").is_some_and(|e| !e.is_null());
+    Some(i32::from(failed))
+}
+
 /// Generate a unique token for sentinel matching.
 pub fn generate_token() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -376,5 +437,64 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         let t2 = generate_token();
         assert_ne!(t1, t2);
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| (*a).to_owned()).collect()
+    }
+
+    #[test]
+    fn ndjson_frame_adds_the_id_on_one_line() {
+        let frame = ndjson_frame(
+            &argv(&["{\n \"cmd\": \"read\", \"s\": \"a\\nb\"\n}"]),
+            "ab12",
+        )
+        .unwrap();
+        assert!(frame.ends_with('\n'));
+        assert_eq!(frame.matches('\n').count(), 1, "one line: {frame:?}");
+        let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"cmd": "read", "s": "a\nb", "id": "ab12"})
+        );
+    }
+
+    #[test]
+    fn ndjson_frame_refuses_what_is_not_one_object_without_id() {
+        assert_eq!(
+            ndjson_frame(&argv(&["{}", "{}"]), "t"),
+            Err(NdjsonRequestError::ArgCount(2))
+        );
+        assert_eq!(
+            ndjson_frame(&argv(&["[1]"]), "t"),
+            Err(NdjsonRequestError::NotObject("an array"))
+        );
+        assert!(matches!(
+            ndjson_frame(&argv(&["{"]), "t"),
+            Err(NdjsonRequestError::Json(_))
+        ));
+        assert_eq!(
+            ndjson_frame(&argv(&[r#"{"id":null}"#]), "t"),
+            Err(NdjsonRequestError::HasId)
+        );
+    }
+
+    #[test]
+    fn ndjson_reply_matches_only_its_own_id() {
+        assert_eq!(parse_ndjson_reply(r#"{"id":"t","ok":true}"#, "t"), Some(0));
+        assert_eq!(parse_ndjson_reply(r#"{"id":"t"}"#, "t"), Some(0));
+        assert_eq!(parse_ndjson_reply(r#"{"id":"t","ok":false}"#, "t"), Some(1));
+        assert_eq!(
+            parse_ndjson_reply(r#"{"id":"t","error":{"code":"x"}}"#, "t"),
+            Some(1)
+        );
+        assert_eq!(
+            parse_ndjson_reply(r#"{"id":"t","error":null}"#, "t"),
+            Some(0)
+        );
+        assert_eq!(parse_ndjson_reply(r#"{"id":"u","ok":true}"#, "t"), None);
+        assert_eq!(parse_ndjson_reply(r#"{"id":1}"#, "1"), None);
+        assert_eq!(parse_ndjson_reply(r#"["t"]"#, "t"), None);
+        assert_eq!(parse_ndjson_reply("t", "t"), None);
     }
 }

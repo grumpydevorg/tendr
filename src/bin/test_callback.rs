@@ -6,12 +6,15 @@
 //! echo-env <path>   — write "$TENDR_SESSION $TENDR_NAMESPACE $TENDR_EXIT_REASON" to <path>
 //! copy-stdin <path> — copy stdin to <path> as it arrives, until end of input
 //! print-cwd         — print the current working directory to stdout
+//! ndjson-echo       — a line-oriented JSON process (see `ndjson_echo`)
 //! ```
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: test_callback <touch|echo-env|copy-stdin|print-cwd> [<path>]");
+        eprintln!(
+            "usage: test_callback <touch|echo-env|copy-stdin|print-cwd|ndjson-echo> [<path>]"
+        );
         std::process::exit(1);
     }
 
@@ -62,9 +65,56 @@ fn main() {
             });
             println!("{}", cwd.display());
         }
+        "ndjson-echo" => ndjson_echo(),
         other => {
             eprintln!("test_callback: unknown command '{other}'");
             std::process::exit(1);
         }
+    }
+}
+
+/// Read one JSON object per stdin line and answer each in order with one
+/// line `{"id": <request id>, "ok": <request ok, default true>, "cmd": <request
+/// cmd>}`, plus the request's `error` member if it has one. Before answering,
+/// a request's members act: `stderr` (string) is written to stderr, `push`
+/// (string) is written to stdout as a line of its own, `sleep_ms` (number)
+/// delays, and `exit` (number) exits with that code without answering.
+fn ndjson_echo() {
+    use std::io::{BufRead, Write};
+    let mut out = std::io::stdout().lock();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { return };
+        let request: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(e) => {
+                let reply = serde_json::json!({"ok": false, "error": e.to_string()});
+                writeln!(out, "{reply}").unwrap();
+                out.flush().unwrap();
+                continue;
+            }
+        };
+        if let Some(text) = request["stderr"].as_str() {
+            eprintln!("{text}");
+        }
+        if let Some(text) = request["push"].as_str() {
+            writeln!(out, "{text}").unwrap();
+            out.flush().unwrap();
+        }
+        if let Some(ms) = request["sleep_ms"].as_u64() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        if let Some(code) = request["exit"].as_i64() {
+            std::process::exit(code as i32);
+        }
+        let mut reply = serde_json::json!({
+            "id": request["id"],
+            "ok": request.get("ok").cloned().unwrap_or(serde_json::Value::Bool(true)),
+            "cmd": request["cmd"],
+        });
+        if let Some(error) = request.get("error") {
+            reply["error"] = error.clone();
+        }
+        writeln!(out, "{reply}").unwrap();
+        out.flush().unwrap();
     }
 }

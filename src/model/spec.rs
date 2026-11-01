@@ -42,6 +42,10 @@ pub enum ExecTarget {
     PythonRepl,
     /// DuckDB SQL. JSON results via stdout, sentinel completion, pipe transport.
     DuckDb,
+    /// A line-oriented JSON process: one JSON object per stdin line, one JSON
+    /// reply per request on stdout, matched by the `id` tendr adds. Pipe
+    /// transport only; never inferred.
+    Ndjson,
 }
 
 /// A dependency on another session's specific execution.

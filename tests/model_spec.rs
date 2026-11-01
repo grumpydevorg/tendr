@@ -42,6 +42,17 @@ fn launch_spec_duckdb_serializes() {
     assert!(json.contains("\"DuckDb\""), "json: {json}");
 }
 
+#[test]
+fn launch_spec_ndjson_round_trips() {
+    let mut spec = tendr::model::spec::LaunchSpec::new(vec!["sio".into()]).unwrap();
+    spec.exec_target = tendr::model::spec::ExecTarget::Ndjson;
+    spec.stdin_mode = tendr::model::spec::StdinMode::Pipe;
+    let json = serde_json::to_string(&spec).unwrap();
+    assert!(json.contains("\"exec_target\":\"Ndjson\""), "json: {json}");
+    let back: tendr::model::spec::LaunchSpec = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.exec_target, tendr::model::spec::ExecTarget::Ndjson);
+}
+
 // --- boundary metadata ---
 
 #[test]

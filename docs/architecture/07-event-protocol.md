@@ -117,7 +117,8 @@ Two environment variables chain events across processes:
 | `TENDR_PARENT_EVENT_ID` | `wrap` (valid `--event` kind only) | The `id` of the event `wrap` will write after the child exits. |
 
 So a `tendr emit` run from a hook or an exec command chains to that block.
-Python REPL, PowerShell and DuckDB exec frames do not set `TENDR_BLOCK_ID`.
+Python REPL, PowerShell, DuckDB and NDJSON exec frames do not set
+`TENDR_BLOCK_ID`.
 A malformed value in either variable prints a warning on stderr and is
 ignored; it never fails the producer.
 
