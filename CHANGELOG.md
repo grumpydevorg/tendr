@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Security
+
+- **`--host` no longer passes your values through the remote login shell.**
+  Before, `start`, `status`, `list`, `log`, `push`, `kill`, `wait` and `watch`
+  rebuilt their arguments into a POSIX-quoted command line for the remote
+  shell. A Windows host whose ssh shell is `cmd.exe` or PowerShell does not
+  honour POSIX quoting, so a session name, namespace, `--cwd`, `--env` value,
+  `--on-exit` callback, child argument, `--boundary` label or `log --since`
+  value such as `x&calc` could run a command there. Now the remote command
+  line is always `tendr [--hello] --exit-trailer _remote`, and the request
+  travels on ssh's stdin as a length-prefixed JSON frame, so values arrive as
+  data on any shell. A `push` body follows the frame on the same stdin, byte
+  for byte.
+  The remote tendr checks a request before it does anything; one it refuses
+  exits 2 with `tendr _remote:` and the reason. A `--cwd` that is not UTF-8
+  is refused before `ssh` starts. `attach` still needs `ssh -t`, so over
+  `--host` it now takes only plain names (`[A-Za-z][A-Za-z0-9_-]{0,254}`)
+  and exits 2 on any other.
+- **Exit codes survive a PowerShell login shell.** Windows PowerShell 5.1 and
+  PowerShell 7 as the ssh login shell report any failure as ssh exit 1. The
+  remote tendr now runs under `--exit-trailer`: it writes its exit code as
+  its last stderr line, `tendr-exit <code>`, and the client exits with that
+  code and does not show the line. This also tells a remote exit of 255 from
+  ssh failing to connect, which ssh's own status cannot.
+- **Compatibility.** A client from this version needs this version or newer
+  on the remote host for every `--host` command, `exec` included: `exec`
+  keeps its frame but now also runs under `--exit-trailer`. An older remote
+  fails with clap's `unrecognized subcommand '_remote'`,
+  `unexpected argument '--exit-trailer' found` or, older still,
+  `unexpected argument '--hello' found`, and the client says to upgrade it.
+  With `TENDR_SSH_CONNECT_TIMEOUT=0`, `exec`'s stderr is now relayed rather
+  than inherited, so its interleaving with stdout is no longer exact. Older
+  clients still work against a remote of this version. The printed fallback
+  for a local-only command is now labelled `try (POSIX shell):`.
+
 ### Added
 
 - **`--unset-env NAME` removes an inherited variable from the child.** It is

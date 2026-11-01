@@ -1,12 +1,13 @@
 //! Test fixture: a portable stand-in for `ssh`, linked or copied into a temp
-//! PATH dir as `ssh` (`ssh.exe` on Windows) by `tests/cli_remote.rs`.
+//! PATH dir as `ssh` (`ssh.exe` on Windows) by `harness::fake_ssh` in `tests/`.
 //!
 //! What it does is read from the file `fake-ssh-actions` beside it (the
 //! `FAKE_SSH` environment variable, if set, takes precedence). It holds one
 //! action per line, run in order:
 //!
 //! ```text
-//! args              print each argv entry as `ARG:<value>` on stdout
+//! args [<path>]     print each argv entry as `ARG:<value>` on stdout, or
+//!                   write those lines to <path>
 //! out <text>        write <text> to stdout (`\n` is a newline, `\\` a backslash)
 //! err <text>        write <text> to stderr (likewise)
 //! stdin <path>      copy all of stdin to <path>
@@ -51,11 +52,14 @@ fn main() {
         let (action, value) = line.split_once(' ').unwrap_or((line, ""));
         match action {
             "args" => {
-                let mut out = std::io::stdout().lock();
-                for arg in &argv {
-                    writeln!(out, "ARG:{arg}").unwrap();
+                let lines: String = argv.iter().map(|arg| format!("ARG:{arg}\n")).collect();
+                if value.is_empty() {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(lines.as_bytes()).unwrap();
+                    out.flush().unwrap();
+                } else {
+                    std::fs::write(value, lines).unwrap();
                 }
-                out.flush().unwrap();
             }
             "out" => {
                 let mut out = std::io::stdout().lock();

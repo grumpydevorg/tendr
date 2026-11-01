@@ -166,6 +166,33 @@ pub fn echo_env_cmd(path: &Path) -> String {
     format!("{} echo-env {quoted}", test_callback_bin_quoted())
 }
 
+/// A PATH dir holding only a fake `ssh` that runs `actions` (one per line;
+/// the list is in `src/bin/fake_ssh.rs`). Keep the TempDir alive while the
+/// PATH is in use.
+#[allow(dead_code)]
+pub fn fake_ssh(actions: &str) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let ssh = tmp
+        .path()
+        .join(format!("ssh{}", std::env::consts::EXE_SUFFIX));
+    let bin = assert_cmd::cargo::cargo_bin("fake_ssh");
+    // A hard link never holds the executable open for writing, so a fork in
+    // a parallel test cannot make exec fail with ETXTBSY; copy across devices.
+    if std::fs::hard_link(&bin, &ssh).is_err() {
+        std::fs::copy(&bin, &ssh).unwrap();
+    }
+    std::fs::write(tmp.path().join("fake-ssh-actions"), actions).unwrap();
+    tmp
+}
+
+/// The fake ssh's dir in front of the inherited PATH.
+#[allow(dead_code)]
+pub fn shim_path_env(tmp: &TempDir) -> std::ffi::OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = std::iter::once(tmp.path().to_path_buf()).chain(std::env::split_paths(&inherited));
+    std::env::join_paths(dirs).unwrap()
+}
+
 /// Read all stored events for a default-namespace session, merged by
 /// (ts, writer, seq) — the spec §4 merge rule.
 #[allow(dead_code)]

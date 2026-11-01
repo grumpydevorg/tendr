@@ -5,10 +5,13 @@ depends_on: []
 
 # Remote frame transport: make `--host` cross-platform
 
-**Status:** steps 0a (portable fake ssh) and 1 (typed `RemoteOperation` +
-shared `dispatch`) are done. Steps 2–4, 6 and 7 are in progress. Step 5 (the attach bridge,
-which the cloud PTY workflow needs; see the
-[VM scripts and results](../../../scripts/pty-vm/README.md)) comes after them.
+**Status:** steps 0a, 1, 2, 3, 4 and 6 are done: every `--host` operation but
+`attach` travels as a frame. Step 7 (real cmd.exe and PowerShell on the
+Windows lanes) is in progress. Step 5 (the attach bridge, which the cloud PTY
+workflow needs; see the
+[VM scripts and results](../../../scripts/pty-vm/README.md)) comes after it.
+The current contract is in
+[transport boundaries](../../architecture/06-transport-boundaries.md#the-remote-frame).
 
 Goal: every `--host` command travels as a typed request over SSH stdin, as
 `exec` already does. No user- or host-derived value is rebuilt into a remote
@@ -21,10 +24,10 @@ PowerShell state) belongs to [windows-parity](../backlog/windows-parity.md).
 
 ## Why — the security motivation
 
-`src/ssh.rs:57` (`build_ssh_command`) POSIX-`shell_words::quote`s every arg of
-the general remote commands (`start`, `status`, `list`, `log`, `push`, `kill`,
-`wait`, `watch`, `attach`) and sends them to the remote **login shell**. The doc
-comment (`src/ssh.rs:54`) already scopes this to POSIX shells and defers Windows.
+`build_ssh_command` POSIX-`shell_words::quote`d every arg of the general
+remote commands (`start`, `status`, `list`, `log`, `push`, `kill`, `wait`,
+`watch`, `attach`) and sent them to the remote **login shell**, which its doc
+comment scoped to POSIX shells. Step 6 removed it.
 
 The gap is exploitable, not cosmetic:
 
@@ -35,9 +38,9 @@ The gap is exploitable, not cosmetic:
 - Therefore `tendr --host winbox status 'x&calc'` → `ssh -T winbox tendr status
   'x&calc'` → cmd.exe splits on `&` → **`calc` executes**.
 
-`exec` is immune because its remote argv is constant by construction
-(`src/ssh.rs:96`). That is the proof the framed approach is correct; the older
-reconstructed-argv transport is not.
+`exec` was immune because its remote argv is constant by construction. That is
+the proof the framed approach is correct; the older reconstructed-argv
+transport was not.
 
 ### The local ssh-option vector (fixed)
 
@@ -84,7 +87,7 @@ are stable protocol/domain DTOs.
 ### 2. Wire format — one hidden, constant entry point
 
 ```
-ssh -T host tendr [--hello] _remote
+ssh -T host tendr [--hello] --exit-trailer _remote
 ```
 
 Nothing host- or user-derived appears after the SSH destination. The stream is:
@@ -98,11 +101,14 @@ optional raw body
 Example header:
 
 ```json
-{ "v": 1, "op": "start",
-  "params": { "session": "build", "namespace": "default",
-              "argv": ["powershell","-NoProfile"],
-              "cwd": "C:\\Users\\rick\\project", "env": {"MODE":"release"},
-              "stdin": true, "timeout": 300 } }
+{"v": 1, "op": "start",
+ "params": {"session": "build", "namespace": null,
+            "argv": ["powershell", "-NoProfile"],
+            "cwd": "C:\\Users\\rick\\project", "env": ["MODE=release"],
+            "unset_env": [], "stdin": true, "timeout": 300,
+            "exec_target": "PowerShell", "pty": false, "replace": false,
+            "on_exit": [], "after": [], "any_exit": false,
+            "boundary": null, "boundary_parent": []}}
 ```
 
 The length prefix exists because `push` needs raw bytes after the header. Cap
@@ -164,14 +170,10 @@ network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
 1. **Done.** `RemoteOperation` request types + shared `dispatch` (`src/remote_op.rs`);
    local commands route through them, SSH behaviour unchanged. A completeness
    test pins every `start` flag through the round trip.
-2. Add the framed codec + hidden `tendr [--hello] _remote` endpoint
-   (partial-read handling, header limits, version check, semantic validation).
-3. Move `start, status, list, log, kill, wait, watch` to the frame (`exec`
-   already rides its own).
-   **`start` is the security priority** — cwd, env, callbacks, child argv,
-   `--boundary`/`--boundary-parent` labels, and (easy to miss) **`log --since`**
-   are all currently shell-exposed.
-4. Move `push` (header + raw body framing).
+2. **Done.** `src/remote_frame.rs`: the codec and the hidden
+   `tendr [--hello] _remote` entry point.
+3. **Done.** `start, status, list, log, kill, wait, watch` travel as frames.
+4. **Done.** `push` sends its body after the header on the same stdin.
 5. Build the `attach` bridge.
    - **Unix bridge.** `attach --host` runs `ssh -T` to the constant entry
      point; the hello and typed PTY frames follow the header. Raw mode,
@@ -202,15 +204,14 @@ network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
      the `ssh -t` path during transition if that case matters. The ConPTY
      backend and console frontend themselves are in
      [windows-parity](../backlog/windows-parity.md#no-pty-or-attach).
-6. Delete general POSIX remote-argv reconstruction: every `legacy_argv` arm
-   but attach's. From here `attach` accepts only plain session names and fixed
-   flag values, since it is the one op still on `ssh -t` until step 5. Keep
-   shell quoting only for
-   the human-facing copy/paste **fallback text** (verified: `local_fallback_args`
-   is only `eprintln!`'d, never spawned) — label it "(POSIX shell)" so users don't
-   paste POSIX-quoted text at a Windows host.
+6. **Done.** The POSIX remote-argv path is gone. `attach` builds its `ssh -t`
+   command line from plain names and fixed flag values only. Shell quoting is
+   left only in the copy/paste fallback text, labelled `try (POSIX shell):`.
 7. Add real cmd.exe and PowerShell OpenSSH tests to the native Windows x64 and
-   ARM64 CI lanes (the lanes already exist).
+   ARM64 CI lanes (the lanes already exist). The first runs showed a
+   PowerShell login shell collapsing ssh's exit status to 0/1, so the remote
+   tendr now also sends its code as the last stderr line
+   ([exit trailer](../../architecture/06-transport-boundaries.md#the-exit-trailer)).
 
 ## Phase 1 build pins (the dispatch refactor)
 
@@ -286,8 +287,9 @@ Target grammar: `[A-Za-z0-9][A-Za-z0-9_-]{0,254}`. But flipping
 3. Keep a narrowly-scoped legacy-name reader for local cleanup/migration.
 4. Remove the remote restriction once framed transport lands.
 
-Defense-in-depth only — `start` stays vulnerable via cwd/env/callback/child argv
-until the frame replaces reconstruction. Not a substitute for the frame.
+Defense-in-depth only, and not a substitute for the frame. Since step 6 the
+remote restriction (1) applies to `attach` alone, the one op still on a
+rebuilt command line; step 4 here lifts it with the attach bridge.
 
 ## Scope / non-goals
 

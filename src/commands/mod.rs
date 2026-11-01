@@ -50,6 +50,7 @@ pub use run::cmd_run;
 pub use sidecar::cmd_sidecar;
 pub use skill::{cmd_skill_install, cmd_skill_path, cmd_skill_print};
 pub use start::cmd_start;
+pub(crate) use start::{check_unset_env_name, parse_env_entry};
 pub use status::cmd_status;
 pub use wait::cmd_wait;
 pub use watch::cmd_watch;

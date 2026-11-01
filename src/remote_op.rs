@@ -2,10 +2,10 @@
 //! list, log, push, kill, wait, watch and attach.
 //!
 //! The parsed command line becomes a [`RemoteOperation`] (`TryFrom<&Commands>`),
-//! and [`dispatch`] runs it. The local path already goes through both; the SSH
-//! path still rebuilds an argv from the request ([`RemoteOperation::legacy_argv`])
-//! until the frame transport carries the request itself
-//! (`docs/plans/active/01_remote-frame-transport.md`).
+//! and [`dispatch`] runs it. Locally that is the whole path. With `--host`
+//! the request travels as data in the remote frame ([`crate::remote_frame`])
+//! and the remote tendr dispatches it; `attach` alone still runs under
+//! `ssh -t`, with a command line of plain names ([`AttachRequest::ssh_argv`]).
 //!
 //! A request holds only what the user typed. Defaults (the namespace) and
 //! bindings (`--after` run ids) resolve in [`dispatch`], on the host that runs
@@ -161,8 +161,58 @@ pub struct AttachRequest {
     pub escape: EscapeMode,
 }
 
+impl AttachRequest {
+    /// The remote tendr argv for `attach --host`, which still runs under
+    /// `ssh -t` as a command line until the attach bridge lands. Only plain
+    /// names ([`tendr::ssh::is_plain_name`]) and fixed flag values go in it,
+    /// so no remote shell acts on any of it.
+    ///
+    /// # Errors
+    /// [`NotPlainName`] for a session or namespace that is not a plain name.
+    pub fn ssh_argv(&self) -> Result<Vec<String>, NotPlainName> {
+        let plain = |what, value: &str| {
+            if tendr::ssh::is_plain_name(value) {
+                Ok(value.to_owned())
+            } else {
+                Err(NotPlainName {
+                    what,
+                    value: value.to_owned(),
+                })
+            }
+        };
+        let mut args = vec!["attach".to_owned(), plain("session", &self.session)?];
+        if let Some(ns) = &self.namespace {
+            args.extend(["--namespace".to_owned(), plain("namespace", ns)?]);
+        }
+        if self.takeover {
+            args.push("--takeover".to_owned());
+        }
+        if self.escape == EscapeMode::Disabled {
+            args.extend(["--escape".to_owned(), "none".to_owned()]);
+        }
+        Ok(args)
+    }
+}
+
+/// A session or namespace that `attach --host` cannot put on its command line.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "attach over --host takes plain names until the attach bridge lands: \
+     {what} {value:?} must match [A-Za-z][A-Za-z0-9_-]{{0,254}}"
+)]
+pub struct NotPlainName {
+    what: &'static str,
+    value: String,
+}
+
 /// The remote operations, as listed when a local-only command is refused.
 const SUPPORTED_REMOTE: &str = "start, status, list, log, push, kill, wait, watch, attach";
+
+/// Whether `name` is an operation's name (`op` in the remote frame).
+pub fn is_operation(name: &str) -> bool {
+    // The list is pinned to the operations by `supported_list_names_every_operation`.
+    SUPPORTED_REMOTE.split(", ").any(|op| op == name)
+}
 
 /// A command that cannot be a [`RemoteOperation`]: it runs only locally (or,
 /// for `exec`, travels on its own frame). `wrap` relies on local process
@@ -306,149 +356,8 @@ impl TryFrom<&Commands> for RemoteOperation {
             Commands::Guide { .. } => return local("guide"),
             Commands::Skill { .. } => return local("skill"),
             Commands::Sidecar { .. } => return local("_sidecar"),
+            Commands::Remote => return local("_remote"),
         })
-    }
-}
-
-impl RemoteOperation {
-    /// The subcommand name.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Start(_) => "start",
-            Self::Status(_) => "status",
-            Self::List(_) => "list",
-            Self::Log(_) => "log",
-            Self::Push(_) => "push",
-            Self::Kill(_) => "kill",
-            Self::Wait(_) => "wait",
-            Self::Watch(_) => "watch",
-            Self::Attach(_) => "attach",
-        }
-    }
-
-    /// Whether the SSH session needs a remote TTY (`ssh -t`): attach only.
-    pub fn allocates_tty(&self) -> bool {
-        matches!(self, Self::Attach(_))
-    }
-
-    /// The remote tendr argv for the POSIX-quoted SSH transport.
-    pub fn legacy_argv(&self) -> Vec<String> {
-        let mut args = vec![self.name().to_owned()];
-        let flag = |args: &mut Vec<String>, name: &str, on: bool| {
-            if on {
-                args.push(format!("--{name}"));
-            }
-        };
-        let value = |args: &mut Vec<String>, name: &str, value: String| {
-            args.extend([format!("--{name}"), value]);
-        };
-        let namespace = |args: &mut Vec<String>, namespace: &Option<String>| {
-            if let Some(ns) = namespace {
-                value(args, "namespace", ns.clone());
-            }
-        };
-        match self {
-            Self::Start(r) => {
-                args.push(r.session.clone());
-                namespace(&mut args, &r.namespace);
-                flag(&mut args, "stdin", r.stdin);
-                flag(&mut args, "pty", r.pty);
-                flag(&mut args, "replace", r.replace);
-                if let Some(t) = r.timeout {
-                    value(&mut args, "timeout", t.to_string());
-                }
-                if let Some(c) = &r.cwd {
-                    value(&mut args, "cwd", c.display().to_string());
-                }
-                for e in &r.env {
-                    value(&mut args, "env", e.clone());
-                }
-                for u in &r.unset_env {
-                    value(&mut args, "unset-env", u.clone());
-                }
-                for o in &r.on_exit {
-                    value(&mut args, "on-exit", o.clone());
-                }
-                for a in &r.after {
-                    value(&mut args, "after", a.clone());
-                }
-                flag(&mut args, "any-exit", r.any_exit);
-                if let Some(et) = r.exec_target {
-                    value(&mut args, "exec-target", exec_target_flag(et).to_owned());
-                }
-                if let Some(b) = &r.boundary {
-                    // Display is the inverse of the parse, so this round-trips.
-                    value(&mut args, "boundary", b.to_string());
-                }
-                for parent in &r.boundary_parent {
-                    value(&mut args, "boundary-parent", parent.to_string());
-                }
-                args.push("--".to_owned());
-                args.extend(r.argv.iter().cloned());
-            }
-            Self::Status(r) => {
-                args.push(r.session.clone());
-                namespace(&mut args, &r.namespace);
-            }
-            Self::List(r) => namespace(&mut args, &r.namespace),
-            Self::Log(r) => {
-                args.push(r.session.clone());
-                namespace(&mut args, &r.namespace);
-                if let Some(n) = r.tail {
-                    value(&mut args, "tail", n.to_string());
-                }
-                flag(&mut args, "follow", r.follow);
-                if let Some(s) = &r.since {
-                    value(&mut args, "since", s.clone());
-                }
-                flag(&mut args, "raw", r.raw);
-            }
-            Self::Push(r) => {
-                args.push(r.session.clone());
-                namespace(&mut args, &r.namespace);
-            }
-            Self::Kill(r) => {
-                args.push(r.session.clone());
-                namespace(&mut args, &r.namespace);
-                flag(&mut args, "force", r.force);
-            }
-            Self::Wait(r) => {
-                namespace(&mut args, &r.namespace);
-                if let Some(t) = r.timeout {
-                    value(&mut args, "timeout", t.to_string());
-                }
-                flag(&mut args, "any", r.any);
-                args.extend(r.sessions.iter().cloned());
-            }
-            Self::Watch(r) => {
-                // ready_file is a local orchestration signal; not forwarded.
-                namespace(&mut args, &r.namespace);
-                flag(&mut args, "events", r.events);
-                flag(&mut args, "logs", r.logs);
-                flag(&mut args, "annotations", r.annotations);
-                flag(&mut args, "from-now", r.from_now);
-            }
-            Self::Attach(r) => {
-                args.push(r.session.clone());
-                namespace(&mut args, &r.namespace);
-                flag(&mut args, "takeover", r.takeover);
-                if r.escape == EscapeMode::Disabled {
-                    value(&mut args, "escape", "none".to_owned());
-                }
-            }
-        }
-        args
-    }
-}
-
-/// The `--exec-target` value naming `target`.
-fn exec_target_flag(target: ExecTarget) -> &'static str {
-    match target {
-        ExecTarget::PosixShell => "posix-shell",
-        ExecTarget::PowerShell => "powershell",
-        ExecTarget::PythonRepl => "python-repl",
-        ExecTarget::DuckDb => "duckdb",
-        ExecTarget::None => "none",
     }
 }
 
@@ -860,164 +769,11 @@ mod tests {
         assert!(!(i.stdin || i.pty || i.replace || i.any_exit));
     }
 
-    /// The SSH argv derived from the typed operation, pinned byte for byte
-    /// against what the argv reconstruction has always produced.
+    /// attach's `ssh -t` command line: the plain names and fixed flags, in
+    /// the order the remote parse expects.
     #[test]
-    fn legacy_argv_is_unchanged() {
+    fn attach_ssh_argv_is_plain() {
         let cases: &[(&[&str], &[&str])] = &[
-            (
-                &[
-                    "start",
-                    "s",
-                    "--namespace",
-                    "n",
-                    "--stdin",
-                    "--pty",
-                    "--replace",
-                    "--timeout",
-                    "5",
-                    "--cwd",
-                    "/w d",
-                    "--env",
-                    "A=1",
-                    "--unset-env",
-                    "U",
-                    "--on-exit",
-                    "cb x",
-                    "--after",
-                    "d",
-                    "--any-exit",
-                    "--exec-target",
-                    "python-repl",
-                    "--boundary",
-                    "host:h",
-                    "--boundary-parent",
-                    "vm:v",
-                    "--",
-                    "prog",
-                    "-x",
-                ],
-                &[
-                    "start",
-                    "s",
-                    "--namespace",
-                    "n",
-                    "--stdin",
-                    "--pty",
-                    "--replace",
-                    "--timeout",
-                    "5",
-                    "--cwd",
-                    "/w d",
-                    "--env",
-                    "A=1",
-                    "--unset-env",
-                    "U",
-                    "--on-exit",
-                    "cb x",
-                    "--after",
-                    "d",
-                    "--any-exit",
-                    "--exec-target",
-                    "python-repl",
-                    "--boundary",
-                    "host:h",
-                    "--boundary-parent",
-                    "vm:v",
-                    "--",
-                    "prog",
-                    "-x",
-                ],
-            ),
-            (&["start", "s", "true"], &["start", "s", "--", "true"]),
-            (
-                &["start", "--exec-target", "posix-shell", "s", "sh"],
-                &["start", "s", "--exec-target", "posix-shell", "--", "sh"],
-            ),
-            (
-                &["start", "--exec-target", "powershell", "s", "pwsh"],
-                &["start", "s", "--exec-target", "powershell", "--", "pwsh"],
-            ),
-            (
-                &["start", "--exec-target", "duckdb", "s", "duckdb"],
-                &["start", "s", "--exec-target", "duckdb", "--", "duckdb"],
-            ),
-            (
-                &["start", "--exec-target", "none", "s", "x"],
-                &["start", "s", "--exec-target", "none", "--", "x"],
-            ),
-            (
-                &["status", "--namespace", "n", "s"],
-                &["status", "s", "--namespace", "n"],
-            ),
-            (&["list"], &["list"]),
-            (&["list", "--namespace", "n"], &["list", "--namespace", "n"]),
-            (
-                &[
-                    "log",
-                    "s",
-                    "-n",
-                    "3",
-                    "-f",
-                    "--since",
-                    "5m",
-                    "-r",
-                    "--namespace",
-                    "n",
-                ],
-                &[
-                    "log",
-                    "s",
-                    "--namespace",
-                    "n",
-                    "--tail",
-                    "3",
-                    "--follow",
-                    "--since",
-                    "5m",
-                    "--raw",
-                ],
-            ),
-            (&["push", "s"], &["push", "s"]),
-            (
-                &["kill", "-f", "s", "--namespace", "n"],
-                &["kill", "s", "--namespace", "n", "--force"],
-            ),
-            (
-                &["wait", "a", "b", "--any", "-t", "7", "--namespace", "n"],
-                &[
-                    "wait",
-                    "--namespace",
-                    "n",
-                    "--timeout",
-                    "7",
-                    "--any",
-                    "a",
-                    "b",
-                ],
-            ),
-            (
-                &[
-                    "watch",
-                    "--from-now",
-                    "--annotations",
-                    "--logs",
-                    "--events",
-                    "--namespace",
-                    "n",
-                    "--ready-file",
-                    "/r",
-                ],
-                &[
-                    "watch",
-                    "--namespace",
-                    "n",
-                    "--events",
-                    "--logs",
-                    "--annotations",
-                    "--from-now",
-                ],
-            ),
             (&["attach", "s"], &["attach", "s"]),
             (
                 &["attach", "s", "--escape", "ctrl-backslash"],
@@ -1030,14 +786,14 @@ mod tests {
                     "--escape",
                     "none",
                     "--namespace",
-                    "n",
-                    "s",
+                    "n-1",
+                    "S_2",
                 ],
                 &[
                     "attach",
-                    "s",
+                    "S_2",
                     "--namespace",
-                    "n",
+                    "n-1",
                     "--takeover",
                     "--escape",
                     "none",
@@ -1045,16 +801,31 @@ mod tests {
             ),
         ];
         for (args, expected) in cases {
-            let argv = round_trip(&op(args)).legacy_argv();
-            assert_eq!(argv, strings(expected), "{args:?}");
+            let RemoteOperation::Attach(request) = op(args) else {
+                panic!("not an attach");
+            };
+            assert_eq!(request.ssh_argv().unwrap(), strings(expected), "{args:?}");
         }
     }
 
     #[test]
-    fn only_attach_allocates_a_tty() {
-        assert!(op(&["attach", "s"]).allocates_tty());
-        for args in [&["status", "s"][..], &["list"], &["start", "s", "x"]] {
-            assert!(!op(args).allocates_tty(), "{args:?}");
+    fn attach_ssh_argv_refuses_names_a_shell_acts_on() {
+        for args in [
+            &["attach", "x&calc"][..],
+            &["attach", "a'b"],
+            &["attach", "_s"],
+            &["attach", "0x1F"],
+            &["attach", "--namespace", "n$(id)", "s"],
+        ] {
+            let RemoteOperation::Attach(request) = op(args) else {
+                panic!("not an attach");
+            };
+            let err = request.ssh_argv().expect_err("not plain");
+            assert!(
+                err.to_string()
+                    .starts_with("attach over --host takes plain names"),
+                "{err}"
+            );
         }
     }
 
@@ -1071,6 +842,7 @@ mod tests {
             (&["events"], "events"),
             (&["exec", "s", "true"], "exec"),
             (&["_sidecar", "--session-dir", "/d"], "_sidecar"),
+            (&["_remote"], "_remote"),
         ];
         for (args, name) in cases {
             let err = RemoteOperation::try_from(&parse(args)).expect_err("local-only");
@@ -1079,10 +851,11 @@ mod tests {
         }
     }
 
-    /// The generic rejection names every remote operation, and only those.
+    /// The generic rejection names every remote operation, and only those,
+    /// as the frame's `op` spells them.
     #[test]
     fn supported_list_names_every_operation() {
-        let names: Vec<&str> = [
+        let names: Vec<String> = [
             op(&["start", "s", "x"]),
             op(&["status", "s"]),
             op(&["list"]),
@@ -1094,9 +867,16 @@ mod tests {
             op(&["attach", "s"]),
         ]
         .iter()
-        .map(RemoteOperation::name)
+        .map(|o| {
+            serde_json::to_value(o).unwrap()["op"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
         .collect();
         assert_eq!(SUPPORTED_REMOTE, names.join(", "));
+        assert!(names.iter().all(|name| is_operation(name)));
+        assert!(!is_operation("exec") && !is_operation("st"));
     }
 
     #[test]

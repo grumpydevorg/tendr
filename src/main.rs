@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tendr::model::event::EventTimestamp;
 use tendr::model::ids::{Namespace, Source};
 
 mod commands;
+mod remote_frame;
 mod remote_op;
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -59,8 +60,9 @@ struct Cli {
     /// Route command through SSH to a remote host (e.g. user@box).
     ///
     /// Supported remotely: start, status, list, log, push, kill, wait,
-    /// watch, attach, and exec (the payload rides the frame transport,
-    /// not a shell). Every other command is local-only.
+    /// watch, attach and exec. The request travels to the remote tendr as
+    /// data, never through a shell; the remote tendr must be this version
+    /// or newer. Every other command is local-only.
     // allow_hyphen_values so an option-shaped destination (`-oProxyCommand=…`)
     // is captured as the value and rejected by our own validate_destination
     // (clear error, exit 2) rather than mis-parsed by clap as a flag.
@@ -72,6 +74,13 @@ struct Cli {
     /// through authentication, which ends the connect deadline.
     #[arg(long, global = true, hide = true)]
     hello: bool,
+
+    /// Run the command, then write `tendr-exit <code>` (`tendr::ssh::EXIT_TRAILER`)
+    /// to stderr as its last line. A local `--host` call passes it to the
+    /// remote tendr: a PowerShell login shell reports any failure as ssh exit
+    /// 1, so the code travels in-band.
+    #[arg(long, hide = true)]
+    exit_trailer: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -473,6 +482,9 @@ enum Commands {
         #[arg(long)]
         session_dir: PathBuf,
     },
+    /// Internal: run one `--host` request read from stdin (not for direct use)
+    #[command(name = "_remote", hide = true)]
+    Remote,
 }
 
 /// Subcommands of `tendr skill`.
@@ -702,8 +714,83 @@ fn parse_optional_namespace(namespace: Option<String>) -> anyhow::Result<Option<
         .transpose()
 }
 
+/// `--exit-trailer`: run this command line as a child, without
+/// `--exit-trailer`, with our stdin, stdout and stderr. Then write the
+/// child's exit code to stderr as the last line, `tendr-exit <code>`, and
+/// exit with it. The child writes the hello, if asked, as the first line:
+/// this process writes nothing before it. Running the command in a child
+/// covers every way it can end, every `process::exit` and a panic included.
+/// This process never reads stdin. A child ended by a signal (Unix) gets no
+/// trailer: this exits 128 + the signal.
+fn run_with_exit_trailer(matches: &clap::ArgMatches) -> ! {
+    use std::io::Write;
+
+    let Some(args) = without_exit_trailer(std::env::args_os().collect(), matches) else {
+        eprintln!("error: --exit-trailer must be given as its own word before the command");
+        std::process::exit(2);
+    };
+    let code = match std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).args(&args[1..]).status())
+    {
+        Ok(status) => match status.code() {
+            Some(code) => code,
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    std::process::exit(128 + status.signal().unwrap_or(0));
+                }
+                #[cfg(not(unix))]
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("error: cannot run tendr: {e}");
+            1
+        }
+    };
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{}{code}", tendr::ssh::EXIT_TRAILER);
+    let _ = stderr.flush();
+    std::process::exit(code);
+}
+
+/// `argv` without the `--exit-trailer` clap read as the flag, found by its
+/// position, so the same word as a child command's argument stays. The flag
+/// is accepted only before the subcommand, where clap's positions count from
+/// the start of `argv`. `None` when a position clap reports does not hold the
+/// plain flag (clap counts `--opt=value` as two positions), so the wrong word
+/// is never removed.
+fn without_exit_trailer(
+    argv: Vec<std::ffi::OsString>,
+    matches: &clap::ArgMatches,
+) -> Option<Vec<std::ffi::OsString>> {
+    let flag: Vec<usize> = matches
+        .indices_of("exit_trailer")
+        .into_iter()
+        .flatten()
+        .collect();
+    if flag
+        .iter()
+        .any(|&i| argv.get(i).is_none_or(|arg| arg != "--exit-trailer"))
+    {
+        return None;
+    }
+    Some(
+        argv.into_iter()
+            .enumerate()
+            .filter(|(i, _)| !flag.contains(i))
+            .map(|(_, arg)| arg)
+            .collect(),
+    )
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if cli.exit_trailer {
+        run_with_exit_trailer(&matches);
+    }
     if cli.hello {
         eprintln!("{}", tendr::ssh::HELLO_LINE);
     }
@@ -759,9 +846,11 @@ fn main() {
                     let mut full = vec!["tendr".to_string()];
                     full.extend(args);
                     let remote_cmd = shell_words::join(&full);
+                    // POSIX quoting: the text is for a POSIX shell on both
+                    // ends, and is labelled so.
                     eprintln!(
                         "error: '{}' is local-only and does not support --host\n\
-                         try:  ssh {} {}",
+                         try (POSIX shell):  ssh {} {}",
                         local.command,
                         shell_words::quote(host),
                         shell_words::quote(&remote_cmd)
@@ -772,7 +861,28 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        match tendr::ssh::exec_ssh(host, &operation.legacy_argv(), operation.allocates_tty()) {
+        let sent = match operation {
+            // attach still needs `ssh -t`, so it cannot take its request on
+            // stdin: it sends a command line of plain names instead.
+            remote_op::RemoteOperation::Attach(request) => match request.ssh_argv() {
+                Ok(args) => tendr::ssh::exec_ssh_attach(host, &args),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
+            operation => match remote_frame::encode(&operation) {
+                Ok(frame) => {
+                    let body = matches!(operation, remote_op::RemoteOperation::Push(_));
+                    tendr::ssh::exec_ssh_remote(host, frame, body)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
+        };
+        match sent {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("{e}");
@@ -936,6 +1046,7 @@ fn main() {
             SkillAction::Path { global } => commands::cmd_skill_path(global),
         },
         Commands::Sidecar { session_dir } => commands::cmd_sidecar(session_dir),
+        Commands::Remote => remote_frame::serve(),
         // The remote-capable commands run through the same typed layer as
         // `--host`. Named, not a catch-all, so a new command must be classified.
         remote @ (Commands::Start { .. }
@@ -955,5 +1066,80 @@ fn main() {
         eprintln!("{e:#}");
         // 1, or a PTY operation's own code (80–85, `tendr::pty_exit`).
         std::process::exit(tendr::pty_exit::exit_code(&e));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wrapper's child gets the command line without the `--exit-trailer`
+    /// clap read as the flag, and keeps the same word when it is a child
+    /// command's argument. `--hello` stays: the child writes the hello.
+    #[test]
+    fn the_wrapper_child_runs_the_command_without_the_flag() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["tendr", "--hello", "--exit-trailer", "_remote"],
+                &["tendr", "--hello", "_remote"],
+            ),
+            (
+                &["tendr", "--exit-trailer", "exec", "--frame-from-stdin"],
+                &["tendr", "exec", "--frame-from-stdin"],
+            ),
+            (
+                &["tendr", "--exit-trailer", "status", "s", "--hello"],
+                &["tendr", "status", "s", "--hello"],
+            ),
+            (
+                &[
+                    "tendr",
+                    "--exit-trailer",
+                    "start",
+                    "s",
+                    "--",
+                    "prog",
+                    "--hello",
+                    "--exit-trailer",
+                ],
+                &[
+                    "tendr",
+                    "start",
+                    "s",
+                    "--",
+                    "prog",
+                    "--hello",
+                    "--exit-trailer",
+                ],
+            ),
+        ];
+        for (argv, expected) in cases {
+            let matches = Cli::command().try_get_matches_from(*argv).unwrap();
+            let argv = argv.iter().map(std::ffi::OsString::from).collect();
+            let got = without_exit_trailer(argv, &matches);
+            assert_eq!(
+                got,
+                Some(
+                    expected
+                        .iter()
+                        .map(std::ffi::OsString::from)
+                        .collect::<Vec<_>>()
+                )
+            );
+        }
+        // clap counts `--host=box` as two positions, so its index for the
+        // flag no longer names the flag's word: refuse rather than strip
+        // the wrong one.
+        let argv = ["tendr", "--host=box", "--exit-trailer", "status", "s"];
+        let matches = Cli::command().try_get_matches_from(argv).unwrap();
+        let argv = argv.iter().map(std::ffi::OsString::from).collect();
+        assert_eq!(without_exit_trailer(argv, &matches), None);
+        // Only before the subcommand: the child never sees the flag, so it
+        // cannot wrap itself again.
+        assert!(
+            Cli::command()
+                .try_get_matches_from(["tendr", "status", "s", "--exit-trailer"])
+                .is_err()
+        );
     }
 }
