@@ -92,6 +92,10 @@ struct ExecResult {
     /// reply (late replies to a timed-out exec, unsolicited output).
     #[serde(skip_serializing_if = "Option::is_none")]
     unmatched: Option<Vec<String>>,
+    /// NDJSON target only: the `id` tendr added to the request, so a caller
+    /// can address it later (for example, to cancel it after a timeout).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -277,6 +281,10 @@ pub fn cmd_exec(
             result_data["unmatched"] = serde_json::json!(unmatched);
             result_preview["unmatched_count"] = serde_json::json!(unmatched.len());
         }
+        if let Some(request_id) = &result.request_id {
+            result_data["request_id"] = serde_json::json!(request_id);
+            result_preview["request_id"] = serde_json::json!(request_id);
+        }
         emit_exec_event(
             &mut event_writer,
             &meta,
@@ -313,8 +321,9 @@ pub fn cmd_exec(
     if result.timed_out {
         if meta.launch_spec().exec_target == tendr::model::spec::ExecTarget::Ndjson {
             eprintln!(
-                "exec timed out — the request may still be running in the session; its reply \
-                 will arrive in a later exec's `unmatched` (or `tendr log`)"
+                "exec timed out — request {} may still be running in the session; its reply \
+                 will arrive in a later exec's `unmatched` (or `tendr log`)",
+                result.request_id.as_deref().unwrap_or_default()
             );
         } else {
             eprintln!("exec timed out — command may still be running in the shell");
@@ -554,6 +563,7 @@ fn wait_sentinel_result(
             timed_out,
             truncated: false,
             unmatched: None,
+            request_id: None,
         }
     };
 
@@ -685,6 +695,7 @@ fn wait_side_channel_result(
                     timed_out: true,
                     truncated: false,
                     unmatched: None,
+                    request_id: None,
                 });
             }
         }
@@ -712,6 +723,7 @@ fn wait_side_channel_result(
                 timed_out: false,
                 truncated: false,
                 unmatched: None,
+                request_id: None,
             });
         }
 
@@ -759,6 +771,7 @@ fn wait_ndjson_result(
             timed_out,
             truncated: false,
             unmatched: Some(unmatched),
+            request_id: Some(token.to_owned()),
         }
     };
 
@@ -1167,6 +1180,7 @@ mod tests {
             timed_out: false,
             truncated: false,
             unmatched: None,
+            request_id: None,
         }
     }
 

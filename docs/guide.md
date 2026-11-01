@@ -190,15 +190,49 @@ tendr exec  dev -- '{"cmd":"read","bytes":4,"timeout_ms":1000}'
 - Every other stdout line seen while waiting is kept, in order, in
   `unmatched`: a late reply to an `exec` that timed out, or output the program
   sent on its own. The program's stderr is `stderr`.
+- `request_id` is the `id` tendr added to the request. It is present on every
+  NDJSON result, including a timeout, so you can still address the request.
 
 ```json
-{"session":"dev","stdout":"{\"id\":\"…\",\"ok\":true,…}","stderr":"","exit_code":0,"cwd_after":"","timed_out":false,"truncated":false,"unmatched":[]}
+{"session":"dev","stdout":"{\"id\":\"…\",\"ok\":true,…}","stderr":"","exit_code":0,"cwd_after":"","timed_out":false,"truncated":false,"unmatched":[],"request_id":"…"}
 ```
 
 A timed-out `exec` exits 124 at once, unlike the other targets, and the next
 `exec` can start while the program is still busy. It still gets its own
 reply, because replies are matched by `id`. Lines the program writes while no
 `exec` is waiting are only in the log (`tendr log dev`).
+
+Tendr has no cancel of its own; to stop a timed-out request, send the
+program's own cancel request naming `request_id`. For example, on a `sio
+stdio` session named `serial`:
+
+```bash
+tendr exec serial -- '{"cmd":"cancel","target":"<request_id>"}'
+```
+
+This is an ordinary NDJSON request. What follows is sio's behaviour (sio
+0.4.0, [SKILL.md, "Waiting and cancelling"](https://github.com/grumpydevorg/sio/blob/main/skills/sio/SKILL.md)),
+not tendr's:
+
+- A cancel skips sio's queue and stops the `read`, `readline` or `expect`
+  running when it arrives, within about 100 ms. With `target`, it stops it
+  only if the running request's id equals `target`.
+- The stopped request replies with `end:"cancelled"` and
+  `consumes_input:false`; its bytes stay buffered.
+- The cancel's own reply is `{"ok":true,"result":{"cancelled":true|false}}`
+  (sio main f91bf29). A cancel that stops a wait replies `true` right after
+  that wait's `cancelled` reply. A cancel that stops nothing (wrong or stale
+  `target`, or nothing running) replies `false` at once, ahead of the
+  replies to running and queued requests.
+- An untargeted `{"cmd":"cancel"}` is safe only when one caller owns the
+  session.
+- Requests queued behind a running one are capped at 16 MiB (sio main
+  ae2fe52); beyond that, a request gets an immediate, retryable
+  `queue_full` reply and does nothing.
+
+On tendr's side, the cancel `exec` exits 0 either way, and the stopped
+request's reply, which arrives while it waits, lands in its `unmatched`. A
+`queue_full` reply is an `ok:false` reply, so its `exec` exits 1.
 
 ## Answer prompts and attach
 

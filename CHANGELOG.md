@@ -52,14 +52,16 @@
   takes one JSON object, adds a fresh string `id`, and writes it as one line
   to the child's stdin. The stdout line whose `id` matches is the result's
   `stdout`; every other stdout line seen meanwhile, such as a late reply to an
-  `exec` that timed out, is listed in a new `unmatched` field. A reply with
-  `"ok": false` or a non-null `error` exits 1. A request that is not one
-  object, or that has its own `id`, exits 2 and sends nothing. A timed-out
-  NDJSON `exec` exits 124 at once and the next one can start, since replies
-  are matched by `id`. The target is never inferred and needs a pipe session
-  (`--stdin`); `exec` refuses it on a PTY session. `tendr guide ndjson`
-  covers it. Other targets' `exec` results are unchanged. Using it over
-  `--host` needs this version on the remote host.
+  `exec` that timed out, is listed in a new `unmatched` field. A new
+  `request_id` field reports the `id` tendr added, even on a timeout, so a
+  caller can cancel a timed-out request with the program's own cancel
+  request. A reply with `"ok": false` or a non-null `error` exits 1. A
+  request that is not one object, or that has its own `id`, exits 2 and
+  sends nothing. A timed-out NDJSON `exec` exits 124 at once and the next
+  one can start, since replies are matched by `id`. The target is never
+  inferred and needs a pipe session (`--stdin`); `exec` refuses it on a PTY
+  session. `tendr guide ndjson` covers it. Other targets' `exec` results are
+  unchanged. Using it over `--host` needs this version on the remote host.
 
 ### Changed
 

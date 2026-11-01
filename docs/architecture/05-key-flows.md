@@ -118,7 +118,9 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
   first stdout line that parses as a JSON object with that `id` is the
   reply; every other stdout line goes to `unmatched`, and stderr lines to
   `stderr`. A reply with `"ok": false` or a non-null `error` sets the exit
-  code to 1. The `exec.result` event carries `unmatched` too.
+  code to 1. The result's `request_id` is the token, on every NDJSON result
+  including a timeout. The `exec.result` event carries `unmatched` and
+  `request_id` too.
 
 ### Timeouts
 

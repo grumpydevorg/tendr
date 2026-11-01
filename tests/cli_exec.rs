@@ -2190,6 +2190,7 @@ fn exec_ndjson_returns_the_matching_reply() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let mut keys = EXEC_RESULT_KEYS.map(str::to_owned).to_vec();
     keys.push("unmatched".to_owned());
+    keys.push("request_id".to_owned());
     assert_eq!(result_keys(&output.stdout), keys);
 
     let result = json(&output.stdout);
@@ -2209,6 +2210,7 @@ fn exec_ndjson_returns_the_matching_reply() {
         reply["id"].as_str().is_some_and(|id| !id.is_empty()),
         "tendr sets a string id: {reply}"
     );
+    assert_eq!(result["request_id"], reply["id"], "{result}");
 }
 
 /// `"ok": false` or a non-null `error` in the reply is exit code 1; the
@@ -2231,6 +2233,7 @@ fn exec_ndjson_failure_reply_exits_1() {
         let reply: serde_json::Value =
             serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
         assert_eq!(reply["cmd"], "open");
+        assert_eq!(result["request_id"], reply["id"], "{result}");
     }
 
     let status = json(
@@ -2246,6 +2249,8 @@ fn exec_ndjson_failure_reply_exits_1() {
 /// The exec lock is free once a timed-out exec exits, while the child still
 /// works on its request. The child's late reply must not be taken as the next
 /// exec's reply: the next exec returns its own, with the late one unmatched.
+/// The timed-out result's `request_id` is the id the child received, which
+/// the child echoes in its late reply.
 #[test]
 fn exec_ndjson_late_reply_lands_in_the_next_exec() {
     let _lock = lock();
@@ -2256,7 +2261,7 @@ fn exec_ndjson_late_reply_lands_in_the_next_exec() {
     assert_eq!(slow.status.code(), Some(124), "{slow:?}");
     let warning = String::from_utf8_lossy(&slow.stderr);
     assert!(
-        warning.contains("request may still be running in the session")
+        warning.contains("may still be running in the session")
             && warning.contains("unmatched")
             && !warning.contains("in the shell"),
         "{warning}"
@@ -2265,6 +2270,10 @@ fn exec_ndjson_late_reply_lands_in_the_next_exec() {
     assert_eq!(slow["timed_out"], true);
     assert_eq!(slow["stdout"], "");
     assert_eq!(slow["unmatched"], serde_json::json!([]));
+    let request_id = slow["request_id"]
+        .as_str()
+        .expect("request_id on a timeout");
+    assert!(!request_id.is_empty(), "{slow}");
 
     let next = ndjson_exec(&root, "dev", 20, r#"{"cmd":"fast"}"#);
     assert_eq!(next.status.code(), Some(0), "{next:?}");
@@ -2276,8 +2285,9 @@ fn exec_ndjson_late_reply_lands_in_the_next_exec() {
     assert_eq!(unmatched.len(), 1, "{next}");
     let late: serde_json::Value = serde_json::from_str(unmatched[0].as_str().unwrap()).unwrap();
     assert_eq!(late["cmd"], "slow", "{next}");
-    assert!(late["id"].is_string());
+    assert_eq!(late["id"], request_id, "the child received the reported id");
     assert_ne!(late["id"], reply["id"]);
+    assert_eq!(next["request_id"], reply["id"], "{next}");
 }
 
 /// Anything but one JSON object without an `id` is a usage error (exit 2)
@@ -2403,7 +2413,7 @@ fn exec_ndjson_target_is_explicit_only() {
 }
 
 /// The other targets' exec result keeps exactly its keys, in order: the
-/// NDJSON `unmatched` field never appears there.
+/// NDJSON `unmatched` and `request_id` fields never appear there.
 #[test]
 fn exec_result_shape_of_other_targets_is_unchanged() {
     let _lock = lock();
