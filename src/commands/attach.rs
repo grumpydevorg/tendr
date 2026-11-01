@@ -79,8 +79,11 @@ struct Control {
 
 #[cfg(unix)]
 impl Control {
-    /// Whether another client took this control over: the event log records a
-    /// takeover granting the epoch after this one, in this run.
+    /// Whether another client took this control over: in this run, the event
+    /// log records a takeover granting the epoch after this one, and no
+    /// detach releasing this one. A client that had already let go (dropped
+    /// for falling behind, say) is not taken over by a later `--takeover`,
+    /// which also grants the next epoch.
     ///
     /// A client that stopped reading its output cannot read the `MSG_RETIRED`
     /// queued behind it, so the sidecar records the takeover before it ends the
@@ -94,13 +97,18 @@ impl Control {
         let Ok(log) = tendr::events::read_session_events(&self.session_dir) else {
             return false;
         };
-        log.events.iter().any(|event| {
-            event.run_id == self.run_id
-                && event.kind.as_str() == "pty.control_changed"
-                && event.data.as_ref().is_some_and(|data| {
-                    data["trigger"] == "takeover" && data["epoch"] == successor.get()
-                })
-        })
+        let changes = || {
+            log.events.iter().filter_map(|event| {
+                (event.run_id == self.run_id && event.kind.as_str() == "pty.control_changed")
+                    .then_some(event.data.as_ref())
+                    .flatten()
+            })
+        };
+        let released =
+            changes().any(|data| data["trigger"] == "detach" && data["epoch"] == self.epoch.get());
+        !released
+            && changes()
+                .any(|data| data["trigger"] == "takeover" && data["epoch"] == successor.get())
     }
 }
 
@@ -411,9 +419,10 @@ mod unix_relay {
         // Only report once the terminal is restored, and never after a user
         // detach, whose terminal may be the thing that is blocked. A client
         // that was not reading when it was taken over never got the message,
-        // so the event log decides.
-        let taken_over =
-            ending != Ending::Detached && (retired.load(Ordering::SeqCst) || control.taken_over());
+        // so at the end of its connection the event log decides.
+        let taken_over = ending != Ending::Detached
+            && (retired.load(Ordering::SeqCst)
+                || (ending == Ending::SessionClosed && control.taken_over()));
         let mut notes = Vec::new();
         if let Ending::Signalled(cancel) = ending {
             notes.push(format!("tendr: attach ended by {}", cancel.name()));

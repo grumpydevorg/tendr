@@ -1002,10 +1002,15 @@ fn read_until_closed(stream: &mut UnixStream) -> Vec<(u8, Vec<u8>)> {
 
 /// Wait for meta.json PTY control to reach a specific state.
 fn wait_for_pty_control(root: &TempDir, session: &str, expected: &str) {
+    wait_for_pty_control_within(root, session, expected, Duration::from_secs(5));
+}
+
+/// [`wait_for_pty_control`], for a change that may take up to `within`.
+fn wait_for_pty_control_within(root: &TempDir, session: &str, expected: &str, within: Duration) {
     let meta_path = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/meta.json"));
-    poll_until(Duration::from_secs(5), Duration::from_millis(50), || {
+    poll_until(within, Duration::from_millis(50), || {
         let control = std::fs::read_to_string(&meta_path)
             .ok()
             .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
@@ -3713,15 +3718,21 @@ fn cli_attach_taken_over_while_stalled_exits_81() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = harness::SessionGuard::new(&root, "pty-x81-stalled");
-    // A steady flood, slow enough that the stalled client stays well inside
-    // the sidecar's queue budget and is never disconnected for falling behind.
+    // A paced flood of 8000 bytes per 10 ms tick: at most 800 KB/s, so at
+    // most 3.2 MB in the 4 s stall, well inside the sidecar's 8 MiB viewer
+    // queue, and the client is never disconnected for falling behind. What
+    // must fill for the sidecar's write to block is well under 1 MB: the
+    // terminal's PTY buffer (tens of KB), the socket's buffers (16 KB on
+    // macOS, about 2 × 208 KB on Linux) and the one output frame (at most
+    // 64 KB) the client's reader holds. Even with `sleep` taking twice its
+    // 10 ms, the flood brings 1.6 MB in 4 s, so the stall is certain.
     tendr(&root)
         .args(["start", "pty-x81-stalled", "--pty", "--stdin", "--"])
         .args([
             "sh",
             "-c",
-            "stty raw -echo; line=$(printf '%0100d' 0); \
-             while :; do i=0; while [ $i -lt 10 ]; do printf '%s' \"$line\"; i=$((i+1)); done; sleep 0.01; done",
+            "stty raw -echo; line=$(printf '%01000d' 0); \
+             while :; do i=0; while [ $i -lt 8 ]; do printf '%s' \"$line\"; i=$((i+1)); done; sleep 0.01; done",
         ])
         .output()
         .unwrap();
@@ -3732,8 +3743,7 @@ fn cli_attach_taken_over_while_stalled_exits_81() {
     wrapped.wait_output_contains("0000000000");
     wait_for_pty_control(&root, "pty-x81-stalled", "HumanControl");
     // The terminal stops reading; the flood fills its buffer, the CLI's socket
-    // and the sidecar's write to it. That cannot be observed directly, so give
-    // the flood time to fill them.
+    // and the sidecar's write to it.
     wrapped.cli.pause_output();
     std::thread::sleep(Duration::from_secs(4));
 
@@ -3756,6 +3766,51 @@ fn cli_attach_taken_over_while_stalled_exits_81() {
     );
     wrapped.assert_terminal_restored();
     wrapped.wait_output_contains("took over");
+}
+
+/// A client dropped for falling behind has already let go of control, so a
+/// later `--takeover`, which grants the next epoch, did not take it over: it
+/// exits 0 once its terminal reads again.
+#[test]
+fn cli_attach_dropped_for_lag_then_taken_over_exits_0() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-x0-lagged");
+    // Unpaced: far past the 8 MiB viewer queue within a few seconds.
+    tendr(&root)
+        .args(["start", "pty-x0-lagged", "--pty", "--stdin", "--"])
+        .args(["sh", "-c", "stty raw -echo; yes 0000000000"])
+        .output()
+        .unwrap();
+    harness::wait_running(&root, "pty-x0-lagged");
+    let sock_path = wait_for_attach_socket(&root, "pty-x0-lagged");
+
+    let wrapped = WrappedAttach::spawn(&root, "x0-lagged", &["pty-x0-lagged"]);
+    wrapped.wait_output_contains("0000000000");
+    wait_for_pty_control(&root, "pty-x0-lagged", "HumanControl");
+    wrapped.cli.pause_output();
+    // The sidecar drops the client once its queue overflows, releasing control.
+    // Under a loaded test run the flood can take a while to pass 8 MiB.
+    wait_for_pty_control_within(
+        &root,
+        "pty-x0-lagged",
+        "AgentControl",
+        Duration::from_secs(60),
+    );
+
+    let (other, (msg_type, _)) = hello(&sock_path, Mode::Takeover);
+    assert_eq!(msg_type, MSG_ACCEPTED);
+    drop(other);
+    wait_for_pty_control(&root, "pty-x0-lagged", "AgentControl");
+
+    wrapped.cli.resume_output();
+    assert_eq!(
+        wrapped.wait_exit(Duration::from_secs(20)),
+        0,
+        "a client dropped before the takeover; cli output tail: {:?}",
+        tail(&wrapped.cli.output())
+    );
+    assert!(!wrapped.cli.output().contains("took over"));
 }
 
 fn tail(output: &str) -> &str {

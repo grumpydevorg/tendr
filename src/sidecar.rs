@@ -2059,8 +2059,8 @@ impl crate::pty_input::ControlHooks for SidecarControlHooks {
     }
 }
 
-/// How long retiring a client that could not be told waits for the takeover
-/// to reach the event log before ending its connection.
+/// How long retiring a client that may not have been told waits for the
+/// takeover to reach the event log before ending its connection.
 #[cfg(unix)]
 const TAKEOVER_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -2075,7 +2075,7 @@ const TAKEOVER_RECORD_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// - **`MSG_RETIRED`**, if it can be sent. It shares the connection's framed
 ///   writer with the viewer's sender, which holds the lock for one output
 ///   frame at a time, so a client that reads its output gets the message
-///   within the 200 ms spin.
+///   after up to 200 ms of lock attempts and a write of up to 200 ms.
 /// - **The event log**, otherwise. The lock stays held only while an output
 ///   write is stalled, that is, while the client is not reading, and such a
 ///   client could not read a message queued behind that output either (PR #68
@@ -2084,6 +2084,11 @@ const TAKEOVER_RECORD_GRACE: std::time::Duration = std::time::Duration::from_sec
 ///   the connection ends only once the takeover's `pty.control_changed` is
 ///   recorded (`recorded` acknowledges it), or after
 ///   [`TAKEOVER_RECORD_GRACE`] if the state root is stalled.
+///
+/// The connection also waits for the record when an output write was in
+/// flight at the first attempt, even if `MSG_RETIRED` was then written: that
+/// write may have ended part-way through a frame, and the client cannot read
+/// a message that follows a torn frame.
 #[cfg(unix)]
 fn retire_connection(
     holder: crate::model::pty_control::HolderId,
@@ -2097,14 +2102,16 @@ fn retire_connection(
 
     let _ = control.set_write_timeout(Some(std::time::Duration::from_millis(200)));
     let mut told = false;
+    let mut contended = false;
     for _ in 0..20 {
         if let Ok(mut conn) = conn.try_lock() {
             told = write_frame(&mut *conn, &Frame::Retired(epoch)).is_ok();
             break;
         }
+        contended = true;
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    if !told {
+    if contended || !told {
         // Returns at once if the effects thread has stopped: the run ended.
         let _ = recorded.recv_timeout(TAKEOVER_RECORD_GRACE);
     }
@@ -2839,6 +2846,22 @@ mod tests {
     /// connection. So the end must not come before the takeover is recorded.
     #[test]
     fn a_stalled_client_is_cut_off_only_once_the_takeover_is_recorded() {
+        retire_behind_a_busy_writer(None);
+    }
+
+    /// An output write in flight at the takeover may end part-way through a
+    /// frame, so a `MSG_RETIRED` written after it may be unreadable: that
+    /// client too is cut off only once the takeover is recorded.
+    #[test]
+    fn a_client_told_after_a_busy_write_is_cut_off_only_once_recorded() {
+        retire_behind_a_busy_writer(Some(std::time::Duration::from_millis(50)));
+    }
+
+    /// Retire a viewer whose output sender holds the framed writer for `busy`
+    /// after the retirement starts (`None`: throughout), while the state root
+    /// stalls the takeover's record. The connection must stay open until the
+    /// record is made, and end promptly once it is.
+    fn retire_behind_a_busy_writer(busy: Option<std::time::Duration>) {
         use crate::model::pty_control::{ControllerEpoch, ControllerKind, HolderId};
         use crate::pty_input::{ControlHooks, Trigger};
         use std::io::Read;
@@ -2847,15 +2870,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let meta = write_pty_meta(dir.path());
         let (old_conn, mut client) = UnixStream::pair().unwrap();
-        // The output sender is stuck writing: it holds the framed writer.
         let conn: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(old_conn.try_clone().unwrap())));
-        let stuck = Arc::clone(&conn);
+        let held = Arc::clone(&conn);
         let (release, released) = std::sync::mpsc::channel::<()>();
+        let (holding, writer_busy) = std::sync::mpsc::channel::<()>();
         let sender = std::thread::spawn(move || {
-            let _held = lock(&stuck);
+            let _held = lock(&held);
+            let _ = holding.send(());
             let _ = released.recv();
         });
+        writer_busy.recv().unwrap();
         let (mut hooks, _control, teardown) = hooks_for(dir.path());
         let old = HolderId::new(1);
         assert!(hooks.registry.insert(
@@ -2870,26 +2895,54 @@ mod tests {
 
         hooks.human_control(Trigger::Takeover, ControllerEpoch::new(2));
         hooks.retire(old, ControllerKind::Human, ControllerEpoch::new(2));
+        if let Some(busy) = busy {
+            std::thread::sleep(busy);
+            let _ = release.send(());
+        }
 
-        // Well past the 200 ms attempt to send MSG_RETIRED: still open.
+        // Well past the attempts to send MSG_RETIRED: whatever was sent can
+        // be read, but the connection is still open.
         std::thread::sleep(std::time::Duration::from_millis(600));
         client.set_nonblocking(true).unwrap();
-        let mut byte = [0u8; 1];
-        let early = client.read(&mut byte);
-        assert!(
-            matches!(&early, Err(e) if e.kind() == io::ErrorKind::WouldBlock),
-            "the connection ended before the takeover was recorded: {early:?}"
-        );
+        let mut buf = [0u8; 64];
+        let mut told = 0;
+        let early = loop {
+            match client.read(&mut buf) {
+                Ok(0) => break Some("end of stream".to_owned()),
+                Ok(n) => told += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break None,
+                Err(e) => break Some(e.to_string()),
+            }
+        };
 
+        // Unstall before asserting anything: the stalled record holds the
+        // process-wide meta lock, which would hang every later test.
+        // The record's acknowledgement ends it, not the grace: that starts
+        // when the lock attempts end (at 50 or 200 ms) and lasts
+        // TAKEOVER_RECORD_GRACE (2 s), so it expires at least 1.4 s from here.
         unstall_meta_json(dir.path(), &meta);
         client.set_nonblocking(false).unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-        assert_eq!(client.read(&mut byte).unwrap(), 0, "the connection ends");
+        // EINVAL on macOS once the peer has shut the socket down; a read then
+        // returns end of stream at once, so it cannot hang.
+        let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+        let end = client.read(&mut buf);
         let _ = release.send(());
         sender.join().unwrap();
         teardown.run();
+
+        assert_eq!(
+            early, None,
+            "the connection ended before the takeover was recorded"
+        );
+        assert_eq!(
+            told > 0,
+            busy.is_some(),
+            "MSG_RETIRED is sent once the writer is free"
+        );
+        assert!(
+            matches!(end, Ok(0)),
+            "the connection did not end within 1 s of the record: {end:?}"
+        );
     }
 
     /// Control hooks for a session at `dir`, the owner they publish, and the

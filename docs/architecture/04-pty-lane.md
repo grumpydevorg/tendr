@@ -101,14 +101,21 @@ flowchart LR
 - A plain attach is refused while a human holds control.
 - `--takeover` replaces the holder, which is disconnected and exits 81. The
   holder is told in one of two ways:
-  - `MSG_RETIRED`, when the sidecar can send it within 200 ms.
+  - `MSG_RETIRED`, when the sidecar can send it: up to 200 ms of lock
+    attempts plus a 200 ms write timeout.
   - The event log, when it cannot. A client that has stopped reading its
     output holds up the sidecar's writes to it, and could not read a
     message queued behind that output anyway. The sidecar ends its
     connection only once the takeover's `pty.control_changed` is in the
-    event log, or after 2 s if the state root is stalled. When that client
-    reads again and reaches the end of its connection, it looks for a
-    `takeover` granting the epoch after its own, in its run.
+    event log, or after 2 s if the state root is stalled. It waits the same
+    way when an output write was in flight at its first attempt, even if
+    `MSG_RETIRED` was then sent: that write may have stopped part-way
+    through a frame, leaving the message unreadable. When the client reads
+    again and reaches the end of its connection, it checks its run's
+    events: a `takeover` granting the epoch after its own, and no `detach`
+    releasing its own. A client that had already let go, for example one
+    dropped for falling behind, is not taken over by a later `--takeover`
+    and exits 0.
 - A client frozen when it is taken over (its terminal or SSH connection
   stopped) stays alive, blocked writing to its terminal, until it is
   resumed. It has no control, and its connection is gone; it only learns
