@@ -52,6 +52,13 @@ impl SessionRoot {
     pub fn path(&self) -> &Path {
         &self.0
     }
+
+    /// The state root that holds this sessions directory (`~/.tendr`), by
+    /// structure: its parent, whatever the directories are named.
+    #[must_use]
+    pub fn state_root(&self) -> Option<&Path> {
+        self.0.parent()
+    }
 }
 
 /// Handle to an existing session directory.

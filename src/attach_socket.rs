@@ -15,6 +15,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::model::ids::RunId;
+use crate::session::SessionRoot;
 
 /// Directory, under the state root, that holds attach sockets.
 pub const SOCKET_DIR: &str = "sockets";
@@ -23,9 +24,7 @@ pub const SOCKET_DIR: &str = "sockets";
 pub enum SocketError {
     #[error("cannot locate the tendr state root for {0}")]
     NoStateRoot(PathBuf),
-    #[error(
-        "{path} is unsafe for attach sockets: {reason}; it must be a directory owned by this user"
-    )]
+    #[error("{path} is not a private directory owned by this user: {reason}")]
     UnsafeDirectory { path: PathBuf, reason: &'static str },
     #[error("socket path {path} is {len} bytes; this platform allows at most {max}")]
     PathTooLong {
@@ -47,17 +46,29 @@ pub enum SocketError {
 pub struct BoundSocket {
     pub listener: UnixListener,
     pub path: PathBuf,
+    /// Set if binding removed group or other write permission from the
+    /// state root; the run records it as a warning.
+    pub tightened_root: Option<Tightened>,
 }
 
-/// The state root (`…/.tendr`) for a session directory
-/// (`…/.tendr/sessions/<namespace>/<name>`).
-#[must_use]
-pub fn state_root_for(session_dir: &Path) -> Option<PathBuf> {
-    session_dir
-        .ancestors()
-        .find(|p| p.file_name().is_some_and(|name| name == "sessions"))
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
+/// A permission change [`bind_for_session`] made to the state root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tightened {
+    pub path: PathBuf,
+    pub from: u32,
+    pub to: u32,
+}
+
+impl std::fmt::Display for Tightened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tightened {} from {:04o} to {:04o}: others could write it",
+            self.path.display(),
+            self.from,
+            self.to
+        )
+    }
 }
 
 /// Create `dir` as an owner-only directory, or verify an existing one: not a
@@ -115,14 +126,15 @@ pub fn prepare_private_dir(dir: &Path) -> Result<(), SocketError> {
 /// symlinks followed, owned by the effective user. Anyone who can write it
 /// can rename `sockets/` away and break the owner's attach and next start,
 /// so group and other write permission is removed from a root we own. Other
-/// bits are left alone. Run before `sockets/` is created or used.
+/// bits are left alone. Run before `sockets/` is created or used. Returns the
+/// change, if it made one.
 ///
 /// # Errors
 ///
 /// [`SocketError::UnsafeDirectory`] for a root that is not a directory or is
 /// owned by another user; [`SocketError::Io`] if it cannot be read or
 /// tightened.
-fn secure_state_root(root: &Path) -> Result<(), SocketError> {
+fn secure_state_root(root: &Path) -> Result<Option<Tightened>, SocketError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let io_err = |source| SocketError::Io {
@@ -140,12 +152,17 @@ fn secure_state_root(root: &Path) -> Result<(), SocketError> {
     if meta.uid() != rustix::process::geteuid().as_raw() {
         return Err(unsafe_dir("it is owned by another user"));
     }
-    let mode = meta.mode() & 0o7777;
-    if mode & 0o022 != 0 {
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode & !0o022))
-            .map_err(io_err)?;
+    let from = meta.mode() & 0o7777;
+    if from & 0o022 == 0 {
+        return Ok(None);
     }
-    Ok(())
+    let to = from & !0o022;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(to)).map_err(io_err)?;
+    Ok(Some(Tightened {
+        path: root.to_path_buf(),
+        from,
+        to,
+    }))
 }
 
 /// The socket path for a run, checked against the platform's `sun_path` limit.
@@ -187,14 +204,19 @@ pub fn socket_path(
 /// # Errors
 ///
 /// Any [`SocketError`]; the caller must not start the PTY session.
-pub fn bind_for_session(session_dir: &Path, run_id: RunId) -> Result<BoundSocket, SocketError> {
+pub fn bind_for_session(
+    sessions: &SessionRoot,
+    session_dir: &Path,
+    run_id: RunId,
+) -> Result<BoundSocket, SocketError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = state_root_for(session_dir)
-        .ok_or_else(|| SocketError::NoStateRoot(session_dir.to_path_buf()))?;
-    secure_state_root(&root)?;
+    let root = sessions
+        .state_root()
+        .ok_or_else(|| SocketError::NoStateRoot(sessions.path().to_path_buf()))?;
+    let tightened_root = secure_state_root(root)?;
     prepare_private_dir(&root.join(SOCKET_DIR))?;
-    let path = socket_path(&root, session_dir, run_id)?;
+    let path = socket_path(root, session_dir, run_id)?;
     // Never adopt or remove what is already there. `bind` below also refuses an
     // existing path, which closes the race after this check.
     if std::fs::symlink_metadata(&path).is_ok() {
@@ -219,7 +241,11 @@ pub fn bind_for_session(session_dir: &Path, run_id: RunId) -> Result<BoundSocket
         let _ = std::fs::remove_file(&path); // ours: just bound
         return Err(e);
     }
-    Ok(BoundSocket { listener, path })
+    Ok(BoundSocket {
+        listener,
+        path,
+        tightened_root,
+    })
 }
 
 /// Atomically point the session's breadcrumb at `socket`.
@@ -477,18 +503,33 @@ mod tests {
             & 0o777
     }
 
-    fn fake_session(root: &Path) -> PathBuf {
-        let dir = root.join(".tendr/sessions/default/work");
+    /// A session dir `<root>/.tendr/sessions/default/<name>` and its sessions
+    /// root.
+    fn fake_session_named(root: &Path, name: &str) -> (SessionRoot, PathBuf) {
+        let sessions = SessionRoot::new(root.join(".tendr/sessions"));
+        let dir = sessions.path().join("default").join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (sessions, dir)
     }
 
+    fn fake_session(root: &Path) -> (SessionRoot, PathBuf) {
+        fake_session_named(root, "work")
+    }
+
+    /// The state root comes from the sessions root's place, not from a
+    /// directory's name: a session called `sessions` must not move it.
     #[test]
-    fn state_root_is_the_parent_of_the_sessions_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session = fake_session(tmp.path());
-        assert_eq!(state_root_for(&session), Some(tmp.path().join(".tendr")));
-        assert_eq!(state_root_for(Path::new("/no/session/dir/here")), None);
+    fn a_session_named_sessions_binds_under_the_real_state_root() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ts")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (sessions, session) = fake_session_named(tmp.path(), "sessions");
+        let bound = bind_for_session(&sessions, &session, RunId::new()).unwrap();
+        assert_eq!(
+            bound.path.parent().unwrap(),
+            tmp.path().join(".tendr").join(SOCKET_DIR)
+        );
     }
 
     #[test]
@@ -528,7 +569,7 @@ mod tests {
     #[test]
     fn socket_path_is_short_stable_per_run_and_distinct_across_runs() {
         let tmp = tempfile::tempdir().unwrap();
-        let session = fake_session(tmp.path());
+        let (_, session) = fake_session(tmp.path());
         let root = tmp.path().join(".tendr");
         let run = RunId::new();
         let a = socket_path(&root, &session, run).unwrap();
@@ -541,7 +582,7 @@ mod tests {
     #[test]
     fn an_overlong_parent_directory_is_an_error_not_a_truncation() {
         let tmp = tempfile::tempdir().unwrap();
-        let session = fake_session(tmp.path());
+        let (_, session) = fake_session(tmp.path());
         let root = tmp.path().join("x".repeat(120));
         assert!(matches!(
             socket_path(&root, &session, RunId::new()),
@@ -556,8 +597,9 @@ mod tests {
             .prefix("ts")
             .tempdir_in("/tmp")
             .unwrap();
-        let session = fake_session(tmp.path());
-        let bound = bind_for_session(&session, RunId::new()).unwrap();
+        let (sessions, session) = fake_session(tmp.path());
+        let bound = bind_for_session(&sessions, &session, RunId::new()).unwrap();
+        assert_eq!(bound.tightened_root, None, "a private root is left alone");
 
         assert_eq!(mode(bound.path.parent().unwrap()), 0o700);
         assert_eq!(mode(&bound.path), 0o600);
@@ -575,15 +617,24 @@ mod tests {
             .prefix("ts")
             .tempdir_in("/tmp")
             .unwrap();
-        let session = fake_session(tmp.path());
-        let root = state_root_for(&session).unwrap();
+        let (sessions, session) = fake_session(tmp.path());
+        let root = sessions.state_root().unwrap().to_path_buf();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        bind_for_session(&session, RunId::new()).unwrap();
+        let bound = bind_for_session(&sessions, &session, RunId::new()).unwrap();
         assert_eq!(
             mode(&root),
             0o755,
             "group and other write removed, nothing else"
+        );
+        // The change is reported, so the run can record it.
+        assert_eq!(
+            bound.tightened_root,
+            Some(Tightened {
+                path: root,
+                from: 0o777,
+                to: 0o755,
+            })
         );
     }
 
@@ -591,15 +642,21 @@ mod tests {
     /// where the sockets live.
     #[test]
     fn bind_refuses_a_state_root_owned_by_another_user() {
-        if rustix::process::geteuid().is_root() {
-            return; // root owns the system directory used below
-        }
-        // A session dir whose state root is `/usr`, which root owns. Nothing
-        // under it is created: the root is checked first.
-        let session = Path::new("/usr/sessions/default/work");
-        let err = bind_for_session(session, RunId::new()).err().unwrap();
+        // A system directory every Unix has that this user does not own.
+        // Nothing under it is created: the root is checked first.
+        let euid = rustix::process::geteuid().as_raw();
+        let Some(foreign) = ["/usr", "/dev", "/"].into_iter().map(Path::new).find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) != euid)
+        }) else {
+            return; // every candidate is ours (running as root)
+        };
+        let sessions = SessionRoot::new(foreign.join("sessions"));
+        let session = sessions.path().join("default/work");
+        let err = bind_for_session(&sessions, &session, RunId::new())
+            .err()
+            .unwrap();
         assert!(
-            matches!(err, SocketError::UnsafeDirectory { ref path, .. } if path == Path::new("/usr")),
+            matches!(err, SocketError::UnsafeDirectory { ref path, .. } if path == foreign),
             "{err}"
         );
     }
@@ -610,15 +667,15 @@ mod tests {
             .prefix("ts")
             .tempdir_in("/tmp")
             .unwrap();
-        let session = fake_session(tmp.path());
+        let (sessions, session) = fake_session(tmp.path());
         let run = RunId::new();
-        let root = state_root_for(&session).unwrap();
+        let root = sessions.state_root().unwrap();
         prepare_private_dir(&root.join(SOCKET_DIR)).unwrap();
-        let path = socket_path(&root, &session, run).unwrap();
+        let path = socket_path(root, &session, run).unwrap();
         std::fs::write(&path, b"foreign").unwrap();
 
         assert!(matches!(
-            bind_for_session(&session, run),
+            bind_for_session(&sessions, &session, run),
             Err(SocketError::PathExists(_))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"foreign", "never removed");

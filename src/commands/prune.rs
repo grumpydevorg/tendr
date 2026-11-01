@@ -195,7 +195,7 @@ fn prune_sessions(
 /// cannot prove a socket unused removes nothing and warns on stderr.
 #[cfg(unix)]
 fn sweep_attach_sockets(root: &SessionRoot, dry_run: bool) -> u64 {
-    let Some(state_root) = root.path().parent() else {
+    let Some(state_root) = root.state_root() else {
         return 0;
     };
     match tendr::attach_socket::sweep_orphans(state_root, dry_run) {

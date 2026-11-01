@@ -144,9 +144,10 @@ A `push` to a pipe session that is not running exits 1.
 ## Input arbitration
 
 - Input queued by a controller that is superseded (a takeover) or leaves (a
-  detach or a lost connection) is never written. It is recorded as
-  `pty.input_revoked`, after the `pty.control_changed` that ended its
-  control.
+  detach or a lost connection), and not yet written to the PTY master, is
+  never written. It is recorded as `pty.input_revoked`, after the
+  `pty.control_changed` that ended its control. Bytes already written stay in
+  the PTY's buffer for the child.
 - PTY `exec` frames arrive over the stdin FIFO. The FIFO forwarder is
   arbitrated the same way, but it cannot report an outcome:
   - It waits behind another agent's push.
@@ -166,8 +167,10 @@ A `push` to a pipe session that is not running exits 1.
 - Its parent, `~/.tendr`, is checked first. Anyone who can write it could
   rename `sockets/` away and break the owner's attach and next start. It must
   be a directory (symlinks followed) owned by the user. The sidecar removes
-  group and other write permission from it and leaves the other bits alone.
-  A root owned by another user fails the start.
+  group and other write permission from it, leaves the other bits alone, and
+  records the change as a run warning. A root owned by another user fails the
+  start. The root is the parent of the sessions directory, found by position,
+  not by name.
 - The socket is bound, and `a.sock.path` written, before the child is
   spawned. An unsafe directory, an overlong path, or an existing path fails
   the start as `SpawnFailed`, with `attach_socket_failed` evidence. The
