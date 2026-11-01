@@ -76,6 +76,11 @@ flags:
 |`--any-exit`|With `--after`, start even if the dependency exited non-zero.|
 |`--on-exit <command>`|Run a command after the child exits. Repeatable.|
 
+The sidecar and the child get no descriptor above stderr from the shell that
+ran `start` or `run`. A descriptor left open there, such as a terminal leaked by a
+VM's init, does not reach them. `wrap` runs inline, so its command keeps the
+caller's descriptors.
+
 Tendr infers the exec target from argv[0]: `bash`, `sh`, `zsh`, `dash` or `ash`
 → `posix-shell`; `pwsh` or `powershell` → `powershell`; `python`, `python3`,
 `ipython` or `py` → `python-repl`; `duckdb` → `duckdb`. Set it yourself when
