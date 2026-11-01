@@ -1,3 +1,5 @@
-# Written by the scripts: run output, and the VM's sshd-accept host key.
+# Written by the scripts: run output, the VM's sshd-accept host key, and the
+# processes treekill.py saw survive.
 out/
 known_hosts.acc
+treekill/*.survivors

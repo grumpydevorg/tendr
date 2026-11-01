@@ -257,12 +257,12 @@ observed exit means the sidecar reaped the child, and `SpawnFailed` or
   - A `nohup` job ignores the hangup and has its own group, so the group's
     SIGTERM does not reach it either.
   - A program can start its children in sessions of their own: Claude Code
-    runs each Bash tool shell as a session leader. After a hangup Claude
-    stops its own tasks; after SIGKILL they survive.
+    runs each Bash tool shell as a session leader. After a hangup Claude's
+    tasks were gone within half a second; after SIGKILL they survive.
   - Measured on Linux in the cloud PTY plan's step 9, which also chooses the
     fix ([plan](../plans/active/00_cloud-pty-control.md)).
 - **A terminal holder keeps a PTY run going.** Capture ends when the
-  terminal does, so while any process outside the stop still holds the
+  terminal does, so while any process the stop did not reach still holds the
   terminal, a PTY run whose child has exited stays `Running` with the child
   unreaped, `kill` returns after about 20 s with `kill_sent`, and the run
   ends when the last holder exits.
