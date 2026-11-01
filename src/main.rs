@@ -97,7 +97,7 @@ enum Commands {
         /// Replace existing session (kill + restart)
         #[arg(long)]
         replace: bool,
-        /// Kill child after N seconds
+        /// Stop the child, as `kill` does, after N seconds
         #[arg(long)]
         timeout: Option<u64>,
         /// Working directory for the child process
@@ -154,7 +154,7 @@ enum Commands {
         /// Replace existing session (kill + restart)
         #[arg(long)]
         replace: bool,
-        /// Kill child after N seconds
+        /// Stop the child, as `kill` does, after N seconds
         #[arg(long)]
         timeout: Option<u64>,
         /// Working directory for the child process

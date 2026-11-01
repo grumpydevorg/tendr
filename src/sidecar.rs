@@ -303,7 +303,8 @@ fn pty_term(spec: &LaunchSpec) -> String {
     }
 }
 
-/// Spawn a timeout thread that kills the child after `timeout_s` seconds.
+/// Spawn a timeout thread that stops the child after `timeout_s` seconds,
+/// with the same graceful sequence as `tendr kill`.
 /// Returns the `timed_out` flag. The caller passes a `cancel` flag to prevent the kill
 /// after the child exits naturally.
 ///
@@ -332,11 +333,14 @@ fn setup_timeout(
         if cancel.load(Ordering::Relaxed) {
             return; // Final check after deadline
         }
+        // Set before the stop, so the exit classifies as TimedOut however
+        // the child ends during the graceful sequence.
         timed_out_clone.store(true, Ordering::Relaxed);
-        // Use kill_child with the live kill handle context.
-        // On Windows this uses the Job Object for full tree kill;
-        // on Unix this uses process group kill.
-        let _ = Current::kill_child(&kill_handle, true);
+        // The same stop as `tendr kill`: a PTY run is hung up first, a pipe
+        // run gets SIGTERM, and SIGKILL follows if it does not exit. The
+        // live kill handle keeps the stop tree-aware (Job Object on Windows,
+        // process group on Unix).
+        let _ = Current::kill_child(&kill_handle, false);
     });
     timed_out
 }
