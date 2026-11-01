@@ -14,8 +14,9 @@
 //! - cursor visibility (25) and autowrap (7), both on by default;
 //! - application cursor keys (1) and keypad (`ESC =`);
 //! - mouse tracking (9, 1000, 1002, 1003) and its encoding (1005, 1006, 1015,
-//!   1016), each one setting as in xterm and Ghostty: the last one set wins,
-//!   and resetting any of them turns it off;
+//!   1016), each one setting as in Ghostty: the last one set wins, and
+//!   resetting any of them turns it off (xterm resets an encoding only by its
+//!   own number);
 //! - alternate scroll (1007), focus events (1004), bracketed paste (2004),
 //!   synchronized output (2026), colour-scheme reports (2031) and in-band size
 //!   reports (2048);
@@ -300,13 +301,14 @@ impl KittyFlags {
         self.stack.push(flags);
     }
 
-    /// A pop that empties the stack resets all flags.
+    /// Popping more entries than were pushed empties the stack and resets all
+    /// flags; popping exactly as many leaves the flags set without a push.
     fn pop(&mut self, count: u32) {
         if count == 0 {
             return;
         }
         match usize::try_from(count) {
-            Ok(count) if count < self.stack.len() => {
+            Ok(count) if count <= self.stack.len() => {
                 self.stack.truncate(self.stack.len() - count);
             }
             _ => *self = Self::default(),
@@ -651,6 +653,11 @@ mod tests {
     fn a_kitty_pop_that_empties_the_stack_resets_all_flags() {
         assert_eq!(text(&fed(&[b"\x1b[=5u\x1b[>1u\x1b[<2u"]).replay()), "");
         assert_eq!(text(&fed(&[b"\x1b[=5u\x1b[<u"]).replay()), "");
+        // Popping exactly what was pushed leaves the flags set without a push.
+        assert_eq!(
+            text(&fed(&[b"\x1b[=5u\x1b[>1u\x1b[<1u"]).replay()),
+            "^[[=5u"
+        );
         // A pop of nothing pops nothing.
         assert_eq!(text(&fed(&[b"\x1b[>1u\x1b[<0u"]).replay()), "^[[>1u");
     }
