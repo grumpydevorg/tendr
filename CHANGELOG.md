@@ -31,6 +31,10 @@
   one row and restored once its output goes quiet, both recorded as `REPAINT`
   resizes. An attach at a new size already redraws and gets no repaint. An
   older sidecar ignores the request.
+- **A paste no longer detaches.** A bracketed paste containing `Ctrl-\ d`
+  used to detach `tendr attach` mid-paste and lose the rest of it. While the
+  program in the session has bracketed paste on, as shells and Claude Code
+  do, bytes inside a paste are now sent to it as pasted.
 
 ## v0.4.1 — capture fixes
 

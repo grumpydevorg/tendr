@@ -197,9 +197,15 @@ A `push` to a pipe session that is not running exits 1.
   the bytes typed.
 - Key releases, repeats of `\`, and modifier-key events neither complete nor
   cancel a held prefix. A `\` repeat never starts one.
-- An unfinished `ESC [` at the end of a read is held only while it could
-  still become a prefix. The main thread's poll wakes after 20 ms to forward
-  it, so a lone Esc is never stuck.
+- Outside a paste, an unfinished `ESC [` at the end of a read is held only
+  while it could still become a prefix or a paste start. The main thread's
+  poll wakes after 20 ms to forward it, so a lone Esc is never stuck.
+- While the child has bracketed paste on (the client tracks it with the
+  other terminal modes), every byte inside a paste (`ESC [ 200 ~` …
+  `ESC [ 201 ~`) is forwarded as text, so pasted `Ctrl-\` bytes neither start
+  the escape nor detach. A read that ends inside a possible paste end holds
+  it until the next byte, with no deadline. Turning bracketed paste off ends
+  a paste.
 - The terminal size is checked every 100 ms and changes are forwarded.
   SIGWINCH only brings that check forward, because signals coalesce.
 - SIGHUP, SIGTERM and SIGINT end the attach like a detach: a detach message

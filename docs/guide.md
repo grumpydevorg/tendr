@@ -191,7 +191,10 @@ concurrent `push` is refused, not interleaved.
 The escape works with the legacy `Ctrl-\` byte, the kitty keyboard protocol
 (which Claude Code can switch Ghostty, kitty, WezTerm and foot to) and xterm's
 `modifyOtherKeys`. Key releases, auto-repeat and modifier-only keys do not
-interrupt it. A doubled `Ctrl-\` is sent in the encoding you typed.
+interrupt it. A doubled `Ctrl-\` is sent in the encoding you typed. When the
+program in the session has turned on bracketed paste, as shells and Claude
+Code do, a paste is sent as pasted: a `Ctrl-\ d` inside it does not detach.
+Otherwise a paste is typing, and the escape applies to it.
 
 ### PTY details
 

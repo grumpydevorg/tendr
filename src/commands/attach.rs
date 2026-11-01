@@ -328,6 +328,7 @@ mod unix_relay {
                 Err(_) => break Ending::KeyboardClosed,
             };
             let mut forward = Vec::new();
+            parser.set_bracketed_paste(screen.bracketed_paste.load(Ordering::SeqCst));
             let decision = parser.feed(&buf[..n], &mut forward);
             queue_keystrokes(&outbox, forward, &mut dropped);
             if decision == Escape::Detach {
@@ -433,6 +434,9 @@ mod unix_relay {
         /// Set by the main thread when leaving: the reader writes nothing
         /// more, so at most the chunk it is writing precedes the reset.
         done: AtomicBool,
+        /// The child has bracketed paste on. Read by the keyboard loop
+        /// without taking `modes`, which a blocked write can hold.
+        bracketed_paste: AtomicBool,
     }
 
     /// Turn off the terminal modes the session turned on (the alternate
@@ -616,6 +620,9 @@ mod unix_relay {
                         // Track before writing: modes from a partial write are
                         // still turned off when leaving.
                         modes.feed(&payload);
+                        screen
+                            .bracketed_paste
+                            .store(modes.bracketed_paste(), Ordering::SeqCst);
                         let mut stdout = std::io::stdout().lock();
                         if stdout.write_all(&payload).is_err() || stdout.flush().is_err() {
                             break;
