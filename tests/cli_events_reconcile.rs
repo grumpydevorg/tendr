@@ -236,3 +236,30 @@ fn sidecar_lost_stops_a_pty_recording() {
     );
     assert_eq!(events[stopped.unwrap()]["data"]["reason"], "sidecar_lost");
 }
+
+/// A PTY sidecar that crashes between its terminal event and its meta write
+/// leaves the recording `Recording`. Healing the run from the event must not
+/// leave a recording still "Recording" on a run that has ended.
+#[test]
+fn healed_pty_run_stops_its_recording() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    tendr(&root)
+        .env("TENDR_TEST_ABORT", "before_terminal_meta")
+        .args(["start", "p1", "--pty", "--", "false"])
+        .assert()
+        .success();
+    wait_for_event_kind(&root, "p1", "run.exited");
+
+    let status = poll_status_until_terminal(&root, "p1");
+    assert_eq!(status["status"], "Exited");
+    assert_eq!(
+        status["transition_provenance"]["evidence"][0],
+        "event_log_terminal"
+    );
+
+    let recording = &read_meta_json(&root, "p1")["pty"]["recording"];
+    assert_eq!(recording["state"], "Stopped", "{recording}");
+    assert_eq!(recording["reason"], "sidecar_lost", "{recording}");
+}

@@ -30,6 +30,12 @@
 
 ### Fixed
 
+- **A PTY run healed from its terminal event no longer shows a live
+  recording.** When a sidecar died after logging the run's end but before
+  writing `meta.json`, reconciliation healed the run but left
+  `pty.recording.state` as `Recording`. It now marks it `Stopped` with
+  reason `sidecar_lost`, as it does for `SidecarLost`.
+
 - **A descriptor leaked into `tendr start` or `tendr run` no longer reaches
   the run.**
   exe.dev's init leaks two terminal masters into every SSH command, and tendr

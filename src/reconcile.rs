@@ -76,6 +76,10 @@ pub fn reconcile_sidecar_gone(session: &SessionDir, meta: &mut Meta) -> anyhow::
                 .is_ok()
             {
                 stop_healed_orphan(meta)?;
+                // The sidecar died before recording its own stop. The healed
+                // path appends no events: a `recording.stopped` now would
+                // follow the run's terminal event, so meta alone records it.
+                meta.stop_live_recording(RecordingStopReason::SidecarLost);
                 session::write_meta_atomic(session, meta)?;
                 return Ok(Reconciled::Healed);
             }

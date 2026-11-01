@@ -83,7 +83,10 @@ foreground `run`:
   `sidecar_lost` and no last sequence, and a `recording.stopped` event is
   logged before `run.sidecar_lost`.
 - A healed terminal state, copied from the sidecar's own terminal event. The
-  sidecar's observation and provenance are kept, not re-derived.
+  sidecar's observation and provenance are kept, not re-derived. A PTY
+  recording still marked `Recording` is marked `Stopped` with reason
+  `sidecar_lost` too, in `meta.json` only: no event is logged, as a
+  `recording.stopped` would follow the run's terminal event.
 
 ## Transition provenance
 

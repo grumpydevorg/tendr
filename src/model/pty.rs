@@ -85,7 +85,8 @@ pub enum RecordingStopReason {
     /// Storage had not caught up when the run ended.
     Stalled,
     /// The sidecar was lost: reconciliation ended the recording, not the
-    /// recorder. The last recorded sequence is not known.
+    /// recorder, whether it inferred `SidecarLost` or healed the run from
+    /// the sidecar's terminal event. The last recorded sequence is not known.
     SidecarLost,
 }
 
