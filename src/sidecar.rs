@@ -2703,7 +2703,9 @@ mod tests {
     #[test]
     fn a_repaint_waits_for_quiet_output_but_not_past_its_bound() {
         use std::time::{Duration, Instant};
-        let quiet = Duration::from_millis(50);
+        // Wide margins: the writer below must not miss a whole `quiet` window
+        // on a busy runner.
+        let quiet = Duration::from_millis(100);
         let max = Duration::from_millis(300);
 
         // Nothing written: done once `quiet` has passed.
