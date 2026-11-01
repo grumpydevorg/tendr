@@ -274,8 +274,9 @@ A PTY run ends with its child, even if a process the child started still holds
 the terminal, such as a `setsid` job. Once the child has exited, tendr captures
 that process's output for up to 2 s more, then records the child's exit. On
 Linux a run warning names the pids that still hold the terminal. The process
-keeps running. A pipe run still waits until every process holding its output
-pipes has exited.
+is left running; its later writes to the terminal fail once the sidecar has
+exited. A pipe run still waits until every process holding its output pipes
+has exited.
 
 `kill` succeeds only when the run has ended. If the sidecar has not recorded
 the end after about 20 s, `kill` exits 1. If the sidecar is gone, `kill` stops

@@ -73,16 +73,19 @@
   program in the session has bracketed paste on, as shells and Claude Code
   do, bytes inside a paste are now sent to it as pasted.
 - **A PTY run ends when its child does.** A process the child left in another
-  session, such as a `setsid` job or a tool shell Claude Code or omp started,
-  kept the terminal open. On Linux the run then stayed `Running`, with the
-  child an unreaped zombie, until that process exited. Now capture reads its
-  output for at most 2 s after the child has exited, then the child's exit is
-  recorded, with a run warning that names the pids still holding the
-  terminal. The process itself keeps running.
+  session, such as a `setsid` job or a tool shell started by Claude Code or
+  omp, kept the terminal open. On Linux the run then stayed `Running`, with
+  the child an unreaped zombie, until that process exited. Now capture reads
+  its output for at most 2 s after the child has exited, then the child's
+  exit is recorded, with a run warning that names the pids still holding the
+  terminal. The process is left running; its later writes to the terminal
+  fail once the sidecar has exited.
 - **`kill` no longer reports success for a run that did not end.** It used to
   print `kill_sent` and exit 0 when the run was still `Running`. Now it exits 1
-  with an error. When the sidecar is gone, `kill` records the run as
-  `SidecarLost`, as `status` would.
+  with an error. The same goes for a `Starting` run (waiting on `--after`)
+  whose sidecar does not act on the kill: `kill` used to print `no_child` and
+  exit 0. When the sidecar is gone, `kill` records the run as `SidecarLost`,
+  as `status` would, for a `Running` or a `Starting` run.
 
 ## v0.4.1 — capture fixes
 

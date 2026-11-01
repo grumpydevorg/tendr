@@ -199,3 +199,49 @@ fn kill_records_the_end_of_a_run_whose_sidecar_is_gone() {
     assert_eq!(meta["status"], "SidecarLost", "{meta}");
     harness::wait_pid_dead(child);
 }
+
+/// The same for a run still `Starting` (waiting on `--after`) when its
+/// sidecar died: `kill` records `SidecarLost` instead of leaving it live.
+#[cfg(unix)]
+#[test]
+fn kill_records_the_end_of_a_starting_run_whose_sidecar_is_gone() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    start_sleeper(&root, "lost-dep");
+    let _dep = harness::SessionGuard::new(&root, "lost-dep");
+    tendr(&root)
+        .args([
+            "start",
+            "lost-starting",
+            "--after",
+            "lost-dep",
+            "sleep",
+            "60",
+        ])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "lost-starting");
+    let meta_path = root
+        .path()
+        .join(".tendr/sessions/default/lost-starting/meta.json");
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["status"], "Starting", "{meta}");
+    let sidecar = meta["sidecar"]["pid"].as_i64().expect("sidecar pid") as libc::pid_t;
+    // SAFETY: the pid is the test's own sidecar.
+    unsafe { libc::kill(sidecar, libc::SIGKILL) };
+    harness::wait_pid_dead(sidecar);
+
+    let out = tendr(&root)
+        .args(["kill", "lost-starting"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: serde_json::Value = serde_json::from_str(&stdout).expect("kill prints meta");
+    assert_eq!(meta["status"], "SidecarLost", "{meta}");
+}

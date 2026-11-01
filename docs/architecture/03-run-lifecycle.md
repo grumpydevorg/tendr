@@ -272,8 +272,10 @@ observed exit means the sidecar reaped the child, and `SpawnFailed` or
   child exited`. On Linux the warning names the pids that still hold the
   terminal, found through `/proc/*/fd`; processes of another user are missed.
   On macOS the child's exit revokes the terminal from every process, so
-  capture ends with the child and there is no warning. The holder keeps
-  running, and its later output is not captured.
+  capture ends with the child and there is no warning. A terminal that has
+  closed by the time the 2 s pass is read to its end, with no warning. The
+  holder is left running; its later writes to the terminal fail once the
+  sidecar has exited, and are not captured.
 - **An output holder keeps a pipe run going.** A pipe run's capture ends when
   its stdout and stderr pipes close. A process that inherited them and
   outlives the child keeps the run `Running`, with the child unreaped, until

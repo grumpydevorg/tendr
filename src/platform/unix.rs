@@ -960,9 +960,10 @@ pub fn set_nonblocking(fd: &impl rustix::fd::AsFd) -> io::Result<()> {
 /// session-leader shell), which no hangup reaches. Such a holder would keep
 /// end of stream, and so the run, waiting for as long as it lives, with the
 /// child an unreaped zombie. So the reader goes on reading what they write
-/// for at most `HOLDER_GRACE` (2 s) after the release, then ends the stream
-/// itself and records that it cut capture short (see
-/// [`SupervisedChild::terminal_holders_warning`]).
+/// for at most `HOLDER_GRACE` (2 s) after the release. If the terminal is
+/// still open then, it ends the stream itself and records that it cut
+/// capture short (see [`SupervisedChild::terminal_holders_warning`]); if it
+/// has closed, it reads on to the end of stream as usual.
 pub struct PtyReader {
     file: File,
     drain: Drain,
@@ -1127,19 +1128,40 @@ impl PtyReader {
         }
     }
 
-    /// Whether the holder grace has passed, so the stream ends here. Records
-    /// that capture was cut short.
-    fn grace_over(&self) -> bool {
+    /// Whether the holder grace has passed with the terminal still open, so
+    /// the stream ends here; records that capture was cut short. If every
+    /// holder has closed the terminal by then (a reader stalled past the
+    /// deadline sees this), end of stream is already on its way, so the
+    /// reader reads on to it as a plain reader and keeps what is pending.
+    fn grace_over(&mut self) -> io::Result<bool> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
         let Drain::Released { hold, deadline } = &self.drain else {
-            return false;
+            return Ok(false);
         };
-        let over = std::time::Instant::now() >= *deadline;
-        if over {
-            hold.0
-                .cut_short
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        if std::time::Instant::now() < *deadline {
+            return Ok(false);
         }
-        over
+        let mut fds = [PollFd::new(&self.file, PollFlags::IN)];
+        let now = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        loop {
+            match poll(&mut fds, Some(&now)) {
+                Ok(_) => break,
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if fds[0].revents().contains(PollFlags::HUP) {
+            self.drain = Drain::Plain;
+            return Ok(false);
+        }
+        hold.0
+            .cut_short
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
     }
 
     /// Called when a read would block: wait until the master may be readable,
@@ -1192,7 +1214,7 @@ impl Read for PtyReader {
         loop {
             // Checked before each read, so a holder that keeps writing after
             // the release cannot extend the grace.
-            if self.grace_over() {
+            if self.grace_over()? {
                 return Ok(0);
             }
             match self.file.read(buf) {
