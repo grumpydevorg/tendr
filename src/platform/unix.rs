@@ -488,13 +488,24 @@ fn spawn_sidecar(tendr_bin: &Path, session_dir: &Path, ready_write_fd: &File) ->
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    // Descriptors our caller leaked to us (exe.dev's init leaks /dev/ptmx
+    // masters into every SSH command) must not reach the sidecar, nor through
+    // it the child. Found before the fork, since listing allocates.
+    let inherited = InheritedFds::find();
+
     // SAFETY: pre_exec runs after fork() in the child process, before exec().
-    // The closure captures only write_fd_raw (a Copy integer), so no shared
-    // mutable state is accessed. fcntl and setsid are async-signal-safe.
-    // We clear close-on-exec on the ready fd so it survives exec,
-    // and call setsid to detach from the parent's session.
+    // The closure captures write_fd_raw (a Copy integer) and reads the
+    // `inherited` set found before the fork; it does not allocate.
+    // close_range, fcntl and setsid are async-signal-safe.
+    // Every inherited fd above 2 is marked close-on-exec rather than closed,
+    // so std's own exec-error pipe keeps working; then close-on-exec is
+    // cleared on the ready fd so it survives exec. setsid detaches the
+    // sidecar from the parent's session.
     unsafe {
         cmd.pre_exec(move || {
+            if !cloexec_from_3() {
+                inherited.mark_cloexec();
+            }
             // Clear close-on-exec so the ready fd survives exec
             if libc::fcntl(write_fd_raw, libc::F_SETFD, 0) == -1 {
                 return Err(io::Error::last_os_error());
@@ -509,6 +520,86 @@ fn spawn_sidecar(tendr_bin: &Path, session_dir: &Path, ready_write_fd: &File) ->
 
     let child = cmd.spawn()?;
     Ok(child.id())
+}
+
+/// The descriptors to mark close-on-exec where `close_range` cannot.
+enum InheritedFds {
+    /// The fds listed in `/dev/fd` before the fork.
+    Listed(Vec<RawFd>),
+    /// `/dev/fd` could not be read: every fd from 3 below this bound, the
+    /// soft `RLIMIT_NOFILE` (capped, as it may be unlimited).
+    Below(RawFd),
+}
+
+impl InheritedFds {
+    /// Highest bound for the `Below` sweep: Linux's default `nr_open`.
+    const SWEEP_CAP: RawFd = 1 << 20;
+
+    fn find() -> Self {
+        open_fds().map_or_else(|| Self::Below(fd_limit()), Self::Listed)
+    }
+
+    /// Mark each fd above 2 close-on-exec. Async-signal-safe: no allocation.
+    fn mark_cloexec(&self) {
+        let mark = |fd: RawFd| {
+            // SAFETY: fcntl only changes a descriptor flag; EBADF (no such
+            // fd, or one closed since the listing) is harmless.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        };
+        match self {
+            Self::Listed(fds) => fds.iter().copied().filter(|&fd| fd > 2).for_each(mark),
+            Self::Below(limit) => (3..*limit).for_each(mark),
+        }
+    }
+}
+
+/// The soft `RLIMIT_NOFILE`, capped at `InheritedFds::SWEEP_CAP`.
+fn fd_limit() -> RawFd {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into the rlimit we own.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return InheritedFds::SWEEP_CAP;
+    }
+    RawFd::try_from(lim.rlim_cur)
+        .map_or(InheritedFds::SWEEP_CAP, |n| n.min(InheritedFds::SWEEP_CAP))
+}
+
+/// The calling process's open descriptors, from `/dev/fd`, or `None` if it
+/// cannot be read.
+fn open_fds() -> Option<Vec<RawFd>> {
+    let dir = std::fs::read_dir("/dev/fd").ok()?;
+    Some(
+        dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .collect(),
+    )
+}
+
+/// Mark every fd from 3 up close-on-exec with one `close_range` call.
+/// Returns false where that is unavailable: not Linux, a kernel without
+/// `CLOSE_RANGE_CLOEXEC` (added in 5.11), or a seccomp filter denying the
+/// call. Async-signal-safe.
+fn cloexec_from_3() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: close_range only changes descriptor flags in this process.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        ret == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// Read the readiness result from the pipe.
@@ -1129,6 +1220,27 @@ mod tests {
     use super::*;
     use std::num::NonZeroU32;
     use std::time::{Duration, Instant};
+
+    /// The sweep used when `/dev/fd` cannot be read must reach a leaked fd
+    /// high in the table, as exe-init's are.
+    #[test]
+    fn rlimit_sweep_marks_a_high_leaked_fd_cloexec() {
+        let file = File::open("/dev/null").unwrap();
+        // SAFETY: F_DUPFD makes a new fd, at 200 or above, that this test
+        // owns; unlike F_DUPFD_CLOEXEC it starts without close-on-exec.
+        let high = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(high >= 200);
+        // SAFETY: F_GETFD only reads a descriptor flag.
+        let flags = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(flags(high) & libc::FD_CLOEXEC, 0);
+
+        InheritedFds::Below(fd_limit()).mark_cloexec();
+
+        let marked = flags(high) & libc::FD_CLOEXEC != 0;
+        // SAFETY: `high` is ours, from F_DUPFD above.
+        unsafe { libc::close(high) };
+        assert!(marked, "fd {high} below the limit was not marked");
+    }
 
     // --- Shared-description nonblocking PTY I/O ---
 
