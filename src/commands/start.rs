@@ -7,7 +7,7 @@ use tendr::model::spec::{ExecTarget, IoMode, LaunchSpec, StdinMode};
 use tendr::platform::{Current, Platform};
 use tendr::session::{self, SessionRoot};
 
-#[allow(clippy::too_many_arguments)] // launch surface; bundled into StartRequest by the frame-transport work
+#[allow(clippy::too_many_arguments)] // the launch surface; `remote_op::dispatch` resolves a StartRequest into it
 pub fn cmd_start(
     name: &str,
     cmd: Vec<String>,
@@ -67,7 +67,7 @@ pub fn cmd_start(
 /// the same spec), it re-reads the existing meta from disk.
 ///
 /// Does not print to stdout or call process::exit — callers decide what to do.
-#[allow(clippy::too_many_arguments)] // launch surface; bundled into StartRequest by the frame-transport work
+#[allow(clippy::too_many_arguments)] // the launch surface, shared by start and run
 pub(crate) fn launch_session(
     name: &str,
     cmd: Vec<String>,

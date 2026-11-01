@@ -6,6 +6,7 @@ use tendr::model::event::EventTimestamp;
 use tendr::model::ids::{Namespace, Source};
 
 mod commands;
+mod remote_op;
 
 #[derive(Clone, Debug, clap::ValueEnum)]
 enum CliExecTarget {
@@ -497,214 +498,6 @@ enum SkillAction {
 }
 
 impl Commands {
-    /// Reconstruct CLI args for this command, suitable for remote invocation.
-    fn remote_args(&self) -> Vec<String> {
-        match self {
-            Commands::Start {
-                name,
-                namespace,
-                stdin,
-                pty,
-                exec_target,
-                replace,
-                timeout,
-                cwd,
-                env_vars,
-                unset_env,
-                on_exit,
-                after,
-                any_exit,
-                boundary,
-                boundary_parent,
-                cmd,
-            } => {
-                let mut args = vec!["start".to_string(), name.clone()];
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
-                }
-                if *stdin {
-                    args.push("--stdin".to_string());
-                }
-                if *pty {
-                    args.push("--pty".to_string());
-                }
-                if *replace {
-                    args.push("--replace".to_string());
-                }
-                if let Some(t) = timeout {
-                    args.extend(["--timeout".to_string(), t.to_string()]);
-                }
-                if let Some(c) = cwd {
-                    args.extend(["--cwd".to_string(), c.display().to_string()]);
-                }
-                for e in env_vars {
-                    args.extend(["--env".to_string(), e.clone()]);
-                }
-                for u in unset_env {
-                    args.extend(["--unset-env".to_string(), u.clone()]);
-                }
-                for o in on_exit {
-                    args.extend(["--on-exit".to_string(), o.clone()]);
-                }
-                for a in after {
-                    args.extend(["--after".to_string(), a.clone()]);
-                }
-                if *any_exit {
-                    args.push("--any-exit".to_string());
-                }
-                if let Some(et) = exec_target {
-                    args.extend([
-                        "--exec-target".to_string(),
-                        match et {
-                            CliExecTarget::PosixShell => "posix-shell",
-                            CliExecTarget::PowerShell => "powershell",
-                            CliExecTarget::PythonRepl => "python-repl",
-                            CliExecTarget::DuckDb => "duckdb",
-                            CliExecTarget::None => "none",
-                        }
-                        .to_string(),
-                    ]);
-                }
-                if let Some(b) = boundary {
-                    // Display is the inverse of the parse, so this round-trips.
-                    args.extend(["--boundary".to_string(), b.to_string()]);
-                }
-                for parent in boundary_parent {
-                    args.extend(["--boundary-parent".to_string(), parent.to_string()]);
-                }
-                args.push("--".to_string());
-                args.extend(cmd.iter().cloned());
-                args
-            }
-            Commands::Status { name, namespace } => {
-                let mut args = vec!["status".to_string(), name.clone()];
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
-                }
-                args
-            }
-            Commands::List { namespace } => {
-                let mut args = vec!["list".to_string()];
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
-                }
-                args
-            }
-            Commands::Log {
-                name,
-                namespace,
-                tail,
-                follow,
-                since,
-                raw,
-            } => {
-                let mut args = vec!["log".to_string(), name.clone()];
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
-                }
-                if let Some(n) = tail {
-                    args.extend(["--tail".to_string(), n.to_string()]);
-                }
-                if *follow {
-                    args.push("--follow".to_string());
-                }
-                if let Some(s) = since {
-                    args.extend(["--since".to_string(), s.clone()]);
-                }
-                if *raw {
-                    args.push("--raw".to_string());
-                }
-                args
-            }
-            Commands::Push { name, namespace } => {
-                let mut args = vec!["push".to_string(), name.clone()];
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
-                }
-                args
-            }
-            Commands::Kill {
-                name,
-                namespace,
-                force,
-            } => {
-                let mut args = vec!["kill".to_string(), name.clone()];
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
-                }
-                if *force {
-                    args.push("--force".to_string());
-                }
-                args
-            }
-            Commands::Wait {
-                names,
-                namespace,
-                timeout,
-                any,
-            } => {
-                let mut args = vec!["wait".to_string()];
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
-                }
-                if let Some(t) = timeout {
-                    args.extend(["--timeout".to_string(), t.to_string()]);
-                }
-                if *any {
-                    args.push("--any".to_string());
-                }
-                args.extend(names.iter().cloned());
-                args
-            }
-            Commands::Watch {
-                namespace,
-                events,
-                logs,
-                annotations,
-                from_now,
-                // ready-file is a local orchestration signal; not forwarded.
-                ready_file: _,
-            } => {
-                let mut args = vec!["watch".to_string()];
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
-                }
-                if *events {
-                    args.push("--events".to_string());
-                }
-                if *logs {
-                    args.push("--logs".to_string());
-                }
-                if *annotations {
-                    args.push("--annotations".to_string());
-                }
-                if *from_now {
-                    args.push("--from-now".to_string());
-                }
-                args
-            }
-            Commands::Attach {
-                name,
-                namespace,
-                takeover,
-                escape,
-            } => {
-                let mut args = vec!["attach".to_string(), name.clone()];
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
-                }
-                if *takeover {
-                    args.push("--takeover".to_string());
-                }
-                if *escape == AttachEscape::None {
-                    args.extend(["--escape".to_string(), "none".to_string()]);
-                }
-                args
-            }
-            _ => unreachable!("remote_args called on unsupported command"),
-        }
-    }
-
     /// Reconstruct CLI args for local-only commands that can offer a pre-filled
     /// `ssh <host> 'tendr …'` fallback when `--host` is rejected. Reconstructed
     /// from clap-parsed state — never raw argv, which would corrupt child args
@@ -883,31 +676,6 @@ impl Commands {
             _ => None,
         }
     }
-
-    /// Return the subcommand name string for allowlist checking.
-    fn name(&self) -> &'static str {
-        match self {
-            Commands::Start { .. } => "start",
-            Commands::Status { .. } => "status",
-            Commands::List { .. } => "list",
-            Commands::Log { .. } => "log",
-            Commands::Push { .. } => "push",
-            Commands::Kill { .. } => "kill",
-            Commands::Wait { .. } => "wait",
-            Commands::Watch { .. } => "watch",
-            Commands::Attach { .. } => "attach",
-            Commands::Run { .. } => "run",
-            Commands::Exec { .. } => "exec",
-            Commands::Events { .. } => "events",
-            Commands::Query { .. } => "query",
-            Commands::Emit { .. } => "emit",
-            Commands::Wrap { .. } => "wrap",
-            Commands::Prune { .. } => "prune",
-            Commands::Guide { .. } => "guide",
-            Commands::Skill { .. } => "skill",
-            Commands::Sidecar { .. } => "_sidecar",
-        }
-    }
 }
 
 /// Parse a human-readable duration string (e.g. "7d", "24h", "30m").
@@ -981,35 +749,30 @@ fn main() {
                 }
             }
         }
-        let cmd_name = cli.command.name();
-        if !tendr::ssh::is_remote_supported(cmd_name) {
-            // The local-only verbs are a usage error (exit 2) with a
-            // pre-filled, copy-pasteable fallback — rejected before any
-            // connection or side effect.
-            if let Some(args) = cli.command.local_fallback_args() {
-                let mut full = vec!["tendr".to_string()];
-                full.extend(args);
-                let remote_cmd = shell_words::join(&full);
-                eprintln!(
-                    "error: '{cmd_name}' is local-only and does not support --host\n\
-                     try:  ssh {} {}",
-                    shell_words::quote(host),
-                    shell_words::quote(&remote_cmd)
-                );
-                std::process::exit(2);
+        let operation = match remote_op::RemoteOperation::try_from(&cli.command) {
+            Ok(operation) => operation,
+            Err(local) => {
+                // The local-only verbs are a usage error (exit 2) with a
+                // pre-filled, copy-pasteable fallback — rejected before any
+                // connection or side effect.
+                if let Some(args) = cli.command.local_fallback_args() {
+                    let mut full = vec!["tendr".to_string()];
+                    full.extend(args);
+                    let remote_cmd = shell_words::join(&full);
+                    eprintln!(
+                        "error: '{}' is local-only and does not support --host\n\
+                         try:  ssh {} {}",
+                        local.command,
+                        shell_words::quote(host),
+                        shell_words::quote(&remote_cmd)
+                    );
+                    std::process::exit(2);
+                }
+                eprintln!("{local}");
+                std::process::exit(1);
             }
-            eprintln!(
-                "command '{cmd_name}' is not supported over SSH (--host).\n\
-                 Supported remote commands: {}.\n\
-                 Some local-only commands rely on local FIFO, process context,\n\
-                 or filesystem state that cannot tunnel through ssh -T.",
-                tendr::ssh::REMOTE_COMMANDS.join(", ")
-            );
-            std::process::exit(1);
-        }
-        let args = cli.command.remote_args();
-        let allocate_tty = cmd_name == "attach";
-        match tendr::ssh::exec_ssh(host, &args, allocate_tty) {
+        };
+        match tendr::ssh::exec_ssh(host, &operation.legacy_argv(), operation.allocates_tty()) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("{e}");
@@ -1019,46 +782,6 @@ fn main() {
     }
 
     let result = match cli.command {
-        Commands::Start {
-            name,
-            namespace,
-            cmd,
-            stdin,
-            pty,
-            exec_target,
-            replace,
-            timeout,
-            cwd,
-            env_vars,
-            unset_env,
-            on_exit,
-            after,
-            any_exit,
-            boundary,
-            boundary_parent,
-        } => resolve_namespace(namespace).and_then(|ns| {
-            let boundary_ctx = boundary.map(|current| tendr::model::boundary::BoundaryContext {
-                current,
-                parents: boundary_parent,
-            });
-            commands::cmd_start(
-                &name,
-                cmd,
-                stdin,
-                replace,
-                timeout,
-                cwd.as_deref(),
-                &env_vars,
-                &unset_env,
-                &on_exit,
-                &after,
-                any_exit,
-                &ns,
-                pty,
-                exec_target.map(tendr::model::spec::ExecTarget::from),
-                boundary_ctx,
-            )
-        }),
         Commands::Run {
             script,
             shell,
@@ -1094,36 +817,6 @@ fn main() {
                 any_exit,
             )
         }),
-        Commands::Push { name, namespace } => {
-            resolve_namespace(namespace).and_then(|ns| commands::cmd_push(&name, &ns))
-        }
-        Commands::Status { name, namespace } => {
-            resolve_namespace(namespace).and_then(|ns| commands::cmd_status(&name, &ns))
-        }
-        Commands::Kill {
-            name,
-            namespace,
-            force,
-        } => resolve_namespace(namespace).and_then(|ns| commands::cmd_kill(&name, force, &ns)),
-        Commands::List { namespace } => {
-            parse_optional_namespace(namespace).and_then(|ns| commands::cmd_list(ns.as_ref()))
-        }
-        Commands::Log {
-            name,
-            namespace,
-            tail,
-            follow,
-            since,
-            raw,
-        } => resolve_namespace(namespace)
-            .and_then(|ns| commands::cmd_log(&name, tail, follow, since, raw, &ns)),
-        Commands::Wait {
-            names,
-            namespace,
-            timeout,
-            any,
-        } => resolve_namespace(namespace)
-            .and_then(|ns| commands::cmd_wait(&names, timeout, any, &ns)),
         Commands::Exec {
             name,
             namespace,
@@ -1139,16 +832,6 @@ fn main() {
                     .and_then(|ns| commands::cmd_exec(&name, cmd, timeout, &ns))
             }
         }
-        Commands::Watch {
-            namespace,
-            events,
-            logs,
-            annotations,
-            from_now,
-            ready_file,
-        } => parse_optional_namespace(namespace).and_then(|ns| {
-            commands::cmd_watch(ns.as_ref(), events, logs, annotations, from_now, ready_file)
-        }),
         Commands::Events {
             namespace,
             sessions,
@@ -1246,18 +929,6 @@ fn main() {
                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
             }
         }
-        Commands::Attach {
-            name,
-            namespace,
-            takeover,
-            escape,
-        } => resolve_namespace(namespace).and_then(|ns| {
-            let mode = match escape {
-                AttachEscape::CtrlBackslash => tendr::attach_escape::EscapeMode::CtrlBackslash,
-                AttachEscape::None => tendr::attach_escape::EscapeMode::Disabled,
-            };
-            commands::cmd_attach(&name, &ns, takeover, mode)
-        }),
         Commands::Guide { topic } => commands::cmd_guide(topic.as_deref()),
         Commands::Skill { action } => match action {
             SkillAction::Print => commands::cmd_skill_print(),
@@ -1265,6 +936,19 @@ fn main() {
             SkillAction::Path { global } => commands::cmd_skill_path(global),
         },
         Commands::Sidecar { session_dir } => commands::cmd_sidecar(session_dir),
+        // The remote-capable commands run through the same typed layer as
+        // `--host`. Named, not a catch-all, so a new command must be classified.
+        remote @ (Commands::Start { .. }
+        | Commands::Status { .. }
+        | Commands::List { .. }
+        | Commands::Log { .. }
+        | Commands::Push { .. }
+        | Commands::Kill { .. }
+        | Commands::Wait { .. }
+        | Commands::Watch { .. }
+        | Commands::Attach { .. }) => remote_op::RemoteOperation::try_from(&remote)
+            .map_err(anyhow::Error::from)
+            .and_then(remote_op::dispatch),
     };
 
     if let Err(e) = result {

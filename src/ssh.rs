@@ -1,11 +1,12 @@
 //! Remote transport — a thin SSH wrapper, not a second lifecycle model.
 //!
-//! `--host` forwards an allowlisted subset of commands ([`REMOTE_COMMANDS`]) to
-//! a remote `tendr`, which runs the *same* local lifecycle on the far side.
-//! Ordinary commands are POSIX-shell-quoted into an `ssh -T` argv; `exec`
-//! instead rides the [`exec_frame`](crate::exec_frame) over SSH stdin so no
-//! user value ever reaches the remote argv. Destinations are validated
-//! ([`validate_destination`]) to fail closed against option-shaped hosts.
+//! `--host` forwards the remote-capable commands (the binary's
+//! `RemoteOperation`) to a remote `tendr`, which runs the *same* local
+//! lifecycle on the far side. Ordinary commands are POSIX-shell-quoted into an
+//! `ssh -T` argv; `exec` instead rides the [`exec_frame`](crate::exec_frame)
+//! over SSH stdin so no user value ever reaches the remote argv. Destinations
+//! are validated ([`validate_destination`]) to fail closed against
+//! option-shaped hosts.
 
 use std::io;
 use std::process::{Command, Stdio};
@@ -58,24 +59,6 @@ impl SshError {
             _ => 1,
         }
     }
-}
-
-/// Commands whose argv is forwarded verbatim over SSH transport.
-///
-/// `exec` is deliberately absent: it is remote-capable, but travels via
-/// the frame transport (`exec_ssh_frame`) — the request rides the SSH
-/// stdin channel as one JSON frame, never the remote argv. Every command
-/// not in this list (and not `exec`) is local-only when `--host` is set —
-/// e.g. `run`, `wrap`, `prune`, `query`, `guide`, `skill`, `emit`,
-/// `events`. Of these, `wrap` relies on local process context, `run`
-/// reads a local script file, and `prune` walks the local session root.
-pub const REMOTE_COMMANDS: &[&str] = &[
-    "start", "status", "list", "log", "push", "kill", "wait", "watch", "attach",
-];
-
-/// Check whether a subcommand is supported for remote execution.
-pub fn is_remote_supported(subcommand: &str) -> bool {
-    REMOTE_COMMANDS.contains(&subcommand)
 }
 
 /// Validate an SSH destination before it is handed to the local `ssh` binary.
@@ -596,24 +579,5 @@ mod tests {
         let remote_cmd = remote_args.join(" ");
         let parsed = shell_words::split(&remote_cmd).unwrap();
         assert_eq!(parsed[7], "echo $HOME && ls");
-    }
-
-    #[test]
-    fn remote_allowlist() {
-        assert!(is_remote_supported("start"));
-        assert!(is_remote_supported("status"));
-        assert!(is_remote_supported("list"));
-        assert!(is_remote_supported("log"));
-        assert!(is_remote_supported("push"));
-        assert!(is_remote_supported("kill"));
-        assert!(is_remote_supported("wait"));
-        assert!(is_remote_supported("watch"));
-        assert!(is_remote_supported("attach"));
-
-        assert!(!is_remote_supported("run"));
-        assert!(!is_remote_supported("exec"));
-        assert!(!is_remote_supported("wrap"));
-        assert!(!is_remote_supported("prune"));
-        assert!(!is_remote_supported("_sidecar"));
     }
 }

@@ -110,12 +110,15 @@ const EVENT_RELEASE: u32 = 3;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
-/// Which escape the client recognizes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which escape the client recognizes. On the wire it uses the
+/// `--escape` flag values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EscapeMode {
     /// `Ctrl-\ d` detaches.
+    #[serde(rename = "ctrl-backslash")]
     CtrlBackslash,
     /// No escape: every byte is forwarded.
+    #[serde(rename = "none")]
     Disabled,
 }
 
