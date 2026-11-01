@@ -185,7 +185,7 @@ fn prune_sessions(
         dry_run,
         namespace: namespace.map(|ns| ns.as_str().to_owned()),
     };
-    println!("{}", serde_json::to_string(&summary).unwrap());
+    outln!("{}", serde_json::to_string(&summary).unwrap());
 
     Ok(not_found)
 }
@@ -195,7 +195,7 @@ fn prune_sessions(
 /// cannot prove a socket unused removes nothing and warns on stderr.
 #[cfg(unix)]
 fn sweep_attach_sockets(root: &SessionRoot, dry_run: bool) -> u64 {
-    let Some(state_root) = root.path().parent() else {
+    let Some(state_root) = root.state_root() else {
         return 0;
     };
     match tendr::attach_socket::sweep_orphans(state_root, dry_run) {
@@ -228,7 +228,7 @@ fn emit_skip(
         error: None,
         bytes: None,
     };
-    println!("{}", serde_json::to_string(&line).unwrap());
+    outln!("{}", serde_json::to_string(&line).unwrap());
 }
 
 fn emit_delete(
@@ -248,7 +248,7 @@ fn emit_delete(
         error: None,
         bytes,
     };
-    println!("{}", serde_json::to_string(&line).unwrap());
+    outln!("{}", serde_json::to_string(&line).unwrap());
 }
 
 fn emit_error(ns: &Namespace, name: &tendr::model::ids::SessionName, error: &str) {
@@ -262,7 +262,7 @@ fn emit_error(ns: &Namespace, name: &tendr::model::ids::SessionName, error: &str
         error: Some(error.to_owned()),
         bytes: None,
     };
-    println!("{}", serde_json::to_string(&line).unwrap());
+    outln!("{}", serde_json::to_string(&line).unwrap());
 }
 
 fn exit_reason_label(status: &RunStatus) -> String {

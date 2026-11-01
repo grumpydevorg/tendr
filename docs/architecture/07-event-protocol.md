@@ -64,7 +64,7 @@ dot, no empty segments, at most 128 bytes.
 | `run.sidecar_failed` | sidecar | `data`: `{"status":"Exited","reason":"SidecarFailed","step":"<step>"}`. The sidecar's direct record that it failed and stopped the child. |
 | `run.sidecar_lost` | CLI reconciliation (`source: tendr.cli`) | `data.provenance` is `"inferred"`. |
 | `callback.finished` | sidecar | One per `--on-exit` hook. |
-| `pty.control_changed`, `pty.input_revoked`, `recording.stopped` | sidecar | PTY sessions ([04-pty-lane.md](04-pty-lane.md)). |
+| `pty.control_changed`, `pty.input_revoked`, `recording.stopped` | sidecar | PTY sessions ([04-pty-lane.md](04-pty-lane.md)). CLI reconciliation also logs `recording.stopped` (reason `sidecar_lost`) for a lost sidecar. |
 | `exec.started`, `exec.result` | `exec` (`source: tendr.exec`) | `exec.result` holds the `ExecResult` fields. |
 | `log.stdout`, `log.stderr` | `events --include-logs` | Derived at read time, never stored (§5.1). |
 | `cursor.bookmark` | `events --cursors` | Derived at read time, never stored (§5.2). |

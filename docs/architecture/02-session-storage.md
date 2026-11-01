@@ -93,6 +93,12 @@ The attach socket is not in the session dir. It is
 `~/.tendr/sockets/<name>.sock`, where `<name>` is 12 hex characters of a
 SHA-256 over the session path and run ID (`src/attach_socket.rs`). The
 `sockets/` directory is owner-only (`0700`) and the socket is `0600`.
+
+One state root serves one account. `~/.tendr` must be owned by the user who
+runs tendr, and only that user may write it: binding an attach socket refuses a
+root owned by anyone else, and removes group and other write permission from
+the user's own root, with a run warning. Sharing a state root between accounts
+is not supported.
 `a.sock.path` in the session dir holds the socket's full path.
 
 Covered elsewhere:

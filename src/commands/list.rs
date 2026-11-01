@@ -15,7 +15,7 @@ pub fn cmd_list(namespace: Option<&Namespace>) -> anyhow::Result<()> {
         })
         .collect();
     let json = serde_json::to_string_pretty(&entries)?;
-    println!("{json}");
+    outln!("{json}");
 
     Ok(())
 }

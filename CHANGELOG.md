@@ -34,7 +34,25 @@
   exe.dev's init leaks two terminal masters into every SSH command, and tendr
   passed them on to the sidecar and the child, keeping those terminals open
   for the run's life. The sidecar now inherits only stdio and its ready pipe.
-
+- **The attach socket's parent directory is checked too.** Before, only
+  `~/.tendr/sockets` was checked. Another user who could write `~/.tendr`
+  could rename `sockets/` away and make the owner's attach and next start
+  fail. A PTY start now refuses a `~/.tendr` owned by another user. It removes
+  group and other write permission from one the user owns, and records the
+  change as a run warning.
+- **Piping into a reader that exits early no longer panics.** `tendr status
+  x | head -c1` crashed with "Broken pipe". Now `status`, `list`, `log`,
+  `wait`, `kill`, `start`, `prune` and the other commands drop the rest of
+  their output quietly and keep their exit code, as `events` and `watch`
+  already did.
+- **A socket bind failure no longer looks like a failed spawn.** When a PTY
+  session's attach socket cannot be bound, the run still ends `SpawnFailed`,
+  but its evidence is now `attach_socket_failed`, not `spawn_failed_syscall`.
+  Nothing was spawned.
+- **A lost sidecar no longer leaves its recording "Recording".** When
+  reconciliation finds a PTY run's sidecar gone, it now marks the recording
+  `Stopped` with reason `sidecar_lost` and logs `recording.stopped` before
+  `run.sidecar_lost`.
 - **Detaching gives your terminal back.** When you detach, or the attach ends
   for any other reason, `tendr attach` now turns off the terminal modes the
   session turned on: among them the alternate screen, mouse reports, focus

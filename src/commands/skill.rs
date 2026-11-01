@@ -19,16 +19,16 @@ const SKILL_SUBPATH: &str = ".claude/skills/using-tendr/SKILL.md";
 
 /// Print the embedded skill stub to stdout.
 pub fn cmd_skill_print() -> anyhow::Result<()> {
-    print!("{SKILL_STUB}");
+    out!("{SKILL_STUB}");
     if !SKILL_STUB.ends_with('\n') {
-        println!();
+        outln!();
     }
     Ok(())
 }
 
 /// Print where `install` would write, without touching the filesystem.
 pub fn cmd_skill_path(global: bool) -> anyhow::Result<()> {
-    println!("{}", skill_path(global)?.display());
+    outln!("{}", skill_path(global)?.display());
     Ok(())
 }
 
@@ -43,7 +43,7 @@ pub fn cmd_skill_install(global: bool, force: bool) -> anyhow::Result<()> {
         let existing = std::fs::read(&path)
             .with_context(|| format!("reading existing skill file {}", path.display()))?;
         if existing == SKILL_STUB.as_bytes() {
-            println!("already installed: {}", path.display());
+            outln!("already installed: {}", path.display());
             return Ok(());
         }
         if !force {
@@ -59,7 +59,7 @@ pub fn cmd_skill_install(global: bool, force: bool) -> anyhow::Result<()> {
     }
 
     write_stub(&path)?;
-    println!("installed: {}", path.display());
+    outln!("installed: {}", path.display());
     Ok(())
 }
 

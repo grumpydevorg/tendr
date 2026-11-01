@@ -18,9 +18,10 @@ use std::path::Path;
 
 use crate::events::{self, EventDraft, EventWriter, read_session_events};
 use crate::model::dep_fail::DepFailReason;
-use crate::model::event::{Event, Uuid7};
+use crate::model::event::{Event, Kind, Uuid7};
 use crate::model::ids::{EpochTimestamp, Namespace, ProcessIdentity, Source};
 use crate::model::meta::Meta;
+use crate::model::pty::RecordingStopReason;
 use crate::model::state::{ExitReason, RunStatus, SidecarStep};
 use crate::model::transition::{HealedTerminal, Orphan};
 use crate::platform::{Current, Platform, ProcessStatus};
@@ -86,8 +87,32 @@ pub fn reconcile_sidecar_gone(session: &SessionDir, meta: &mut Meta) -> anyhow::
         killed: stop_orphan(&child, meta, "its sidecar was lost"),
     });
     meta.reconcile_sidecar_lost(EpochTimestamp::now(), orphan)?;
-    // WAL discipline holds for the inferred record too: event before meta.
-    append_sidecar_lost_event(session, meta);
+    // WAL discipline holds for the inferred records too: events before meta,
+    // and the recording's stop before the run's terminal record.
+    let mut writer = EventWriter::new(session.path());
+    if meta.stop_live_recording(RecordingStopReason::SidecarLost) {
+        append_cli_event(
+            session,
+            &mut writer,
+            meta,
+            Kind::new("recording.stopped").expect("a grammatical kind"),
+            serde_json::json!({
+                "last_recorded_sequence": null,
+                "reason": "sidecar_lost",
+            }),
+        );
+    }
+    append_cli_event(
+        session,
+        &mut writer,
+        meta,
+        events::lifecycle_kind(meta.status()),
+        events::lifecycle_data(
+            meta.status(),
+            "inferred",
+            meta.launch_spec().boundary.as_ref(),
+        ),
+    );
     session::write_meta_atomic(session, meta)?;
     Ok(Reconciled::Inferred)
 }
@@ -247,10 +272,16 @@ fn healed_terminal_of(data: &serde_json::Value) -> Option<HealedTerminal> {
     }
 }
 
-/// Append the inferred `run.sidecar_lost` event (`data.provenance:
-/// "inferred"`, source `tendr.cli`, fresh CLI writer identity). Best-effort:
-/// reconciliation must not fail because the history log is unwritable.
-fn append_sidecar_lost_event(session: &SessionDir, meta: &Meta) {
+/// Append an inferred event from reconciliation (source `tendr.cli`, the
+/// fresh CLI writer identity of `writer`). Best-effort: reconciliation must
+/// not fail because the history log is unwritable.
+fn append_cli_event(
+    session: &SessionDir,
+    writer: &mut EventWriter,
+    meta: &Meta,
+    kind: Kind,
+    data: serde_json::Value,
+) {
     let Some(namespace) = namespace_of(session) else {
         return;
     };
@@ -259,7 +290,7 @@ fn append_sidecar_lost_event(session: &SessionDir, meta: &Meta) {
     };
     let draft = EventDraft {
         id: None,
-        kind: events::lifecycle_kind(meta.status()),
+        kind,
         namespace,
         session: meta.session().clone(),
         run_id: meta.run_id(),
@@ -267,14 +298,9 @@ fn append_sidecar_lost_event(session: &SessionDir, meta: &Meta) {
         source,
         block_id: None,
         parent_id: None,
-        data: Some(events::lifecycle_data(
-            meta.status(),
-            "inferred",
-            meta.launch_spec().boundary.as_ref(),
-        )),
+        data: Some(data),
         preview: None,
     };
-    let mut writer = EventWriter::new(session.path());
     let _ = writer.append(draft, true);
 }
 

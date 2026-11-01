@@ -180,6 +180,10 @@ concurrent `push` is refused, not interleaved.
 - `Ctrl-\` then `d` detaches; the session keeps running. `Ctrl-\` twice sends
   one `Ctrl-\`; `Ctrl-\` then any other key sends both. `--escape none` turns
   the escape off. `Enter ~ .` is the outer `ssh` escape, not tendr's.
+- Detaching, or losing the connection, drops any input you typed that tendr
+  had not yet written to the session's terminal, as `--takeover` does. Tendr
+  logs it as `pty.input_revoked`. Input already written stays for the program
+  to read.
 - `Ctrl-C` goes to the session; it does not stop `attach`.
 - Window resizes follow your terminal, and your terminal settings are restored
   however the attach ends. The modes the session turned on, such as the
@@ -189,7 +193,7 @@ concurrent `push` is refused, not interleaved.
   such as Claude Code redraws; scrollback is not restored.
 - `attach` is refused while another client holds the terminal. `--takeover`
   disconnects that client and drops any input it or an in-flight `push` had
-  queued. Use it to reconnect after a dropped SSH connection.
+  queued but tendr had not yet written to the terminal. Use it to reconnect after a dropped SSH connection.
 - SIGTERM, SIGHUP or SIGINT (closing the window sends SIGHUP) also detach. It
   exits 1 with `tendr: attach ended by SIGTERM` (or the signal received).
 
@@ -209,7 +213,8 @@ under `recording/<run_id>/` in the session directory, but not typed input.
 (size limit, disk failure, or storage falling behind), the session keeps
 running. `status` then shows `Stopped` with the last recorded sequence, Tendr
 logs a `recording.stopped` event, and the run ends with a warning that later
-output was not recorded.
+output was not recorded. If the sidecar itself is lost, the recording shows
+`Stopped` with reason `sidecar_lost`.
 
 The child gets `TERM=xterm-256color` when `TERM` was missing, empty, `dumb`,
 or removed with `--unset-env TERM` for the `tendr start` that launched it, as

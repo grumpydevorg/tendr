@@ -44,7 +44,7 @@ pub fn cmd_start(
     )?;
 
     let json = serde_json::to_string_pretty(&meta)?;
-    println!("{json}");
+    outln!("{json}");
 
     // Exit non-zero if the run already ended in failure — agents branch on
     // exit code (the same codes as `wait`).

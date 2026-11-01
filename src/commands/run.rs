@@ -105,7 +105,7 @@ pub fn cmd_run(
     // --- Detached mode: print JSON and return ---
     if effective_detach {
         let json = serde_json::to_string_pretty(&meta)?;
-        println!("{json}");
+        outln!("{json}");
         return Ok(());
     }
 

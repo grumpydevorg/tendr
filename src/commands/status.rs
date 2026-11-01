@@ -32,7 +32,7 @@ pub fn cmd_status(name: &str, namespace: &Namespace) -> anyhow::Result<()> {
     tendr::reconcile::reconcile_sidecar_gone(&session, &mut meta)?;
 
     let json = serde_json::to_string_pretty(&meta)?;
-    println!("{json}");
+    outln!("{json}");
     Ok(())
 }
 

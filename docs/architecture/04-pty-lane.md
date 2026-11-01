@@ -143,8 +143,11 @@ A `push` to a pipe session that is not running exits 1.
 
 ## Input arbitration
 
-- Input queued by a superseded controller is never written. It is recorded
-  as `pty.input_revoked`.
+- Input queued by a controller that is superseded (a takeover) or leaves (a
+  detach or a lost connection), and not yet written to the PTY master, is
+  never written. It is recorded as `pty.input_revoked`, after the
+  `pty.control_changed` that ended its control. Bytes already written stay in
+  the PTY's buffer for the child.
 - PTY `exec` frames arrive over the stdin FIFO. The FIFO forwarder is
   arbitrated the same way, but it cannot report an outcome:
   - It waits behind another agent's push.
@@ -161,9 +164,17 @@ A `push` to a pipe session that is not running exits 1.
 - The socket is bound in `~/.tendr/sockets` (owner-only directory, `0600`
   socket, short name derived from the session and run;
   [02-session-storage.md](02-session-storage.md#pty-attach-socket)).
+- Its parent, `~/.tendr`, is checked first. Anyone who can write it could
+  rename `sockets/` away and break the owner's attach and next start. It must
+  be a directory (symlinks followed) owned by the user. The sidecar removes
+  group and other write permission from it, leaves the other bits alone, and
+  records the change as a run warning. A root owned by another user fails the
+  start. The root is the parent of the sessions directory, found by position,
+  not by name.
 - The socket is bound, and `a.sock.path` written, before the child is
   spawned. An unsafe directory, an overlong path, or an existing path fails
-  the start as `SpawnFailed`. The session never runs without a listener.
+  the start as `SpawnFailed`, with `attach_socket_failed` evidence. The
+  session never runs without a listener.
 - After spawn, the lifecycle guard owns the socket. If the recorder, input
   writer or listener cannot start, the guard stops the child and records
   `SidecarFailed { step: attach_bind }`
@@ -321,6 +332,11 @@ Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
   sequence), before the run's terminal record, never after it.
 - After a stop the run ends with a warning. The child and viewers keep
   running.
+- A lost sidecar cannot record its stop. When reconciliation infers
+  `SidecarLost`, it marks a recording still `Recording` as `Stopped` with
+  reason `sidecar_lost` and no last sequence, and logs `recording.stopped`
+  from `tendr.cli` before `run.sidecar_lost`. The segments on disk hold what
+  was recorded.
 
 `cargo run --example dump-recording -- <path>` prints a recording as text.
 `<path>` is a segment file, a run's recording directory, or a session
