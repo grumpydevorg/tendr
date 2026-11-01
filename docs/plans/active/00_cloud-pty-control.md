@@ -55,12 +55,14 @@ back is [PTY replay](../backlog/pty-replay.md).
   `proc_pidinfo` and `getsid` worked for same-user processes in another
   session on macOS 27, so the EPERM noted in `src/platform/unix.rs` needs
   rechecking.
-- **Step 16. A healed run stops its recording** (local). When a sidecar dies
-  between writing its terminal event and writing `meta.json`, the next CLI
-  call heals the run from the event (`heal_terminal_from_event` in
+- **Step 16. A healed run stops its recording** (local; builds on #140's
+  `Meta::stop_live_recording`). When a sidecar dies between writing its
+  terminal event and writing `meta.json`, the next `status`, `wait`, `kill`
+  or `run` heals the run from the event (`heal_terminal_from_event` in
   `src/model/transition.rs`), but leaves `pty.recording.state` as
-  `Recording` on the ended run. Mark the recording stopped there too, as
-  `SidecarLost` reconciliation now does.
+  `Recording` on the ended run. Mark the recording stopped in meta only: the
+  terminal event is already logged, and `recording.stopped` never follows a
+  run's terminal record.
 
 ## Gates
 
@@ -75,11 +77,11 @@ bracketed-paste-safe escape), Claude Code 2.1.316, omp 18.14.0 and Ghostty
 | Invariant | Result |
 |-----------|--------|
 | Same Claude pid throughout | Pass: pid 17435 through agent push, human typing in Ghostty, agent push, an exe.dev takeover and two reattaches |
-| Old epochs cannot write after an acknowledged takeover | Pass on both half-open paths (SIGSTOP of the Mac's ssh; `iptables` drop on the VM's own sshd): bytes typed into the frozen client never reached the child; the new client had control in 0.5–0.7 s; the old one exited 81 after resuming or healing. A client taken over while stalled exited 0 instead of 81 until #141 |
+| Old epochs cannot write after an acknowledged takeover | Pass on both half-open paths (SIGSTOP of the Mac's ssh; `iptables` drop on the VM's own sshd): bytes typed into the frozen client never reached the child; the new client had control in 0.5–0.7 s; the old one exited 81 after resuming or healing. A client taken over while stalled, resumed after the new client detached, exited 0 on `a04f061`; with #141's build on the VM, its two CLI tests passed 3 of 3 runs and `rep_exit.py` printed the takeover note 3 of 3 |
 | Viewers cannot block capture or control | Pass: with input full and a stalled viewer during a 250–320 KB/s flood, takeover took 0.071 s on the VM (0.79 s from the Mac), and the recording had no sequence or line gaps. Input still queued at takeover was dropped (50 KB in the `slowread` runs) |
 | Reconnects do not accumulate stale clients | Pass: through 32 idle half-open takeovers the sidecar went from 13 fds, 8 threads, 0 clients to 17/10/1 (one live client) 3 s after the last takeover, unchanged after the heal, and back to 13/8/0 once that client left; no SSH timeout involved |
 | A surviving run stays attachable after logout | Pass with `KillUserProcesses=no`, lingering off and on: same run and pid after relogin. With `KillUserProcesses=yes` logind removed the session 9 ms after the disconnect, and the sidecar and child were gone at the first check 1.4 s later; only a lingering user's `systemd-run --user --scope tendr start …` survived |
-| Terminal bytes stay within the owner's account | Pass with two accounts: every attempt by `intruder` on `acc`'s socket was refused by permissions; with the socket made reachable, the sidecar answered `REJECTED` before reading the hello, and the CLI exits 85 on a foreign listener. Symlinked or foreign `sockets` directories and every bind failure tested (file, symlink, foreign directory, over-long path, EPERM, EROFS) failed the start with no child. Not reachable on the VM, so covered only by the unit test in `src/attach_socket.rs`: an existing file at the computed socket path. The unchecked parent of `sockets/` was fixed in #140 |
+| Terminal bytes stay within the owner's account | Pass with two accounts: every attempt by `intruder` on `acc`'s socket was refused by permissions; with the socket made reachable, the sidecar answered `REJECTED` before reading the hello, and the CLI exits 85 on a foreign listener. Symlinked or foreign `sockets` directories and every bind failure tested (file, symlink, foreign directory, over-long path, EPERM, EROFS) failed the start with no child. Not reachable on the VM, so covered only by the unit test in `src/attach_socket.rs`: an existing file at the computed socket path. A writable parent of `sockets/` let another user break the owner's attach (denial of service only) |
 | Detach leaves ordinary Claude input alone | Pass from Ghostty in legacy, kitty and `modifyOtherKeys` modes: `Ctrl-]` passes, prefix then a key forwards both, a doubled prefix forwards one, modes come back on reattach. Ghostty turns a pasted `Ctrl-\` into a space, so the paste case ran over nested `ssh -t`, where it arrived intact. `TENDR_TEST_SSH_HOST=tendr-pty.exe.xyz TENDR_TEST_SSH_TENDR=/usr/local/bin/tendr cargo test --test cli_attach_ssh` (tests at `b2a4e3d`): 4 ran, 4 passed, 12 s |
 | Query handling supports the measured workflow | Pass: no stall started detached; modes replayed on attach; each same-size reattach recorded a repaint pair with a 1.7–1.9 KB redraw about 16 ms later. The full recording: 134 output and 12 resize records, sequence 1–146, no gaps, clean end |
 
