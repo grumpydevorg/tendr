@@ -55,7 +55,10 @@ flowchart LR
 - The input writer only decides ownership changes and revocations. It does
   not write to the session dir. Those side effects travel as typed effects
   on one channel to one *effects thread*, which writes them in order:
-  - events: `pty.control_changed`, `pty.input_revoked`, `recording.stopped`
+  - events: `pty.control_changed`, `pty.input_revoked`, `recording.stopped`.
+    `pty.control_changed` carries `control`, `trigger` (`attach`,
+    `takeover` or `detach`) and `epoch`: the controller epoch granted, or
+    the one a detach released.
   - `meta.json` patches: `pty.control`, `pty.recording`
 
   So a slow disk never delays a takeover's acknowledgement, an input step,
@@ -96,9 +99,27 @@ flowchart LR
 
 - `attach` must open with a version 1 hello (`MSG_HELLO`).
 - A plain attach is refused while a human holds control.
-- `--takeover` replaces the holder, which is disconnected. The sidecar first
-  sends it `MSG_RETIRED`, best-effort: a client that has stopped reading its
-  output misses it and sees only end of stream.
+- `--takeover` replaces the holder, which is disconnected and exits 81. The
+  holder is told in one of two ways:
+  - `MSG_RETIRED`, when the sidecar can send it: up to 200 ms of lock
+    attempts plus a 200 ms write timeout.
+  - The event log, when it cannot. A client that has stopped reading its
+    output holds up the sidecar's writes to it, and could not read a
+    message queued behind that output anyway. The sidecar ends its
+    connection only once the takeover's `pty.control_changed` is in the
+    event log, or after 2 s if the state root is stalled. It waits the same
+    way when an output write was in flight at its first attempt, even if
+    `MSG_RETIRED` was then sent: that write may have stopped part-way
+    through a frame, leaving the message unreadable. When the client reads
+    again and reaches the end of its connection, it checks its run's
+    events: a `takeover` granting the epoch after its own, and no `detach`
+    releasing its own. A client that had already let go, for example one
+    dropped for falling behind, is not taken over by a later `--takeover`
+    and exits 0.
+- A client frozen when it is taken over (its terminal or SSH connection
+  stopped) stays alive, blocked writing to its terminal, until it is
+  resumed. It has no control, and its connection is gone; it only learns
+  of the takeover, and exits 81, once it runs again.
 - The hello must complete within one overall deadline of 5 s
   (`attach_proto::HELLO_TIMEOUT`). Any frame that declares more than 64 KiB
   closes the connection.

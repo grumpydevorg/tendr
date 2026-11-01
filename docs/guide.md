@@ -193,7 +193,11 @@ concurrent `push` is refused, not interleaved.
   such as Claude Code redraws; scrollback is not restored.
 - `attach` is refused while another client holds the terminal. `--takeover`
   disconnects that client and drops any input it or an in-flight `push` had
-  queued but tendr had not yet written to the terminal. Use it to reconnect after a dropped SSH connection.
+  queued but tendr had not yet written to the terminal. Use it to reconnect
+  after a dropped SSH connection. The client taken over exits 81 with
+  `tendr: another client took over this session`. If it was frozen at the
+  time (a stopped terminal or SSH connection), it stays alive, without
+  control, until it runs again, and then exits 81.
 - SIGTERM, SIGHUP or SIGINT (closing the window sends SIGHUP) also detach. It
   exits 1 with `tendr: attach ended by SIGTERM` (or the signal received).
 
@@ -562,7 +566,7 @@ or an I/O error.
 |`query`|DuckDB's|DuckDB's exit code|
 |`guide`, `skill install`|2|Unknown topic; refusing to overwrite a modified skill file|
 |`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not within 10 s (an older or newer `tendr`)|
-|`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach, or the session's run has ended|
+|`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach (also when the attach had stopped reading its output and learns of it only later), or the session's run has ended|
 |`attach`, `push` to a PTY session|82, 83|Reserved, not used yet|
 |`attach`, `push` to a PTY session|84|Runtime or transport: the attach socket is missing or unreachable, the connection fails, or a push ended revoked or stopped with bytes unwritten (stderr gives the byte counts)|
 |`attach`, `push` to a PTY session|85|Identity: the socket's listener, or the connecting client, is another user|
