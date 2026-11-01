@@ -100,3 +100,42 @@ fn none_boundary_does_not_change_canonical_hash() {
     b.boundary = None;
     assert_eq!(a.canonical_hash(), b.canonical_hash());
 }
+
+// --- unset_env ---
+
+#[test]
+fn launch_spec_without_unset_env_serializes_as_before() {
+    // Pins the exact canonical form of a spec that names nothing to unset, so
+    // the hash of every existing spec, and idempotent-start matching against
+    // runs started by older tendr versions, stays the same.
+    let spec = tendr::model::spec::LaunchSpec::new(vec!["echo".into()]).unwrap();
+    assert_eq!(
+        serde_json::to_string(&spec).unwrap(),
+        r#"{"argv":["echo"],"stdin_mode":"None","io_mode":"Pipe","exec_target":"None"}"#
+    );
+}
+
+#[test]
+fn old_launch_spec_json_without_unset_env_deserializes_cleanly() {
+    let json = r#"{"argv":["echo"],"stdin_mode":"None","exec_target":"None"}"#;
+    let spec: tendr::model::spec::LaunchSpec = serde_json::from_str(json).unwrap();
+    assert!(spec.unset_env.is_empty());
+    assert_eq!(
+        spec.canonical_hash(),
+        tendr::model::spec::LaunchSpec::new(vec!["echo".into()])
+            .unwrap()
+            .canonical_hash()
+    );
+}
+
+#[test]
+fn launch_spec_unset_env_round_trips_and_changes_the_hash() {
+    let plain = tendr::model::spec::LaunchSpec::new(vec!["echo".into()]).unwrap();
+    let mut spec = plain.clone();
+    spec.unset_env.insert("CI".to_owned());
+    let json = serde_json::to_string(&spec).unwrap();
+    assert!(json.contains(r#""unset_env":["CI"]"#), "json: {json}");
+    let back: tendr::model::spec::LaunchSpec = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, spec);
+    assert_ne!(spec.canonical_hash(), plain.canonical_hash());
+}

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
@@ -86,6 +86,7 @@ impl Platform for UnixPlatform {
         argv: &[String],
         stdin_piped: bool,
         cwd: Option<&Path>,
+        env_remove: &BTreeSet<String>,
         env: &BTreeMap<String, String>,
     ) -> io::Result<SupervisedChild> {
         let mut cmd = Command::new(&argv[0]);
@@ -102,6 +103,9 @@ impl Platform for UnixPlatform {
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
+        }
+        for name in env_remove {
+            cmd.env_remove(name);
         }
         if !env.is_empty() {
             cmd.envs(env);
@@ -140,6 +144,7 @@ impl Platform for UnixPlatform {
     fn spawn_child_pty(
         argv: &[String],
         cwd: Option<&Path>,
+        env_remove: &BTreeSet<String>,
         env: &BTreeMap<String, String>,
     ) -> io::Result<SupervisedChild> {
         // 1. Create PTY pair at the initial size (a zero size breaks TUIs and
@@ -238,6 +243,9 @@ impl Platform for UnixPlatform {
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
+        }
+        for name in env_remove {
+            cmd.env_remove(name);
         }
         if !env.is_empty() {
             cmd.envs(env);
@@ -1202,7 +1210,8 @@ mod tests {
             "-c".to_owned(),
             "sleep 0.2; printf late-output".to_owned(),
         ];
-        let mut child = UnixPlatform::spawn_child_pty(&argv, None, &BTreeMap::new()).unwrap();
+        let mut child =
+            UnixPlatform::spawn_child_pty(&argv, None, &BTreeSet::new(), &BTreeMap::new()).unwrap();
         let mut reader = UnixPlatform::child_stdout(&mut child).unwrap();
         let mut out = Vec::new();
         let mut chunk = [0u8; 1024];

@@ -5,9 +5,10 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 6b, 8, 9 and 10 remain. Step 5's measurement (below)
-settled step 6's design; 6a, restoring the terminal's modes, shipped. Step 8
-needs any sshd (`TENDR_TEST_SSH_HOST`); step 9 the VM.
+**Status:** steps 6b, 8 and 9 remain. Step 5's measurement (below) settled
+step 6's design; 6a, restoring the terminal's modes, shipped, and so did step
+10, `--unset-env`. Step 8 needs any sshd (`TENDR_TEST_SSH_HOST`); step 9 the
+VM.
 
 ## Goal
 
@@ -81,19 +82,6 @@ back is [PTY replay](../backlog/pty-replay.md).
    orphans. macOS has neither: the sidecar would list processes before
    signalling them, which races with new forks, and `proc_pidinfo` already
    returns EPERM for a process in another session (`src/platform/unix.rs`).
-- **Step 10. Unset an inherited variable** (local). `--unset-env NAME`
-  (repeatable) on `start` and `run` removes `NAME` from the child's
-  environment. An agent's shell exports `CI`, and Claude turns colour off for
-  any `CI` value, empty included, so `--env` cannot undo it.
-   - A new `LaunchSpec` field, `#[serde(default, skip_serializing_if =
-     "BTreeSet::is_empty")]` like `boundary`, so existing specs and their
-     idempotency hashes do not change.
-   - Applied as `env_remove` before the `--env` and `TENDR_*` overrides, which
-     still win. A name containing `=` is a usage error.
-   - `--host` rebuilds `start` and `run` arguments field by field
-     (`src/main.rs`), so it must pass the option on.
-   - Tests: the child does not see the variable; `--env` of the same name
-     still sets it; `--unset-env CI=true` is refused; `--host` passes it on.
 
 Step 9 uses the VM harness in
 [`scripts/pty-vm/`](../../../scripts/pty-vm/README.md).
@@ -164,7 +152,8 @@ else is inherited from the caller:
 | `tendr --host` from the laptop (`ssh -T`) | none, repaired to `xterm-256color` | none | 256 colours |
 
 `NO_COLOR=1` turns colour off and `NO_COLOR=` (empty) does not. `CI` turns it
-off with any value, empty included, so `--env` cannot undo it: step 10.
+off with any value, empty included, so `--env` cannot undo it; step 10 added
+`--unset-env` for that.
 
 ## Open measurements
 

@@ -274,8 +274,8 @@ A `push` to a pipe session that is not running exits 1.
   reports and keyboard protocol, so mouse moves typed escape sequences into
   the shell and `Ctrl-C` arrived as `ESC[99;5u`.
 - The child starts at 24×80. It gets `TERM=xterm-256color` when the launching
-  environment had no `TERM`, an empty one, or `dumb`. An explicit
-  `--env TERM` wins (`sidecar::pty_term`).
+  environment's `TERM` was missing, empty, `dumb`, or removed with
+  `--unset-env TERM`. An explicit `--env TERM` wins (`sidecar::pty_term`).
 
 ## Recording
 

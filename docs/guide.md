@@ -71,6 +71,7 @@ flags:
 |`--replace`|Kill an existing session of the same name and start a new run.|
 |`--timeout <sec>`|Kill the child after this many seconds.|
 |`--cwd <dir>`, `--env KEY=VALUE`|Set the child's working directory or an environment variable.|
+|`--unset-env NAME`|Remove an inherited variable from the child's environment. Repeatable; `--env` of the same name still sets it.|
 |`--after <session>`|Wait for that session to exit before starting. Repeatable.|
 |`--any-exit`|With `--after`, start even if the dependency exited non-zero.|
 |`--on-exit <command>`|Run a command after the child exits. Repeatable.|
@@ -200,11 +201,13 @@ running. `status` then shows `Stopped` with the last recorded sequence, Tendr
 logs a `recording.stopped` event, and the run ends with a warning that later
 output was not recorded.
 
-The child gets `TERM=xterm-256color` when `TERM` was unset, empty or `dumb` for
-the `tendr start` that launched it, as in an agent's tool shell or `ssh -T`.
-Otherwise `TERM` passes through, and `--env TERM=…` always wins. Other
-variables pass through unchanged: remove an agent shell's `CI=true` or
-`NO_COLOR=1` with, for example, `-- env -u CI -u NO_COLOR claude`.
+The child gets `TERM=xterm-256color` when `TERM` was missing, empty, `dumb`,
+or removed with `--unset-env TERM` for the `tendr start` that launched it, as
+in an agent's tool shell or `ssh -T`. Otherwise `TERM` passes through, and
+`--env TERM=…` always wins. Other variables pass through unchanged. An agent's
+shell exports `CI=true` and `NO_COLOR=1`, and Claude Code turns colour off for
+any `CI` value, even an empty one, so `--env CI=` cannot undo it. Remove them
+with `--unset-env CI --unset-env NO_COLOR`.
 
 ## Observe long-running work
 
@@ -282,9 +285,10 @@ make all
 The keys are `session=NAME`, `namespace`, `timeout`, `on-exit` (repeatable),
 `stdin=pipe`, `cwd`, `env=KEY=VALUE` (repeatable), `replace` and `detach`.
 Each matches the flag of the same name; `--foreground` overrides `detach`.
-Command-line values win: `--on-exit` replaces every `on-exit` directive, and
-`--env` entries apply after `env` directives. An unknown directive, or a second
-copy of a non-repeatable one, is an error.
+Command-line values win: `--on-exit` replaces every `on-exit` directive,
+`--env` entries apply after `env` directives, and `--unset-env NAME` drops an
+`env` directive for that name. An unknown directive, or a second copy of a
+non-repeatable one, is an error.
 
 **Annotations.** Inside a session, `tendr wrap` runs a command and records it
 in the session's event log:

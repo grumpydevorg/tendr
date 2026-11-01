@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
 use tendr::platform::Platform;
 use tendr::platform::windows::WindowsPlatform;
@@ -9,8 +9,9 @@ use tendr::platform::windows::WindowsPlatform;
 #[test]
 fn windows_spawn_child_identity() {
     let argv = vec!["cmd".into(), "/C".into(), "echo hello".into()];
-    let mut child = WindowsPlatform::spawn_child(&argv, false, None, &BTreeMap::new())
-        .expect("spawn_child should succeed");
+    let mut child =
+        WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
+            .expect("spawn_child should succeed");
 
     let id = WindowsPlatform::child_identity(&child);
     assert!(id.pid.get() > 0);
@@ -24,8 +25,9 @@ fn windows_spawn_child_identity() {
 #[test]
 fn windows_spawn_captures_stdout() {
     let argv = vec!["cmd".into(), "/C".into(), "echo hello-windows".into()];
-    let mut child = WindowsPlatform::spawn_child(&argv, false, None, &BTreeMap::new())
-        .expect("spawn_child should succeed");
+    let mut child =
+        WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
+            .expect("spawn_child should succeed");
 
     let mut stdout = WindowsPlatform::child_stdout(&mut child).expect("stdout should be available");
 
@@ -44,8 +46,9 @@ fn windows_spawn_captures_stdout() {
 #[test]
 fn windows_try_wait_while_running() {
     let argv = vec!["cmd".into(), "/C".into(), "timeout /t 10 /nobreak".into()];
-    let mut child = WindowsPlatform::spawn_child(&argv, false, None, &BTreeMap::new())
-        .expect("spawn_child should succeed");
+    let mut child =
+        WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
+            .expect("spawn_child should succeed");
 
     // Child should still be running
     let poll = WindowsPlatform::child_try_wait(&mut child).expect("try_wait should not error");
@@ -67,8 +70,9 @@ fn windows_try_wait_while_running() {
 #[test]
 fn windows_force_kill() {
     let argv = vec!["cmd".into(), "/C".into(), "timeout /t 60 /nobreak".into()];
-    let mut child = WindowsPlatform::spawn_child(&argv, false, None, &BTreeMap::new())
-        .expect("spawn_child should succeed");
+    let mut child =
+        WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
+            .expect("spawn_child should succeed");
 
     let handle = WindowsPlatform::child_kill_handle(&child);
     WindowsPlatform::kill_child(&handle, true).expect("force kill should succeed");
@@ -81,8 +85,9 @@ fn windows_force_kill() {
 #[test]
 fn windows_force_kill_idempotent() {
     let argv = vec!["cmd".into(), "/C".into(), "echo done".into()];
-    let mut child = WindowsPlatform::spawn_child(&argv, false, None, &BTreeMap::new())
-        .expect("spawn_child should succeed");
+    let mut child =
+        WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
+            .expect("spawn_child should succeed");
 
     let handle = WindowsPlatform::child_kill_handle(&child);
     WindowsPlatform::child_wait(&mut child).expect("wait should succeed");
@@ -95,8 +100,9 @@ fn windows_force_kill_idempotent() {
 #[test]
 fn windows_kill_graceful_escalates() {
     let argv = vec!["cmd".into(), "/C".into(), "timeout /t 60 /nobreak".into()];
-    let mut child = WindowsPlatform::spawn_child(&argv, false, None, &BTreeMap::new())
-        .expect("spawn_child should succeed");
+    let mut child =
+        WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
+            .expect("spawn_child should succeed");
 
     let handle = WindowsPlatform::child_kill_handle(&child);
 
@@ -118,8 +124,9 @@ fn windows_spawn_with_stdin() {
 
     // `findstr .` reads stdin and echoes lines that match "." (i.e., everything)
     let argv = vec!["findstr".into(), ".".into()];
-    let mut child = WindowsPlatform::spawn_child(&argv, true, None, &BTreeMap::new())
-        .expect("spawn_child should succeed");
+    let mut child =
+        WindowsPlatform::spawn_child(&argv, true, None, &BTreeSet::new(), &BTreeMap::new())
+            .expect("spawn_child should succeed");
 
     let mut stdin = WindowsPlatform::child_stdin(&mut child).expect("stdin should be available");
     stdin.write_all(b"hello from stdin\n").unwrap();
@@ -145,8 +152,8 @@ fn windows_spawn_with_env() {
     env.insert("TENDR_TEST_VAR".into(), "hello-env".into());
 
     let argv = vec!["cmd".into(), "/C".into(), "echo %TENDR_TEST_VAR%".into()];
-    let mut child =
-        WindowsPlatform::spawn_child(&argv, false, None, &env).expect("spawn_child should succeed");
+    let mut child = WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &env)
+        .expect("spawn_child should succeed");
 
     let mut stdout = WindowsPlatform::child_stdout(&mut child).expect("stdout should be available");
 
@@ -167,8 +174,9 @@ fn windows_spawn_with_env() {
 fn windows_kill_graceful_cooperative() {
     let helper = env!("CARGO_BIN_EXE_ctrl_break_responder");
     let argv = vec![helper.to_string()];
-    let mut child = WindowsPlatform::spawn_child(&argv, false, None, &BTreeMap::new())
-        .expect("spawn_child should succeed");
+    let mut child =
+        WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
+            .expect("spawn_child should succeed");
 
     // The helper prints READY once its console control handler is installed, so a
     // CTRL_BREAK sent after this line is guaranteed to be caught — replacing a

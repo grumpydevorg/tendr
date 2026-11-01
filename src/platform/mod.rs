@@ -7,7 +7,7 @@
 //! *observation* is the typed [`ProcessStatus`], never a boolean; lifecycle
 //! *state* is owned by the sidecar, not decided here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -102,11 +102,15 @@ pub trait Platform {
     /// - Unix: setpgid(0,0) to create new process group
     /// - Windows: CREATE_SUSPENDED -> Job Object -> ResumeThread
     ///
+    /// `env_remove` names are removed from the inherited environment first;
+    /// `env` entries are applied after, so they win.
+    ///
     /// Returns an opaque SupervisedChild that owns all backend state.
     fn spawn_child(
         argv: &[String],
         stdin_piped: bool,
         cwd: Option<&Path>,
+        env_remove: &BTreeSet<String>,
         env: &BTreeMap<String, String>,
     ) -> io::Result<Self::SupervisedChild>;
 
@@ -114,11 +118,13 @@ pub trait Platform {
     /// child_stdout() returns PTY master read half.
     /// child_stdin() returns PTY master write half.
     /// child_stderr() returns None (merged output).
+    /// `env_remove` and `env` apply as for `spawn_child`.
     ///
     /// Unix only in slice one. Windows returns Err.
     fn spawn_child_pty(
         argv: &[String],
         cwd: Option<&Path>,
+        env_remove: &BTreeSet<String>,
         env: &BTreeMap<String, String>,
     ) -> io::Result<Self::SupervisedChild>;
 

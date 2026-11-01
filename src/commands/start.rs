@@ -16,6 +16,7 @@ pub fn cmd_start(
     timeout: Option<u64>,
     cwd: Option<&std::path::Path>,
     env_vars: &[String],
+    unset_env: &[String],
     on_exit: &[String],
     after: &[String],
     any_exit: bool,
@@ -32,6 +33,7 @@ pub fn cmd_start(
         timeout,
         cwd,
         env_vars,
+        unset_env,
         on_exit,
         after,
         any_exit,
@@ -74,6 +76,7 @@ pub(crate) fn launch_session(
     timeout: Option<u64>,
     cwd: Option<&std::path::Path>,
     env_vars: &[String],
+    unset_env: &[String],
     on_exit: &[String],
     after: &[String],
     any_exit: bool,
@@ -111,6 +114,17 @@ pub(crate) fn launch_session(
             "invalid --env format: key cannot be empty, got: {entry}"
         );
         launch_spec.env.insert(key.to_string(), value.to_string());
+    }
+    for name in unset_env {
+        anyhow::ensure!(
+            !name.is_empty(),
+            "invalid --unset-env: name cannot be empty"
+        );
+        anyhow::ensure!(
+            !name.contains('='),
+            "invalid --unset-env: name cannot contain '=', got: {name}"
+        );
+        launch_spec.unset_env.insert(name.clone());
     }
     launch_spec.on_exit = on_exit.to_vec();
     launch_spec.boundary = boundary;

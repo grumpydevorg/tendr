@@ -1240,6 +1240,76 @@ fn start_boundary_is_reconstructed_for_ssh() {
     assert!(args.contains(&"echo"), "missing trailing cmd: {args:?}");
 }
 
+#[test]
+fn start_unset_env_is_reconstructed_for_ssh() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = fake_ssh_echo();
+
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        .args([
+            "--host",
+            "user@box",
+            "start",
+            "job",
+            "--unset-env",
+            "CI",
+            "--unset-env",
+            "NO_COLOR",
+            "--",
+            "echo",
+            "hi",
+        ])
+        .env("PATH", tmp.path())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let args: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("ARG:"))
+        .collect();
+    for name in ["CI", "NO_COLOR"] {
+        assert!(
+            args.windows(2).any(|w| w == ["--unset-env", name]),
+            "missing --unset-env {name}: {args:?}"
+        );
+    }
+    let sep = args.iter().position(|a| *a == "--").expect("missing --");
+    assert!(
+        args.iter().rposition(|a| *a == "--unset-env").unwrap() < sep,
+        "--unset-env must precede the child command: {args:?}"
+    );
+}
+
+#[test]
+fn host_run_fallback_keeps_unset_env() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = poison_ssh();
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        .args([
+            "--host",
+            "user@box",
+            "run",
+            "--unset-env",
+            "CI",
+            "deploy.sh",
+        ])
+        .env("PATH", tmp.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let remote = parse_fallback_argv(&stderr, "user@box");
+    assert_eq!(
+        remote,
+        ["tendr", "run", "--unset-env", "CI", "deploy.sh"],
+        "fallback passes --unset-env on"
+    );
+}
+
 // --- host destination hardening (v0.2.1) ---
 
 #[test]

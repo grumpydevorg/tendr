@@ -281,8 +281,9 @@ fn pty_child_term(
 
 /// A PTY is a real terminal, so a caller's `TERM=dumb` (an agent's tool
 /// shell) or no `TERM` at all (`ssh -T`) would tell its child it cannot draw.
-/// Such a session gets `xterm-256color`; a real `TERM` is kept, and an
-/// explicit `--env TERM=…` always wins.
+/// Such a session gets `xterm-256color`, as does one started with
+/// `--unset-env TERM`; a real `TERM` is kept, and an explicit `--env TERM=…`
+/// always wins.
 #[test]
 fn pty_child_gets_a_usable_term() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -310,6 +311,24 @@ fn pty_child_gets_a_usable_term() {
             "term-explicit",
             Some("xterm-ghostty"),
             &["--env", "TERM=dumb"]
+        ),
+        "dumb"
+    );
+    assert_eq!(
+        pty_child_term(
+            &root,
+            "term-unset-flag",
+            Some("xterm-ghostty"),
+            &["--unset-env", "TERM"]
+        ),
+        "xterm-256color"
+    );
+    assert_eq!(
+        pty_child_term(
+            &root,
+            "term-unset-then-env",
+            Some("xterm-ghostty"),
+            &["--unset-env", "TERM", "--env", "TERM=dumb"]
         ),
         "dumb"
     );
@@ -1101,7 +1120,8 @@ impl CliAttach {
         for (key, value) in extra_env {
             env.insert((*key).to_owned(), (*value).to_owned());
         }
-        let mut child = Current::spawn_child_pty(argv, None, &env).unwrap();
+        let mut child =
+            Current::spawn_child_pty(argv, None, &std::collections::BTreeSet::new(), &env).unwrap();
         // Take the resize handle before stdin takes the master's write half.
         let resize_fd = Current::pty_resize_fd(&child);
         let input = Current::child_stdin(&mut child).unwrap();

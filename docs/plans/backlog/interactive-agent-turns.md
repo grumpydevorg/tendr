@@ -53,7 +53,8 @@ was not re-run on 0.4.0.
    and stores only a preview (`MAX_INLINE_DATA_BYTES`, `src/events.rs:37`). A
    raw 40 KB `Stop` payload lost `prompt_id`; project it with `jq` first.
 7. **Agent shells set `TERM=dumb`, `CI=true`, `NO_COLOR=1`.** Since 0.4.0 (#117)
-   a PTY child gets `xterm-256color` for a dumb `TERM`; unset the others.
+   a PTY child gets `xterm-256color` for a dumb `TERM`; remove the others with
+   `--unset-env CI --unset-env NO_COLOR`.
 8. **`--kind` is a prefix match**: `--kind hook.stop` also matches
    `hook.stop_failure`.
 9. **A follower can start first.** `events --follow --from-now --ready-file f`

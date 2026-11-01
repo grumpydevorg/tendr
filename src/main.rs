@@ -106,6 +106,9 @@ enum Commands {
         /// Environment variable override (KEY=VALUE)
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env_vars: Vec<String>,
+        /// Remove NAME from the inherited environment (repeatable)
+        #[arg(long = "unset-env", value_name = "NAME")]
+        unset_env: Vec<String>,
         /// Command to run after the child exits (repeatable)
         #[arg(long = "on-exit", value_name = "COMMAND")]
         on_exit: Vec<String>,
@@ -160,6 +163,9 @@ enum Commands {
         /// Environment variable override (KEY=VALUE)
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env_vars: Vec<String>,
+        /// Remove NAME from the inherited environment (repeatable)
+        #[arg(long = "unset-env", value_name = "NAME")]
+        unset_env: Vec<String>,
         /// Command to run after the child exits (repeatable)
         #[arg(long = "on-exit", value_name = "COMMAND")]
         on_exit: Vec<String>,
@@ -504,6 +510,7 @@ impl Commands {
                 timeout,
                 cwd,
                 env_vars,
+                unset_env,
                 on_exit,
                 after,
                 any_exit,
@@ -532,6 +539,9 @@ impl Commands {
                 }
                 for e in env_vars {
                     args.extend(["--env".to_string(), e.clone()]);
+                }
+                for u in unset_env {
+                    args.extend(["--unset-env".to_string(), u.clone()]);
                 }
                 for o in on_exit {
                     args.extend(["--on-exit".to_string(), o.clone()]);
@@ -712,6 +722,7 @@ impl Commands {
                 timeout,
                 cwd,
                 env_vars,
+                unset_env,
                 on_exit,
                 after,
                 any_exit,
@@ -744,6 +755,9 @@ impl Commands {
                 }
                 for e in env_vars {
                     args.extend(["--env".to_string(), e.clone()]);
+                }
+                for u in unset_env {
+                    args.extend(["--unset-env".to_string(), u.clone()]);
                 }
                 for o in on_exit {
                     args.extend(["--on-exit".to_string(), o.clone()]);
@@ -1016,6 +1030,7 @@ fn main() {
             timeout,
             cwd,
             env_vars,
+            unset_env,
             on_exit,
             after,
             any_exit,
@@ -1034,6 +1049,7 @@ fn main() {
                 timeout,
                 cwd.as_deref(),
                 &env_vars,
+                &unset_env,
                 &on_exit,
                 &after,
                 any_exit,
@@ -1054,6 +1070,7 @@ fn main() {
             timeout,
             cwd,
             env_vars,
+            unset_env,
             on_exit,
             after,
             any_exit,
@@ -1071,6 +1088,7 @@ fn main() {
                 replace,
                 cwd.as_deref(),
                 &env_vars,
+                &unset_env,
                 &on_exit,
                 &after,
                 any_exit,

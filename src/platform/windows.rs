@@ -4,7 +4,7 @@
 //! identity, status), sidecar spawn with STARTUPINFOEXW handle whitelisting,
 //! readiness channel (CreatePipe), and stdin transport (named pipes).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
@@ -118,6 +118,7 @@ impl Platform for WindowsPlatform {
         argv: &[String],
         stdin_piped: bool,
         cwd: Option<&Path>,
+        env_remove: &BTreeSet<String>,
         env: &BTreeMap<String, String>,
     ) -> io::Result<SupervisedChild> {
         use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
@@ -135,6 +136,9 @@ impl Platform for WindowsPlatform {
             .stderr(std::process::Stdio::piped());
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
+        }
+        for name in env_remove {
+            cmd.env_remove(name);
         }
         if !env.is_empty() {
             cmd.envs(env);
@@ -176,6 +180,7 @@ impl Platform for WindowsPlatform {
     fn spawn_child_pty(
         _argv: &[String],
         _cwd: Option<&Path>,
+        _env_remove: &BTreeSet<String>,
         _env: &BTreeMap<String, String>,
     ) -> io::Result<SupervisedChild> {
         Err(io::Error::new(

@@ -272,15 +272,19 @@ fn setup_stdin_forwarding(
 /// The terminal type assumed when a PTY child would otherwise inherit none.
 const DEFAULT_PTY_TERM: &str = "xterm-256color";
 
-/// The `TERM` a PTY child runs under, given its launch `--env` overrides.
+/// The `TERM` a PTY child runs under, given its launch spec.
 ///
 /// An explicit `--env TERM=…` wins. Otherwise the inherited `TERM` is kept
-/// unless it is unset, empty or `dumb`: those come from callers that are not
-/// terminals (an agent's tool shell, `ssh -T`), and would tell a child that
-/// has a real terminal that it cannot draw.
-fn pty_term(launch_env: &std::collections::BTreeMap<String, String>) -> String {
-    if let Some(term) = launch_env.get("TERM") {
+/// unless it is unset, empty, `dumb` or removed with `--unset-env TERM`: the
+/// first three come from callers that are not terminals (an agent's tool
+/// shell, `ssh -T`), and would tell a child that has a real terminal that it
+/// cannot draw.
+fn pty_term(spec: &LaunchSpec) -> String {
+    if let Some(term) = spec.env.get("TERM") {
         return term.clone();
+    }
+    if spec.unset_env.contains("TERM") {
+        return DEFAULT_PTY_TERM.to_owned();
     }
     match std::env::var("TERM") {
         Ok(term) if !term.is_empty() && term != "dumb" => term,
@@ -1123,6 +1127,8 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
     }
 
     // Build effective env: user-supplied first, then TENDR_* overlay (authoritative).
+    // The spawn removes `unset_env` names from the inherited env before applying
+    // this, so both still win over an unset.
     let mut effective_env = meta.launch_spec().env.clone();
     effective_env.insert(
         "TENDR_SESSION".to_owned(),
@@ -1138,7 +1144,7 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
     // A PTY is a real terminal: don't hand its child a `TERM` that says it
     // cannot draw.
     if meta.launch_spec().io_mode == IoMode::Pty {
-        effective_env.insert("TERM".to_owned(), pty_term(&meta.launch_spec().env));
+        effective_env.insert("TERM".to_owned(), pty_term(meta.launch_spec()));
     }
 
     // --- Wait for --after dependencies ---
@@ -1262,6 +1268,7 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
         Current::spawn_child_pty(
             meta.launch_spec().argv(),
             meta.launch_spec().cwd.as_deref(),
+            &meta.launch_spec().unset_env,
             &effective_env,
         )
     } else {
@@ -1269,6 +1276,7 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
             meta.launch_spec().argv(),
             meta.launch_spec().stdin_mode == crate::model::spec::StdinMode::Pipe,
             meta.launch_spec().cwd.as_deref(),
+            &meta.launch_spec().unset_env,
             &effective_env,
         )
     };
@@ -2485,14 +2493,14 @@ impl PtyRecordingRun {
 fn start_pty_recording(
     session_dir: &Path,
     run_id: RunId,
-    launch_env: &std::collections::BTreeMap<String, String>,
+    launch_spec: &LaunchSpec,
     limits: crate::recorder::RecorderLimits,
     effects: std::sync::mpsc::Sender<RunEffect>,
 ) -> PtyRecordingRun {
     use crate::recording::{Geometry, SegmentHeader, Sequence, TermName};
 
     let dir = format!("recording/{run_id}");
-    let term = TermName::new(pty_term(launch_env))
+    let term = TermName::new(pty_term(launch_spec))
         .unwrap_or_else(|_| TermName::new("").expect("an empty TERM is recordable"));
     let origin_unix_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2852,7 +2860,7 @@ mod tests {
         let recording = start_pty_recording(
             dir.path(),
             run_a,
-            &std::collections::BTreeMap::new(),
+            &LaunchSpec::new(vec!["true".into()]).unwrap(),
             limits,
             hooks.effects.clone(),
         );
