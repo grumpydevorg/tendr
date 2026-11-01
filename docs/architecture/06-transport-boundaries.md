@@ -97,8 +97,10 @@ The JSON is the request under a version:
 `attach` needs a remote terminal, so it stays on `ssh -t` with a rebuilt
 command line until the attach bridge lands
 ([plan](../plans/active/01_remote-frame-transport.md)). Its session and
-namespace must match `[A-Za-z0-9][A-Za-z0-9_-]{0,254}`, and its flag values
-are fixed tokens; any other name exits 2 before ssh starts.
+namespace must match `[A-Za-z][A-Za-z0-9_-]{0,254}`, and its flag values
+are fixed tokens; any other name exits 2 before ssh starts. A name starts
+with a letter because PowerShell reads a bare token that starts with a digit
+as a number (`0x1F` arrives as `31`).
 
 ### Remote `exec`
 

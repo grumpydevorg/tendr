@@ -1,5 +1,5 @@
 //! Test fixture: a portable stand-in for `ssh`, linked or copied into a temp
-//! PATH dir as `ssh` (`ssh.exe` on Windows) by `tests/cli_remote.rs`.
+//! PATH dir as `ssh` (`ssh.exe` on Windows) by `harness::fake_ssh` in `tests/`.
 //!
 //! What it does is read from the file `fake-ssh-actions` beside it (the
 //! `FAKE_SSH` environment variable, if set, takes precedence). It holds one

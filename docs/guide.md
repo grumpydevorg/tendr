@@ -368,8 +368,8 @@ Start work under `--host`, disconnect, and come back later to `log`, `status`,
 
 |Commands|With `--host`|
 |---|---|
-|`start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `exec`|Run on the remote host, with the same output and exit code as there. The request travels as data on the SSH stdin, so no remote shell parses it.|
-|`attach`|Runs on the remote host under `ssh -t`. The session and namespace must be plain names: letters, digits, `-` and `_`, starting with a letter or digit. Any other name exits 2.|
+|`start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `exec`|Run on the remote host. The request travels as data on the SSH stdin, so no remote shell parses it. Through a POSIX login shell, output and exit codes are byte for byte those of the command run there.|
+|`attach`|Runs on the remote host under `ssh -t`. The session and namespace must be plain names: letters, digits, `-` and `_`, starting with a letter. Any other name exits 2.|
 |`run`, `wrap`, `prune`, `query`, `guide`, `skill`|Refused with exit 2 and a ready-to-paste fallback for a POSIX shell, such as `try (POSIX shell):  ssh data-box 'tendr run deploy.sh'`.|
 |`events`, `emit`|Refused with exit 1.|
 
@@ -383,11 +383,13 @@ exits 2 with `tendr _remote:` and the reason, where the same command run
 locally exits 1. A `--cwd` that is not valid UTF-8 cannot be sent, and exits 2
 before `ssh` starts.
 
-**Windows hosts.** The remote host's default ssh shell never sees your values:
-`cmd.exe`, PowerShell and POSIX shells all only run a fixed `tendr` command.
-Values are carried exactly, not translated, so a Windows session takes
-Windows commands and paths. If you wrap a local-only command in `ssh`
-yourself, quote for the remote shell, for example with
+**Windows hosts.** Your values arrive as data whatever the remote host's
+default ssh shell: `cmd.exe`, PowerShell and POSIX shells only ever run a fixed
+`tendr` command, so they cannot act on a value. That output and exit codes
+match through `cmd.exe` and PowerShell as they do through a POSIX shell is
+still being verified. Values are carried exactly, not translated, so a
+Windows session takes Windows commands and paths. If you wrap a local-only
+command in `ssh` yourself, quote for the remote shell, for example with
 `powershell -NoProfile -Command`.
 
 **Connect deadline.** Every `--host` command except `attach` must authenticate

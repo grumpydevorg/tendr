@@ -53,7 +53,7 @@ pub struct Boundary {
 
 impl fmt::Display for Boundary {
     /// Reconstructs the `kind:label` CLI form — the inverse of `FromStr`, so a
-    /// parsed `Boundary` round-trips (used by `--host` arg reconstruction).
+    /// parsed `Boundary` round-trips (the remote frame checks labels this way).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.kind, self.label)
     }

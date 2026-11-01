@@ -17,14 +17,18 @@
   The remote tendr checks a request before it does anything; one it refuses
   exits 2 with `tendr _remote:` and the reason. A `--cwd` that is not UTF-8
   is refused before `ssh` starts. `attach` still needs `ssh -t`, so over
-  `--host` it now takes only plain names (`[A-Za-z0-9][A-Za-z0-9_-]{0,254}`)
+  `--host` it now takes only plain names (`[A-Za-z][A-Za-z0-9_-]{0,254}`)
   and exits 2 on any other.
 - **Compatibility.** A client from this version needs this version or newer
   on the remote host for every `--host` command but `exec`; an older remote
   fails with clap's `unrecognized subcommand '_remote'`, and the client says
-  to upgrade it. `exec` is unchanged. Older clients still work against a
-  remote of this version. The printed fallback for a local-only command is
-  now labelled `try (POSIX shell):`.
+  to upgrade it. A remote too old to know `--hello` fails with clap's
+  `unexpected argument '--hello'`, which is recognised the same way. `exec`
+  keeps its frame and entry point, but with `TENDR_SSH_CONNECT_TIMEOUT=0` its
+  stderr is now relayed rather than inherited, so its interleaving with
+  stdout is no longer exact. Older clients still work against a remote of
+  this version. The printed fallback for a local-only command is now
+  labelled `try (POSIX shell):`.
 
 ### Added
 

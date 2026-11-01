@@ -198,7 +198,7 @@ impl AttachRequest {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "attach over --host takes plain names until the attach bridge lands: \
-     {what} {value:?} must match [A-Za-z0-9][A-Za-z0-9_-]{{0,254}}"
+     {what} {value:?} must match [A-Za-z][A-Za-z0-9_-]{{0,254}}"
 )]
 pub struct NotPlainName {
     what: &'static str,
@@ -814,6 +814,7 @@ mod tests {
             &["attach", "x&calc"][..],
             &["attach", "a'b"],
             &["attach", "_s"],
+            &["attach", "0x1F"],
             &["attach", "--namespace", "n$(id)", "s"],
         ] {
             let RemoteOperation::Attach(request) = op(args) else {

@@ -89,12 +89,14 @@ pub fn validate_destination(host: &str) -> Result<(), SshError> {
     Ok(())
 }
 
-/// Whether `value` is a plain name: `[A-Za-z0-9][A-Za-z0-9_-]{0,254}`. No
-/// POSIX shell, cmd.exe or PowerShell treats any of these characters
-/// specially, so a plain name can go on a remote command line as it is.
+/// Whether `value` is a plain name: `[A-Za-z][A-Za-z0-9_-]{0,254}`. No POSIX
+/// shell, cmd.exe or PowerShell treats any of these characters specially, so
+/// a plain name can go on a remote command line as it is. It starts with a
+/// letter because PowerShell reads a bare token that starts with a digit as a
+/// number (`0x1F` is 31, `1kb` is 1024) and passes the converted value.
 pub fn is_plain_name(value: &str) -> bool {
     let mut bytes = value.bytes();
-    bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+    bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
         && value.len() <= 255
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
@@ -330,15 +332,38 @@ fn wait_framed(
 
     let started = Instant::now();
     let mut hello = false;
-    let mut verdict = None;
+    // `Some` once stderr has ended, with the relay's verdict on an old tendr.
+    let mut verdict: Option<Option<OldTendr>> = None;
+    let finish = |status: std::process::ExitStatus, old: Option<OldTendr>| {
+        if let Some(old) = old.filter(|_| status.code() == Some(2)) {
+            eprintln!("{}", old.advice(host, entry));
+        }
+        status
+    };
     loop {
         // Only the hello proves ssh got through. An end of stream before it
         // proves nothing: a process can close its stderr and keep running.
-        while let Ok(event) = events.try_recv() {
-            match event {
-                Relay::Hello => hello = true,
-                Relay::Done { old_tendr } => verdict = Some(old_tendr),
+        let awaiting_hello = deadline.is_some() && !hello;
+        match verdict {
+            // Stderr has ended and no deadline is pending: only the exit is
+            // left to wait for.
+            Some(old) if !awaiting_hello => {
+                let status = child.wait().map_err(SshError::SpawnFailed)?;
+                return Ok(finish(status, old));
             }
+            Some(_) => std::thread::sleep(PENDING_POLL),
+            // Wake for the relay, or to look at ssh and the deadline: often
+            // while a deadline is pending, rarely during a long call.
+            None => match events.recv_timeout(if awaiting_hello {
+                PENDING_POLL
+            } else {
+                RUNNING_POLL
+            }) {
+                Ok(Relay::Hello) => hello = true,
+                Ok(Relay::Done { old_tendr }) => verdict = Some(old_tendr),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => verdict = Some(None),
+            },
         }
         if let Some(status) = child.try_wait().map_err(SshError::SpawnFailed)? {
             // The relay reads stderr to its end, so it waits for every holder
@@ -347,17 +372,12 @@ fn wait_framed(
             // ssh's SIGHUP holds the call open, as it held the terminal
             // before). Without a hello, a leftover holder must not hold the
             // call open: wait briefly for the rest, then report the status.
-            if verdict.is_none() {
-                verdict = if hello {
-                    wait_relay(&events, None)
-                } else {
-                    wait_relay(&events, Some(Duration::from_secs(1)))
-                };
-            }
-            if let Some(Some(old)) = verdict.filter(|_| status.code() == Some(2)) {
-                eprintln!("{}", old.advice(host, entry));
-            }
-            return Ok(status);
+            let old = match verdict {
+                Some(old) => old,
+                None if hello => wait_relay(&events, None).flatten(),
+                None => wait_relay(&events, Some(Duration::from_secs(1))).flatten(),
+            };
+            return Ok(finish(status, old));
         }
         if let Some(deadline) = deadline.filter(|d| !hello && started.elapsed() >= *d) {
             stop(child);
@@ -368,9 +388,15 @@ fn wait_framed(
                 seconds: deadline.as_secs_f64(),
             });
         }
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// How often a framed call looks at ssh while the connect deadline is pending.
+const PENDING_POLL: Duration = Duration::from_millis(20);
+
+/// How often a framed call looks at ssh once no deadline is pending: it wakes
+/// at once for stderr ending, which is how a call normally ends.
+const RUNNING_POLL: Duration = Duration::from_secs(1);
 
 /// How a remote tendr showed it is too old for the call, by its parse error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,12 +408,14 @@ enum OldTendr {
 }
 
 impl OldTendr {
-    /// The parse error in a stderr line, if it is one of these.
+    /// The parse error in a stderr line, if it is one of these. The whole of
+    /// clap's phrase is matched, so a newer tendr's own error that quotes a
+    /// user value such as `'--hello'` is not mistaken for one.
     fn detect(line: &[u8]) -> Option<Self> {
         let line = String::from_utf8_lossy(line);
-        if line.contains("unrecognized subcommand '_remote'") {
+        if line.contains("error: unrecognized subcommand '_remote'") {
             Some(Self::NoRemote)
-        } else if line.contains("'--hello'") {
+        } else if line.contains("error: unexpected argument '--hello' found") {
             Some(Self::NoHello)
         } else {
             None
@@ -619,6 +647,10 @@ mod tests {
             "a\"b",
             "a%b",
             "a^b",
+            "0x1F",
+            "1kb",
+            "1e3",
+            "9",
             "\u{e9}",
             too_long.as_str(),
         ] {
@@ -637,6 +669,13 @@ mod tests {
             Some(OldTendr::NoHello)
         );
         assert_eq!(OldTendr::detect(b"session not found: x\n"), None);
+        for quoted in [
+            "session not found: '--hello'\n",
+            "invalid --since: '--hello'\n",
+            "session not found: unrecognized subcommand '_remote'\n",
+        ] {
+            assert_eq!(OldTendr::detect(quoted.as_bytes()), None, "{quoted}");
+        }
     }
 
     #[test]

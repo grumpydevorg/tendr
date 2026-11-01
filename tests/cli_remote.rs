@@ -542,6 +542,27 @@ fn host_call_to_a_tendr_without_the_frame_entry_says_to_upgrade_it() {
     }
 }
 
+/// A current remote's own exit-2 refusal that quotes a user value such as
+/// `'--hello'` or `'_remote'` is passed on as it is, not mistaken for an old
+/// tendr, with the deadline on or off.
+#[test]
+fn host_refusal_quoting_hello_is_not_upgrade_advice() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = fake_ssh(
+        "err tendr _remote: invalid remote request: session name '--hello' and \
+         unrecognized subcommand '_remote'\\n\nexit 2",
+    );
+    for deadline in ["0", "5"] {
+        let output = host_call(&tmp, deadline, &["status", "job"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(2), "{deadline}: {stderr}");
+        assert!(stderr.starts_with("tendr _remote:"), "{deadline}: {stderr}");
+        assert!(!stderr.contains("upgrade"), "{deadline}: {stderr}");
+    }
+}
+
 /// What the remote end does: `tendr --hello …` writes the hello as its very
 /// first stderr line, before the command's own output.
 #[test]
@@ -762,6 +783,10 @@ fn host_attach_takes_only_plain_names() {
         &["attach", "it's"],
         &["attach", "caf\u{e9}"],
         &["attach", "_lead"],
+        &["attach", "0x1F"],
+        &["attach", "1kb"],
+        &["attach", "1e3"],
+        &["attach", "--namespace", "9", "s"],
         &["attach", &long],
         &["attach", "--namespace", "n&s", "s"],
         &["attach", "--namespace", "n|s", "s"],
