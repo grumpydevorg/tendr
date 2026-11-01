@@ -66,6 +66,117 @@ jobs:
       - name: Doc tests
         run: cargo test --locked --doc --no-fail-fast
 
+  # `--host` against a real Windows OpenSSH server on this runner, under the
+  # default cmd.exe login shell and then PowerShell (tests/
+  # cli_remote_windows_ssh.rs). Runner facts this relies on: Server 2025
+  # (windows-latest) ships sshd with `AllowGroups administrators "openssh
+  # users"`; windows-11-arm has no sshd capability (installing it takes 15+
+  # min), so the pinned portable Win32-OpenSSH release is used. Key auth fails for
+  # every account under the service, so a dedicated local user logs in by
+  # password through SSH_ASKPASS. The remote tendr is this build, on the
+  # machine PATH sshd hands its sessions.
+  windows-openssh:
+    name: windows openssh ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    env:
+      TENDR_TEST_WIN_SSH_HOST: tendr-ssh
+      TENDR_TEST_WIN_SSH_SCRATCH: C:\tendr-ssh
+      # Without the host the tests must fail, not skip to a false green.
+      TENDR_REQUIRE_WIN_SSH_TESTS: "1"
+      # Pinned, with each zip's SHA-256 from the release's asset digests.
+      WIN32_OPENSSH_VERSION: 10.4.0.0p1-Preview
+      WIN32_OPENSSH_SHA256_ARM64: d2b1928225479fec9e0c938f527fdb5ed676446cca1bbcc5af84aca1f272842e
+      WIN32_OPENSSH_SHA256_Win64: b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: rustup update stable --no-self-update
+      - name: Build tendr, test_callback and the tests
+        run: cargo test --locked --test cli_remote_windows_ssh --no-run
+      - name: Install sshd where it is missing
+        shell: pwsh
+        run: |
+          $sshd = 'C:\Windows\System32\OpenSSH\sshd.exe'
+          if (-not (Test-Path $sshd)) {
+            $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'ARM64' } else { 'Win64' }
+            $zip = "$env:RUNNER_TEMP\openssh.zip"
+            Invoke-WebRequest "https://github.com/PowerShell/Win32-OpenSSH/releases/download/$env:WIN32_OPENSSH_VERSION/OpenSSH-$arch.zip" -OutFile $zip
+            $want = [Environment]::GetEnvironmentVariable("WIN32_OPENSSH_SHA256_$arch")
+            $got = (Get-FileHash $zip -Algorithm SHA256).Hash
+            if ($got -ne $want) { throw "OpenSSH-$arch.zip SHA-256 is $got, expected $want" }
+            Expand-Archive $zip -DestinationPath 'C:\Program Files\OpenSSH' -Force
+            $dir = "C:\Program Files\OpenSSH\OpenSSH-$arch"
+            & powershell.exe -ExecutionPolicy Bypass -File "$dir\install-sshd.ps1"
+            if ($LASTEXITCODE) { throw "install-sshd.ps1 exited $LASTEXITCODE" }
+            $sshd = "$dir\sshd.exe"
+          }
+          "sshd: $sshd $((Get-Item $sshd).VersionInfo.ProductVersion)"
+          "ssh: $((Get-Command ssh).Source)"
+      - name: Remote user, tendr on its PATH, ssh client alias
+        id: setup
+        shell: pwsh
+        run: |
+          $pw = 'Tz9-' + [guid]::NewGuid().ToString()
+          "::add-mask::$pw"
+          New-LocalUser -Name tendrssh -Password (ConvertTo-SecureString $pw -AsPlainText -Force) -PasswordNeverExpires | Out-Null
+          if (Get-LocalGroup 'OpenSSH Users' -ErrorAction SilentlyContinue) { Add-LocalGroupMember 'OpenSSH Users' tendrssh }
+          $ask = "$env:RUNNER_TEMP\askpass.cmd"
+          Set-Content $ask "@echo $pw" -Encoding ascii
+          "SSH_ASKPASS=$ask", 'SSH_ASKPASS_REQUIRE=force', 'DISPLAY=x' | Add-Content $env:GITHUB_ENV
+          $env:SSH_ASKPASS = $ask; $env:SSH_ASKPASS_REQUIRE = 'force'; $env:DISPLAY = 'x'
+          New-Item -ItemType Directory -Force "$env:USERPROFILE\.ssh" | Out-Null
+          Set-Content "$env:USERPROFILE\.ssh\config" -Encoding ascii -Value @(
+            "Host $env:TENDR_TEST_WIN_SSH_HOST",
+            '  HostName localhost',
+            '  User tendrssh',
+            '  PreferredAuthentications password',
+            '  PubkeyAuthentication no',
+            '  StrictHostKeyChecking no',
+            '  UserKnownHostsFile NUL',
+            '  LogLevel ERROR')
+          # Both users write here: an injected command would leave a file.
+          New-Item -ItemType Directory -Force $env:TENDR_TEST_WIN_SSH_SCRATCH | Out-Null
+          icacls.exe $env:TENDR_TEST_WIN_SSH_SCRATCH /grant '*S-1-1-0:(OI)(CI)F' | Out-Null
+          $bin = 'C:\tendr-ssh-bin'
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Copy-Item target\debug\tendr.exe, target\debug\test_callback.exe $bin
+          $path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          [Environment]::SetEnvironmentVariable('Path', "$bin;$path", 'Machine')
+          Restart-Service sshd
+          # The first login creates the remote user's profile. sshd may still
+          # be binding just after the restart, so retry briefly.
+          for ($i = 1; $i -le 10; $i++) {
+            ssh $env:TENDR_TEST_WIN_SSH_HOST 'echo user=%USERNAME% HOME=%HOME% USERPROFILE=%USERPROFILE% & tendr --version'
+            if (-not $LASTEXITCODE) { break }
+            if ($i -eq 10) { throw "ssh to the remote tendr exited $LASTEXITCODE" }
+            Start-Sleep 1
+          }
+      - name: Tests, cmd.exe login shell
+        env:
+          TENDR_TEST_WIN_SSH_SHELL: cmd
+        run: cargo test --locked --test cli_remote_windows_ssh -- --test-threads=1 --nocapture
+      - name: Switch the login shell to PowerShell
+        id: powershell
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) { New-Item 'HKLM:\SOFTWARE\OpenSSH' | Out-Null }
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -PropertyType String -Force `
+            -Value "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" | Out-Null
+          $v = ssh $env:TENDR_TEST_WIN_SSH_HOST '$PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -or "$v" -notmatch '^\d+\.\d+') { throw "the PowerShell login shell is not in effect: $v" }
+          "login shell: PowerShell $v"
+      - name: Tests, PowerShell login shell
+        if: ${{ !cancelled() && steps.powershell.outcome == 'success' }}
+        env:
+          TENDR_TEST_WIN_SSH_SHELL: powershell
+        run: cargo test --locked --test cli_remote_windows_ssh -- --test-threads=1 --nocapture
+
   lint:
     name: lint (ubuntu)
     runs-on: ubuntu-latest

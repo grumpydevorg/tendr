@@ -5,11 +5,13 @@ depends_on: []
 
 # Remote frame transport: make `--host` cross-platform
 
-**Status:** steps 0a, 1, 2, 3, 4 and 6 are done: every `--host` operation but
-`attach` travels as a frame. Step 7 (real cmd.exe and PowerShell on the
-Windows lanes) is in progress. Step 5 (the attach bridge, which the cloud PTY
-workflow needs; see the
-[VM scripts and results](../../../scripts/pty-vm/README.md)) comes after it.
+**Status:** steps 0a, 1, 2, 3, 4, 6 and 7 are done: every `--host` operation
+but `attach` travels as a frame. The Windows lanes run `start`, `status`,
+`list`, `log`, `push`, `kill`, `wait` and `exec` through a real OpenSSH server
+under cmd.exe and Windows PowerShell 5.1; `watch` is covered only by the fake
+ssh. Step 5 (the attach bridge, which the cloud PTY workflow needs; see the
+[VM scripts and results](../../../scripts/pty-vm/README.md)) is the only step
+left.
 The current contract is in
 [transport boundaries](../../architecture/06-transport-boundaries.md#the-remote-frame).
 
@@ -207,10 +209,12 @@ network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
 6. **Done.** The POSIX remote-argv path is gone. `attach` builds its `ssh -t`
    command line from plain names and fixed flag values only. Shell quoting is
    left only in the copy/paste fallback text, labelled `try (POSIX shell):`.
-7. Add real cmd.exe and PowerShell OpenSSH tests to the native Windows x64 and
-   ARM64 CI lanes (the lanes already exist). The first runs showed a
-   PowerShell login shell collapsing ssh's exit status to 0/1, so the remote
-   tendr now also sends its code as the last stderr line
+7. **Done.** `tests/cli_remote_windows_ssh.rs` runs against a real Windows
+   OpenSSH server on the x64 and ARM64 lanes, under cmd.exe and Windows
+   PowerShell 5.1 ([Windows login shells](../../architecture/06-transport-boundaries.md#windows-login-shells)).
+   The first runs showed a PowerShell login shell collapsing ssh's exit
+   status to 0/1, so the remote tendr now also sends its code as the last
+   stderr line
    ([exit trailer](../../architecture/06-transport-boundaries.md#the-exit-trailer)).
 
 ## Phase 1 build pins (the dispatch refactor)

@@ -29,18 +29,43 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
 }
 
+/// The home directory tendr keeps its state under: `HOME`, or on Windows,
+/// when `HOME` is unset, `USERPROFILE`. Windows sets `USERPROFILE` for every
+/// logon but does not set `HOME` (Windows OpenSSH sessions do).
+///
+/// # Errors
+/// Returns an error if neither is set.
+pub fn home_dir() -> anyhow::Result<PathBuf> {
+    home_from(
+        std::env::var("HOME").ok(),
+        std::env::var("USERPROFILE").ok(),
+    )
+    .ok_or_else(|| {
+        if cfg!(windows) {
+            anyhow::anyhow!("neither HOME nor USERPROFILE is set")
+        } else {
+            anyhow::anyhow!("HOME not set")
+        }
+    })
+}
+
+/// [`home_dir`]'s rule over given values of `HOME` and `USERPROFILE`.
+fn home_from(home: Option<String>, userprofile: Option<String>) -> Option<PathBuf> {
+    home.or(userprofile.filter(|_| cfg!(windows)))
+        .map(PathBuf::from)
+}
+
 /// Root directory for all sessions. Overridable for tests.
 #[derive(Debug, Clone)]
 pub struct SessionRoot(PathBuf);
 
 impl SessionRoot {
-    /// Default: ~/.tendr/sessions/
+    /// Default: `.tendr/sessions/` under [`home_dir`].
     ///
     /// # Errors
-    /// Returns an error if `HOME` is not set.
+    /// Returns an error if [`home_dir`] finds no home directory.
     pub fn default_path() -> anyhow::Result<Self> {
-        let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
-        Ok(Self(PathBuf::from(home).join(".tendr").join("sessions")))
+        Ok(Self(home_dir()?.join(".tendr").join("sessions")))
     }
 
     /// Explicit path (for tests or custom deployments).
@@ -435,5 +460,43 @@ impl LockGuard {
             return Err(SessionError::Io(std::io::Error::last_os_error()));
         }
         Ok(Self { _file: file })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::home_from;
+    use std::path::PathBuf;
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_owned())
+    }
+
+    #[test]
+    fn home_wins_over_userprofile() {
+        assert_eq!(
+            home_from(some("/h"), some("C:\\Users\\u")),
+            Some(PathBuf::from("/h"))
+        );
+    }
+
+    #[test]
+    fn neither_set_is_none() {
+        assert_eq!(home_from(None, None), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_falls_back_to_userprofile() {
+        assert_eq!(
+            home_from(None, some("C:\\Users\\u")),
+            Some(PathBuf::from("C:\\Users\\u"))
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_ignores_userprofile() {
+        assert_eq!(home_from(None, some("/u")), None);
     }
 }

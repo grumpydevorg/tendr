@@ -1,5 +1,9 @@
 #![cfg(windows)]
 
+mod harness;
+
+use harness::DeadlineAssertExt;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
 use tendr::platform::Platform;
@@ -215,4 +219,25 @@ fn windows_kill_graceful_cooperative() {
         Some(42),
         "child should exit with code 42 from cooperative CTRL_BREAK handler, got: {status:?}"
     );
+}
+
+/// With `HOME` unset, which is how Windows starts a process, tendr keeps its
+/// state under `USERPROFILE`.
+#[test]
+fn state_lives_under_userprofile_when_home_is_unset() {
+    let profile = tempfile::TempDir::new().unwrap();
+    harness::tendr(&profile)
+        .env_remove("HOME")
+        .env("USERPROFILE", profile.path())
+        .args([
+            "start",
+            "profile",
+            "--",
+            &harness::test_callback_bin(),
+            "print-cwd",
+        ])
+        .assert_within_deadline()
+        .success();
+    let meta = harness::wait_terminal(&profile, "profile");
+    assert_eq!(meta["reason"], "ExitedOk", "{meta}");
 }

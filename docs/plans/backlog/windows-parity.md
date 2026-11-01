@@ -17,8 +17,8 @@ child-tree ownership. Tendr does not translate Bash to PowerShell or Unix paths
 to Windows paths.
 
 Native Windows x64 and ARM64 test lanes already run in required CI. Remote
-`exec` against a Windows host was checked once by hand (2026-07-10, Tendr 0.2.0
-on an ARM Windows VM over SSH); no test covers it.
+`exec` into a PowerShell session on a Windows host is tested on both lanes
+through a real OpenSSH server (`tests/cli_remote_windows_ssh.rs`).
 
 ## Gaps a user hits today
 
@@ -39,6 +39,13 @@ The sidecar breaks away from its parent's job only when that job allows it
 job, so a `start` that succeeded over SSH can die when the connection closes.
 Fix: launch independently by a supported mechanism, or make `start` fail with
 a clear error when it cannot guarantee the session outlives the caller.
+
+Measured on GitHub's Windows runners (2026-11-01; cmd.exe and powershell.exe
+5.1 login shells; x64 with the inbox `OpenSSH_9.5p2 for Windows`, ARM64 with
+the portable `OpenSSH_10.4p1 for Windows`, release `10.4.0.0p1-Preview`): a
+run started over OpenSSH was still `Running` 10 s after the session closed
+(`tests/cli_remote_windows_ssh.rs`,
+[run 41292804852](https://github.com/grumpydevorg/tendr/actions/runs/41292804852)).
 
 ### Orphan kill stops only the root process
 
@@ -77,6 +84,21 @@ lingers after ssh exits keeps the caller's pipes open after tendr has exited
 (seen in CI with the fake ssh in `tests/cli_remote.rs`). A likely fix, not
 yet tried: clear `HANDLE_FLAG_INHERIT` on tendr's std handles with
 `SetHandleInformation` before spawning ssh.
+
+### pwsh 7 exec hangs on ARM64
+
+With pwsh 7 as the OpenSSH login shell on windows-11-arm, a remote `exec` hung
+in all three CI runs that tried it; the last one is
+[run 41287789101](https://github.com/grumpydevorg/tendr/actions/runs/41287789101/job/124792522200).
+The session was a `powershell -NoProfile` started over the same login shell.
+The remote `tendr --hello exec --frame-from-stdin` stayed alive after the
+frame's 30 s timeout had passed, still holding the session's `exec.lock`.
+Later execs then failed with "another exec is already running on this session
+… (os error 33)". It is not the transport: ssh carried stdin byte-exact in the
+same setup, and the remote took the lock, so it had decoded the frame. x64
+with pwsh 7, and both lanes with cmd.exe and powershell.exe 5.1, were fine.
+Untested hypothesis: the session's `powershell.exe` (5.1) child inherits
+pwsh 7's environment (`PSModulePath` among it).
 
 ## Acceptance
 
