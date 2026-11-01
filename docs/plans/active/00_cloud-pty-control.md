@@ -5,8 +5,7 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 8 and 9 remain. Step 8 needs any sshd
-(`TENDR_TEST_SSH_HOST`); step 9 the VM.
+**Status:** step 9 remains: remote acceptance on the Linux VM.
 
 ## Goal
 
@@ -28,10 +27,6 @@ back is [PTY replay](../backlog/pty-replay.md).
 
 ## Remaining steps (one PR each)
 
-- **Step 8. Nested `ssh -t` fixtures, opt-in** (sshd; `TENDR_TEST_SSH_HOST`).
-   `tests/cli_attach_ssh.rs`: detach on `Ctrl-\ d`, `Ctrl-]` passthrough,
-   paste with prefixes, terminal restore, takeover over a stopped first
-   client.
 - **Step 9. Remote acceptance on the Linux VM.**
    - Same Claude pid throughout. Attach from Ghostty; half-open the
      connection two ways, then take over; agent → human → agent.
@@ -46,6 +41,9 @@ back is [PTY replay](../backlog/pty-replay.md).
    - Cross-user rejection. It needs two accounts; never mark it passed
      without them.
    - Dump the whole recording.
+   - Run the nested `ssh -t` fixtures against the VM:
+     `TENDR_TEST_SSH_HOST=<vm> TENDR_TEST_SSH_TENDR=<path> cargo test --test
+     cli_attach_ssh`.
    - Run Claude Code, omp, a dev server and a shell with background jobs.
      For each, before and after `tendr kill`, and separately `--timeout`,
      snapshot `ps -eo pid,ppid,pgid,sid,comm` and diff. The sid is the run's
