@@ -85,29 +85,35 @@ foreach ($name in $shells.Keys) {
   # 4. exec (JSON frame on ssh stdin): non-ASCII and CRLF payload.
   $null = T "start ex$n --stdin --exec-target powershell -- powershell -NoProfile" "exs$n"
   for ($i = 0; $i -lt 60; $i++) { $st = T "status ex$n" "exst$n"; if ((Esc $st.out) -match '"status": "Running"') { break }; Start-Sleep 1 }
-  $payload = "Write-Output 'é-ü 日本'`r`nWrite-Output 'line2'"
-  $sw = [Diagnostics.Stopwatch]::StartNew()
-  $ex = & $tendr --host $h exec "ex$n" --timeout 30 -- $payload 2>&1
-  $exCode = $LASTEXITCODE
-  $exText = ($ex | Out-String).Trim() -replace "`r", '\r' -replace "`n", '\n'
-  $exOk = ($exText -match 'é-ü 日本') -and ($exText -match 'line2')
-  "exec: exit=$exCode ok=$exOk in $([math]::Round($sw.Elapsed.TotalSeconds,1))s: $exText"
+  # The frame exactly as main sends it, with raw CRLF between JSON tokens.
+  $frame = "{`r`n`"v`":1,`"session`":`"ex$n`",`"cmd`":[`"Write-Output 'é-ü 日本'\r\nWrite-Output 'line2'`"],`"timeout`":30}`r`n"
+  [IO.File]::WriteAllText("$tmp\frame$n.json", $frame, $utf8)
+  $r = RunCmd "`"$tendr`" --host $h exec --frame-from-stdin < `"$tmp\frame$n.json`"" "exec$n"
+  $exCode = $r.code
+  $exText = Esc $r.out
+  $exOk = ($exText -match 'é-ü 日本\\r\\nline2')
+  "exec: exit=$exCode ok=$exOk in $($r.secs)s: stdout [$exText] stderr [$(Esc $r.err)]"
   $null = T "kill ex$n --force" "exk$n"
 
   # 5. push binary bytes to a child that copies its stdin to a file.
   $pushFile = "$s\push$n.bin"
-  [IO.File]::WriteAllText("$bin\pushprobe\fake-ssh-actions", "stdin $pushFile`n", $utf8)
+  [IO.File]::WriteAllText("$bin\pushprobe\fake-ssh-actions", "stdin $pushFile`nsleep 600`n", $utf8)
   $null = T "start pu$n --stdin -- C:\tendr-ssh-bin\pushprobe\pushprobe.exe" "pus$n"
   for ($i = 0; $i -lt 60; $i++) { $st = T "status pu$n" "pust$n"; if ((Esc $st.out) -match '"status": "Running"') { break }; Start-Sleep 1 }
   $r = RunCmd "`"$tendr`" --host $h push pu$n < `"$tmp\in.bin`"" "push$n"
   $pushExit = $r.code
   $pgot = $null
   for ($i = 0; $i -lt 30; $i++) {
-    if (Test-Path $pushFile) { $pgot = [IO.File]::ReadAllBytes($pushFile); if ($pgot.Length -ge $input_bytes.Length) { break } }
+    if (Test-Path $pushFile) {
+      $fs = [IO.File]::Open($pushFile, 'Open', 'Read', 'ReadWrite')
+      $ms = New-Object IO.MemoryStream; $fs.CopyTo($ms); $fs.Close(); $pgot = $ms.ToArray()
+      if ($pgot.Length -ge $input_bytes.Length) { break }
+    }
     Start-Sleep 1
   }
   $push = if (Same $pgot $input_bytes) { 'exact' } elseif ($pgot) { "DIFF ($($pgot.Length) of $($input_bytes.Length) B)" } else { 'none' }
-  "push: exit=$pushExit bytes=$push stderr [$(Esc $r.err)]"
+  $after = Esc (T "status pu$n" "pusa$n").out
+  "push: exit=$pushExit bytes=$push stderr [$(Esc $r.err)] status-after [$($after -replace '\s+', ' ')]"
   $null = T "kill pu$n --force" "puk$n"
 
   $rows += "| $name | $rawExit | $waitExit | $rawStdin | $push | $(if ($exOk) {'ok'} else {"FAIL exit=$exCode"}) | $rawErr | $deadline |"
