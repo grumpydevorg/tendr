@@ -1,37 +1,98 @@
-// Remote SSH transport tests — POSIX only.
-// All tests rely on fake shell scripts as ssh shims.
-#![cfg(unix)]
+// Remote SSH transport tests. The `ssh` they reach is the portable fake in
+// `src/bin/fake_ssh.rs`, put on a temp PATH by `fake_ssh`.
 
 mod harness;
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Helper: create a fake ssh script that dumps args to stdout.
-/// Returns the TempDir (must be kept alive for PATH to stay valid).
-fn fake_ssh_echo() -> TempDir {
+/// A PATH dir holding only a fake `ssh` that runs `actions` (one per line;
+/// the list is in `src/bin/fake_ssh.rs`). Keep the TempDir alive while the
+/// PATH is in use.
+fn fake_ssh(actions: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    std::fs::write(
-        &fake_ssh,
-        "#!/bin/sh\nfor arg in \"$@\"; do echo \"ARG:$arg\"; done\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
+    let ssh = tmp
+        .path()
+        .join(format!("ssh{}", std::env::consts::EXE_SUFFIX));
+    let bin = assert_cmd::cargo::cargo_bin("fake_ssh");
+    // A hard link never holds the executable open for writing, so a fork in
+    // a parallel test cannot make exec fail with ETXTBSY; copy across devices.
+    if std::fs::hard_link(&bin, &ssh).is_err() {
+        std::fs::copy(&bin, &ssh).unwrap();
+    }
+    std::fs::write(tmp.path().join("fake-ssh-actions"), actions).unwrap();
     tmp
 }
 
-/// Helper: create a fake ssh that exits 0 immediately (no-op).
+/// A fake ssh that prints each of its args as `ARG:<value>` on stdout.
+fn fake_ssh_echo() -> TempDir {
+    fake_ssh("args")
+}
+
+/// A fake ssh that exits 0 immediately (no-op).
 fn fake_ssh_noop() -> TempDir {
-    let tmp = TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    std::fs::write(&fake_ssh, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
-    tmp
+    fake_ssh("exit 0")
+}
+
+/// A running process, watched from while it is known to be alive so a later
+/// check cannot be fooled by its pid being reused.
+#[cfg(unix)]
+struct ProcessWatch(i32);
+
+#[cfg(unix)]
+impl ProcessWatch {
+    fn new(pid: u32) -> Self {
+        Self(i32::try_from(pid).unwrap())
+    }
+
+    /// Whether the process is still running.
+    fn alive(&self) -> bool {
+        // SAFETY: signal 0 only probes whether the process still exists.
+        // Pids are reused only after the counter wraps, which a test lasting
+        // a few seconds does not reach in practice.
+        unsafe { libc::kill(self.0, 0) == 0 }
+    }
+}
+
+/// A running process, watched from while it is known to be alive so a later
+/// check cannot be fooled by its pid being reused.
+#[cfg(windows)]
+struct ProcessWatch(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl ProcessWatch {
+    fn new(pid: u32) -> Self {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: plain FFI call; the result is checked.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(!handle.is_null(), "open process {pid}");
+        Self(handle)
+    }
+
+    /// Whether the process is still running. The open handle pins the
+    /// process object, so this is the same process even if the pid is reused.
+    fn alive(&self) -> bool {
+        use windows_sys::Win32::Foundation::STILL_ACTIVE;
+        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+        let mut code = 0u32;
+        // SAFETY: `self.0` is a valid process handle until drop.
+        let ok = unsafe { GetExitCodeProcess(self.0, &mut code) } != 0;
+        assert!(ok, "GetExitCodeProcess");
+        code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessWatch {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from OpenProcess and is closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
 }
 
 #[test]
@@ -112,15 +173,6 @@ fn parse_remote_argv(stdout: &str) -> Vec<String> {
 
 // -- Connect deadline: a --host call that never reaches the remote tendr --
 
-/// A fake ssh running `script` (a POSIX `sh` body), on a PATH holding only it.
-fn fake_ssh(script: &str) -> TempDir {
-    let tmp = TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    std::fs::write(&fake_ssh, format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
-    tmp
-}
-
 /// Run `tendr --host box <args>` against `tmp`'s fake ssh with a connect
 /// deadline of `deadline` (the `TENDR_SSH_CONNECT_TIMEOUT` value).
 fn host_call(tmp: &TempDir, deadline: &str, args: &[&str]) -> (std::process::Output, Duration) {
@@ -130,7 +182,6 @@ fn host_call(tmp: &TempDir, deadline: &str, args: &[&str]) -> (std::process::Out
         .args(args)
         .env("PATH", tmp.path())
         .env("TENDR_SSH_CONNECT_TIMEOUT", deadline)
-        .env("PIDF", tmp.path().join("ssh.pid"))
         .output()
         .unwrap();
     (output, started.elapsed())
@@ -146,13 +197,38 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
 
     // The last stall closes its stderr first: end of stream before a hello
     // proves nothing about authentication.
-    for (args, stall) in [
-        (&["status", "job"][..], "exec /bin/sleep 30"),
-        (&["exec", "shell", "--", "true"][..], "exec /bin/sleep 30"),
-        (&["status", "job"][..], "exec 2>&-\nexec /bin/sleep 30"),
+    for (args, close_stderr) in [
+        (&["status", "job"][..], false),
+        (&["exec", "shell", "--", "true"][..], false),
+        (&["status", "job"][..], true),
     ] {
-        let tmp = fake_ssh(&format!("echo $$ > \"$PIDF\"\n{stall}"));
-        let (output, took) = host_call(&tmp, "1", args);
+        let pid_file = TempDir::new().unwrap();
+        let pid_file = pid_file.path().join("ssh.pid");
+        let close = if close_stderr { "close-stderr\n" } else { "" };
+        let tmp = fake_ssh(&format!("pidfile {}\n{close}sleep 30", pid_file.display()));
+        let started = Instant::now();
+        let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+            .args(["--host", "box"])
+            .args(args)
+            .env("PATH", tmp.path())
+            .env("TENDR_SSH_CONNECT_TIMEOUT", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The fake ssh writes its pidfile atomically before it stalls.
+        let ssh = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                break ProcessWatch::new(pid.trim().parse().unwrap());
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{args:?}: the fake ssh never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let took = started.elapsed();
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert_eq!(output.status.code(), Some(82), "{args:?}: {stderr}");
@@ -161,14 +237,7 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
             stderr.contains("box") && stderr.contains("did not reach"),
             "{args:?}: the error names the host: {stderr}"
         );
-        let pid: i32 = std::fs::read_to_string(tmp.path().join("ssh.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        // SAFETY: signal 0 only probes whether the fake ssh still exists.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        assert!(!alive, "{args:?}: the stalled ssh was killed");
+        assert!(!ssh.alive(), "{args:?}: the stalled ssh was killed");
     }
 }
 
@@ -179,16 +248,35 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
 fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    // The leftover holds only ssh's stderr, as a ProxyCommand does (its stdout
-    // is the ssh connection, not ours).
-    let tmp = fake_ssh(
-        "/bin/sleep 30 </dev/null >/dev/null &\necho 'ssh: connection closed' >&2\nexit 255",
-    );
-    let (output, took) = host_call(&tmp, "1", &["status", "job"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The leftover is given ssh's stderr but not its stdout, as a ProxyCommand
+    // is (its stdout is the ssh connection, not ours).
+    // The leftover runs from the built fake, not the linked `ssh` copy, so it
+    // does not keep that copy (and its temp dir) in use on Windows.
+    let tmp = fake_ssh(&format!(
+        "leftover 30 {}\nerr ssh: connection closed\\n\nexit 255",
+        assert_cmd::cargo::cargo_bin("fake_ssh").display()
+    ));
+    // tendr's stdout and stderr go to files, so `took` is when tendr exits,
+    // not when the last holder of a pipe lets go. On Windows a child inherits
+    // every inheritable handle, so ssh and the leftover also hold tendr's own
+    // stdio; that is not what this test is about.
+    let out_dir = TempDir::new().unwrap();
+    let stderr_path = out_dir.path().join("stderr");
+    let started = Instant::now();
+    let status = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        .args(["--host", "box", "status", "job"])
+        .env("PATH", tmp.path())
+        .env("TENDR_SSH_CONNECT_TIMEOUT", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(out_dir.path().join("stdout")).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .status()
+        .unwrap();
+    let took = started.elapsed();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
 
     assert!(took < Duration::from_secs(10), "took {took:?}: {stderr}");
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("ssh: connection closed"), "{stderr}");
     assert!(stderr.contains("exit 255"), "{stderr}");
 }
@@ -203,12 +291,12 @@ fn host_call_runs_past_the_deadline_once_the_remote_tendr_says_hello() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let tmp = fake_ssh(&format!(
-        "echo 'ssh: before hello' >&2\n\
-         printf 'rc says hi ' >&2\n\
-         echo '{}' >&2\n\
-         /bin/sleep 3\n\
-         echo 'remote result'\n\
-         echo 'remote: after hello' >&2\n\
+        "err ssh: before hello\\n\n\
+         err rc says hi \n\
+         err {}\\n\n\
+         sleep 3\n\
+         out remote result\\n\n\
+         err remote: after hello\\n\n\
          exit 0",
         tendr::ssh::HELLO_LINE
     ));
@@ -229,10 +317,7 @@ fn host_call_runs_past_the_deadline_once_the_remote_tendr_says_hello() {
 fn host_connect_deadline_of_zero_waits_and_works_with_an_older_remote() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = fake_ssh(
-        "for a in \"$@\"; do [ \"$a\" = --hello ] && { echo \"error: unexpected argument '--hello' found\" >&2; exit 2; }; done\n\
-         /bin/sleep 2\necho 'slow but fine'\nexit 0",
-    );
+    let tmp = fake_ssh("reject-hello\nsleep 2\nout slow but fine\\n\nexit 0");
     for args in [&["list"][..], &["exec", "shell", "--", "true"][..]] {
         let (output, _) = host_call(&tmp, "0", args);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -247,7 +332,7 @@ fn host_connect_deadline_that_cannot_be_represented_falls_back() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let tmp = fake_ssh(&format!(
-        "echo '{}' >&2\necho ok\nexit 0",
+        "err {}\\n\nout ok\\n\nexit 0",
         tendr::ssh::HELLO_LINE
     ));
     let (output, _) = host_call(&tmp, "1e30", &["list"]);
@@ -265,7 +350,7 @@ fn host_connect_deadline_that_cannot_be_represented_falls_back() {
 fn host_call_to_a_tendr_without_hello_says_to_upgrade_it() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = fake_ssh("echo \"error: unexpected argument '--hello' found\" >&2\nexit 2");
+    let tmp = fake_ssh("err error: unexpected argument '--hello' found\\n\nexit 2");
     let (output, _) = host_call(&tmp, "5", &["list"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -297,10 +382,7 @@ fn hello_flag_writes_the_hello_line_first() {
 fn host_flag_exit_255_is_transport_error() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = tempfile::TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    std::fs::write(&fake_ssh, "#!/bin/sh\nexit 255\n").unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
+    let tmp = fake_ssh("exit 255");
 
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .args(["--host", "user@box", "list"])
@@ -324,10 +406,7 @@ fn host_flag_exit_255_is_transport_error() {
 fn host_flag_preserves_remote_exit_code() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = tempfile::TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    std::fs::write(&fake_ssh, "#!/bin/sh\nexit 42\n").unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
+    let tmp = fake_ssh("exit 42");
 
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .args(["--host", "user@box", "wait", "my-session"])
@@ -348,11 +427,9 @@ fn host_flag_preserves_remote_exit_code() {
 fn host_flag_passes_through_json_stdout() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = tempfile::TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    let script = "#!/bin/sh\nprintf '{\"schema_version\":1,\"session\":\"remote-job\",\"status\":\"Running\"}\\n'\nexit 0\n";
-    std::fs::write(&fake_ssh, script).unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
+    let tmp = fake_ssh(
+        "out {\"schema_version\":1,\"session\":\"remote-job\",\"status\":\"Running\"}\\n\nexit 0",
+    );
 
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .args(["--host", "user@box", "status", "remote-job"])
@@ -374,15 +451,11 @@ fn host_flag_passes_through_json_stdout() {
 fn host_flag_passes_through_ndjson_stream() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = tempfile::TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    let script = r#"#!/bin/sh
-echo '{"ts":1.0,"namespace":"default","session":"s1","run_id":"abc","source":"tendr.sidecar","kind":"run","name":"run.started","data":{"status":"Running"}}'
-echo '{"ts":2.0,"namespace":"default","session":"s1","run_id":"abc","source":"tendr.sidecar","kind":"run","name":"run.exited","data":{"status":"Exited","reason":"ExitedOk","exit_code":0}}'
-exit 0
-"#;
-    std::fs::write(&fake_ssh, script).unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
+    let tmp = fake_ssh(
+        r#"out {"ts":1.0,"namespace":"default","session":"s1","run_id":"abc","source":"tendr.sidecar","kind":"run","name":"run.started","data":{"status":"Running"}}\n
+out {"ts":2.0,"namespace":"default","session":"s1","run_id":"abc","source":"tendr.sidecar","kind":"run","name":"run.exited","data":{"status":"Exited","reason":"ExitedOk","exit_code":0}}\n
+exit 0"#,
+    );
 
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .args(["--host", "user@box", "watch", "--events"])
@@ -470,11 +543,7 @@ fn host_flag_forwards_namespace_and_strips_host() {
 fn host_flag_passes_through_stderr() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = tempfile::TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    let script = "#!/bin/sh\necho 'session not found: oops' >&2\nexit 1\n";
-    std::fs::write(&fake_ssh, script).unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
+    let tmp = fake_ssh("err session not found: oops\\n\nexit 1");
 
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .args(["--host", "user@box", "status", "oops"])
@@ -695,11 +764,7 @@ fn host_flag_forwards_exec_target() {
 /// A poison ssh shim: running it is the failure the slice exists to
 /// prevent, so it exits loudly. Returns the PATH dir.
 fn poison_ssh() -> TempDir {
-    let tmp = TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    std::fs::write(&fake_ssh, "#!/bin/sh\necho SSH_MUST_NOT_RUN >&2\nexit 99\n").unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
-    tmp
+    fake_ssh("err SSH_MUST_NOT_RUN\\n\nexit 99")
 }
 
 /// Extract the `try:` line's fallback and re-split it twice — once as the
@@ -819,15 +884,9 @@ fn host_run_fallback_keeps_separator_before_script_args() {
 fn host_local_only_rejection_spawns_no_ssh() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = TempDir::new().unwrap();
-    let marker = tmp.path().join("ssh-was-run");
-    let fake_ssh = tmp.path().join("ssh");
-    std::fs::write(
-        &fake_ssh,
-        format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
+    let marker = TempDir::new().unwrap();
+    let marker = marker.path().join("ssh-was-run");
+    let tmp = fake_ssh(&format!("touch {}\nexit 0", marker.display()));
 
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .args(["--host", "user@box", "prune", "--all"])
@@ -946,26 +1005,76 @@ fn host_events_keeps_generic_rejection() {
 
 // -- Remote exec via frame-from-stdin --
 
-/// A fake ssh that drops everything up to and including the "tendr"
-/// argv token, then executes the real tendr binary with the remainder —
-/// the frame arrives on real stdin, the session root rides in on HOME.
-/// This exercises the full frame path end-to-end on one machine.
+/// A fake ssh that acts as the remote login shell: it drops the ssh options
+/// and destination, re-splits the remote command as a POSIX shell would, and
+/// runs the real tendr binary (`TENDR_TEST_BIN`) with it — the frame arrives
+/// on real stdin, the session root rides in on HOME. This exercises the full
+/// frame path end-to-end on one machine.
 fn fake_ssh_frame_shim() -> TempDir {
-    let tmp = TempDir::new().unwrap();
-    let fake_ssh = tmp.path().join("ssh");
-    std::fs::write(
-        &fake_ssh,
-        "#!/bin/sh\n\
-         while [ $# -gt 0 ]; do a=\"$1\"; shift; [ \"$a\" = tendr ] && break; done\n\
-         exec \"$TENDR_TEST_BIN\" \"$@\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_ssh, PermissionsExt::from_mode(0o755)).unwrap();
-    tmp
+    fake_ssh("forward")
 }
 
-fn shim_path_env(tmp: &TempDir) -> String {
-    format!("{}:/usr/bin:/bin", tmp.path().display())
+/// The fake ssh's dir in front of the inherited PATH.
+fn shim_path_env(tmp: &TempDir) -> std::ffi::OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = std::iter::once(tmp.path().to_path_buf()).chain(std::env::split_paths(&inherited));
+    std::env::join_paths(dirs).unwrap()
+}
+
+// The exec sessions behind the fake ssh are each platform's native shell, as
+// in `cli_exec.rs`: bash on Unix, PowerShell on Windows.
+
+/// Start the native-shell session "shell" and wait until it runs.
+fn start_native_shell(root: &TempDir) -> harness::SessionGuard<'_> {
+    let shell: &[&str] = if cfg!(windows) {
+        &[
+            "--exec-target",
+            "powershell",
+            "--",
+            "powershell",
+            "-NoProfile",
+        ]
+    } else {
+        &["--", "bash"]
+    };
+    harness::tendr(root)
+        .args(["start", "shell", "--stdin"])
+        .args(shell)
+        .assert()
+        .success();
+    let guard = harness::SessionGuard::new(root, "shell");
+    harness::wait_running(root, "shell");
+    guard
+}
+
+/// A command that prints `text` verbatim and a newline. On Unix the newline
+/// comes from printf's format, not argv: a newline-less payload trips the
+/// sentinel merge quirk and hangs exec.
+fn native_echo(text: &str) -> Vec<String> {
+    if cfg!(windows) {
+        // PowerShell takes a single-quoted literal; a quote inside doubles.
+        vec![format!("Write-Output '{}'", text.replace('\'', "''"))]
+    } else {
+        vec!["printf".into(), "%s\\n".into(), text.into()]
+    }
+}
+
+/// A command that exits with `code` without ending the session.
+fn native_exit(code: u8) -> Vec<String> {
+    if cfg!(windows) {
+        vec![format!("cmd /c exit {code}")]
+    } else {
+        vec!["sh".into(), "-c".into(), format!("exit {code}")]
+    }
+}
+
+/// A command that sleeps for `secs` seconds.
+fn native_sleep(secs: u64) -> Vec<String> {
+    if cfg!(windows) {
+        vec![format!("Start-Sleep {secs}")]
+    } else {
+        vec!["sleep".into(), secs.to_string()]
+    }
 }
 
 /// `tendr --host h exec …` works end-to-end: the envelope comes back on
@@ -975,16 +1084,12 @@ fn host_exec_frame_end_to_end() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
-        .args(["--host", "box", "exec", "shell", "--", "echo", "remote hi"])
+        .args(["--host", "box", "exec", "shell", "--"])
+        .args(native_echo("remote hi"))
         .env("PATH", shim_path_env(&tmp))
         .env(
             "TENDR_TEST_BIN",
@@ -1009,16 +1114,12 @@ fn host_exec_inner_exit_code_propagates() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
-        .args(["--host", "box", "exec", "shell", "--", "sh", "-c", "exit 7"])
+        .args(["--host", "box", "exec", "shell", "--"])
+        .args(native_exit(7))
         .env("PATH", shim_path_env(&tmp))
         .env(
             "TENDR_TEST_BIN",
@@ -1036,26 +1137,12 @@ fn host_exec_timeout_propagates() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
-        .args([
-            "--host",
-            "box",
-            "exec",
-            "shell",
-            "--timeout",
-            "1",
-            "--",
-            "sleep",
-            "3",
-        ])
+        .args(["--host", "box", "exec", "shell", "--timeout", "1", "--"])
+        .args(native_sleep(3))
         .env("PATH", shim_path_env(&tmp))
         .env(
             "TENDR_TEST_BIN",
@@ -1077,22 +1164,14 @@ fn host_exec_torture_payload_matches_local() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
-    // %s\n in printf's FORMAT: trailing newline without a newline byte
-    // in argv (a newline-less payload trips the pre-existing sentinel
-    // merge quirk and hangs exec); --timeout guards regressions.
     let torture = r#"it's a "test" $VAR `tick` back\slash ;&|"#;
-    let argv = ["printf", "%s\\n", torture];
+    let argv = native_echo(torture);
 
     let local = harness::tendr(&root)
         .args(["exec", "shell", "--timeout", "30", "--"])
-        .args(argv)
+        .args(&argv)
         .output()
         .unwrap();
     assert!(local.status.success());
@@ -1100,7 +1179,7 @@ fn host_exec_torture_payload_matches_local() {
     let tmp = fake_ssh_frame_shim();
     let remote = harness::tendr(&root)
         .args(["--host", "box", "exec", "shell", "--timeout", "30", "--"])
-        .args(argv)
+        .args(&argv)
         .env("PATH", shim_path_env(&tmp))
         .env(
             "TENDR_TEST_BIN",
@@ -1121,7 +1200,10 @@ fn host_exec_torture_payload_matches_local() {
         "local and remote exec agree byte-exact"
     );
     assert_eq!(
-        local_env["stdout"].as_str().unwrap().trim_end_matches('\n'),
+        local_env["stdout"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches(['\r', '\n']),
         torture
     );
 }
@@ -1162,15 +1244,11 @@ fn host_exec_frame_stdin_passes_through() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
-    let frame = r#"{"v":1,"session":"shell","cmd":["echo","piped frame"]}"#;
+    let frame = serde_json::json!({"v": 1, "session": "shell", "cmd": native_echo("piped frame")})
+        .to_string();
     let output = harness::tendr(&root)
         .args(["--host", "box", "exec", "--frame-from-stdin"])
         .env("PATH", shim_path_env(&tmp))
@@ -1189,6 +1267,33 @@ fn host_exec_frame_stdin_passes_through() {
     );
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(envelope["stdout"].as_str().unwrap().contains("piped frame"));
+}
+
+/// The frame reaches ssh's stdin byte for byte: nothing is added, dropped or
+/// re-encoded on the way.
+#[test]
+fn host_exec_frame_stdin_reaches_ssh_unchanged() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    let captured = TempDir::new().unwrap();
+    let captured = captured.path().join("stdin");
+    let tmp = fake_ssh(&format!("stdin {}\nexit 0", captured.display()));
+    let frame = "{\"v\":1,\"session\":\"shell\",\"cmd\":[\"echo\",\"it's \\\"q\\\" \u{e9}\"]}\n";
+    let output = harness::tendr(&root)
+        .args(["--host", "box", "exec", "--frame-from-stdin"])
+        .env("PATH", shim_path_env(&tmp))
+        .write_stdin(frame)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&captured).unwrap(), frame.as_bytes());
 }
 
 #[test]

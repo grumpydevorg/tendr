@@ -5,8 +5,8 @@ depends_on: []
 
 # Remote frame transport: make `--host` cross-platform
 
-**Status:** step 1 (typed `RemoteOperation` + shared `dispatch`) is done; step 0a
-is in #149. Steps 2–4, 6 and 7 are in progress. Step 5 (the attach bridge,
+**Status:** steps 0a (portable fake ssh) and 1 (typed `RemoteOperation` +
+shared `dispatch`) are done. Steps 2–4, 6 and 7 are in progress. Step 5 (the attach bridge,
 which the cloud PTY workflow needs; see the
 [VM scripts and results](../../../scripts/pty-vm/README.md)) comes after them.
 
@@ -158,11 +158,9 @@ network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
 0. **Shipped (v0.2.1).** A `--host` value that is empty or starts with `-` is
    rejected with exit 2 before ssh starts. Both SSH builders fail closed through
    `ssh::validate_destination`.
-0a. **Portable fake-SSH harness.** `tests/cli_remote.rs` is `cfg(unix)` because
-   its fake ssh is a shell script. Replace it with a Rust test-helper exe that
-   records argv, captures and forwards stdin, emits configured stdout/stderr
-   and exit code, and installs as `ssh`/`ssh.exe` on the temp PATH. It must land
-   before step 3 moves any operation onto the frame.
+0a. **Done.** `tests/cli_remote.rs` runs on every CI lane against the Rust fake
+   ssh in `src/bin/fake_ssh.rs`: `forward` emulates the remote login shell and
+   runs the real tendr, and `stdin` captures the bytes the client wrote.
 1. **Done.** `RemoteOperation` request types + shared `dispatch` (`src/remote_op.rs`);
    local commands route through them, SSH behaviour unchanged. A completeness
    test pins every `start` flag through the round trip.
