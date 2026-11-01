@@ -373,9 +373,9 @@ Start work under `--host`, disconnect, and come back later to `log`, `status`,
 |`run`, `wrap`, `prune`, `query`, `guide`, `skill`|Refused with exit 2 and a ready-to-paste fallback for a POSIX shell, such as `try (POSIX shell):  ssh data-box 'tendr run deploy.sh'`.|
 |`events`, `emit`|Refused with exit 1.|
 
-**The remote `tendr` must be this version or newer.** An older one rejects the
-request, and tendr says to upgrade it. `exec` is the exception: it also reaches
-older versions. An older client still works against a newer remote.
+**The remote `tendr` must be this version or newer**, `exec` included. An
+older one rejects the request, and tendr says to upgrade it. An older client
+still works against a newer remote.
 
 **Invalid requests.** The remote `tendr` checks a request before it does
 anything. One it refuses, such as a bad session name or a malformed `--env`,
@@ -385,11 +385,14 @@ before `ssh` starts.
 
 **Windows hosts.** Your values arrive as data whatever the remote host's
 default ssh shell: `cmd.exe`, PowerShell and POSIX shells only ever run a fixed
-`tendr` command, so they cannot act on a value. That output and exit codes
-match through `cmd.exe` and PowerShell as they do through a POSIX shell is
-still being verified. Values are carried exactly, not translated, so a
-Windows session takes Windows commands and paths. If you wrap a local-only
-command in `ssh` yourself, quote for the remote shell, for example with
+`tendr` command, so they cannot act on a value. A PowerShell login shell
+reports any failure as ssh exit 1, so the remote `tendr` also sends its exit
+code as its last stderr line, which tendr reads and hides: exit codes come
+through PowerShell too. That output and exit codes match through `cmd.exe`
+and PowerShell as they do through a POSIX shell is still being verified.
+Values are carried exactly, not translated, so a Windows session takes
+Windows commands and paths. If you wrap a local-only command in `ssh`
+yourself, quote for the remote shell, for example with
 `powershell -NoProfile -Command`.
 
 **Connect deadline.** Every `--host` command except `attach` must authenticate
@@ -402,8 +405,7 @@ about 30 minutes with no prompt.
 - Time spent at an `ssh` prompt (passphrase, unknown host key) counts.
 - `TENDR_SSH_CONNECT_TIMEOUT` sets the limit in seconds; `0` turns it off.
 - A remote `tendr` too old to know the `--hello` flag fails, and the error says
-  to upgrade it. With `TENDR_SSH_CONNECT_TIMEOUT=0` tendr sends no `--hello`,
-  so `exec` reaches such a remote.
+  to upgrade it, also with `TENDR_SSH_CONNECT_TIMEOUT=0`.
 - If the deadline fires during authentication, a `ProxyCommand` that ignores
   its input can be left running.
 
@@ -572,7 +574,7 @@ or an I/O error.
 |any|2|Usage error from argument parsing|
 |any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); an `attach` name that is not plain; a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request|
 |`events`, `emit` with `--host`|1|Not supported over SSH|
-|any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 is `ssh` failing to connect|
+|any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 without one from the remote is `ssh` failing to connect|
 |any, with `--host` except `attach`|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s)|
 |`start`|2, 5|The child failed to spawn; the sidecar failed|
 |`run`|the child's|The child's own code, or 2 spawn failed, 3 sidecar lost, 4 dependency failed, 5 sidecar failed, 124 timed out, 137 killed|

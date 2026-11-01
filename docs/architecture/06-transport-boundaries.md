@@ -54,8 +54,8 @@ remote login shell, whether that is bash, `cmd.exe` or PowerShell:
 
 | Operations | Remote command line | Request |
 |---|---|---|
-| `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch` | `ssh -T … tendr [--hello] _remote` | The remote frame on ssh stdin |
-| `exec` | `ssh -T … tendr [--hello] exec --frame-from-stdin` | The exec frame on ssh stdin |
+| `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch` | `ssh -T … tendr [--hello] --exit-trailer _remote` | The remote frame on ssh stdin |
+| `exec` | `ssh -T … tendr [--hello] --exit-trailer exec --frame-from-stdin` | The exec frame on ssh stdin |
 | `attach` | `ssh -t … tendr attach <name> [--namespace <ns>] [--takeover] [--escape none]` | The command line itself |
 
 ### The remote frame
@@ -90,9 +90,32 @@ The JSON is the request under a version:
   stdout, stderr and exit code are the local command's, and `log -f` and
   `watch` stream.
 - A remote tendr from before the frame fails with clap's
-  `unrecognized subcommand '_remote'`. The client passes that on and adds
-  that the remote tendr is too old for this client and which version to
-  upgrade it to. Old clients still work against a new remote tendr.
+  `unrecognized subcommand '_remote'` (or `unexpected argument
+  '--exit-trailer' found`, or, older still, the same for `--hello`). The
+  client passes that on and adds that the remote tendr is too old for this
+  client and which version to upgrade it to. Old clients still work against
+  a new remote tendr.
+
+### The exit trailer
+
+Under a PowerShell login shell (Windows PowerShell 5.1 and PowerShell 7),
+ssh's exit status collapses to 0 or 1; `cmd.exe` and POSIX shells pass the
+code on. Stdin and stderr pass through all three exactly, so the code also
+travels on stderr:
+
+- `tendr --exit-trailer <command>` (`src/main.rs`) runs the same command line
+  without the flag as a child with the same stdin, stdout and stderr, then
+  writes `tendr-exit <code>` as the last stderr line and exits with the
+  code. The wrapper covers every exit path, panics included, and never reads
+  stdin; the child writes the hello. The flag is accepted only before the
+  subcommand. A child killed by a signal gets no trailer.
+- The client's stderr relay (`src/ssh.rs`) holds back only a line that may be
+  the trailer, and only while it is the last thing that arrived. A
+  `tendr-exit <int>` line followed by anything else is the command's own
+  output and is passed on. At end of stream a held trailer is dropped and its
+  code becomes the call's exit code.
+- Without a trailer the client falls back to ssh's status. ssh's 255 without
+  a trailer is a connection failure; a trailer of 255 is the remote's code.
 
 `attach` needs a remote terminal, so it stays on `ssh -t` with a rebuilt
 command line until the attach bridge lands
@@ -130,11 +153,11 @@ before the remote tendr starts.
 - The marker comes from the remote tendr, not from ssh's log. ssh's log is
   unreliable across ControlMaster reuse and OpenSSH versions.
 - `attach` gets no deadline, because its stderr shares the terminal.
-- `TENDR_SSH_CONNECT_TIMEOUT=0` sends no `--hello`. Use it to reach, for
-  `exec`, a remote tendr that does not know `--hello`; the other operations
-  need a remote tendr that knows `_remote`.
-- A remote tendr that rejects `--hello` or `_remote` exits 2 with clap's
-  error; the local end adds what to upgrade.
+- `TENDR_SSH_CONNECT_TIMEOUT=0` sends no `--hello`. Stderr is still relayed,
+  for the exit trailer and an old remote's parse error.
+- A remote tendr that rejects `_remote`, `--hello` or `--exit-trailer` fails
+  with clap's error (exit 2, or 1 under PowerShell); the local end adds what
+  to upgrade.
 - stdout stays inherited while a thread relays stderr. So the order between
   the two streams is not exact; each stream keeps its own order.
 

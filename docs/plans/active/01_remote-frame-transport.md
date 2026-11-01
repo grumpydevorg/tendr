@@ -87,7 +87,7 @@ are stable protocol/domain DTOs.
 ### 2. Wire format — one hidden, constant entry point
 
 ```
-ssh -T host tendr [--hello] _remote
+ssh -T host tendr [--hello] --exit-trailer _remote
 ```
 
 Nothing host- or user-derived appears after the SSH destination. The stream is:
@@ -208,7 +208,10 @@ network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
    command line from plain names and fixed flag values only. Shell quoting is
    left only in the copy/paste fallback text, labelled `try (POSIX shell):`.
 7. Add real cmd.exe and PowerShell OpenSSH tests to the native Windows x64 and
-   ARM64 CI lanes (the lanes already exist).
+   ARM64 CI lanes (the lanes already exist). The first runs showed a
+   PowerShell login shell collapsing ssh's exit status to 0/1, so the remote
+   tendr now also sends its code as the last stderr line
+   ([exit trailer](../../architecture/06-transport-boundaries.md#the-exit-trailer)).
 
 ## Phase 1 build pins (the dispatch refactor)
 

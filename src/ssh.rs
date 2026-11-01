@@ -138,7 +138,8 @@ pub fn exec_ssh_attach(host: &str, args: &[String]) -> Result<i32, SshError> {
         .spawn()
         .and_then(|mut child| child.wait())
         .map_err(SshError::SpawnFailed)?;
-    exit_code(status)
+    // attach shares the terminal and has no exit trailer.
+    exit_code(status.code(), None)
 }
 
 /// The remote tendr entry point of a framed call.
@@ -170,14 +171,19 @@ enum Input {
 }
 
 /// The argv of a framed call — constant by construction:
-/// `ssh -T -o ConnectTimeout=10 <host> tendr [--hello] <entry>`. Nothing
-/// user-controlled rides in it, so there is no shell-quoting layer to
-/// traverse; the request travels on ssh's stdin as opaque bytes. `--hello`
-/// asks the remote tendr to announce itself on stderr first ([`HELLO_LINE`]),
-/// which ends the connect deadline; it is left out when the deadline is off
-/// (`TENDR_SSH_CONNECT_TIMEOUT=0`), which is how a remote exec too old to
-/// know it is still reached. Stderr is always relayed, so an old remote
-/// tendr's parse error can be explained ([`wait_framed`]).
+/// `ssh -T -o ConnectTimeout=10 <host> tendr [--hello] --exit-trailer <entry>`.
+/// Nothing user-controlled rides in it, so there is no shell-quoting layer to
+/// traverse; the request travels on ssh's stdin as opaque bytes.
+///
+/// - `--hello` asks the remote tendr to announce itself on stderr first
+///   ([`HELLO_LINE`]), which ends the connect deadline; it is left out when
+///   the deadline is off (`TENDR_SSH_CONNECT_TIMEOUT=0`).
+/// - `--exit-trailer` asks it to end stderr with `tendr-exit <code>`
+///   ([`EXIT_TRAILER`]): a PowerShell login shell reports any failure as ssh
+///   exit 1, so ssh's own status cannot carry the code.
+///
+/// Stderr is always relayed, to strip both lines and to explain an old remote
+/// tendr's parse error ([`wait_framed`]).
 ///
 /// No `--` separator is used between the host and the remote command: ssh
 /// does not treat `--` after the destination as an option terminator.
@@ -192,7 +198,7 @@ fn build_ssh_frame_command(
     if connect_deadline().is_some() {
         cmd.arg("--hello");
     }
-    cmd.args(entry.args());
+    cmd.arg("--exit-trailer").args(entry.args());
     cmd.stdin(if inherit_stdin {
         Stdio::inherit()
     } else {
@@ -218,7 +224,8 @@ pub fn exec_ssh_frame(host: &str, frame: Option<Vec<u8>>) -> Result<i32, SshErro
 /// Run one request on `host`'s tendr through its `_remote` entry point:
 /// write `frame` (the encoded request) to ssh's stdin, then, with `body`,
 /// copy local stdin after it as it arrives, until it ends (push). Remote
-/// stdout and stderr stream through; returns the remote exit code.
+/// stdout and stderr stream through; returns the remote exit code, from the
+/// remote's exit trailer when there is one, otherwise from ssh.
 ///
 /// A failed write to the remote's stdin is deliberately ignored: it means the
 /// remote died early (EPIPE), and the remote's exit status is the
@@ -226,9 +233,8 @@ pub fn exec_ssh_frame(host: &str, frame: Option<Vec<u8>>) -> Result<i32, SshErro
 ///
 /// # Errors
 /// `SshError::InvalidDestination` before ssh starts; `SshError::TransportFailed`
-/// on ssh exit 255 (which shadows a remote command genuinely exiting 255 — an
-/// inherent ssh limitation); `SshError::ConnectDeadline` if the remote tendr
-/// never said hello in time; `SshError::SpawnFailed`/`Abnormal`.
+/// on ssh exit 255 without an exit trailer; `SshError::ConnectDeadline` if the
+/// remote tendr never said hello in time; `SshError::SpawnFailed`/`Abnormal`.
 pub fn exec_ssh_remote(host: &str, frame: Vec<u8>, body: bool) -> Result<i32, SshError> {
     let input = if body {
         Input::FrameThenStdin(frame)
@@ -264,21 +270,25 @@ fn run_framed(host: &str, entry: Entry, input: Input) -> Result<i32, SshError> {
         })
     });
 
-    let status = wait_framed(host, entry, &mut child, connect_deadline())?;
+    let (status, trailer) = wait_framed(host, &mut child, connect_deadline())?;
     // Once ssh is gone a frame write fails with EPIPE, so that join never
     // hangs. A body copy can be blocked reading local stdin, which ssh's exit
     // does not end: it is left to the process exit.
     if let Some(writer) = writer.filter(|_| !body) {
         let _ = writer.join();
     }
-    exit_code(status)
+    exit_code(status.code(), trailer)
 }
 
-fn exit_code(status: std::process::ExitStatus) -> Result<i32, SshError> {
-    match status.code() {
-        Some(255) => Err(SshError::TransportFailed),
-        Some(code) => Ok(code),
-        None => Err(SshError::Abnormal),
+/// The call's exit code: the remote's exit trailer if it wrote one, else
+/// ssh's own `code`. Without a trailer, 255 is ssh failing to connect; with
+/// one, 255 is the remote's.
+fn exit_code(code: Option<i32>, trailer: Option<i32>) -> Result<i32, SshError> {
+    match (trailer, code) {
+        (Some(code), _) => Ok(code),
+        (None, Some(255)) => Err(SshError::TransportFailed),
+        (None, Some(code)) => Ok(code),
+        (None, None) => Err(SshError::Abnormal),
     }
 }
 
@@ -300,29 +310,29 @@ fn connect_deadline() -> Option<Duration> {
     }
 }
 
-/// Wait for `child` (an ssh to a remote `tendr [--hello] <entry>`) to exit,
-/// stopping it if a `deadline` is set and the remote tendr has not said hello
-/// within it.
+/// Wait for `child` (an ssh to a remote `tendr [--hello] --exit-trailer
+/// <entry>`) to exit, stopping it if a `deadline` is set and the remote tendr
+/// has not said hello within it. Returns ssh's status and the remote's exit
+/// trailer, if it wrote one.
 ///
 /// ssh's own `ConnectTimeout` ends at key exchange; authentication can then
 /// stall indefinitely (a lapsed Tailscale SSH check-mode approval waits about
 /// 30 minutes, silently). The hello is the remote tendr's first stderr line,
 /// so it arrives only once ssh is through. After it, the call may run as long
-/// as it needs (`wait`, `log -f`). Everything on stderr except the hello is
-/// passed through in order; stdout stays inherited, so the order *between*
-/// the two streams is no longer exact.
+/// as it needs (`wait`, `log -f`). Everything on stderr except the hello and
+/// the trailer is passed through in order; stdout stays inherited, so the
+/// order *between* the two streams is no longer exact.
 ///
-/// A remote tendr too old for the call fails with clap's parse error (exit
-/// 2), which is passed on with advice on what to do.
+/// A remote tendr too old for the call fails with clap's parse error, which
+/// is passed on with advice on what to do.
 ///
 /// Time a human spends at an ssh prompt (passphrase, host key) counts against
 /// the deadline: those prompts use the terminal, not stderr.
 fn wait_framed(
     host: &str,
-    entry: Entry,
     child: &mut std::process::Child,
     deadline: Option<Duration>,
-) -> Result<std::process::ExitStatus, SshError> {
+) -> Result<(std::process::ExitStatus, Option<i32>), SshError> {
     let stderr = child
         .stderr
         .take()
@@ -332,24 +342,29 @@ fn wait_framed(
 
     let started = Instant::now();
     let mut hello = false;
-    // `Some` once stderr has ended, with the relay's verdict on an old tendr.
-    let mut verdict: Option<Option<OldTendr>> = None;
-    let finish = |status: std::process::ExitStatus, old: Option<OldTendr>| {
-        if let Some(old) = old.filter(|_| status.code() == Some(2)) {
-            eprintln!("{}", old.advice(host, entry));
+    // `Some` once stderr has ended.
+    let mut ended: Option<Ended> = None;
+    let finish = |status: std::process::ExitStatus, ended: Ended| {
+        // An old tendr writes no trailer; its parse error fails the call
+        // (exit 2, or 1 under a PowerShell login shell).
+        if ended.old_tendr && ended.trailer.is_none() && status.code() != Some(0) {
+            eprintln!(
+                "tendr on {host} is too old for this client: upgrade it to {} or later",
+                env!("CARGO_PKG_VERSION")
+            );
         }
-        status
+        (status, ended.trailer)
     };
     loop {
         // Only the hello proves ssh got through. An end of stream before it
         // proves nothing: a process can close its stderr and keep running.
         let awaiting_hello = deadline.is_some() && !hello;
-        match verdict {
+        match ended {
             // Stderr has ended and no deadline is pending: only the exit is
             // left to wait for.
-            Some(old) if !awaiting_hello => {
+            Some(ended) if !awaiting_hello => {
                 let status = child.wait().map_err(SshError::SpawnFailed)?;
-                return Ok(finish(status, old));
+                return Ok(finish(status, ended));
             }
             Some(_) => std::thread::sleep(PENDING_POLL),
             // Wake for the relay, or to look at ssh and the deadline: often
@@ -360,9 +375,9 @@ fn wait_framed(
                 RUNNING_POLL
             }) {
                 Ok(Relay::Hello) => hello = true,
-                Ok(Relay::Done { old_tendr }) => verdict = Some(old_tendr),
+                Ok(Relay::Done(done)) => ended = Some(done),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => verdict = Some(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => ended = Some(Ended::default()),
             },
         }
         if let Some(status) = child.try_wait().map_err(SshError::SpawnFailed)? {
@@ -372,12 +387,12 @@ fn wait_framed(
             // ssh's SIGHUP holds the call open, as it held the terminal
             // before). Without a hello, a leftover holder must not hold the
             // call open: wait briefly for the rest, then report the status.
-            let old = match verdict {
-                Some(old) => old,
-                None if hello => wait_relay(&events, None).flatten(),
-                None => wait_relay(&events, Some(Duration::from_secs(1))).flatten(),
+            let ended = match ended {
+                Some(ended) => Some(ended),
+                None if hello => wait_relay(&events, None),
+                None => wait_relay(&events, Some(Duration::from_secs(1))),
             };
-            return Ok(finish(status, old));
+            return Ok(finish(status, ended.unwrap_or_default()));
         }
         if let Some(deadline) = deadline.filter(|d| !hello && started.elapsed() >= *d) {
             stop(child);
@@ -398,45 +413,102 @@ const PENDING_POLL: Duration = Duration::from_millis(20);
 /// at once for stderr ending, which is how a call normally ends.
 const RUNNING_POLL: Duration = Duration::from_secs(1);
 
-/// How a remote tendr showed it is too old for the call, by its parse error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OldTendr {
-    /// It does not know `--hello` (before the connect deadline).
-    NoHello,
-    /// It does not know `_remote` (before the frame transport).
-    NoRemote,
+/// Whether a stderr line is clap's parse error from a remote tendr too old
+/// for the call: one that does not know `_remote`, `--hello` or
+/// `--exit-trailer`. The whole of clap's phrase is matched, so a newer
+/// tendr's own error that quotes a user value such as `'--hello'` is not
+/// mistaken for one.
+fn is_old_tendr_error(line: &[u8]) -> bool {
+    let line = String::from_utf8_lossy(line);
+    [
+        "error: unrecognized subcommand '_remote'",
+        "error: unexpected argument '--hello' found",
+        "error: unexpected argument '--exit-trailer' found",
+    ]
+    .iter()
+    .any(|phrase| line.contains(phrase))
 }
 
-impl OldTendr {
-    /// The parse error in a stderr line, if it is one of these. The whole of
-    /// clap's phrase is matched, so a newer tendr's own error that quotes a
-    /// user value such as `'--hello'` is not mistaken for one.
-    fn detect(line: &[u8]) -> Option<Self> {
-        let line = String::from_utf8_lossy(line);
-        if line.contains("error: unrecognized subcommand '_remote'") {
-            Some(Self::NoRemote)
-        } else if line.contains("error: unexpected argument '--hello' found") {
-            Some(Self::NoHello)
-        } else {
-            None
+/// The last stderr line of a remote `tendr --exit-trailer …` is this, then
+/// the exit code and a newline.
+pub const EXIT_TRAILER: &str = "tendr-exit ";
+
+/// The exit code in `line` if it is exactly an exit trailer:
+/// `tendr-exit <code>`, then `\n` or `\r\n`.
+fn trailer_code(line: &[u8]) -> Option<i32> {
+    let line = line.strip_suffix(b"\n")?;
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let code = line.strip_prefix(EXIT_TRAILER.as_bytes())?;
+    let digits = code.strip_prefix(b"-").unwrap_or(code);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(code).ok()?.parse().ok()
+}
+
+/// Whether `tail`, the unfinished last line of what has arrived so far,
+/// could still turn out to be an exit trailer.
+fn could_be_trailer(tail: &[u8]) -> bool {
+    let prefix = EXIT_TRAILER.as_bytes();
+    if tail.len() <= prefix.len() {
+        return prefix.starts_with(tail);
+    }
+    let Some(code) = tail.strip_prefix(prefix) else {
+        return false;
+    };
+    let code = code.strip_suffix(b"\r").unwrap_or(code);
+    let digits = code.strip_prefix(b"-").unwrap_or(code);
+    digits.len() <= 11 && digits.iter().all(u8::is_ascii_digit)
+}
+
+/// Passes stderr through to `out`, holding back only what may be the exit
+/// trailer: the last line, while it reads `tendr-exit <code>` so far. A
+/// trailer-shaped line counts only if it is the last line of the stream; one
+/// with anything after it is passed through unchanged. A partial line that
+/// cannot be a trailer goes out at once, so progress output still streams.
+struct TrailerFilter<W> {
+    out: W,
+    held: Vec<u8>,
+}
+
+impl<W: io::Write> TrailerFilter<W> {
+    fn new(out: W) -> Self {
+        Self {
+            out,
+            held: Vec::new(),
         }
     }
 
-    /// What the caller should do. An exec reaches a tendr without `--hello`
-    /// once the deadline is off; every other operation needs a tendr that
-    /// knows `_remote`.
-    fn advice(self, host: &str, entry: Entry) -> String {
-        match (self, entry) {
-            (Self::NoHello, Entry::Exec) => format!(
-                "tendr on {host} does not know --hello, so it predates the \
-                 connect deadline: upgrade tendr on {host}, or set \
-                 TENDR_SSH_CONNECT_TIMEOUT=0 to reach it without one"
-            ),
-            _ => format!(
-                "tendr on {host} is too old for this client: upgrade it to {} or later",
-                env!("CARGO_PKG_VERSION")
-            ),
+    /// Pass on `data`, keeping back a possible trailer at its end.
+    fn write(&mut self, data: &[u8]) {
+        self.held.extend_from_slice(data);
+        // The last line: after the last newline, or, if what has arrived ends
+        // with a newline, the complete line that newline ends.
+        let body = self.held.strip_suffix(b"\n").unwrap_or(&self.held);
+        let start = body.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let last = &self.held[start..];
+        let keep = if last.ends_with(b"\n") {
+            trailer_code(last).is_some()
+        } else {
+            could_be_trailer(last)
+        };
+        let send = if keep { start } else { self.held.len() };
+        if send > 0 {
+            let _ = self.out.write_all(&self.held[..send]);
+            let _ = self.out.flush();
+            self.held.drain(..send);
         }
+    }
+
+    /// The stream has ended: strip a held trailer and return its code, or
+    /// pass on what was held.
+    fn finish(mut self) -> (W, Option<i32>) {
+        let code = trailer_code(&self.held);
+        if code.is_none() && !self.held.is_empty() {
+            let _ = self.out.write_all(&self.held);
+            let _ = self.out.flush();
+        }
+        (self.out, code)
     }
 }
 
@@ -444,14 +516,23 @@ impl OldTendr {
 enum Relay {
     /// The remote tendr's hello arrived.
     Hello,
-    /// Stderr ended; whether, before any hello, the remote rejected the call
-    /// as a tendr too old for it.
-    Done { old_tendr: Option<OldTendr> },
+    /// Stderr ended.
+    Done(Ended),
+}
+
+/// How a framed call's stderr ended.
+#[derive(Debug, Clone, Copy, Default)]
+struct Ended {
+    /// Before any hello, the remote rejected the call as a tendr too old for
+    /// it.
+    old_tendr: bool,
+    /// The remote's exit trailer.
+    trailer: Option<i32>,
 }
 
 /// Wait for the relay to finish, at most `limit` (forever with `None`).
-/// Returns its verdict on an old remote tendr, or `None` if it did not finish.
-fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option<Option<OldTendr>> {
+/// Returns how stderr ended, or `None` if it did not finish.
+fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option<Ended> {
     let until = limit.map(|limit| Instant::now() + limit);
     loop {
         let event = match until {
@@ -460,8 +541,8 @@ fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option
                 .recv_timeout(until.saturating_duration_since(Instant::now()))
                 .ok()?,
         };
-        if let Relay::Done { old_tendr } = event {
-            return Some(old_tendr);
+        if let Relay::Done(ended) = event {
+            return Some(ended);
         }
     }
 }
@@ -489,45 +570,56 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Copy a framed call's stderr to ours, dropping the hello and reporting
-/// it. The hello ends a line but need not start one: anything a login shell's
-/// rc file wrote without a newline just before tendr ran is glued in front,
-/// and is passed through. Reports [`Relay::Done`] when stderr ends.
+/// Copy a framed call's stderr to ours through a [`TrailerFilter`], dropping
+/// the hello and reporting it. The hello ends a line but need not start one:
+/// anything a login shell's rc file wrote without a newline just before tendr
+/// ran is glued in front, and is passed through. Reports [`Relay::Done`] when
+/// stderr ends.
 fn relay_stderr(stderr: std::process::ChildStderr, events: mpsc::Sender<Relay>) {
-    use std::io::{BufRead, Write};
+    use std::io::BufRead;
 
     let mut reader = io::BufReader::new(stderr);
-    let mut out = io::stderr();
-    let mut old_tendr = None;
+    let mut out = TrailerFilter::new(io::stderr());
+    let mut old_tendr = false;
     let mut line = Vec::new();
-    loop {
+    // Before the hello, line by line: the hello and an old tendr's parse
+    // error are whole lines. Without a deadline no hello comes, and the whole
+    // stream is read this way.
+    let hello = loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => {
-                let _ = events.send(Relay::Done { old_tendr });
-                return;
-            }
+            Ok(0) | Err(_) => break false,
             Ok(_) => {}
         }
         let body = line.trim_ascii_end();
         if body.ends_with(HELLO_LINE.as_bytes()) {
             let prefix = &body[..body.len() - HELLO_LINE.len()];
             if !prefix.is_empty() {
-                let _ = out.write_all(prefix);
-                let _ = out.write_all(b"\n");
+                out.write(prefix);
+                out.write(b"\n");
             }
             let _ = events.send(Relay::Hello);
-            break;
+            break true;
         }
-        old_tendr = old_tendr.or_else(|| OldTendr::detect(&line));
-        let _ = out.write_all(&line);
+        old_tendr |= is_old_tendr_error(&line);
+        out.write(&line);
+    };
+    // After the hello the stream is the command's own: pass it on as it
+    // comes.
+    if hello {
+        loop {
+            let n = match reader.fill_buf() {
+                Ok([]) | Err(_) => break,
+                Ok(chunk) => {
+                    out.write(chunk);
+                    chunk.len()
+                }
+            };
+            reader.consume(n);
+        }
     }
-    // After the hello the stream is the command's own: copy it as it comes.
-    {
-        let mut out = out.lock();
-        let _ = io::copy(&mut reader, &mut out);
-    }
-    let _ = events.send(Relay::Done { old_tendr });
+    let (_, trailer) = out.finish();
+    let _ = events.send(Relay::Done(Ended { old_tendr, trailer }));
 }
 
 #[cfg(test)]

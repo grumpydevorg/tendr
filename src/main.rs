@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tendr::model::event::EventTimestamp;
 use tendr::model::ids::{Namespace, Source};
 
@@ -74,6 +74,13 @@ struct Cli {
     /// through authentication, which ends the connect deadline.
     #[arg(long, global = true, hide = true)]
     hello: bool,
+
+    /// Run the command, then write `tendr-exit <code>` (`tendr::ssh::EXIT_TRAILER`)
+    /// to stderr as its last line. A local `--host` call passes it to the
+    /// remote tendr: a PowerShell login shell reports any failure as ssh exit
+    /// 1, so the code travels in-band.
+    #[arg(long, hide = true)]
+    exit_trailer: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -707,8 +714,70 @@ fn parse_optional_namespace(namespace: Option<String>) -> anyhow::Result<Option<
         .transpose()
 }
 
+/// `--exit-trailer`: run this command line as a child, without
+/// `--exit-trailer`, with our stdin, stdout and stderr. Then write the
+/// child's exit code to stderr as the last line, `tendr-exit <code>`, and
+/// exit with it. The child writes the hello, if asked, as the first line:
+/// this process writes nothing before it. Running the command in a child
+/// covers every way it can end, every `process::exit` and a panic included.
+/// This process never reads stdin. A child ended by a signal (Unix) gets no
+/// trailer: this exits 128 + the signal.
+fn run_with_exit_trailer(matches: &clap::ArgMatches) -> ! {
+    use std::io::Write;
+
+    let args = without_exit_trailer(std::env::args_os().collect(), matches);
+    let code = match std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).args(&args[1..]).status())
+    {
+        Ok(status) => match status.code() {
+            Some(code) => code,
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    std::process::exit(128 + status.signal().unwrap_or(0));
+                }
+                #[cfg(not(unix))]
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("error: cannot run tendr: {e}");
+            1
+        }
+    };
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{}{code}", tendr::ssh::EXIT_TRAILER);
+    let _ = stderr.flush();
+    std::process::exit(code);
+}
+
+/// `argv` without the `--exit-trailer` clap read as the flag, found by its
+/// position, so the same word as a child command's argument stays. The flag
+/// is accepted only before the subcommand, where clap's positions count from
+/// the start of `argv`.
+fn without_exit_trailer(
+    argv: Vec<std::ffi::OsString>,
+    matches: &clap::ArgMatches,
+) -> Vec<std::ffi::OsString> {
+    let flag: Vec<usize> = matches
+        .indices_of("exit_trailer")
+        .into_iter()
+        .flatten()
+        .collect();
+    argv.into_iter()
+        .enumerate()
+        .filter(|(i, _)| !flag.contains(i))
+        .map(|(_, arg)| arg)
+        .collect()
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if cli.exit_trailer {
+        run_with_exit_trailer(&matches);
+    }
     if cli.hello {
         eprintln!("{}", tendr::ssh::HELLO_LINE);
     }
@@ -984,5 +1053,71 @@ fn main() {
         eprintln!("{e:#}");
         // 1, or a PTY operation's own code (80–85, `tendr::pty_exit`).
         std::process::exit(tendr::pty_exit::exit_code(&e));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wrapper's child gets the command line without the `--exit-trailer`
+    /// clap read as the flag, and keeps the same word when it is a child
+    /// command's argument. `--hello` stays: the child writes the hello.
+    #[test]
+    fn the_wrapper_child_runs_the_command_without_the_flag() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["tendr", "--hello", "--exit-trailer", "_remote"],
+                &["tendr", "--hello", "_remote"],
+            ),
+            (
+                &["tendr", "--exit-trailer", "exec", "--frame-from-stdin"],
+                &["tendr", "exec", "--frame-from-stdin"],
+            ),
+            (
+                &["tendr", "--exit-trailer", "status", "s", "--hello"],
+                &["tendr", "status", "s", "--hello"],
+            ),
+            (
+                &[
+                    "tendr",
+                    "--exit-trailer",
+                    "start",
+                    "s",
+                    "--",
+                    "prog",
+                    "--hello",
+                    "--exit-trailer",
+                ],
+                &[
+                    "tendr",
+                    "start",
+                    "s",
+                    "--",
+                    "prog",
+                    "--hello",
+                    "--exit-trailer",
+                ],
+            ),
+        ];
+        for (argv, expected) in cases {
+            let matches = Cli::command().try_get_matches_from(*argv).unwrap();
+            let argv = argv.iter().map(std::ffi::OsString::from).collect();
+            let got = without_exit_trailer(argv, &matches);
+            assert_eq!(
+                got,
+                expected
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Only before the subcommand: the child never sees the flag, so it
+        // cannot wrap itself again.
+        assert!(
+            Cli::command()
+                .try_get_matches_from(["tendr", "status", "s", "--exit-trailer"])
+                .is_err()
+        );
     }
 }
