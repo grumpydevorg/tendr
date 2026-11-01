@@ -105,7 +105,9 @@ pub trait Platform {
     /// - Windows: CREATE_SUSPENDED -> Job Object -> ResumeThread
     ///
     /// `env_remove` names are removed from the inherited environment first;
-    /// `env` entries are applied after, so they win.
+    /// `env` entries are applied after, so they win. On Windows, a Windows
+    /// PowerShell child whose `env_remove` and `env` do not name
+    /// `PSModulePath` also loses pwsh 7's module directories from it.
     ///
     /// Returns an opaque SupervisedChild that owns all backend state.
     fn spawn_child(
