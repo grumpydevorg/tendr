@@ -14,6 +14,19 @@
   versions. Using it over `--host` needs this version on the remote host; a
   `run` over `--host` goes through the printed `ssh` fallback.
 
+### Changed
+
+- **`--timeout` now stops a run gracefully, like `kill`.** Before, it sent
+  SIGKILL to the process group at once. Now a PTY run is hung up first and a
+  pipe run gets SIGTERM, with SIGKILL after 5 s if the child is still alive.
+  So a child can clean up, and a shell hangs up its background jobs. Claude
+  Code and a shell cleaned up their children after a hangup but not after
+  SIGKILL. A timed-out child can now exit up to about 6 s after the deadline.
+  The run is still recorded as `TimedOut`. A process in the group that
+  ignores SIGTERM can now outlive the timeout, which the old SIGKILL to the
+  group reached; while it holds the terminal or stdout the run does not end.
+  The run lifecycle's Limits describe this terminal holder.
+
 ### Fixed
 
 - **A descriptor leaked into `tendr start` or `tendr run` no longer reaches

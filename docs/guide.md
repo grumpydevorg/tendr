@@ -69,7 +69,7 @@ flags:
 |`--namespace <ns>`|Put the session in a namespace.|
 |`--exec-target <target>`|Set the exec target instead of inferring it (`start` only).|
 |`--replace`|Kill an existing session of the same name and start a new run.|
-|`--timeout <sec>`|Kill the child after this many seconds.|
+|`--timeout <sec>`|Stop the child after this many seconds, as `kill` does.|
 |`--cwd <dir>`, `--env KEY=VALUE`|Set the child's working directory or an environment variable.|
 |`--unset-env NAME`|Remove an inherited variable from the child's environment. Repeatable; `--env` of the same name still sets it.|
 |`--after <session>`|Wait for that session to exit before starting. Repeatable.|
@@ -257,8 +257,13 @@ tendr run --detach ./job.sh      # run a script as a session
 **Stopping.** `kill` sends SIGTERM to the session's process group, then SIGKILL
 after 5 s. A PTY session first gets SIGHUP and up to 1 s to act on it, as when
 a terminal window closes, so an interactive shell also hangs up its background
-jobs. `kill --force` and `--timeout` send SIGKILL at once. A shell cannot pass
-SIGKILL on, so its background jobs keep running.
+jobs. `--timeout` stops the same way, so a timed-out child exits up to about
+6 s after the deadline. A process in the group that ignores SIGTERM can
+outlive the timeout, and while it holds the terminal or stdout the run does
+not end (see the run lifecycle's
+[Limits](architecture/03-run-lifecycle.md#limits)). `kill --force` sends
+SIGKILL at once. A shell cannot pass SIGKILL on, so its background jobs keep
+running.
 
 `wait` and `kill` return once the sidecar has released the session, so a
 `prune` or `start --replace` straight after them finds the session free. If the

@@ -250,8 +250,8 @@ observed exit means the sidecar reaped the child, and `SpawnFailed` or
   - The kernel's hangup, when the sidecar's end of the terminal closes, goes
     to the session leader, which by then is dead. A leader's own exit hangs
     up only the foreground group.
-  - So a shell killed with SIGKILL (by `kill --force`, `--timeout` or the
-    escalation) passes nothing on, and its jobs survive.
+  - So a shell killed with SIGKILL (by `kill --force` or the escalation)
+    passes nothing on, and its jobs survive.
   - Processes the shell no longer tracks (`(cmd &)`, `disown`) survive any
     hangup, as they would a closed terminal window.
   - A `nohup` job ignores the hangup and has its own group, so the group's
@@ -266,12 +266,16 @@ observed exit means the sidecar reaped the child, and `SpawnFailed` or
   terminal, a PTY run whose child has exited stays `Running` with the child
   unreaped, `kill` returns after about 20 s with `kill_sent`, and the run
   ends when the last holder exits.
-- **Graceful stop.** `kill` without `--force` sends SIGTERM to the group. It
-  escalates to SIGKILL only while the child itself is alive. A descendant
-  that ignores SIGTERM can outlive a leader that exits promptly. A PTY leader
-  that exits on its hangup leaves SIGTERM for the group's remaining members,
-  with no escalation. `--timeout` skips the graceful stop and sends SIGKILL to
-  the group at once.
+- **Graceful stop.** `kill` without `--force`, and `--timeout`, send SIGTERM
+  to the group. It escalates to SIGKILL only while the child itself is alive.
+  A descendant that ignores SIGTERM can outlive a leader that exits promptly.
+  A PTY leader that exits on its hangup leaves SIGTERM for the group's
+  remaining members, with no escalation. A timed-out child therefore exits
+  up to about 6 s after the deadline, and the run is still recorded as
+  `TimedOut`. A group member that ignores SIGTERM can outlive the timeout,
+  and while it holds the terminal or stdout the run does not end (see the
+  terminal holder above). Before, the timeout's SIGKILL to the group reached
+  it.
 - **Crash before any meta.** The sidecar may crash, or fail to record its
   failure, before any meta was written. The orphan-directory cleanup in
   `status` and `start` handles this. It kills the breadcrumb's child by the
