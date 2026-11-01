@@ -98,6 +98,16 @@
 
 ### Fixed
 
+- **On Windows, a ProxyCommand no longer holds your pipes after a `--host`
+  call returns.** Windows hands a child every inheritable handle, so `ssh`,
+  and anything it starts, held all of the stdin, stdout and stderr tendr was
+  given, not just the ones tendr passed it. A ProxyCommand that outlived ssh
+  kept, for example, a script reading tendr's stderr waiting until it
+  exited. tendr now keeps its own stdio from being inherited and gives ssh
+  only what it means to: stdout on every call, stdin too for
+  `exec --frame-from-stdin`, and all three for `attach`. An ssh that lets its
+  ProxyCommand inherit its own stdio still passes those on.
+
 - **On Windows, tendr works without `HOME`.** It needed `HOME` for its
   state root and for `skill install --global`, and failed with `HOME not
   set` where it was unset. Windows itself does not set `HOME` (Windows

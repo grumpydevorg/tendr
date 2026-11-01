@@ -134,8 +134,8 @@ fn build_ssh_attach_command(host: &str, args: &[String]) -> Result<Command, SshE
 /// ssh starts; `SshError::TransportFailed` on ssh exit 255;
 /// `SshError::SpawnFailed`/`Abnormal`.
 pub fn exec_ssh_attach(host: &str, args: &[String]) -> Result<i32, SshError> {
-    let status = build_ssh_attach_command(host, args)?
-        .spawn()
+    let mut cmd = build_ssh_attach_command(host, args)?;
+    let status = spawn(&mut cmd)
         .and_then(|mut child| child.wait())
         .map_err(SshError::SpawnFailed)?;
     // attach shares the terminal and has no exit trailer.
@@ -245,9 +245,8 @@ pub fn exec_ssh_remote(host: &str, frame: Vec<u8>, body: bool) -> Result<i32, Ss
 }
 
 fn run_framed(host: &str, entry: Entry, input: Input) -> Result<i32, SshError> {
-    let mut child = build_ssh_frame_command(host, entry, matches!(input, Input::Inherit))?
-        .spawn()
-        .map_err(SshError::SpawnFailed)?;
+    let mut cmd = build_ssh_frame_command(host, entry, matches!(input, Input::Inherit))?;
+    let mut child = spawn(&mut cmd).map_err(SshError::SpawnFailed)?;
 
     // The input is written on its own thread: a remote that is still
     // authenticating does not read it, and a large frame (or a push body)
@@ -278,6 +277,34 @@ fn run_framed(host: &str, entry: Entry, input: Input) -> Result<i32, SshError> {
         let _ = writer.join();
     }
     exit_code(status.code(), trailer)
+}
+
+/// Start ssh. Windows hands a child every inheritable handle in its parent,
+/// not just the stdio it is given, and the stdin, stdout and stderr tendr
+/// inherited from its caller are inheritable. So first they are made
+/// non-inheritable: otherwise ssh, and anything it starts that outlives it
+/// (a ProxyCommand), holds the caller's pipes tendr did not give it, and they
+/// stay open after tendr exits. The stdio tendr does give ssh still reaches
+/// it: std passes a `Stdio::inherit()` stream as an inheritable duplicate of
+/// the std handle, whatever the flag on the original.
+fn spawn(cmd: &mut Command) -> io::Result<std::process::Child> {
+    #[cfg(windows)]
+    std_handles_not_inheritable();
+    cmd.spawn()
+}
+
+#[cfg(windows)]
+fn std_handles_not_inheritable() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: only clears a flag on this process's own std handle. A
+        // missing (null) handle makes the call fail, which is harmless: there
+        // is nothing to inherit.
+        unsafe { SetHandleInformation(GetStdHandle(which), HANDLE_FLAG_INHERIT, 0) };
+    }
 }
 
 /// The call's exit code: the remote's exit trailer if it wrote one, else
