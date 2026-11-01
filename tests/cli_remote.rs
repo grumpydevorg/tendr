@@ -952,6 +952,62 @@ fn shim_path_env(tmp: &TempDir) -> std::ffi::OsString {
     std::env::join_paths(dirs).unwrap()
 }
 
+// The exec sessions behind the fake ssh are each platform's native shell, as
+// in `cli_exec.rs`: bash on Unix, PowerShell on Windows.
+
+/// Start the native-shell session "shell" and wait until it runs.
+fn start_native_shell(root: &TempDir) -> harness::SessionGuard<'_> {
+    let shell: &[&str] = if cfg!(windows) {
+        &[
+            "--exec-target",
+            "powershell",
+            "--",
+            "powershell",
+            "-NoProfile",
+        ]
+    } else {
+        &["--", "bash"]
+    };
+    harness::tendr(root)
+        .args(["start", "shell", "--stdin"])
+        .args(shell)
+        .assert()
+        .success();
+    let guard = harness::SessionGuard::new(root, "shell");
+    harness::wait_running(root, "shell");
+    guard
+}
+
+/// A command that prints `text` verbatim and a newline. On Unix the newline
+/// comes from printf's format, not argv: a newline-less payload trips the
+/// sentinel merge quirk and hangs exec.
+fn native_echo(text: &str) -> Vec<String> {
+    if cfg!(windows) {
+        // PowerShell takes a single-quoted literal; a quote inside doubles.
+        vec![format!("Write-Output '{}'", text.replace('\'', "''"))]
+    } else {
+        vec!["printf".into(), "%s\\n".into(), text.into()]
+    }
+}
+
+/// A command that exits with `code` without ending the session.
+fn native_exit(code: u8) -> Vec<String> {
+    if cfg!(windows) {
+        vec![format!("cmd /c exit {code}")]
+    } else {
+        vec!["sh".into(), "-c".into(), format!("exit {code}")]
+    }
+}
+
+/// A command that sleeps for `secs` seconds.
+fn native_sleep(secs: u64) -> Vec<String> {
+    if cfg!(windows) {
+        vec![format!("Start-Sleep {secs}")]
+    } else {
+        vec!["sleep".into(), secs.to_string()]
+    }
+}
+
 /// `tendr --host h exec …` works end-to-end: the envelope comes back on
 /// stdout and the exec ran against the (shim-local) remote session.
 #[test]
@@ -959,16 +1015,12 @@ fn host_exec_frame_end_to_end() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
-        .args(["--host", "box", "exec", "shell", "--", "echo", "remote hi"])
+        .args(["--host", "box", "exec", "shell", "--"])
+        .args(native_echo("remote hi"))
         .env("PATH", shim_path_env(&tmp))
         .env(
             "TENDR_TEST_BIN",
@@ -993,16 +1045,12 @@ fn host_exec_inner_exit_code_propagates() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
-        .args(["--host", "box", "exec", "shell", "--", "sh", "-c", "exit 7"])
+        .args(["--host", "box", "exec", "shell", "--"])
+        .args(native_exit(7))
         .env("PATH", shim_path_env(&tmp))
         .env(
             "TENDR_TEST_BIN",
@@ -1020,26 +1068,12 @@ fn host_exec_timeout_propagates() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
-        .args([
-            "--host",
-            "box",
-            "exec",
-            "shell",
-            "--timeout",
-            "1",
-            "--",
-            "sleep",
-            "3",
-        ])
+        .args(["--host", "box", "exec", "shell", "--timeout", "1", "--"])
+        .args(native_sleep(3))
         .env("PATH", shim_path_env(&tmp))
         .env(
             "TENDR_TEST_BIN",
@@ -1061,22 +1095,14 @@ fn host_exec_torture_payload_matches_local() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
-    // %s\n in printf's FORMAT: trailing newline without a newline byte
-    // in argv (a newline-less payload trips the pre-existing sentinel
-    // merge quirk and hangs exec); --timeout guards regressions.
     let torture = r#"it's a "test" $VAR `tick` back\slash ;&|"#;
-    let argv = ["printf", "%s\\n", torture];
+    let argv = native_echo(torture);
 
     let local = harness::tendr(&root)
         .args(["exec", "shell", "--timeout", "30", "--"])
-        .args(argv)
+        .args(&argv)
         .output()
         .unwrap();
     assert!(local.status.success());
@@ -1084,7 +1110,7 @@ fn host_exec_torture_payload_matches_local() {
     let tmp = fake_ssh_frame_shim();
     let remote = harness::tendr(&root)
         .args(["--host", "box", "exec", "shell", "--timeout", "30", "--"])
-        .args(argv)
+        .args(&argv)
         .env("PATH", shim_path_env(&tmp))
         .env(
             "TENDR_TEST_BIN",
@@ -1105,7 +1131,10 @@ fn host_exec_torture_payload_matches_local() {
         "local and remote exec agree byte-exact"
     );
     assert_eq!(
-        local_env["stdout"].as_str().unwrap().trim_end_matches('\n'),
+        local_env["stdout"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches(['\r', '\n']),
         torture
     );
 }
@@ -1146,15 +1175,11 @@ fn host_exec_frame_stdin_passes_through() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
-        .assert()
-        .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
-    harness::wait_running(&root, "shell");
+    let _session = start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
-    let frame = r#"{"v":1,"session":"shell","cmd":["echo","piped frame"]}"#;
+    let frame = serde_json::json!({"v": 1, "session": "shell", "cmd": native_echo("piped frame")})
+        .to_string();
     let output = harness::tendr(&root)
         .args(["--host", "box", "exec", "--frame-from-stdin"])
         .env("PATH", shim_path_env(&tmp))

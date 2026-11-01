@@ -65,6 +65,7 @@ fn main() {
             "leftover" => {
                 // Deliberately not waited for: it must outlive us, as the
                 // background `sleep` of the shell fake it replaces did.
+                stdin_stdout_not_inheritable();
                 #[allow(clippy::zombie_processes)]
                 let _leftover = Command::new(std::env::current_exe().unwrap())
                     .env(ENV, format!("sleep {value}"))
@@ -142,4 +143,21 @@ fn close_stderr() {
     // SAFETY: closes this process's own stderr handle; nothing in this
     // process writes to stderr afterwards.
     unsafe { CloseHandle(GetStdHandle(STD_ERROR_HANDLE)) };
+}
+
+/// On Unix only the configured stdio reaches a child.
+#[cfg(unix)]
+fn stdin_stdout_not_inheritable() {}
+
+/// Windows hands a child every inheritable handle, not just its configured
+/// stdio, and the stdio this process inherited is inheritable: without this
+/// the leftover would also hold our caller's stdin and stdout.
+#[cfg(windows)]
+fn stdin_stdout_not_inheritable() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE] {
+        // SAFETY: clears a flag on this process's own std handle.
+        unsafe { SetHandleInformation(GetStdHandle(which), HANDLE_FLAG_INHERIT, 0) };
+    }
 }
