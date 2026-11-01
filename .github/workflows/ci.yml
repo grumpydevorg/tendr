@@ -163,11 +163,6 @@ jobs:
         env:
           TENDR_TEST_WIN_SSH_SHELL: powershell
         run: cargo test --locked --test cli_remote_windows_ssh -- --test-threads=1 --nocapture
-      - name: TEMPORARY measure login shells
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        continue-on-error: true
-        shell: pwsh
-        run: ./.github/measure-shells.ps1
 
   lint:
     name: lint (ubuntu)
