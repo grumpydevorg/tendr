@@ -1649,6 +1649,41 @@ fn cli_paste_with_embedded_prefixes_arrives_intact() {
     wait_output_contains(&root, "pty-paste", &expected);
 }
 
+#[test]
+fn cli_bracketed_paste_with_the_escape_inside_does_not_detach() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-bpaste");
+    // The child asks for bracketed paste, as shells and Claude Code do.
+    tendr(&root)
+        .args(["start", "pty-bpaste", "--pty", "--stdin", "--"])
+        .args([
+            "sh",
+            "-c",
+            r"stty raw -echo; printf '\033[?2004h'; exec cat -v",
+        ])
+        .output()
+        .unwrap();
+    harness::wait_running(&root, "pty-bpaste");
+
+    let mut cli = CliAttach::spawn(&root, &["pty-bpaste"]);
+    cli.type_until_logged(&root, "pty-bpaste", "bpaste-ready\n");
+
+    // Over the CLI's 4 KiB read buffer, so the paste spans several reads.
+    let a = "A".repeat(3000);
+    let b = "B".repeat(3000);
+    let mut paste = b"\x1b[200~".to_vec();
+    paste.extend_from_slice(a.as_bytes());
+    paste.extend_from_slice(b"\x1cd");
+    paste.extend_from_slice(b.as_bytes());
+    paste.extend_from_slice(b"\x1b[201~BPASTE-END\n");
+    cli.type_bytes(&paste);
+
+    let expected = format!("^[[200~{a}^\\d{b}^[[201~BPASTE-END");
+    wait_output_contains(&root, "pty-bpaste", &expected);
+    wait_for_pty_control(&root, "pty-bpaste", "HumanControl");
+}
+
 /// Detach with a `Ctrl-\` encoded as a child's keyboard mode makes the
 /// terminal send it: send `prefix` in one read after a marker, wait until the
 /// marker reached the child (so the prefix was held, not forwarded), then send

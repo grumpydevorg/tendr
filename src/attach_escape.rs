@@ -71,10 +71,13 @@
 //!
 //! Between a bracketed paste's start (`ESC [ 200 ~`) and its end
 //! (`ESC [ 201 ~`) every byte is text, forwarded as is: a pasted `Ctrl-\` is
-//! not a prefix, and a pasted `Ctrl-\ d` does not detach. A read that ends
-//! inside what could be the paste's end holds those bytes like any unfinished
-//! sequence. A terminal sends the markers only while the child has asked for
-//! bracketed paste; without them a paste is typing.
+//! not a prefix, and a pasted `Ctrl-\ d` does not detach. The markers count
+//! only while the child has bracketed paste on
+//! ([`EscapeParser::set_bracketed_paste`]), which is when a terminal sends
+//! them; turning it off ends a paste, so stray marker bytes cannot switch the
+//! escape off for good. A read that ends inside what could be the paste's end
+//! holds those bytes with no deadline: the next byte decides, and a late end
+//! forwarded as text would leave the escape off.
 
 use std::time::{Duration, Instant};
 
@@ -142,6 +145,8 @@ pub struct EscapeParser {
     partial_since: Option<Instant>,
     /// Inside a bracketed paste.
     pasting: bool,
+    /// The child has bracketed paste on, so the terminal marks pastes.
+    bracketed_paste: bool,
 }
 
 /// One key or event, classified.
@@ -178,6 +183,16 @@ impl EscapeParser {
             partial: Vec::new(),
             partial_since: None,
             pasting: false,
+            bracketed_paste: false,
+        }
+    }
+
+    /// Tell the parser whether the child has bracketed paste on. Only then is
+    /// `ESC [ 200 ~` a paste's start; turning it off ends a paste.
+    pub fn set_bracketed_paste(&mut self, on: bool) {
+        self.bracketed_paste = on;
+        if !on {
+            self.pasting = false;
         }
     }
 
@@ -194,21 +209,19 @@ impl EscapeParser {
         while at < bytes.len() {
             if self.pasting {
                 let rest = &bytes[at..];
-                if let Some(end) = find(rest, PASTE_END) {
+                if let Some(end) = end_of(rest, PASTE_END) {
                     forward.extend_from_slice(&rest[..end]);
                     self.pasting = false;
                     at += end;
                     continue;
                 }
+                // A possible end is held without a deadline: the next byte
+                // decides it, and forwarding a late end as text would leave
+                // the escape off for good.
                 let held = partial_end(rest);
                 let text = rest.len() - held;
                 forward.extend_from_slice(&rest[..text]);
-                if held == 0 {
-                    break;
-                }
-                if at + text > 0 || self.partial_since.is_none() {
-                    self.partial_since = Some(Instant::now());
-                }
+                self.partial_since = None;
                 self.partial = rest[text..].to_vec();
                 return Escape::Continue;
             }
@@ -219,13 +232,15 @@ impl EscapeParser {
                         self.partial_since = None;
                         return Escape::Detach;
                     }
-                    self.pasting = &rest[..len] == PASTE_START;
+                    if self.bracketed_paste && &rest[..len] == PASTE_START {
+                        self.pasting = true;
+                    }
                     at += len;
                 }
                 Token::Unfinished
                     if self.prefix.is_some()
                         || could_become_prefix(rest)
-                        || PASTE_START.starts_with(rest) =>
+                        || (self.bracketed_paste && PASTE_START.starts_with(rest)) =>
                 {
                     // A sequence continued from the last read keeps its
                     // original deadline.
@@ -261,10 +276,6 @@ impl EscapeParser {
         }
         self.partial_since = None;
         let partial = std::mem::take(&mut self.partial);
-        if self.pasting {
-            forward.extend_from_slice(&partial);
-            return;
-        }
         let decided = self.decide(&partial, Key::Other, forward);
         debug_assert_eq!(decided, Escape::Continue);
     }
@@ -308,7 +319,7 @@ impl EscapeParser {
 }
 
 /// The index just past the first `marker` in `input`.
-fn find(input: &[u8], marker: &[u8]) -> Option<usize> {
+fn end_of(input: &[u8], marker: &[u8]) -> Option<usize> {
     input
         .windows(marker.len())
         .position(|w| w == marker)
@@ -502,8 +513,10 @@ mod tests {
     use proptest::prelude::*;
     use std::time::{Duration, Instant};
 
+    /// Feed `chunks` to a parser for a child that has bracketed paste on.
     fn run(mode: EscapeMode, chunks: &[&[u8]]) -> (Vec<u8>, Escape) {
         let mut parser = EscapeParser::new(mode);
+        parser.set_bracketed_paste(true);
         let mut forward = Vec::new();
         for chunk in chunks {
             if parser.feed(chunk, &mut forward) == Escape::Detach {
@@ -531,22 +544,50 @@ mod tests {
         assert_eq!(decision, Escape::Detach);
         assert_eq!(forward, b"\x1b[200~a\x1cd\x1b[201~");
         // A paste start split across reads starts the paste.
-        let (forward, decision) = run(C, &[b"\x1b[2", b"00~\x1cd", b"\x1b[201~"]);
+        let (forward, decision) = run(C, &[b"\x1b[20", b"0~\x1cd", b"\x1b[201~"]);
         assert_eq!(decision, Escape::Continue);
         assert_eq!(forward, b"\x1b[200~\x1cd\x1b[201~");
     }
 
     #[test]
-    fn text_in_a_paste_that_only_starts_like_its_end_is_forwarded_after_the_hold() {
+    fn a_possible_paste_end_is_held_until_the_next_byte_however_late() {
+        let mut parser = EscapeParser::new(C);
+        parser.set_bracketed_paste(true);
+        let mut forward = Vec::new();
+        parser.feed(b"\x1b[200~x\x1b[20", &mut forward);
+        assert_eq!(forward, b"\x1b[200~x");
+        assert_eq!(parser.partial_deadline(), None, "no deadline");
+        parser.flush_expired(Instant::now() + Duration::from_secs(3600), &mut forward);
+        assert_eq!(forward, b"\x1b[200~x", "still held");
+        assert_eq!(parser.feed(b"1~\x1cd", &mut forward), Escape::Detach);
+        assert_eq!(forward, b"\x1b[200~x\x1b[201~");
+
+        // Bytes that turn out not to be the end are text, and the paste goes on.
+        let (forward, decision) = run(C, &[b"\x1b[200~x\x1b[2", b"y\x1cd"]);
+        assert_eq!(decision, Escape::Continue);
+        assert_eq!(forward, b"\x1b[200~x\x1b[2y\x1cd");
+    }
+
+    #[test]
+    fn paste_markers_count_only_while_the_child_has_bracketed_paste_on() {
         let mut parser = EscapeParser::new(C);
         let mut forward = Vec::new();
-        parser.feed(b"\x1b[200~x\x1b[2", &mut forward);
-        assert_eq!(forward, b"\x1b[200~x");
-        let due = parser.partial_deadline().expect("a possible end is held");
-        parser.flush_expired(due, &mut forward);
-        assert_eq!(forward, b"\x1b[200~x\x1b[2");
-        // Still inside the paste: the prefix and d are text.
-        assert_eq!(parser.feed(b"\x1cd", &mut forward), Escape::Continue);
+        assert_eq!(
+            parser.feed(b"\x1b[200~a\x1cd", &mut forward),
+            Escape::Detach,
+            "without bracketed paste a marker is just a key"
+        );
+
+        let mut parser = EscapeParser::new(C);
+        parser.set_bracketed_paste(true);
+        let mut forward = Vec::new();
+        parser.feed(b"\x1b[200~a", &mut forward);
+        parser.set_bracketed_paste(false);
+        assert_eq!(
+            parser.feed(b"\x1cd", &mut forward),
+            Escape::Detach,
+            "turning bracketed paste off ends a paste"
+        );
     }
 
     #[test]
@@ -648,10 +689,12 @@ mod tests {
         between: Vec<u8>,
         between_kept: Vec<u8>,
         partial: Vec<u8>,
+        pasting: bool,
     }
 
     fn run_state(chunks: &[&[u8]]) -> Outcome {
         let mut parser = EscapeParser::new(EscapeMode::CtrlBackslash);
+        parser.set_bracketed_paste(true);
         let mut forward = Vec::new();
         let mut escape = Escape::Continue;
         for chunk in chunks {
@@ -667,6 +710,7 @@ mod tests {
             between: parser.between,
             between_kept: parser.between_kept,
             partial: parser.partial,
+            pasting: parser.pasting,
         }
     }
 

@@ -160,6 +160,16 @@ impl TermModes {
         out
     }
 
+    /// Whether the child has bracketed paste (2004) on, so the terminal marks
+    /// pastes.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        DEC_FLAGS
+            .iter()
+            .position(|&m| m == 2004)
+            .is_some_and(|i| self.flags & (1 << i) != 0)
+    }
+
     /// The on/off DEC modes that are on, in ascending order.
     fn dec_modes_on(&self) -> Vec<u16> {
         let mut on: Vec<u16> = DEC_FLAGS
