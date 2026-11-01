@@ -66,6 +66,15 @@
 //! [`EscapeParser::flush_expired`]), so a lone `Esc` key costs the child at
 //! most that much latency. Only a complete prefix waits for the next key
 //! without a limit.
+//!
+//! # Bracketed paste
+//!
+//! Between a bracketed paste's start (`ESC [ 200 ~`) and its end
+//! (`ESC [ 201 ~`) every byte is text, forwarded as is: a pasted `Ctrl-\` is
+//! not a prefix, and a pasted `Ctrl-\ d` does not detach. A read that ends
+//! inside what could be the paste's end holds those bytes like any unfinished
+//! sequence. A terminal sends the markers only while the child has asked for
+//! bracketed paste; without them a paste is typing.
 
 use std::time::{Duration, Instant};
 
@@ -94,6 +103,9 @@ const MOD_LOCKS: u32 = 64 | 128;
 const EVENT_PRESS: u32 = 1;
 const EVENT_REPEAT: u32 = 2;
 const EVENT_RELEASE: u32 = 3;
+/// Bracketed paste markers.
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Which escape the client recognizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +140,8 @@ pub struct EscapeParser {
     partial: Vec<u8>,
     /// When `partial` began to be held.
     partial_since: Option<Instant>,
+    /// Inside a bracketed paste.
+    pasting: bool,
 }
 
 /// One key or event, classified.
@@ -163,6 +177,7 @@ impl EscapeParser {
             between_kept: Vec::new(),
             partial: Vec::new(),
             partial_since: None,
+            pasting: false,
         }
     }
 
@@ -177,6 +192,26 @@ impl EscapeParser {
         bytes.extend_from_slice(input);
         let mut at = 0;
         while at < bytes.len() {
+            if self.pasting {
+                let rest = &bytes[at..];
+                if let Some(end) = find(rest, PASTE_END) {
+                    forward.extend_from_slice(&rest[..end]);
+                    self.pasting = false;
+                    at += end;
+                    continue;
+                }
+                let held = partial_end(rest);
+                let text = rest.len() - held;
+                forward.extend_from_slice(&rest[..text]);
+                if held == 0 {
+                    break;
+                }
+                if at + text > 0 || self.partial_since.is_none() {
+                    self.partial_since = Some(Instant::now());
+                }
+                self.partial = rest[text..].to_vec();
+                return Escape::Continue;
+            }
             let rest = &bytes[at..];
             match token(rest) {
                 Token::Complete(len, key) => {
@@ -184,9 +219,14 @@ impl EscapeParser {
                         self.partial_since = None;
                         return Escape::Detach;
                     }
+                    self.pasting = &rest[..len] == PASTE_START;
                     at += len;
                 }
-                Token::Unfinished if self.prefix.is_some() || could_become_prefix(rest) => {
+                Token::Unfinished
+                    if self.prefix.is_some()
+                        || could_become_prefix(rest)
+                        || PASTE_START.starts_with(rest) =>
+                {
                     // A sequence continued from the last read keeps its
                     // original deadline.
                     if at > 0 || self.partial_since.is_none() {
@@ -221,6 +261,10 @@ impl EscapeParser {
         }
         self.partial_since = None;
         let partial = std::mem::take(&mut self.partial);
+        if self.pasting {
+            forward.extend_from_slice(&partial);
+            return;
+        }
         let decided = self.decide(&partial, Key::Other, forward);
         debug_assert_eq!(decided, Escape::Continue);
     }
@@ -261,6 +305,22 @@ impl EscapeParser {
         forward.extend_from_slice(bytes);
         Escape::Continue
     }
+}
+
+/// The index just past the first `marker` in `input`.
+fn find(input: &[u8], marker: &[u8]) -> Option<usize> {
+    input
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .map(|i| i + marker.len())
+}
+
+/// How many bytes at the end of `input` could begin [`PASTE_END`].
+fn partial_end(input: &[u8]) -> usize {
+    (1..PASTE_END.len())
+        .rev()
+        .find(|&n| input.ends_with(&PASTE_END[..n]))
+        .unwrap_or(0)
 }
 
 fn token(input: &[u8]) -> Token {
@@ -453,6 +513,49 @@ mod tests {
         (forward, Escape::Continue)
     }
 
+    const C: EscapeMode = EscapeMode::CtrlBackslash;
+
+    #[test]
+    fn a_bracketed_paste_is_forwarded_whole_and_never_detaches() {
+        let paste: &[u8] = b"\x1b[200~a\x1cd\x1c\x1cb\x1b[92;5ud\x1b[201~";
+        assert_eq!(run(C, &[paste]), (paste.to_vec(), Escape::Continue));
+        // After the paste the escape works again.
+        let (forward, decision) = run(C, &[paste, b"x\x1cd"]);
+        assert_eq!(decision, Escape::Detach);
+        assert_eq!(forward, [paste, b"x"].concat());
+    }
+
+    #[test]
+    fn a_paste_end_split_across_reads_still_ends_the_paste() {
+        let (forward, decision) = run(C, &[b"\x1b[200~a\x1cd\x1b[20", b"1~", b"\x1cd"]);
+        assert_eq!(decision, Escape::Detach);
+        assert_eq!(forward, b"\x1b[200~a\x1cd\x1b[201~");
+        // A paste start split across reads starts the paste.
+        let (forward, decision) = run(C, &[b"\x1b[2", b"00~\x1cd", b"\x1b[201~"]);
+        assert_eq!(decision, Escape::Continue);
+        assert_eq!(forward, b"\x1b[200~\x1cd\x1b[201~");
+    }
+
+    #[test]
+    fn text_in_a_paste_that_only_starts_like_its_end_is_forwarded_after_the_hold() {
+        let mut parser = EscapeParser::new(C);
+        let mut forward = Vec::new();
+        parser.feed(b"\x1b[200~x\x1b[2", &mut forward);
+        assert_eq!(forward, b"\x1b[200~x");
+        let due = parser.partial_deadline().expect("a possible end is held");
+        parser.flush_expired(due, &mut forward);
+        assert_eq!(forward, b"\x1b[200~x\x1b[2");
+        // Still inside the paste: the prefix and d are text.
+        assert_eq!(parser.feed(b"\x1cd", &mut forward), Escape::Continue);
+    }
+
+    #[test]
+    fn a_prefix_held_before_a_paste_is_forwarded_with_it() {
+        let (forward, decision) = run(C, &[b"\x1c", b"\x1b[200~d\x1b[201~"]);
+        assert_eq!(decision, Escape::Continue);
+        assert_eq!(forward, b"\x1c\x1b[200~d\x1b[201~");
+    }
+
     #[test]
     fn prefix_then_d_detaches_and_forwards_what_came_before() {
         assert_eq!(
@@ -574,7 +677,7 @@ mod tests {
             4 => proptest::sample::select(DETACH.to_vec()).prop_map(<[u8]>::to_vec),
             3 => proptest::sample::select(vec![
                 &b"\x1b[92;5:3u"[..], b"\x1b[92;5:2u", b"\x1b[92;1:2u", b"\x1b[57442;5u", b"\x1b[57442;1:3u", b"\x1b[1;1:3A",
-                b"\x1b[A", b"\x1b[1;5A", b"\x1b[97;5u", b"\x1b[100;5u", b"\x1b[200~",
+                b"\x1b[A", b"\x1b[1;5A", b"\x1b[97;5u", b"\x1b[100;5u", b"\x1b[200~", b"\x1b[201~",
                 b"\x1b", b"\x1b[", b"\x1b[9", b"\x1b[92;", b"\x1b[27;5;", b";", b":", b"u", b"~",
             ]).prop_map(<[u8]>::to_vec),
             2 => "[0-9:;]{1,4}".prop_map(String::into_bytes),

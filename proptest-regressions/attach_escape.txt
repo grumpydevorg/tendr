@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5e83c86d98f8fa4bd3e0c5e89388cf258f353f1a87d43b59c2a8c061f9c93a72 # shrinks to bytes = [27, 91, 57, 50, 59, 53, 58, 51, 117, 27, 91, 50, 48, 48, 126, 27, 91, 57, 50, 59, 53, 58, 49, 117, 27, 91, 57, 50, 59, 53, 117, 27, 91, 49, 48, 48, 58, 58, 49, 48, 48, 59, 49, 117, 27, 91, 57, 50, 59, 53, 58, 51, 117, 27, 91, 57, 50, 59, 53, 58, 49, 117], cuts = [Index(3806470999336891604)]
