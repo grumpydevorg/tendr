@@ -18,23 +18,39 @@ function Same([byte[]]$a, [byte[]]$b) {
   if ($null -eq $a -or $null -eq $b) { return $false }
   [System.Linq.Enumerable]::SequenceEqual($a, $b)
 }
+function ReadShared([string]$path) {
+  $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+  $ms = New-Object IO.MemoryStream; $fs.CopyTo($ms); $fs.Close(); , $ms.ToArray()
+}
+function Procs([string]$why) {
+  "--- processes ($why):"
+  Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(tendr|ssh|sshd|sshd-session|powershell|pwsh|cmd|conhost)\.exe$' } |
+    ForEach-Object { "  $($_.ProcessId) <- $($_.ParentProcessId) $($_.Name): $($_.CommandLine)" }
+}
 # Run a command line under local cmd.exe with byte-exact redirects; 90 s cap.
+# A hang lists the live processes, then kills the whole tree.
 function RunCmd([string]$line, [string]$tag) {
   $out = "$tmp\$tag.out"; $err = "$tmp\$tag.err"
   $p = Start-Process cmd.exe -ArgumentList '/d', '/s', '/c', "`"$line > `"$out`" 2> `"$err`"`"" -NoNewWindow -PassThru
   $null = $p.Handle
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  if (-not $p.WaitForExit(90000)) { $p.Kill(); $code = 'HANG' } else { $code = $p.ExitCode }
+  if (-not $p.WaitForExit(90000)) {
+    $code = 'HANG'
+    Procs "HANG: $line" | Write-Host
+    taskkill.exe /T /F /PID $p.Id | Out-Null
+    Start-Sleep 2
+  } else { $code = $p.ExitCode }
   [pscustomobject]@{ code = $code; secs = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-    out = [IO.File]::ReadAllBytes($out); err = [IO.File]::ReadAllBytes($err) }
+    out = (ReadShared $out); err = (ReadShared $err) }
 }
 function T([string]$line, [string]$tag) { RunCmd "`"$tendr`" --host $h $line" $tag }
 
 # Remote byte probe: fake_ssh copies stdin to a file, writes fixed stderr and
 # stdout, exits 42.
-New-Item -ItemType Directory -Force "$bin\probe", "$bin\pushprobe" | Out-Null
+New-Item -ItemType Directory -Force "$bin\probe" | Out-Null
 Copy-Item target\debug\fake_ssh.exe "$bin\probe\probe.exe" -Force
-Copy-Item target\debug\fake_ssh.exe "$bin\pushprobe\pushprobe.exe" -Force
+# On the PATH with a plain name, so `start` needs no quoting under cmd.exe.
+Copy-Item target\debug\fake_ssh.exe "$bin\pushprobe.exe" -Force
 [IO.File]::WriteAllText("$bin\probe\fake-ssh-actions",
   "stdin $s\probe-stdin.bin`nerr tendr-hello 1\nsecond é line\n`nout out é\n`nexit 42`n", $utf8)
 $input_bytes = [byte[]](@(0..255) + $utf8.GetBytes("crlf`r`nend é 日本`n"))
@@ -93,20 +109,26 @@ foreach ($name in $shells.Keys) {
   $exText = Esc $r.out
   $exOk = ($exText -match 'é-ü 日本\\r\\nline2')
   "exec: exit=$exCode ok=$exOk in $($r.secs)s: stdout [$exText] stderr [$(Esc $r.err)]"
+  if (-not $exOk) {
+    "exec status after: $((Esc (T "status ex$n" "exsa$n").out) -replace '\s+', ' ')"
+    $r = RunCmd "ssh -T $h tendr --hello exec --frame-from-stdin < `"$tmp\frame$n.json`"" "execraw$n"
+    "exec direct over ssh: exit=$($r.code) in $($r.secs)s: stdout [$(Esc $r.out)] stderr [$(Esc $r.err)]"
+    $r = RunCmd "`"$tendr`" --host $h exec ex$n --timeout 20 -- Write-Output plain" "execplain$n"
+    "exec plain argv form: exit=$($r.code) in $($r.secs)s: stdout [$(Esc $r.out)] stderr [$(Esc $r.err)]"
+  }
   $null = T "kill ex$n --force" "exk$n"
 
   # 5. push binary bytes to a child that copies its stdin to a file.
   $pushFile = "$s\push$n.bin"
-  [IO.File]::WriteAllText("$bin\pushprobe\fake-ssh-actions", "stdin $pushFile`nsleep 600`n", $utf8)
-  $null = T "start pu$n --stdin -- C:\tendr-ssh-bin\pushprobe\pushprobe.exe" "pus$n"
+  [IO.File]::WriteAllText("$bin\fake-ssh-actions", "stdin $pushFile`nsleep 600`n", $utf8)
+  $null = T "start pu$n --stdin -- pushprobe" "pus$n"
   for ($i = 0; $i -lt 60; $i++) { $st = T "status pu$n" "pust$n"; if ((Esc $st.out) -match '"status": "Running"') { break }; Start-Sleep 1 }
   $r = RunCmd "`"$tendr`" --host $h push pu$n < `"$tmp\in.bin`"" "push$n"
   $pushExit = $r.code
   $pgot = $null
   for ($i = 0; $i -lt 30; $i++) {
     if (Test-Path $pushFile) {
-      $fs = [IO.File]::Open($pushFile, 'Open', 'Read', 'ReadWrite')
-      $ms = New-Object IO.MemoryStream; $fs.CopyTo($ms); $fs.Close(); $pgot = $ms.ToArray()
+      $pgot = ReadShared $pushFile
       if ($pgot.Length -ge $input_bytes.Length) { break }
     }
     Start-Sleep 1
