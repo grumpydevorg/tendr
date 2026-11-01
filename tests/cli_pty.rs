@@ -1354,6 +1354,159 @@ fn cli_escape_detaches_and_restores_the_terminal() {
     wait_log_contains(&root, "pty-escape", "session-still-running");
 }
 
+/// A PTY child that turns on the alternate screen, mouse reports and kitty
+/// keyboard flags (1 on the main screen, 5 on the alternate one) once it reads
+/// a byte, then prints `modes-on`.
+fn start_mode_setter(root: &TempDir, session: &str) {
+    tendr(root)
+        .args(["start", session, "--pty", "--stdin", "--"])
+        .args([
+            "sh",
+            "-c",
+            r#"stty raw -echo; head -c 1 >/dev/null; printf '\033[>1u\033[?1049h\033[>5u\033[?1003h'; printf modes-on; exec cat"#,
+        ])
+        .output()
+        .unwrap();
+    harness::wait_running(root, session);
+}
+
+#[test]
+fn detach_turns_off_the_modes_the_child_turned_on() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-modes-off");
+    start_mode_setter(&root, "pty-modes-off");
+
+    let mut wrapped = WrappedAttach::spawn(&root, "modes-off", &["pty-modes-off"]);
+    wait_for_pty_control(&root, "pty-modes-off", "HumanControl");
+    wrapped.cli.type_bytes(b"x");
+    wrapped.wait_output_contains("modes-on");
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(10)), 0);
+
+    let output = wrapped.cli.output();
+    let after = output.rsplit("modes-on").next().unwrap();
+    assert_eq!(
+        after.replace('\x1b', "^["),
+        "^[[<1u^[[?1049l^[[<1u^[[?1003l",
+        "leaving must turn off, in reverse, exactly the modes the child turned on"
+    );
+    wrapped.assert_terminal_restored();
+}
+
+#[test]
+fn attach_replays_the_modes_set_before_it() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-modes-replay");
+    tendr(&root)
+        .args(["start", "pty-modes-replay", "--pty", "--stdin", "--"])
+        .args([
+            "sh",
+            "-c",
+            r#"stty raw -echo; printf '\033[?1049h\033[?2004h\033[?25l'; echo set; exec cat"#,
+        ])
+        .output()
+        .unwrap();
+    harness::wait_running(&root, "pty-modes-replay");
+    wait_log_contains(&root, "pty-modes-replay", "set");
+
+    let mut wrapped = WrappedAttach::spawn(&root, "modes-replay", &["pty-modes-replay"]);
+    wrapped
+        .cli
+        .type_until_logged(&root, "pty-modes-replay", "typed\n");
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(10)), 0);
+
+    // Keystrokes typed before `attach` entered raw mode are echoed by the
+    // terminal itself, so the session's output starts at the first escape.
+    let output = wrapped.cli.output().replace('\x1b', "^[");
+    assert!(
+        from_first_escape(&output).starts_with("^[[?1049h^[[?2004h^[[?25l"),
+        "the modes set before the attach come first; terminal saw: {output:?}"
+    );
+    assert!(
+        output.ends_with("^[[?1049l^[[?2004l^[[?25h"),
+        "and are turned off when it leaves; terminal saw: {output:?}"
+    );
+}
+
+/// What a terminal showed from its first escape (written `^[`) on.
+fn from_first_escape(output: &str) -> &str {
+    output.find("^[").map_or("", |i| &output[i..])
+}
+
+#[test]
+fn a_takeover_replays_the_modes_and_the_old_client_turns_them_off() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-modes-take");
+    tendr(&root)
+        .args(["start", "pty-modes-take", "--pty", "--stdin", "--"])
+        .args([
+            "sh",
+            "-c",
+            r#"stty raw -echo; printf '\033[?1049h\033[?1003h'; echo set; exec cat"#,
+        ])
+        .output()
+        .unwrap();
+    harness::wait_running(&root, "pty-modes-take");
+    wait_log_contains(&root, "pty-modes-take", "set");
+
+    let first = WrappedAttach::spawn(&root, "modes-take-1", &["pty-modes-take"]);
+    wait_for_pty_control(&root, "pty-modes-take", "HumanControl");
+    let mut second = WrappedAttach::spawn(&root, "modes-take-2", &["pty-modes-take", "--takeover"]);
+    assert_ne!(first.wait_exit(Duration::from_secs(10)), 0);
+    second
+        .cli
+        .type_until_logged(&root, "pty-modes-take", "second\n");
+
+    let replay = "^[[?1049h^[[?1003h";
+    let old = first.cli.output().replace('\x1b', "^[");
+    let (old_terminal, old_note) = old.split_once("tendr: ").unwrap_or((&old, ""));
+    assert!(
+        old_terminal.starts_with(replay) && old_terminal.ends_with("^[[?1049l^[[?1003l"),
+        "the retired client got the modes and turned them off before its note; it saw: {old:?}"
+    );
+    assert!(old_note.starts_with("another client took over"), "{old:?}");
+    let new = second.cli.output().replace('\x1b', "^[");
+    assert!(
+        from_first_escape(&new).starts_with(replay),
+        "the client that took over gets the modes first; it saw: {new:?}"
+    );
+    second.cli.type_bytes(b"\x1cd");
+    assert_eq!(second.wait_exit(Duration::from_secs(10)), 0);
+}
+
+#[test]
+fn nothing_from_the_session_follows_the_reset() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-modes-flood");
+    tendr(&root)
+        .args(["start", "pty-modes-flood", "--pty", "--stdin", "--"])
+        .args([
+            "sh",
+            "-c",
+            r#"stty raw -echo; printf '\033[?1003h'; while :; do printf flood-flood-flood-flood; done"#,
+        ])
+        .output()
+        .unwrap();
+    harness::wait_running(&root, "pty-modes-flood");
+
+    let mut wrapped = WrappedAttach::spawn(&root, "modes-flood", &["pty-modes-flood"]);
+    wrapped.wait_output_contains("flood");
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(10)), 0);
+
+    let output = wrapped.cli.output().replace('\x1b', "^[");
+    assert!(
+        output.ends_with("^[[?1003l"),
+        "the reset is written, and is the last thing written; the terminal's tail: {:?}",
+        &output[output.len().saturating_sub(80)..]
+    );
+}
+
 /// A PTY child that shows control characters: `Ctrl-\` prints as `^\`.
 fn start_visible_cat(root: &TempDir, session: &str) {
     tendr(root)

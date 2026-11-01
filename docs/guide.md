@@ -176,7 +176,9 @@ concurrent `push` is refused, not interleaved.
   the escape off. `Enter ~ .` is the outer `ssh` escape, not tendr's.
 - `Ctrl-C` goes to the session; it does not stop `attach`.
 - Window resizes follow your terminal, and your terminal settings are restored
-  however the attach ends.
+  however the attach ends. The modes the session turned on, such as the
+  alternate screen, mouse reports and keyboard protocols, are turned off when
+  you leave and on again when you attach.
 - `attach` is refused while another client holds the terminal. `--takeover`
   disconnects that client and drops any input it or an in-flight `push` had
   queued. Use it to reconnect after a dropped SSH connection.

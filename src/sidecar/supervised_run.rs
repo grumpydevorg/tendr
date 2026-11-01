@@ -351,7 +351,7 @@ impl RunCore {
             .ok_or_else(|| io::Error::other("PTY write half unavailable"))?;
 
         let AttachEndpoint { socket, cleanup } = endpoint;
-        let sink: AttachSink = Arc::new(Mutex::new(None));
+        let sink: AttachSink = Arc::default();
         let registry = ConnectionRegistry::default();
         let control = Arc::new(Mutex::new(PtyControl::AgentControl));
         let effects = RunEffects::spawn(

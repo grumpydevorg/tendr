@@ -5,8 +5,9 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 6, 8, 9 and 10 remain. Step 5's measurement (below) settled
-step 6's design. Step 8 needs any sshd (`TENDR_TEST_SSH_HOST`); step 9 the VM.
+**Status:** steps 6b, 8, 9 and 10 remain. Step 5's measurement (below)
+settled step 6's design; 6a, restoring the terminal's modes, shipped. Step 8
+needs any sshd (`TENDR_TEST_SSH_HOST`); step 9 the VM.
 
 ## Goal
 
@@ -17,60 +18,32 @@ stays the same process throughout, and its output is recorded exactly. A lost
 SSH connection does not end the run; a dead sidecar or a VM reboot does.
 
 What shipped is described in [PTY lane](../../architecture/04-pty-lane.md) and
-[PTY recording format](../../architecture/08-pty-recording-format.md). Exit
-codes are in the [guide](../../guide.md#exit-codes). The typed `ssh -T`
+[PTY recording format](../../architecture/08-pty-recording-format.md),
+including how attach turns the session's terminal modes on and off again
+([output and viewers](../../architecture/04-pty-lane.md#output-and-viewers)).
+Exit codes are in the [guide](../../guide.md#exit-codes). The typed `ssh -T`
 attach bridge and resumable viewers are step 5 of
 [remote frame transport](01_remote-frame-transport.md). Playing a recording
 back is [PTY replay](../backlog/pty-replay.md).
 
 ## Remaining steps (one PR each)
 
-- **Step 6. Terminal modes and a repaint on (re)attach** (local; design from
-  the [measurement](#measurement-step-5-2026-11-01)). Two parts, one PR each:
-   - **6a. Restore the user's terminal modes.** A streaming parser tracks the
-     terminal modes the child's output turns on: alternate screen, cursor
-     visibility, application cursor keys and keypad, mouse tracking and
-     encodings, focus events, bracketed paste, colour-scheme reports,
-     synchronized output, kitty keyboard flags (one stack per screen) and
-     `modifyOtherKeys`. A full reset (`ESC c`) clears them; a soft reset
-     (`CSI ! p`) shows the cursor and resets cursor keys and keypad.
-     - Sidecar: the tracker lives with the viewer slot under the tee's lock
-       and is fed in the same critical section that offers each chunk. A new
-       viewer gets the replay on its queue before it is installed, so no
-       chunk is both replayed and delivered (a kitty push is not idempotent).
-     - Replay order: main-screen kitty pushes, the alternate screen, its
-       pushes, then the other modes. The inverse runs backwards: synchronized
-       output off, alternate-screen pops, leave it, main-screen pops, the
-       other modes off.
-     - Client: the reader tracks each chunk before writing it, under a lock
-       it also holds while writing. However the attach ends, a helper takes
-       that lock, marks the screen done so the reader writes nothing more,
-       and writes the inverse; the client waits for it at most 200 ms, so a
-       terminal that is not reading cannot hold the exit.
-     - Not tracked: the window title, character sets, cursor shape. A
-       terminal whose last client could not write the inverse (SIGKILL, a
-       dead connection, then `--takeover` from the same window) keeps that
-       state under the replay.
-     - Old clients and sidecars interoperate: the replay is ordinary data.
-       Tests: `detach_turns_off_the_modes_the_child_turned_on`,
-       `attach_replays_the_modes_set_before_it`,
-       `kitty_flags_are_restored_per_screen`,
-       `a_reset_from_the_child_clears_tracked_modes`.
-   - **6b. Repaint nudge.** New `MSG_REPAINT`, sent once by the client after
-     its first resize, authorized like input. When that attach did not change
-     the size, the attach handler shrinks the PTY by one row and later
-     restores it, as two separate writer controls so neither blocks input or
-     a takeover. Both are recorded as `ResizeCause::Repaint { correlation }`
-     after the attach's `user` resize. The restore applies only if the PTY is
-     still at the shrunk size; a user resize or takeover in between cancels
-     it. The first output after a shrink is Claude re-sending its mouse modes
-     (0.25 ms), and the redraw follows 19 ms later, so the restore waits until
-     output has been quiet for 50 ms, at most 500 ms; the VM check must show
-     Claude redraws on that pair. A repaint does not restore history. Old
-     sidecars ignore the frame. Tests:
-     `reattach_at_the_same_size_records_a_tagged_repaint_pair`,
-     `reattach_at_a_new_size_records_only_a_user_resize`,
-     `a_repaint_is_authorized_like_input`.
+- **Step 6b. Repaint nudge** (local; design from the
+  [measurement](#measurement-step-5-2026-11-01)). New `MSG_REPAINT`, sent
+  once by the client after its first resize, authorized like input. When that
+  attach did not change the size, the attach handler shrinks the PTY by one
+  row and later restores it, as two separate writer controls so neither
+  blocks input or a takeover. Both are recorded as `ResizeCause::Repaint
+  { correlation }` after the attach's `user` resize. The restore applies only
+  if the PTY is still at the shrunk size; a user resize or takeover in
+  between cancels it. The first output after a shrink is Claude re-sending
+  its mouse modes (0.25 ms), and the redraw follows 19 ms later, so the
+  restore waits until output has been quiet for 50 ms, at most 500 ms; the VM
+  check must show Claude redraws on that pair. A repaint does not restore
+  history. Old sidecars ignore the frame. Tests:
+  `reattach_at_the_same_size_records_a_tagged_repaint_pair`,
+  `reattach_at_a_new_size_records_only_a_user_resize`,
+  `a_repaint_is_authorized_like_input`.
 - **Step 8. Nested `ssh -t` fixtures, opt-in** (sshd; `TENDR_TEST_SSH_HOST`).
    `tests/cli_attach_ssh.rs`: detach on `Ctrl-\ d`, `Ctrl-]` passthrough,
    paste with prefixes, terminal restore, takeover over a stopped first
@@ -169,7 +142,7 @@ was Ghostty 1.4.0 on macOS, attached over `ssh -t <vm>.exe.xyz` and driven by
   bracketed paste, kitty keyboard flags and `modifyOtherKeys` stay on. In
   Ghostty, mouse moves then typed `ESC[<35;11;5M` into the shell, and `Ctrl-C`
   arrived as `ESC[99;5u` and did not interrupt `cat`. A redraw after reattach
-  sends only the mouse modes again. Step 6a fixes both directions.
+  sends only the mouse modes again. Step 6a fixed both directions.
 - **The escape works through Ghostty → `ssh -t` → attach** in both
   encodings. Legacy: `Ctrl-\ d` detaches, `Ctrl-]` reaches the child as
   `0x1d`, a doubled `Ctrl-\` as one `0x1c`. Kitty: `ESC[92;5u` then `d`
