@@ -223,9 +223,13 @@ not tendr's:
   in queue order. `false` means the target was not running.
 - An untargeted `{"cmd":"cancel"}` is safe only when one caller owns the
   session.
+- Requests queued behind a running one are capped at 16 MiB (sio main
+  ae2fe52); beyond that, a request gets an immediate, retryable
+  `queue_full` reply and does nothing.
 
 On tendr's side, the cancel `exec` exits 0 either way, and the stopped
-request's reply, which arrives while it waits, lands in its `unmatched`.
+request's reply, which arrives while it waits, lands in its `unmatched`. A
+`queue_full` reply is an `ok:false` reply, so its `exec` exits 1.
 
 ## Answer prompts and attach
 
