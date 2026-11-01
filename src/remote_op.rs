@@ -771,6 +771,17 @@ mod tests {
         assert_eq!(json["op"], "list");
     }
 
+    /// The escape travels as the `--escape` value the user typed.
+    #[test]
+    fn escape_uses_the_cli_spelling() {
+        for value in ["ctrl-backslash", "none"] {
+            let original = op(&["attach", "--escape", value, "s"]);
+            let json = serde_json::to_value(&original).unwrap();
+            assert_eq!(json["params"]["escape"], value);
+            assert_eq!(round_trip(&original), original);
+        }
+    }
+
     #[test]
     fn every_operation_round_trips() {
         let cases: &[&[&str]] = &[
