@@ -488,13 +488,29 @@ fn spawn_sidecar(tendr_bin: &Path, session_dir: &Path, ready_write_fd: &File) ->
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    // Descriptors our caller leaked to us (exe.dev's init leaks /dev/ptmx
+    // masters into every SSH command) must not reach the sidecar, nor through
+    // it the child. Listed before the fork, since listing allocates.
+    let inherited = open_fds();
+
     // SAFETY: pre_exec runs after fork() in the child process, before exec().
-    // The closure captures only write_fd_raw (a Copy integer), so no shared
-    // mutable state is accessed. fcntl and setsid are async-signal-safe.
-    // We clear close-on-exec on the ready fd so it survives exec,
-    // and call setsid to detach from the parent's session.
+    // The closure captures write_fd_raw (a Copy integer) and reads the
+    // `inherited` list built before the fork; it does not allocate.
+    // close_range, fcntl and setsid are async-signal-safe.
+    // Every inherited fd above 2 is marked close-on-exec rather than closed,
+    // so std's own exec-error pipe keeps working; then close-on-exec is
+    // cleared on the ready fd so it survives exec. setsid detaches the
+    // sidecar from the parent's session.
     unsafe {
         cmd.pre_exec(move || {
+            if !cloexec_from_3() {
+                for &fd in &inherited {
+                    if fd > 2 {
+                        // EBADF (an fd closed since the listing) is harmless.
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    }
+                }
+            }
             // Clear close-on-exec so the ready fd survives exec
             if libc::fcntl(write_fd_raw, libc::F_SETFD, 0) == -1 {
                 return Err(io::Error::last_os_error());
@@ -509,6 +525,41 @@ fn spawn_sidecar(tendr_bin: &Path, session_dir: &Path, ready_write_fd: &File) ->
 
     let child = cmd.spawn()?;
     Ok(child.id())
+}
+
+/// The calling process's open descriptors, from `/dev/fd`. Empty if it cannot
+/// be read; `cloexec_from_3` covers Linux without it.
+fn open_fds() -> Vec<RawFd> {
+    std::fs::read_dir("/dev/fd")
+        .map(|dir| {
+            dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Mark every fd from 3 up close-on-exec with one `close_range` call.
+/// Returns false where that is unavailable (not Linux, or a kernel before
+/// 5.11). Async-signal-safe.
+fn cloexec_from_3() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: close_range only changes descriptor flags in this process.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        ret == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// Read the readiness result from the pipe.

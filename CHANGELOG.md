@@ -16,6 +16,11 @@
 
 ### Fixed
 
+- **A descriptor leaked into `tendr start` no longer reaches the run.**
+  exe.dev's init leaks two terminal masters into every SSH command, and tendr
+  passed them on to the sidecar and the child, keeping those terminals open
+  for the run's life. The sidecar now inherits only stdio and its ready pipe.
+
 - **Detaching gives your terminal back.** When you detach, or the attach ends
   for any other reason, `tendr attach` now turns off the terminal modes the
   session turned on: among them the alternate screen, mouse reports, focus

@@ -277,6 +277,12 @@ observed exit means the sidecar reaped the child, and `SpawnFailed` or
   `status` and `start` handles this. It kills the breadcrumb's child by the
   same identity rule and removes the directory without a record. The only
   copy of the failure record is then the lost+found one.
+- **Descriptors opened while `start` lists them.** Where `close_range` is
+  missing (macOS, Linux before 5.11), `start` lists its fds in `/dev/fd`
+  before forking the sidecar. A non-close-on-exec fd another thread opens in
+  that window would reach the sidecar. `start`'s own fds are all
+  close-on-exec, so only a caller's leaked fd is at stake, and that is open
+  before `start` runs.
 
 Covered elsewhere:
 
