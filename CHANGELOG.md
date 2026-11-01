@@ -86,6 +86,11 @@
 
 ### Fixed
 
+- **On Windows, tendr works without `HOME`.** It needed `HOME` for its
+  state root and for `skill install --global`, and failed with `HOME not
+  set` where it was unset, as in a Windows OpenSSH session, so `--host` to a
+  stock Windows host failed. With `HOME` unset it now uses `USERPROFILE`.
+
 - **A PTY run healed from its terminal event no longer shows a live
   recording.** When a sidecar died after logging the run's end but before
   writing `meta.json`, reconciliation healed the run but left

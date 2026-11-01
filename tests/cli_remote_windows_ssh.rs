@@ -5,7 +5,9 @@
 //!
 //! The tests are opt-in; CI's `windows-openssh` job sets them up on the
 //! Windows x64 and ARM64 lanes. Without `TENDR_TEST_WIN_SSH_HOST` each test
-//! passes at once, printing that it was skipped. The setup they need:
+//! passes at once, printing that it was skipped, unless
+//! `TENDR_REQUIRE_WIN_SSH_TESTS` is set (CI sets it), which makes it fail.
+//! The setup they need:
 //!
 //! - `TENDR_TEST_WIN_SSH_HOST`: an ssh destination on THIS machine that logs
 //!   in without prompting (an ssh config alias, for example). Its user has
@@ -44,10 +46,18 @@ struct Remote {
 
 impl Remote {
     /// `None`, after printing a skip note, when `TENDR_TEST_WIN_SSH_HOST` is
-    /// unset. Empties the marker directory.
+    /// unset; a panic instead when `TENDR_REQUIRE_WIN_SSH_TESTS` is set, so
+    /// a CI job that lost its setup fails rather than passing empty. Empties
+    /// the marker directory.
     fn connect(test: &str) -> Option<Self> {
         let nonempty = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
         let Some(host) = nonempty("TENDR_TEST_WIN_SSH_HOST") else {
+            if std::env::var_os("TENDR_REQUIRE_WIN_SSH_TESTS").is_some() {
+                panic!(
+                    "{test}: TENDR_TEST_WIN_SSH_HOST is not set but \
+                     TENDR_REQUIRE_WIN_SSH_TESTS is -- CI must set up the ssh host"
+                );
+            }
             eprintln!("skipped {test}: TENDR_TEST_WIN_SSH_HOST is not set");
             return None;
         };
@@ -510,13 +520,15 @@ fn push_wait_kill_and_exit_codes_round_trip() {
                 format!("kill long: {}", describe(&output))
             });
             let output = remote.tendr(&["wait", "long", "--namespace", &ns, "--timeout", "60"]);
-            failures.check(output.status.code().is_some_and(|c| c != 1), || {
-                format!("wait after kill: {}", describe(&output))
+            failures.check(output.status.code() == Some(0), || {
+                format!("wait after kill should exit 0: {}", describe(&output))
             });
             match remote.status("long") {
-                Ok(meta) => failures.check(meta["status"] == "Exited", || {
-                    format!("status after kill: {meta}")
-                }),
+                Ok(meta) => failures.check(
+                    meta["status"] == "Exited"
+                        && (meta["reason"] == "Killed" || meta["reason"] == "KilledForced"),
+                    || format!("status after kill: {meta}"),
+                ),
                 Err(e) => failures.0.push(format!("status long: {e}")),
             }
         }
@@ -526,13 +538,71 @@ fn push_wait_kill_and_exit_codes_round_trip() {
         }
     }
 
-    // A remote error exits 1 here.
+    // A remote error exits 1 here; a request the remote refuses exits 2.
     let output = remote.tendr(&["status", "missing", "--namespace", &ns]);
     failures.check(output.status.code() == Some(1), || {
         format!("status of a missing session: {}", describe(&output))
     });
+    let output = remote.tendr(&["status", "missing", "--namespace", "a.b"]);
+    failures.check(
+        output.status.code() == Some(2)
+            && String::from_utf8_lossy(&output.stderr).contains("tendr _remote:"),
+        || format!("status with an invalid namespace: {}", describe(&output)),
+    );
     failures.check_markers(&remote, "the round trip");
     failures.assert_none(&remote, "push_wait_kill_and_exit_codes_round_trip");
+}
+
+/// `exec` into a PowerShell session: the payload, shell syntax and non-ASCII
+/// included, runs in the session and its output comes back exactly.
+#[test]
+fn exec_runs_in_a_powershell_session() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(remote) = Remote::connect("exec_runs_in_a_powershell_session") else {
+        return;
+    };
+    let ns = remote.namespace.clone();
+    let mut failures = Failures::default();
+    let m = remote.m();
+    let output = remote.start(
+        "ps",
+        &["--stdin", "--exec-target", "powershell"],
+        &["powershell", "-NoProfile"],
+    );
+    failures.check(output.status.success(), || {
+        format!("start ps: {}", describe(&output))
+    });
+    match remote.await_status("ps", "Running") {
+        Ok(_) => {
+            let payload = format!("Write-Output 'é-ü a&b|c;d %USERNAME% $x'; # &echo>{m}\\exec");
+            let output = remote.tendr(&[
+                "exec",
+                "ps",
+                "--namespace",
+                &ns,
+                "--timeout",
+                "30",
+                "--",
+                &payload,
+            ]);
+            match serde_json::from_slice::<Value>(&output.stdout) {
+                Ok(result) => failures.check(
+                    output.status.success()
+                        && result["exit_code"] == 0
+                        && result["stdout"] == "é-ü a&b|c;d %USERNAME% $x\r\n",
+                    || format!("exec result: {}", describe(&output)),
+                ),
+                Err(e) => failures.0.push(format!(
+                    "exec output is not JSON ({e}): {}",
+                    describe(&output)
+                )),
+            }
+        }
+        Err(e) => failures.0.push(e),
+    }
+    remote.kill("ps");
+    failures.check_markers(&remote, "exec");
+    failures.assert_none(&remote, "exec_runs_in_a_powershell_session");
 }
 
 /// A run started over one ssh connection is still running after that

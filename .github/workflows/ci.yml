@@ -71,7 +71,7 @@ jobs:
   # cli_remote_windows_ssh.rs). Runner facts this relies on: Server 2025
   # (windows-latest) ships sshd with `AllowGroups administrators "openssh
   # users"`; windows-11-arm has no sshd capability (installing it takes 15+
-  # min), so the portable Win32-OpenSSH release is used. Key auth fails for
+  # min), so the pinned portable Win32-OpenSSH release is used. Key auth fails for
   # every account under the service, so a dedicated local user logs in by
   # password through SSH_ASKPASS. The remote tendr is this build, on the
   # machine PATH sshd hands its sessions.
@@ -86,6 +86,12 @@ jobs:
     env:
       TENDR_TEST_WIN_SSH_HOST: tendr-ssh
       TENDR_TEST_WIN_SSH_SCRATCH: C:\tendr-ssh
+      # Without the host the tests must fail, not skip to a false green.
+      TENDR_REQUIRE_WIN_SSH_TESTS: "1"
+      # Pinned, with each zip's SHA-256 from the release's asset digests.
+      WIN32_OPENSSH_VERSION: 10.4.0.0p1-Preview
+      WIN32_OPENSSH_SHA256_ARM64: d2b1928225479fec9e0c938f527fdb5ed676446cca1bbcc5af84aca1f272842e
+      WIN32_OPENSSH_SHA256_Win64: b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
@@ -95,18 +101,22 @@ jobs:
       - name: Install sshd where it is missing
         shell: pwsh
         run: |
-          if (-not (Test-Path 'C:\Windows\System32\OpenSSH\sshd.exe')) {
+          $sshd = 'C:\Windows\System32\OpenSSH\sshd.exe'
+          if (-not (Test-Path $sshd)) {
             $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'ARM64' } else { 'Win64' }
-            $rel = Invoke-RestMethod https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest -Headers @{ Authorization = "Bearer ${{ github.token }}" }
-            $asset = $rel.assets | Where-Object name -eq "OpenSSH-$arch.zip"
-            Invoke-WebRequest $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\openssh.zip"
-            Expand-Archive "$env:RUNNER_TEMP\openssh.zip" -DestinationPath 'C:\Program Files\OpenSSH' -Force
-            $dir = (Get-ChildItem 'C:\Program Files\OpenSSH' -Directory | Select-Object -First 1).FullName
+            $zip = "$env:RUNNER_TEMP\openssh.zip"
+            Invoke-WebRequest "https://github.com/PowerShell/Win32-OpenSSH/releases/download/$env:WIN32_OPENSSH_VERSION/OpenSSH-$arch.zip" -OutFile $zip
+            $want = [Environment]::GetEnvironmentVariable("WIN32_OPENSSH_SHA256_$arch")
+            $got = (Get-FileHash $zip -Algorithm SHA256).Hash
+            if ($got -ne $want) { throw "OpenSSH-$arch.zip SHA-256 is $got, expected $want" }
+            Expand-Archive $zip -DestinationPath 'C:\Program Files\OpenSSH' -Force
+            $dir = "C:\Program Files\OpenSSH\OpenSSH-$arch"
             & powershell.exe -ExecutionPolicy Bypass -File "$dir\install-sshd.ps1"
             if ($LASTEXITCODE) { throw "install-sshd.ps1 exited $LASTEXITCODE" }
-            "installed $($rel.tag_name) from $dir"
+            $sshd = "$dir\sshd.exe"
           }
-          (Get-Command ssh).Source
+          "sshd: $sshd $((Get-Item $sshd).VersionInfo.ProductVersion)"
+          "ssh: $((Get-Command ssh).Source)"
       - name: Remote user, tendr on its PATH, ssh client alias
         id: setup
         shell: pwsh
@@ -137,12 +147,15 @@ jobs:
           Copy-Item target\debug\tendr.exe, target\debug\test_callback.exe $bin
           $path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
           [Environment]::SetEnvironmentVariable('Path', "$bin;$path", 'Machine')
-          # tendr keeps its state under HOME, which a Windows ssh session may
-          # not set; point it at the remote user's profile.
-          [Environment]::SetEnvironmentVariable('HOME', 'C:\Users\tendrssh', 'Machine')
           Restart-Service sshd
-          ssh $env:TENDR_TEST_WIN_SSH_HOST 'echo user=%USERNAME% home=%HOME% & tendr --version'
-          if ($LASTEXITCODE) { throw "ssh to the remote tendr exited $LASTEXITCODE" }
+          # The first login creates the remote user's profile. sshd may still
+          # be binding just after the restart, so retry briefly.
+          for ($i = 1; $i -le 10; $i++) {
+            ssh $env:TENDR_TEST_WIN_SSH_HOST 'echo user=%USERNAME% HOME=%HOME% USERPROFILE=%USERPROFILE% & tendr --version'
+            if (-not $LASTEXITCODE) { break }
+            if ($i -eq 10) { throw "ssh to the remote tendr exited $LASTEXITCODE" }
+            Start-Sleep 1
+          }
       - name: Tests, cmd.exe login shell
         env:
           TENDR_TEST_WIN_SSH_SHELL: cmd

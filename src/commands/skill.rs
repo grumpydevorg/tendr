@@ -63,13 +63,12 @@ pub fn cmd_skill_install(global: bool, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the install path. `global` roots it at `$HOME`; otherwise at the
-/// current working directory. `$HOME` resolution matches `SessionRoot` — no new
-/// dependency, and consistent with how tendr already finds the home directory.
+/// Resolve the install path. `global` roots it at the home directory
+/// ([`tendr::session::home_dir`], as for the session state); otherwise at the
+/// current working directory.
 fn skill_path(global: bool) -> anyhow::Result<PathBuf> {
     let root = if global {
-        let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
-        PathBuf::from(home)
+        tendr::session::home_dir()?
     } else {
         std::env::current_dir().context("resolving current working directory")?
     };
