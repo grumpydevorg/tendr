@@ -144,7 +144,8 @@ struct AttachTee {
 
 /// A repaint restores the PTY's size once the child's output has been quiet
 /// this long after the shrink: Claude Code re-sends its mouse modes 0.25 ms
-/// after a resize and redraws 19 ms after it (plan 00, step 5).
+/// after a resize and redraws 19 ms after it (`scripts/pty-vm/README.md`,
+/// "Claude Code in a tendr PTY").
 #[cfg(unix)]
 const REPAINT_QUIET: std::time::Duration = std::time::Duration::from_millis(50);
 /// The longest a repaint keeps the PTY shrunk.

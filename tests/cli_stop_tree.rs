@@ -1,6 +1,7 @@
 //! A stop ends every process the run started, wherever it went: out of the
 //! child's process group, into a session of its own, or orphaned. Each kind
-//! is one that survived a stop in the cloud PTY plan's step 9. On macOS,
+//! is one that survived a stop on the cloud PTY VM (`scripts/pty-vm/README.md`,
+//! "What survives a stop"). On macOS,
 //! where nothing adopts orphans, each kind here is one a stop can still
 //! find: in the child's session, below a live parent, or holding the
 //! terminal.
@@ -32,7 +33,8 @@ const SETSID: &str = r#"exec perl -MPOSIX -e 'if (getpgrp() == $$) { fork and ex
 const LEADER: &str =
     r#"sh "$(dirname "$0")/hold.sh" "$1-child" & echo $$ > "$1.tmp" && mv "$1.tmp" "$1"; wait"#;
 
-/// Every way out of the child's process group that step 9 measured, each
+/// Every way out of the child's process group that the cloud PTY VM measured
+/// ("What survives a stop" in `scripts/pty-vm/README.md`), each
 /// named by the pid file its process writes. `session` is started before job
 /// control is on, so it is not a group leader and gets its own session
 /// without forking; the rest are jobs of a shell with job control, each in a

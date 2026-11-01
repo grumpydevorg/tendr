@@ -574,7 +574,8 @@ mod tests {
     }
 
     /// Claude Code 2.1.316's start-up under `TERM=xterm-ghostty`, as recorded
-    /// on the cloud PTY VM (plan 00, step 5).
+    /// on the cloud PTY VM (`scripts/pty-vm/README.md`, "Claude Code in a
+    /// tendr PTY").
     const CLAUDE_START: &[u8] = b"\x1b7\x1b[r\x1b8\x1b[?25h\
         \x1b[?2004h\x1b[?2031h\x1b[?1004h\x1b[<u\x1b[>5u\x1b[>4;2m\
         \x1b]0;\xe2\x9c\xb3 Claude Code\x07\

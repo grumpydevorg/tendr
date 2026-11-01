@@ -6,8 +6,10 @@ stop. The workflow they test: Ghostty on a laptop, `ssh -t` to tendr on an
 exe.dev Linux VM, Claude Code in a tendr-owned PTY. A person can lose the
 network, attach again with `--takeover`, resize and detach, and an agent can
 drive the same PTY, with Claude the same process throughout and its output
-recorded exactly. The last results are [below](#results-2026-11-01); a
-re-run starts there.
+recorded exactly. What shipped for it is described in the
+[PTY lane](../../docs/architecture/04-pty-lane.md) and the
+[PTY recording format](../../docs/architecture/08-pty-recording-format.md).
+The last results are [below](#results-2026-11-01); a re-run starts there.
 
 They were written on an exe.dev VM on 2026-09-26 and first used on
 2026-11-01, with tendr 0.4.1, Claude Code 2.1.316 and Ghostty 1.4.0.
