@@ -63,12 +63,15 @@ sequenceDiagram
     Caller->>CLI: exec <session> -- <cmd...>
     CLI->>Session: read meta.json
     CLI->>Session: acquire exec.lock
+    CLI->>Session: check exec.pending.json (earlier frame finished?)
     CLI->>Session: append exec.started event
     CLI->>CLI: frame command for exec_target
+    CLI->>Session: write exec.pending.json
     CLI->>FIFO: write framed command
     FIFO->>Shell: inject command via stdin transport
     Shell->>Log: stdout/stderr or side-channel result
     CLI->>Log: wait for sentinel or result file
+    CLI->>Session: remove exec.pending.json, then result file (both kept on timeout or error)
     CLI->>Session: append exec.result event
     CLI->>Log: append exec annotation
     CLI-->>Caller: print structured ExecResult
@@ -109,8 +112,8 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
   base64-encodes the code and the result path. It runs the code, captures
   stdout, stderr, exit code and working directory, and writes them as JSON
   to `exec-results/<token>.json` (temporary file, then rename). `exec` polls
-  for the file, reads it, and deletes it. A Python traceback is appended to
-  stderr.
+  for the file and reads it; the file is removed with the exec's record (see
+  [Timeouts](#timeouts)). A Python traceback is appended to stderr.
 - **Request id (NDJSON).** The command is one JSON object; `exec` adds
   `"id": "<token>"` and writes it as one line. A request that is not one
   object, or already has an `id`, exits 2 before the exec lock or any event.
@@ -124,15 +127,46 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
 
 ### Timeouts
 
-A timed-out exec prints its result and exits 124. It keeps holding
-`exec.lock` until the shell or REPL finishes the frame (the sentinel or
-result file appears) or the session ends. So a second exec cannot
-interleave into a busy session.
+A timed-out exec prints its result and exits 124 at its deadline and frees
+`exec.lock`. The shell or REPL may still be running the frame. Sending the
+next frame then would put it on the stdin of a command that may read it as
+its own input (`read`, `cat`, `input()`, `Read-Host`, a nested REPL), and,
+for the sentinel targets, log the old command's late output after the next
+exec's offset. So no target but NDJSON lets a later exec send until the
+earlier frame is known to have finished.
 
-An NDJSON exec is the exception: it exits 124 at once and frees the lock.
-The next exec may then send its request while the program is still on the
-timed-out one. Matching by `id` keeps the two replies apart: a late reply
-logged while the next exec waits lands in that exec's `unmatched`.
+`exec.pending.json` carries that across processes. Just before sending a
+frame, `exec` writes it (temporary file, then rename) with the token, start
+time, a shortened command and the `output.log` offset. Once it has the
+result, it removes the record and then the result file. The result file is
+the side-channel completion signal, so a client that dies between the two
+leaves no record rather than a record nothing can satisfy. A timeout keeps
+the record, as does an error after sending (the frame may still be running)
+or a client that dies while waiting.
+
+The next exec reads it under `exec.lock`, before any event or framing:
+
+| Exec target | The earlier frame has finished when |
+|---|---|
+| POSIX shell | its stdout sentinel and stderr end marker are in `output.log` after the offset; with the sentinel but no marker, after one more second |
+| DuckDB | its stdout sentinel is in `output.log` after the offset, then 100 ms more for trailing stderr |
+| Python REPL, PowerShell | `exec-results/<token>.json` exists |
+
+If it has finished, the exec removes the record (and result file) and runs as
+usual, taking its own offset after the old output. If not, it exits 1
+without sending anything, naming the earlier exec's token, start time and
+command, and saying to wait or run `tendr kill`. A frame that never finishes
+therefore never wedges the session silently: each later exec says why it was
+refused and how to recover.
+
+A concurrent exec that finds `exec.lock` held fails at once, naming the
+running exec from `exec.pending.json` when that is already written. The
+message carries no OS error code.
+
+NDJSON is the exception: it writes no record, so the next exec may send its
+request while the program is still on the timed-out one. Matching by `id`
+keeps the two replies apart: a late reply logged while the next exec waits
+lands in that exec's `unmatched`.
 
 ### Events and annotation
 

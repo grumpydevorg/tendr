@@ -100,6 +100,22 @@
 
 ### Fixed
 
+- **A timed-out `exec` returns at its deadline and no longer wedges the
+  session silently.** Before, a POSIX shell, DuckDB, Python REPL or
+  PowerShell `exec` that passed `--timeout` held the session's exec lock
+  until the command finished, and returned only then. Any other `exec`
+  meanwhile failed with a bare "another exec is already running on this
+  session" (`(os error 33)` on Windows), and a command that never finished
+  blocked the session until it was killed. An `exec` whose client was
+  killed released the lock at once instead, so the next `exec` was sent
+  into the busy shell and got the old command's output as its own.
+  Now `exec` records its frame in the session dir before sending it, and a
+  timed-out `exec` prints its result and exits 124 at the deadline. Until
+  that frame finishes, a later `exec` sends nothing and fails (exit 1)
+  naming the earlier exec's token, start time and command, and saying to
+  wait or run `tendr kill`. Once it has finished, the next `exec` runs
+  normally and gets only its own output. NDJSON sessions are unchanged.
+
 - **On Windows, a ProxyCommand no longer holds your pipes after a `--host`
   call returns.** Windows hands a child every inheritable handle, so `ssh`,
   and anything it starts, held all of the stdin, stdout and stderr tendr was
