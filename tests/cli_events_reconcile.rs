@@ -238,8 +238,9 @@ fn sidecar_lost_stops_a_pty_recording() {
 }
 
 /// A PTY sidecar that crashes between its terminal event and its meta write
-/// leaves the recording `Recording`. Healing the run from the event must not
-/// leave a recording still "Recording" on a run that has ended.
+/// leaves the recording `Recording`, though the recorder finished. Healing the
+/// run marks it stopped with `end_unrecorded`, in meta only: the run's
+/// terminal event stays the last event.
 #[test]
 fn healed_pty_run_stops_its_recording() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -261,5 +262,13 @@ fn healed_pty_run_stops_its_recording() {
 
     let recording = &read_meta_json(&root, "p1")["pty"]["recording"];
     assert_eq!(recording["state"], "Stopped", "{recording}");
-    assert_eq!(recording["reason"], "sidecar_lost", "{recording}");
+    assert_eq!(recording["reason"], "end_unrecorded", "{recording}");
+
+    let events = read_events(&root, "p1");
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert!(
+        !kinds.contains(&"recording.stopped"),
+        "a healed run logs no recording.stopped: {kinds:?}"
+    );
+    assert_eq!(kinds.last(), Some(&"run.exited"), "{kinds:?}");
 }

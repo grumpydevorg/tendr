@@ -85,9 +85,12 @@ pub enum RecordingStopReason {
     /// Storage had not caught up when the run ended.
     Stalled,
     /// The sidecar was lost: reconciliation ended the recording, not the
-    /// recorder, whether it inferred `SidecarLost` or healed the run from
-    /// the sidecar's terminal event. The last recorded sequence is not known.
+    /// recorder. The last recorded sequence is not known.
     SidecarLost,
+    /// The recorder finished before the run's terminal event; the sidecar
+    /// died before writing the recording's end. The segments on disk hold the
+    /// complete recording; the last sequence was not recorded.
+    EndUnrecorded,
 }
 
 impl Default for PtyMeta {

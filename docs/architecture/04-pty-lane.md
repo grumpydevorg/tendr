@@ -360,11 +360,16 @@ Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
 - A lost sidecar cannot record its stop. When reconciliation infers
   `SidecarLost`, it marks a recording still `Recording` as `Stopped` with
   reason `sidecar_lost` and no last sequence, and logs `recording.stopped`
-  from `tendr.cli` before `run.sidecar_lost`. When reconciliation instead
-  heals the run from the sidecar's terminal event (the sidecar died before
-  writing `meta.json`), it marks the recording the same way but logs no
-  event, since the run's terminal event is already in the log. The segments
-  on disk hold what was recorded.
+  from `tendr.cli` before `run.sidecar_lost`. The segments on disk hold what
+  was recorded.
+- When reconciliation instead heals the run from the sidecar's terminal
+  event (the sidecar died before writing `meta.json`), the recorder had
+  already finished: its end, or any stop, comes before the terminal event.
+  Only the recording's final meta write was lost, so reconciliation marks a
+  recording still `Recording` as `Stopped` with reason `end_unrecorded` and
+  no last sequence. It logs no event, since a `recording.stopped` would
+  follow the run's terminal event. The segments on disk hold the complete
+  recording.
 
 `cargo run --example dump-recording -- <path>` prints a recording as text.
 `<path>` is a segment file, a run's recording directory, or a session

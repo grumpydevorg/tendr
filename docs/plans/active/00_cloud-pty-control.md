@@ -5,8 +5,8 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 12b, 12c and 16 remain. Step 12b needs the VM to verify;
-the others are local.
+**Status:** steps 12b and 12c remain. Step 12b needs the VM to verify; step
+12c is local.
 
 ## Goal
 
@@ -55,14 +55,6 @@ back is [PTY replay](../backlog/pty-replay.md).
   `proc_pidinfo` and `getsid` worked for same-user processes in another
   session on macOS 27, so the EPERM noted in `src/platform/unix.rs` needs
   rechecking.
-- **Step 16. A healed run stops its recording** (local; builds on #140's
-  `Meta::stop_live_recording`). When a sidecar dies between writing its
-  terminal event and writing `meta.json`, the next `status`, `wait`, `kill`
-  or `run` heals the run from the event (`heal_terminal_from_event` in
-  `src/model/transition.rs`), but leaves `pty.recording.state` as
-  `Recording` on the ended run. Mark the recording stopped in meta only: the
-  terminal event is already logged, and `recording.stopped` never follows a
-  run's terminal record.
 
 ## Gates
 
