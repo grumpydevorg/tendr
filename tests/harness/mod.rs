@@ -19,6 +19,9 @@ use tendr::model::meta::Meta;
 use tendr::model::state::RunStatus;
 use tendr::session::{self, LockGuard, SessionRoot};
 
+#[cfg(unix)]
+pub mod terminal;
+
 /// Hang-detector deadline for a single `tendr` CLI invocation in tests.
 ///
 /// This is NOT a performance assertion. A normal detached start completes in
