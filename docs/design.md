@@ -280,3 +280,20 @@ limit in only 3 of 6 attempts. With the engine state cached through
 need a self-hosted runner or a paid engine. Source:
 `docs/plans/completed/2026-09-25-dagger-ci.md` and its data folder; closed
 PR #78.
+
+### The wire protocols are designed and tested here
+
+*2026-11-01.* The formats tendr puts on the wire — the length-prefixed
+request envelope on ssh stdin, the versioned request, the exit trailer, the
+event protocol — are tendr's own designs. They are defined in this
+repository, named in
+[06-transport-boundaries](architecture/06-transport-boundaries.md), and
+changed like any other code: review, tests, and a recorded decision. The
+work is designing and validating this framing against controlled endpoints:
+a fake ssh in unit tests, real OpenSSH on CI runners driven as a test
+endpoint, and local sshd lanes. The injection-style strings in the remote
+tests (`tests/cli_remote*.rs`) are adversarial data, not attack tooling:
+they are sent as framed data to those endpoints, and marker-file regression
+tests assert that a hostile session name creates nothing and runs nothing
+remotely. Branch work (`feat/ndjson-exec-target`) extends the same framing
+with request-id matched replies; it has not landed on `main`.
