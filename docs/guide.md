@@ -404,8 +404,9 @@ about 30 minutes with no prompt.
   `wait --timeout 3600` and `log -f` are unaffected.
 - Time spent at an `ssh` prompt (passphrase, unknown host key) counts.
 - `TENDR_SSH_CONNECT_TIMEOUT` sets the limit in seconds; `0` turns it off.
-- A remote `tendr` too old to know the `--hello` flag fails, and the error says
-  to upgrade it, also with `TENDR_SSH_CONNECT_TIMEOUT=0`.
+- A remote `tendr` too old for this client fails on the first flag it does
+  not know (`--hello`, or `--exit-trailer` with the deadline off), and the
+  error says to upgrade it.
 - If the deadline fires during authentication, a `ProxyCommand` that ignores
   its input can be left running.
 
@@ -572,7 +573,7 @@ or an I/O error.
 |Command|Code|Meaning|
 |---|---|---|
 |any|2|Usage error from argument parsing|
-|any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); an `attach` name that is not plain; a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request|
+|any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); an `attach` name that is not plain; a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request (1 when the remote login shell is PowerShell)|
 |`events`, `emit` with `--host`|1|Not supported over SSH|
 |any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 without one from the remote is `ssh` failing to connect|
 |any, with `--host` except `attach`|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s)|

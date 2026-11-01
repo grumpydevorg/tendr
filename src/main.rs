@@ -725,7 +725,10 @@ fn parse_optional_namespace(namespace: Option<String>) -> anyhow::Result<Option<
 fn run_with_exit_trailer(matches: &clap::ArgMatches) -> ! {
     use std::io::Write;
 
-    let args = without_exit_trailer(std::env::args_os().collect(), matches);
+    let Some(args) = without_exit_trailer(std::env::args_os().collect(), matches) else {
+        eprintln!("error: --exit-trailer must be given as its own word before the command");
+        std::process::exit(2);
+    };
     let code = match std::env::current_exe()
         .and_then(|exe| std::process::Command::new(exe).args(&args[1..]).status())
     {
@@ -755,21 +758,31 @@ fn run_with_exit_trailer(matches: &clap::ArgMatches) -> ! {
 /// `argv` without the `--exit-trailer` clap read as the flag, found by its
 /// position, so the same word as a child command's argument stays. The flag
 /// is accepted only before the subcommand, where clap's positions count from
-/// the start of `argv`.
+/// the start of `argv`. `None` when a position clap reports does not hold the
+/// plain flag (clap counts `--opt=value` as two positions), so the wrong word
+/// is never removed.
 fn without_exit_trailer(
     argv: Vec<std::ffi::OsString>,
     matches: &clap::ArgMatches,
-) -> Vec<std::ffi::OsString> {
+) -> Option<Vec<std::ffi::OsString>> {
     let flag: Vec<usize> = matches
         .indices_of("exit_trailer")
         .into_iter()
         .flatten()
         .collect();
-    argv.into_iter()
-        .enumerate()
-        .filter(|(i, _)| !flag.contains(i))
-        .map(|(_, arg)| arg)
-        .collect()
+    if flag
+        .iter()
+        .any(|&i| argv.get(i).is_none_or(|arg| arg != "--exit-trailer"))
+    {
+        return None;
+    }
+    Some(
+        argv.into_iter()
+            .enumerate()
+            .filter(|(i, _)| !flag.contains(i))
+            .map(|(_, arg)| arg)
+            .collect(),
+    )
 }
 
 fn main() {
@@ -1106,12 +1119,21 @@ mod tests {
             let got = without_exit_trailer(argv, &matches);
             assert_eq!(
                 got,
-                expected
-                    .iter()
-                    .map(std::ffi::OsString::from)
-                    .collect::<Vec<_>>()
+                Some(
+                    expected
+                        .iter()
+                        .map(std::ffi::OsString::from)
+                        .collect::<Vec<_>>()
+                )
             );
         }
+        // clap counts `--host=box` as two positions, so its index for the
+        // flag no longer names the flag's word: refuse rather than strip
+        // the wrong one.
+        let argv = ["tendr", "--host=box", "--exit-trailer", "status", "s"];
+        let matches = Cli::command().try_get_matches_from(argv).unwrap();
+        let argv = argv.iter().map(std::ffi::OsString::from).collect();
+        assert_eq!(without_exit_trailer(argv, &matches), None);
         // Only before the subcommand: the child never sees the flag, so it
         // cannot wrap itself again.
         assert!(

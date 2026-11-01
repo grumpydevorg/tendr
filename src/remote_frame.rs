@@ -1,5 +1,5 @@
 //! The remote frame: how `--host` carries a [`RemoteOperation`] to the remote
-//! tendr. The ssh command line is constant, `tendr [--hello] _remote`
+//! tendr. The ssh command line is constant, `tendr [--hello] --exit-trailer _remote`
 //! ([`tendr::ssh::exec_ssh_remote`]); the request travels on ssh's stdin:
 //!
 //! ```text

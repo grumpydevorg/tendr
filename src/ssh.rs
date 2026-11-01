@@ -3,9 +3,9 @@
 //! `--host` forwards the remote-capable commands (the binary's
 //! `RemoteOperation`) to a remote `tendr`, which runs the *same* local
 //! lifecycle on the far side. The remote command line is constant: every
-//! operation but `attach` runs `tendr [--hello] _remote` and sends the request
-//! on ssh's stdin ([`exec_ssh_remote`]), and `exec` runs
-//! `tendr [--hello] exec --frame-from-stdin` with its own
+//! operation but `attach` runs `tendr [--hello] --exit-trailer _remote` and
+//! sends the request on ssh's stdin ([`exec_ssh_remote`]), and `exec` runs
+//! `tendr [--hello] --exit-trailer exec --frame-from-stdin` with its own
 //! [`exec_frame`](crate::exec_frame) ([`exec_ssh_frame`]). So no user value
 //! reaches the remote login shell, whatever shell that is. `attach` still runs
 //! under `ssh -t` with a rebuilt command line, limited to plain names
@@ -126,8 +126,8 @@ fn build_ssh_attach_command(host: &str, args: &[String]) -> Result<Command, SshE
     Ok(cmd)
 }
 
-/// Run `tendr <args>` (an `attach`) on `host` under `ssh -t`, see
-/// [`build_ssh_attach_command`]. Returns the remote exit code.
+/// Run `tendr <args>` (an `attach`) on `host` under `ssh -t`, with every
+/// argument checked as a plain name or fixed token. Returns the remote exit code.
 ///
 /// # Errors
 /// `SshError::InvalidDestination`, `SshError::UnsafeAttachArgument` before
