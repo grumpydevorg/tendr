@@ -1249,7 +1249,7 @@ fn resize_reaches_child_pty() {
 // --- Slice 3: pty.control_changed events (plan scope 6) ---
 
 /// Attach then detach emits two pty.control_changed events — the shipped
-/// PtyControl vocabulary, exactly the two pinned data fields, appended
+/// PtyControl vocabulary, exactly the three pinned data fields, appended
 /// before the corresponding meta flip, from the attach thread's own writer.
 #[test]
 fn attach_detach_emit_control_changed_events() {
@@ -1284,12 +1284,13 @@ fn attach_detach_emit_control_changed_events() {
     assert_eq!(changed.len(), 2);
     assert_eq!(
         changed[0]["data"],
-        serde_json::json!({"control": "HumanControl", "trigger": "attach"}),
+        serde_json::json!({"control": "HumanControl", "trigger": "attach", "epoch": 1}),
         "minimal by design — a control fact, not a screen event"
     );
     assert_eq!(
         changed[1]["data"],
-        serde_json::json!({"control": "AgentControl", "trigger": "detach"})
+        serde_json::json!({"control": "AgentControl", "trigger": "detach", "epoch": 1}),
+        "a detach names the epoch it released"
     );
     for event in &changed {
         assert_eq!(event["source"], "tendr.sidecar");
@@ -3701,6 +3702,68 @@ fn cli_attach_retired_by_a_takeover_exits_81() {
     assert_eq!(wrapped.wait_exit(Duration::from_secs(10)), 81);
     wrapped.assert_terminal_restored();
     wrapped.wait_output_contains("took over");
+}
+
+/// An attach whose terminal stopped reading during a flood cannot read the
+/// takeover notice queued behind its output. Once its terminal reads again,
+/// it still learns it was taken over and exits 81, even after the client that
+/// took over has detached.
+#[test]
+fn cli_attach_taken_over_while_stalled_exits_81() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-x81-stalled");
+    // A steady flood, slow enough that the stalled client stays well inside
+    // the sidecar's queue budget and is never disconnected for falling behind.
+    tendr(&root)
+        .args(["start", "pty-x81-stalled", "--pty", "--stdin", "--"])
+        .args([
+            "sh",
+            "-c",
+            "stty raw -echo; line=$(printf '%0100d' 0); \
+             while :; do i=0; while [ $i -lt 10 ]; do printf '%s' \"$line\"; i=$((i+1)); done; sleep 0.01; done",
+        ])
+        .output()
+        .unwrap();
+    harness::wait_running(&root, "pty-x81-stalled");
+    let sock_path = wait_for_attach_socket(&root, "pty-x81-stalled");
+
+    let wrapped = WrappedAttach::spawn(&root, "x81-stalled", &["pty-x81-stalled"]);
+    wrapped.wait_output_contains("0000000000");
+    wait_for_pty_control(&root, "pty-x81-stalled", "HumanControl");
+    // The terminal stops reading; the flood fills its buffer, the CLI's socket
+    // and the sidecar's write to it. That cannot be observed directly, so give
+    // the flood time to fill them.
+    wrapped.cli.pause_output();
+    std::thread::sleep(Duration::from_secs(4));
+
+    let (other, (msg_type, _)) = hello(&sock_path, Mode::Takeover);
+    assert_eq!(msg_type, MSG_ACCEPTED);
+    std::thread::sleep(Duration::from_secs(1));
+    drop(other);
+    wait_for_pty_control(&root, "pty-x81-stalled", "AgentControl");
+    assert!(
+        !wrapped.exited(),
+        "a client that is not reading stays blocked"
+    );
+
+    wrapped.cli.resume_output();
+    assert_eq!(
+        wrapped.wait_exit(Duration::from_secs(20)),
+        81,
+        "a stalled client that was taken over; cli output tail: {:?}",
+        tail(&wrapped.cli.output())
+    );
+    wrapped.assert_terminal_restored();
+    wrapped.wait_output_contains("took over");
+}
+
+fn tail(output: &str) -> &str {
+    let start = output.len().saturating_sub(200);
+    let start = (start..output.len())
+        .find(|&i| output.is_char_boundary(i))
+        .unwrap_or(output.len());
+    &output[start..]
 }
 
 /// A sidecar that does not speak this protocol: an unreleased v1 sidecar's

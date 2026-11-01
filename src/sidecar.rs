@@ -1770,14 +1770,18 @@ impl PtyTeardown {
 #[cfg(not(unix))]
 type PtyTeardown = std::convert::Infallible;
 
-/// A change of who owns the PTY's input.
+/// A change of who owns the PTY's input, with the controller epoch it
+/// concerns: the one granted, or the one released.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 enum ControlChange {
     /// A human took control.
-    Human(crate::pty_input::Trigger),
+    Human(
+        crate::pty_input::Trigger,
+        crate::model::pty_control::ControllerEpoch,
+    ),
     /// The human released it; it falls back to the agent.
-    Released,
+    Released(crate::model::pty_control::ControllerEpoch),
 }
 
 /// The `pty.control_changed` event's `trigger`.
@@ -1794,17 +1798,23 @@ enum ChangeTrigger {
 impl ControlChange {
     fn owner(self) -> PtyControl {
         match self {
-            Self::Human(_) => PtyControl::HumanControl,
-            Self::Released => PtyControl::AgentControl,
+            Self::Human(..) => PtyControl::HumanControl,
+            Self::Released(_) => PtyControl::AgentControl,
         }
     }
 
     fn trigger(self) -> ChangeTrigger {
         use crate::pty_input::Trigger;
         match self {
-            Self::Human(Trigger::Attach) => ChangeTrigger::Attach,
-            Self::Human(Trigger::Takeover) => ChangeTrigger::Takeover,
-            Self::Released => ChangeTrigger::Detach,
+            Self::Human(Trigger::Attach, _) => ChangeTrigger::Attach,
+            Self::Human(Trigger::Takeover, _) => ChangeTrigger::Takeover,
+            Self::Released(_) => ChangeTrigger::Detach,
+        }
+    }
+
+    fn epoch(self) -> crate::model::pty_control::ControllerEpoch {
+        match self {
+            Self::Human(_, epoch) | Self::Released(epoch) => epoch,
         }
     }
 }
@@ -1826,6 +1836,8 @@ enum RunEffect {
     },
     /// `recording.stopped`, then the stop patched into `meta.json`.
     RecordingStopped(crate::recorder::Stopped),
+    /// Everything sent earlier is recorded: acknowledge and carry on.
+    Recorded(std::sync::mpsc::SyncSender<()>),
     /// Everything sent earlier is recorded: acknowledge and stop.
     Flush(std::sync::mpsc::SyncSender<()>),
 }
@@ -1835,6 +1847,9 @@ enum RunEffect {
 struct ControlChangedData {
     control: PtyControl,
     trigger: ChangeTrigger,
+    /// The controller epoch granted, or released by a detach. A takeover
+    /// grants the epoch after the retired controller's.
+    epoch: u64,
 }
 
 #[cfg(unix)]
@@ -1885,6 +1900,7 @@ impl RunEffects {
                             &ControlChangedData {
                                 control: owner.clone(),
                                 trigger: change.trigger(),
+                                epoch: change.epoch().get(),
                             },
                         );
                         let _serialized = lock(&META_WRITE);
@@ -1922,6 +1938,9 @@ impl RunEffects {
                                 meta.set_pty_recording(recording);
                             }
                         });
+                    }
+                    RunEffect::Recorded(done) => {
+                        let _ = done.send(());
                     }
                     RunEffect::Flush(done) => {
                         let _ = done.send(());
@@ -1974,13 +1993,19 @@ impl SidecarControlHooks {
 
 #[cfg(unix)]
 impl crate::pty_input::ControlHooks for SidecarControlHooks {
-    fn human_control(&mut self, trigger: crate::pty_input::Trigger) {
+    fn human_control(
+        &mut self,
+        trigger: crate::pty_input::Trigger,
+        epoch: crate::model::pty_control::ControllerEpoch,
+    ) {
         // Minimal by design: who owns the PTY's input, nothing else.
-        self.record(RunEffect::ControlChanged(ControlChange::Human(trigger)));
+        self.record(RunEffect::ControlChanged(ControlChange::Human(
+            trigger, epoch,
+        )));
     }
 
-    fn human_released(&mut self) {
-        self.record(RunEffect::ControlChanged(ControlChange::Released));
+    fn human_released(&mut self, epoch: crate::model::pty_control::ControllerEpoch) {
+        self.record(RunEffect::ControlChanged(ControlChange::Released(epoch)));
     }
 
     fn retire(
@@ -2005,12 +2030,16 @@ impl crate::pty_input::ControlHooks for SidecarControlHooks {
                 let _ = entry.control.shutdown(std::net::Shutdown::Read);
             }
             Retirement::Viewer { conn } => {
+                // The takeover's `pty.control_changed` is already queued; this
+                // tells the retiring thread when it is in the event log.
+                let (done, recorded) = std::sync::mpsc::sync_channel(1);
+                self.record(RunEffect::Recorded(done));
                 // Notifying and shutting down may wait on a stalled connection;
                 // never block the writer with that.
                 let sink = Arc::clone(&self.attach_sink);
                 let control = entry.control;
                 std::thread::spawn(move || {
-                    retire_connection(holder, epoch, &conn, &control, &sink)
+                    retire_connection(holder, epoch, &conn, &control, &sink, &recorded)
                 });
             }
         }
@@ -2030,18 +2059,31 @@ impl crate::pty_input::ControlHooks for SidecarControlHooks {
     }
 }
 
+/// How long retiring a client that could not be told waits for the takeover
+/// to reach the event log before ending its connection.
+#[cfg(unix)]
+const TAKEOVER_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Finish retiring a connection the takeover hook has already removed from the
-/// registry: tell it best-effort, shut the socket down (which also unblocks any
-/// output write stuck on it), and drop its viewer if it had installed one.
+/// registry: tell it, shut the socket down (which also unblocks any output
+/// write stuck on it), and drop its viewer if it had installed one.
 ///
-/// `MSG_RETIRED` is best-effort by design. It shares the connection's framed
-/// writer with the viewer's sender, which holds the lock for one output frame
-/// at a time, so a client that reads its output gets the message within the
-/// 200 ms spin. The lock stays held only while an output write is stalled,
-/// that is, while the client is not reading. Such a client could not read a
-/// message queued behind that output either, so it sees only end of stream.
-/// Nothing depends on delivery: the takeover has already been decided, and
-/// the shutdown follows either way (PR #68 review, open question a).
+/// The client is told in one of two ways, and nothing here can block on it
+/// for long: the takeover has already been decided, and the shutdown follows
+/// either way.
+///
+/// - **`MSG_RETIRED`**, if it can be sent. It shares the connection's framed
+///   writer with the viewer's sender, which holds the lock for one output
+///   frame at a time, so a client that reads its output gets the message
+///   within the 200 ms spin.
+/// - **The event log**, otherwise. The lock stays held only while an output
+///   write is stalled, that is, while the client is not reading, and such a
+///   client could not read a message queued behind that output either (PR #68
+///   review, open question a). It sees only end of stream, whenever it reads
+///   again, and then looks for the takeover of its epoch in the event log. So
+///   the connection ends only once the takeover's `pty.control_changed` is
+///   recorded (`recorded` acknowledges it), or after
+///   [`TAKEOVER_RECORD_GRACE`] if the state root is stalled.
 #[cfg(unix)]
 fn retire_connection(
     holder: crate::model::pty_control::HolderId,
@@ -2049,16 +2091,22 @@ fn retire_connection(
     conn: &Mutex<Box<dyn Write + Send>>,
     control: &std::os::unix::net::UnixStream,
     sink: &AttachSink,
+    recorded: &std::sync::mpsc::Receiver<()>,
 ) {
     use crate::attach_proto::{Frame, write_frame};
 
     let _ = control.set_write_timeout(Some(std::time::Duration::from_millis(200)));
+    let mut told = false;
     for _ in 0..20 {
         if let Ok(mut conn) = conn.try_lock() {
-            let _ = write_frame(&mut *conn, &Frame::Retired(epoch));
+            told = write_frame(&mut *conn, &Frame::Retired(epoch)).is_ok();
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !told {
+        // Returns at once if the effects thread has stopped: the run ended.
+        let _ = recorded.recv_timeout(TAKEOVER_RECORD_GRACE);
     }
     let _ = control.shutdown(std::net::Shutdown::Both);
     let mut tee = lock(sink);
@@ -2786,6 +2834,64 @@ mod tests {
         assert!(lock(&sink).viewer.is_none());
     }
 
+    /// A client whose output is stalled cannot be sent `MSG_RETIRED`; it
+    /// learns of the takeover from the event log when it sees the end of its
+    /// connection. So the end must not come before the takeover is recorded.
+    #[test]
+    fn a_stalled_client_is_cut_off_only_once_the_takeover_is_recorded() {
+        use crate::model::pty_control::{ControllerEpoch, ControllerKind, HolderId};
+        use crate::pty_input::{ControlHooks, Trigger};
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = write_pty_meta(dir.path());
+        let (old_conn, mut client) = UnixStream::pair().unwrap();
+        // The output sender is stuck writing: it holds the framed writer.
+        let conn: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(old_conn.try_clone().unwrap())));
+        let stuck = Arc::clone(&conn);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let sender = std::thread::spawn(move || {
+            let _held = lock(&stuck);
+            let _ = released.recv();
+        });
+        let (mut hooks, _control, teardown) = hooks_for(dir.path());
+        let old = HolderId::new(1);
+        assert!(hooks.registry.insert(
+            old,
+            Registered {
+                retirement: Retirement::Viewer { conn },
+                control: old_conn,
+            },
+        ));
+        // The takeover's record cannot complete while the state root stalls.
+        stall_meta_json(dir.path());
+
+        hooks.human_control(Trigger::Takeover, ControllerEpoch::new(2));
+        hooks.retire(old, ControllerKind::Human, ControllerEpoch::new(2));
+
+        // Well past the 200 ms attempt to send MSG_RETIRED: still open.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        client.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        let early = client.read(&mut byte);
+        assert!(
+            matches!(&early, Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+            "the connection ended before the takeover was recorded: {early:?}"
+        );
+
+        unstall_meta_json(dir.path(), &meta);
+        client.set_nonblocking(false).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(client.read(&mut byte).unwrap(), 0, "the connection ends");
+        let _ = release.send(());
+        sender.join().unwrap();
+        teardown.run();
+    }
+
     /// Control hooks for a session at `dir`, the owner they publish, and the
     /// teardown that ends them.
     fn hooks_for(dir: &Path) -> (SidecarControlHooks, Arc<Mutex<PtyControl>>, PtyTeardown) {
@@ -2846,7 +2952,10 @@ mod tests {
 
         let (done, returned) = std::sync::mpsc::channel();
         let writer_thread = std::thread::spawn(move || {
-            hooks.human_control(crate::pty_input::Trigger::Takeover);
+            hooks.human_control(
+                crate::pty_input::Trigger::Takeover,
+                crate::model::pty_control::ControllerEpoch::new(2),
+            );
             let _ = done.send(());
             hooks
         });
@@ -2891,7 +3000,10 @@ mod tests {
         write_pty_meta(dir.path());
         let (mut hooks, _control, teardown) = hooks_for(dir.path());
 
-        hooks.human_control(crate::pty_input::Trigger::Attach);
+        hooks.human_control(
+            crate::pty_input::Trigger::Attach,
+            crate::model::pty_control::ControllerEpoch::new(1),
+        );
         hooks.input_revoked(ControllerKind::Agent, 1, 2);
         teardown.run();
         // Recorded by the time the teardown returns, without polling.
@@ -2900,7 +3012,7 @@ mod tests {
             ["pty.control_changed", "pty.input_revoked"]
         );
 
-        hooks.human_released();
+        hooks.human_released(crate::model::pty_control::ControllerEpoch::new(1));
         hooks.input_revoked(ControllerKind::Human, 0, 1);
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(control_facts(dir.path()).len(), 2, "nothing after the end");
@@ -3064,14 +3176,14 @@ mod tests {
     /// The typed effects keep the events' v1 data shapes.
     #[test]
     fn run_effects_keep_their_event_data() {
-        use crate::model::pty_control::ControllerKind;
+        use crate::model::pty_control::{ControllerEpoch, ControllerKind};
         use crate::pty_input::{ControlHooks, Trigger};
 
         let dir = tempfile::tempdir().unwrap();
         write_pty_meta(dir.path());
         let (mut hooks, _control, teardown) = hooks_for(dir.path());
-        hooks.human_control(Trigger::Takeover);
-        hooks.human_released();
+        hooks.human_control(Trigger::Takeover, ControllerEpoch::new(3));
+        hooks.human_released(ControllerEpoch::new(3));
         hooks.input_revoked(ControllerKind::Agent, 1, 2);
         let _ = hooks
             .effects
@@ -3091,9 +3203,9 @@ mod tests {
             data,
             [
                 serde_json::json!({"kind": "pty.control_changed",
-                    "data": {"control": "HumanControl", "trigger": "takeover"}}),
+                    "data": {"control": "HumanControl", "trigger": "takeover", "epoch": 3}}),
                 serde_json::json!({"kind": "pty.control_changed",
-                    "data": {"control": "AgentControl", "trigger": "detach"}}),
+                    "data": {"control": "AgentControl", "trigger": "detach", "epoch": 3}}),
                 serde_json::json!({"kind": "pty.input_revoked",
                     "data": {"kind": "Agent", "accepted": 1, "total": 2}}),
                 serde_json::json!({"kind": "recording.stopped",
@@ -3128,8 +3240,13 @@ mod tests {
     struct InertHooks;
 
     impl crate::pty_input::ControlHooks for InertHooks {
-        fn human_control(&mut self, _trigger: crate::pty_input::Trigger) {}
-        fn human_released(&mut self) {}
+        fn human_control(
+            &mut self,
+            _trigger: crate::pty_input::Trigger,
+            _epoch: crate::model::pty_control::ControllerEpoch,
+        ) {
+        }
+        fn human_released(&mut self, _epoch: crate::model::pty_control::ControllerEpoch) {}
         fn retire(
             &mut self,
             _holder: crate::model::pty_control::HolderId,

@@ -69,10 +69,10 @@ pub enum Trigger {
 /// Side effects of ownership changes, run on the writer thread. Implementations
 /// must return promptly; anything that can block belongs on another thread.
 pub trait ControlHooks: Send + 'static {
-    /// A human took control.
-    fn human_control(&mut self, trigger: Trigger);
-    /// No human holds control any more.
-    fn human_released(&mut self);
+    /// A human took control at `epoch`.
+    fn human_control(&mut self, trigger: Trigger, epoch: ControllerEpoch);
+    /// No human holds control any more; `epoch` is the one released.
+    fn human_released(&mut self, epoch: ControllerEpoch);
     /// `holder` was superseded by a takeover at `epoch` and must be retired.
     fn retire(&mut self, holder: HolderId, kind: ControllerKind, epoch: ControllerEpoch);
     /// A request from a superseded controller was stopped.
@@ -567,18 +567,17 @@ fn apply_control<P: WritablePty, H: ControlHooks>(
             reply,
         } => {
             let result = arbiter.claim(holder, kind);
-            if result
-                .as_ref()
-                .is_ok_and(|handle| handle.kind() == ControllerKind::Human)
-            {
-                hooks.human_control(Trigger::Attach);
+            if let Ok(handle) = &result {
+                if handle.kind() == ControllerKind::Human {
+                    hooks.human_control(Trigger::Attach, handle.epoch());
+                }
             }
             let _ = reply.send(result);
         }
         Control::Takeover { holder, reply } => {
             let result = arbiter.takeover(holder);
             if let Ok(takeover) = &result {
-                hooks.human_control(Trigger::Takeover);
+                hooks.human_control(Trigger::Takeover, takeover.handle.epoch());
                 if let Some((retired, kind)) = takeover.retired {
                     hooks.retire(retired, kind, takeover.handle.epoch());
                 }
@@ -632,7 +631,7 @@ fn apply_control<P: WritablePty, H: ControlHooks>(
 /// consumed, so its holder can queue nothing after this.
 fn release<H: ControlHooks>(arbiter: &mut InputArbiter, handle: ControllerHandle, hooks: &mut H) {
     if arbiter.release(&handle).is_ok() && handle.kind() == ControllerKind::Human {
-        hooks.human_released();
+        hooks.human_released(handle.epoch());
     }
 }
 
@@ -689,14 +688,14 @@ mod tests {
     }
 
     impl ControlHooks for Recorded {
-        fn human_control(&mut self, trigger: Trigger) {
+        fn human_control(&mut self, trigger: Trigger, _epoch: ControllerEpoch) {
             self.0
                 .lock()
                 .unwrap()
                 .push(format!("human_control:{trigger:?}"));
         }
 
-        fn human_released(&mut self) {
+        fn human_released(&mut self, _epoch: ControllerEpoch) {
             self.0.lock().unwrap().push("human_released".to_owned());
         }
 

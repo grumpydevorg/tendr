@@ -86,7 +86,7 @@ fn push_over_attach_socket(session_dir: &std::path::Path) -> anyhow::Result<()> 
     use std::io::Read;
     use tendr::attach_proto::{self, Frame, FrameError, Mode, read_frame, write_frame};
 
-    let mut stream = super::attach::connect(session_dir, Mode::Push)?;
+    let (mut stream, _epoch) = super::attach::connect(session_dir, Mode::Push)?;
 
     let mut stdin = std::io::stdin().lock();
     let mut buf = vec![0u8; attach_proto::MAX_FRAME_PAYLOAD];

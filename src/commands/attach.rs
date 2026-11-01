@@ -59,8 +59,48 @@ pub fn cmd_attach(
         } else {
             Mode::Attach
         };
-        let stream = connect(session.path(), mode)?;
-        unix_relay::relay(stream, escape)
+        let (stream, epoch) = connect(session.path(), mode)?;
+        let control = Control {
+            session_dir: session.path().to_path_buf(),
+            run_id: meta.run_id(),
+            epoch,
+        };
+        unix_relay::relay(stream, escape, &control)
+    }
+}
+
+/// The control this attach was granted: its run and controller epoch.
+#[cfg(unix)]
+struct Control {
+    session_dir: std::path::PathBuf,
+    run_id: tendr::model::ids::RunId,
+    epoch: tendr::model::pty_control::ControllerEpoch,
+}
+
+#[cfg(unix)]
+impl Control {
+    /// Whether another client took this control over: the event log records a
+    /// takeover granting the epoch after this one, in this run.
+    ///
+    /// A client that stopped reading its output cannot read the `MSG_RETIRED`
+    /// queued behind it, so the sidecar records the takeover before it ends the
+    /// connection, and the client looks here when it sees the end. An
+    /// unreadable log, or a sidecar that records no epochs, reads as no
+    /// takeover.
+    fn taken_over(&self) -> bool {
+        let Some(successor) = self.epoch.next().ok() else {
+            return false;
+        };
+        let Ok(log) = tendr::events::read_session_events(&self.session_dir) else {
+            return false;
+        };
+        log.events.iter().any(|event| {
+            event.run_id == self.run_id
+                && event.kind.as_str() == "pty.control_changed"
+                && event.data.as_ref().is_some_and(|data| {
+                    data["trigger"] == "takeover" && data["epoch"] == successor.get()
+                })
+        })
     }
 }
 
@@ -70,7 +110,7 @@ const HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Connect to the session's attach socket, check that its listener is this
 /// user's, and complete the v1 hello in `mode`; `attach` and PTY `push` both
-/// start here.
+/// start here. Returns the connection and the controller epoch it was granted.
 ///
 /// Every failure carries its PTY exit code ([`tendr::pty_exit`]): a socket
 /// that is missing or cannot be reached is a runtime failure (84), a listener
@@ -80,7 +120,10 @@ const HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 pub(super) fn connect(
     session_dir: &std::path::Path,
     mode: Mode,
-) -> anyhow::Result<std::os::unix::net::UnixStream> {
+) -> anyhow::Result<(
+    std::os::unix::net::UnixStream,
+    tendr::model::pty_control::ControllerEpoch,
+)> {
     let sock_path = attach_proto::read_sock_path(session_dir)
         .ok_or_else(|| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket not found")))?;
     let mut stream = std::os::unix::net::UnixStream::connect(&sock_path).map_err(|e| {
@@ -98,8 +141,8 @@ pub(super) fn connect(
         ))
     })?;
 
-    hello(&mut stream, mode)?;
-    Ok(stream)
+    let epoch = hello(&mut stream, mode)?;
+    Ok((stream, epoch))
 }
 
 /// Send the v1 hello in `mode` and require the sidecar's acceptance.
@@ -110,7 +153,10 @@ pub(super) fn connect(
 /// read: it, not the failed write, decides the outcome. The write's error is
 /// reported only when no frame can be read.
 #[cfg(unix)]
-fn hello(stream: &mut std::os::unix::net::UnixStream, mode: Mode) -> anyhow::Result<()> {
+fn hello(
+    stream: &mut std::os::unix::net::UnixStream,
+    mode: Mode,
+) -> anyhow::Result<tendr::model::pty_control::ControllerEpoch> {
     let what = verb(mode);
     let transport = |e: std::io::Error| {
         PtyExitCode::Runtime.error(anyhow::anyhow!("{what} handshake failed: {e}"))
@@ -136,11 +182,11 @@ fn hello(stream: &mut std::os::unix::net::UnixStream, mode: Mode) -> anyhow::Res
             return Err(transport(e));
         }
     }
-    hello_reply(reply, what)?;
+    let epoch = hello_reply(reply, what)?;
     // From here an attach waits for output, and a push as long as the terminal
     // applies backpressure.
     stream.set_read_timeout(None).map_err(transport)?;
-    Ok(())
+    Ok(epoch)
 }
 
 #[cfg(unix)]
@@ -158,10 +204,13 @@ fn verb(mode: Mode) -> &'static str {
 /// is a protocol failure (80); a connection that ends first is a transport
 /// failure (84).
 #[cfg(unix)]
-fn hello_reply(reply: Result<Frame, FrameError>, what: &str) -> anyhow::Result<()> {
+fn hello_reply(
+    reply: Result<Frame, FrameError>,
+    what: &str,
+) -> anyhow::Result<tendr::model::pty_control::ControllerEpoch> {
     let protocol = |message: String| Err(PtyExitCode::Protocol.error(anyhow::anyhow!(message)));
     match reply {
-        Ok(Frame::Accepted(_)) => Ok(()),
+        Ok(Frame::Accepted(epoch)) => Ok(epoch),
         Ok(Frame::Rejected { class, reason }) => {
             Err(PtyExitCode::from(class).error(anyhow::anyhow!("{what} refused: {reason}")))
         }
@@ -243,7 +292,11 @@ mod unix_relay {
     /// [`REPORT_GRACE`] applies: SIGHUP means the terminal is gone.
     const MODES_GRACE: Duration = Duration::from_secs(1);
 
-    pub fn relay(stream: UnixStream, escape: EscapeMode) -> anyhow::Result<()> {
+    pub(super) fn relay(
+        stream: UnixStream,
+        escape: EscapeMode,
+        control: &super::Control,
+    ) -> anyhow::Result<()> {
         let socket = |e| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket: {e}"));
         let shutdown = stream.try_clone().map_err(socket)?;
         let reader_stream = stream.try_clone().map_err(socket)?;
@@ -356,8 +409,11 @@ mod unix_relay {
         drop(handlers);
 
         // Only report once the terminal is restored, and never after a user
-        // detach, whose terminal may be the thing that is blocked.
-        let taken_over = ending != Ending::Detached && retired.load(Ordering::SeqCst);
+        // detach, whose terminal may be the thing that is blocked. A client
+        // that was not reading when it was taken over never got the message,
+        // so the event log decides.
+        let taken_over =
+            ending != Ending::Detached && (retired.load(Ordering::SeqCst) || control.taken_over());
         let mut notes = Vec::new();
         if let Ending::Signalled(cancel) = ending {
             notes.push(format!("tendr: attach ended by {}", cancel.name()));

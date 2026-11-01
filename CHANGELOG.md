@@ -87,6 +87,14 @@
   whose sidecar does not act on the kill: `kill` used to print `no_child` and
   exit 0. When the sidecar is gone, `kill` records the run as `SidecarLost`,
   as `status` would, for a `Running` or a `Starting` run.
+- **A client taken over while it was not reading exits 81.** An attach whose
+  terminal had stopped reading during heavy output, and was then taken over,
+  exited 0 with no message once it read again. It never got the takeover
+  notice, which was queued behind its output. It now finds the takeover in
+  the session's event log and exits 81 with `tendr: another client took over
+  this session`. `pty.control_changed` events now carry the controller
+  `epoch`. A client frozen at the takeover still stays alive until it runs
+  again. Both sides need this version.
 
 ## v0.4.1 — capture fixes
 
