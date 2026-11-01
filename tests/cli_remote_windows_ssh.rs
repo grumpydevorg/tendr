@@ -355,7 +355,7 @@ fn start_argv_cwd_and_env_arrive_verbatim() {
         }
         Err(e) => failures.0.push(e),
     }
-    let output = remote.tendr(&["log", session, "--namespace", &remote.namespace]);
+    let output = remote.tendr(&["log", session, "--namespace", &remote.namespace, "--raw"]);
     failures.check(
         String::from_utf8_lossy(&output.stdout).contains(&cwd_text),
         || {
@@ -465,7 +465,7 @@ fn push_wait_kill_and_exit_codes_round_trip() {
             failures.check(output.status.code() == Some(0), || {
                 format!("wait echo: {}", describe(&output))
             });
-            let output = remote.tendr(&["log", "echo", "--namespace", &ns]);
+            let output = remote.tendr(&["log", "echo", "--namespace", &ns, "--raw"]);
             failures.check(
                 String::from_utf8_lossy(&output.stdout).contains(line),
                 || {
