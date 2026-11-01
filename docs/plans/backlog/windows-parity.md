@@ -75,16 +75,6 @@ supported on Unix" (`src/commands/attach.rs:43-46`). Needed:
   Remote attach from a Windows client to a Unix host needs it once remote attach
   moves to `ssh -T`, which remote frame transport owns.
 
-### ssh inherits tendr's own stdio
-
-Windows gives a child every inheritable handle, not just the stdio it is
-given. So `ssh`, and any ProxyCommand it starts, also holds the stdin,
-stdout and stderr tendr inherited from its caller. A ProxyCommand that
-lingers after ssh exits keeps the caller's pipes open after tendr has exited
-(seen in CI with the fake ssh in `tests/cli_remote.rs`). A likely fix, not
-yet tried: clear `HANDLE_FLAG_INHERIT` on tendr's std handles with
-`SetHandleInformation` before spawning ssh.
-
 ### pwsh 7 exec hangs on ARM64
 
 With pwsh 7 as the OpenSSH login shell on windows-11-arm, a remote `exec` hung

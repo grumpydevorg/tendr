@@ -161,6 +161,29 @@ before the remote tendr starts.
 - stdout stays inherited while a thread relays stderr. So the order between
   the two streams is not exact; each stream keeps its own order.
 
+### What ssh is given
+
+- Every call but `attach` gives ssh tendr's stdout. Its stdin is tendr's
+  own for `exec --frame-from-stdin`, otherwise a pipe tendr writes the
+  request (and a `push` body) to. Its stderr is a pipe tendr relays.
+  `attach` gives ssh all three of tendr's streams.
+- No other stream of tendr's reaches ssh. Windows hands a child every
+  inheritable handle in its parent, and the std handles tendr inherited are
+  inheritable, so `spawn` in `src/ssh.rs` clears `HANDLE_FLAG_INHERIT` on
+  them first. The streams tendr does give ssh are unaffected: std passes
+  each as an inheritable duplicate. Everything a `--host` call opens itself
+  is already non-inheritable. Other inheritable handles the caller leaked into
+  tendr (often the caller's own stdio) still pass through, as a leaked fd
+  does on Unix; only an explicit handle list
+  (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) would stop them. That needs a
+  hand-written `CreateProcessW` that also does what the ssh spawn takes
+  from `std::process::Command` (PATH search, piped stdio, `Child` for the
+  deadline's wait and kill), since std's process-attribute API is unstable;
+  the sidecar's raw spawn (`spawn_sidecar_raw`) does none of that.
+- What ssh hands its ProxyCommand is up to ssh. Win32-OpenSSH before its
+  handle allow-list (PowerShell/openssh-portable#852, September 2026) passes
+  on every inheritable handle, its own stdout included.
+
 ### Windows login shells
 
 Windows OpenSSH hands the remote command to cmd.exe by default, or to the
