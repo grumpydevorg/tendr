@@ -264,19 +264,34 @@ observed exit means the sidecar reaped the child, and `SpawnFailed` or
     tasks were gone within half a second; after SIGKILL they survive.
   - Measured on Linux in the cloud PTY plan's step 9, which also chooses the
     fix ([plan](../plans/active/00_cloud-pty-control.md)).
-- **A terminal holder keeps a PTY run going.** Capture ends when the
-  terminal does, so while any process the stop did not reach still holds the
-  terminal, a PTY run whose child has exited stays `Running` with the child
-  unreaped, `kill` returns after about 20 s with `kill_sent`, and the run
-  ends when the last holder exits.
+- **A terminal holder outlives its PTY run.** A process outside the child's
+  session may still hold the terminal after the child has exited, on its own
+  or by a stop. Capture then reads what that process writes for at most 2 s
+  after the child's own output has been read, and ends. The sidecar reaps the
+  child and records its exit, with a run warning `capture ended 2 s after the
+  child exited`. On Linux the warning names the pids that still hold the
+  terminal, found through `/proc/*/fd`; processes of another user are missed.
+  On macOS the child's exit revokes the terminal from every process, so
+  capture ends with the child and there is no warning. The holder keeps
+  running, and its later output is not captured.
+- **An output holder keeps a pipe run going.** A pipe run's capture ends when
+  its stdout and stderr pipes close. A process that inherited them and
+  outlives the child keeps the run `Running`, with the child unreaped, until
+  it exits.
+- **`kill` fails if the run does not end.** `kill` waits for the end to be
+  recorded: by the sidecar, or by reconciliation once no sidecar holds the
+  session (recorded as `SidecarLost`). If the sidecar holds the session but
+  records no end within its wait (about 20 s), `kill` exits 1. The run may
+  still end later.
 - **Graceful stop.** `kill` without `--force`, and `--timeout`, send SIGTERM
   to the group. It escalates to SIGKILL only while the child itself is alive.
   A descendant that ignores SIGTERM can outlive a leader that exits promptly.
   A PTY leader that exits on its hangup leaves SIGTERM for the group's
   remaining members, with no escalation. A timed-out child therefore exits
   up to about 6 s after the deadline, and the run is still recorded as
-  `TimedOut`. A group member that ignores SIGTERM can outlive the timeout,
-  and while it holds the terminal or stdout the run does not end (see the
+  `TimedOut`. A group member that ignores SIGTERM can outlive the timeout.
+  While it holds a pipe run's stdout or stderr, the run does not end (see the
+  output holder above); a PTY run ends at most 2 s after its child (see the
   terminal holder above). Before, the timeout's SIGKILL to the group reached
   it.
 - **Crash before any meta.** The sidecar may crash, or fail to record its

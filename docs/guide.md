@@ -270,6 +270,17 @@ not end (see the run lifecycle's
 SIGKILL at once. A shell cannot pass SIGKILL on, so its background jobs keep
 running.
 
+A PTY run ends with its child, even if a process the child started still holds
+the terminal, such as a `setsid` job. Once the child has exited, tendr captures
+that process's output for up to 2 s more, then records the child's exit. On
+Linux a run warning names the pids that still hold the terminal. The process
+keeps running. A pipe run still waits until every process holding its output
+pipes has exited.
+
+`kill` succeeds only when the run has ended. If the sidecar has not recorded
+the end after about 20 s, `kill` exits 1. If the sidecar is gone, `kill` stops
+the child and records the run as `SidecarLost`.
+
 `wait` and `kill` return once the sidecar has released the session, so a
 `prune` or `start --replace` straight after them finds the session free. If the
 sidecar still holds it after 2 s, they return anyway with a warning on stderr.

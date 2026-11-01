@@ -68,7 +68,7 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
                     outln!("{json}");
                     return Ok(());
                 }
-                // Sidecar didn't act — fall through to report
+                return Err(not_ended(name));
             }
             outln!(
                 "{}",
@@ -115,10 +115,12 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
         return Err(e.into());
     }
 
-    // Wait for sidecar to write terminal state (up to 5 seconds)
+    // Wait up to 5 s for the end to be recorded: by the sidecar, or, once no
+    // sidecar holds the session, by reconciliation, as `status` would.
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(m) = session::read_meta(&session) {
+        if let Ok(mut m) = session::read_meta(&session) {
+            tendr::reconcile::reconcile_sidecar_gone(&session, &mut m)?;
             if m.status().is_terminal() {
                 super::wait::await_release(&session, name, "kill");
                 let json = serde_json::to_string_pretty(&m)?;
@@ -128,10 +130,13 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
         }
     }
 
-    // Sidecar didn't write terminal state in time -- report what we know
-    outln!(
-        "{}",
-        serde_json::json!({"session": name, "result": "kill_sent", "force": force})
-    );
-    Ok(())
+    Err(not_ended(name))
+}
+
+/// The run is still recorded as live after every wait: the kill was sent,
+/// but that is not success.
+fn not_ended(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "kill sent, but session {name} has not ended: its sidecar did not record the end"
+    )
 }

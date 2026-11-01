@@ -241,10 +241,14 @@ A `push` to a pipe session that is not running exits 1.
   before they are on disk. After a failed `output.log` write, capture skips
   the log for the rest of the run; the recorder and the viewer still get
   every chunk.
-- Capture ends when the terminal does, not when the child exits: a
-  background job that keeps the terminal keeps capture going until it closes
-  it. On macOS the session leader's exit ends the session's use of the
-  terminal, so capture ends with the child there.
+- Capture ends when the terminal does, or soon after the child exits. A
+  background job that keeps the terminal is captured for at most 2 s after
+  the child has exited and its output has been read (the holder grace, timed
+  from when the sidecar closes its descriptor, below). Capture then ends, the
+  child is reaped and its exit recorded, and on Linux a run warning names
+  the pids that still hold the terminal (found through `/proc/*/fd`). On
+  macOS the session leader's exit revokes the terminal from every process,
+  so capture ends with the child there.
 - The sidecar keeps its own descriptor for the PTY's slave side
   (close-on-exec, never its controlling terminal) until the child has exited
   and capture has read the master until it would block; then it closes it.

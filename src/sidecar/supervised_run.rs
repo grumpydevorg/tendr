@@ -207,7 +207,9 @@ impl SupervisedRun<Spawned> {
 }
 
 impl SupervisedRun<Running> {
-    /// Capture output until the child closes it, then observe its exit.
+    /// Capture output until the child closes it, then observe its exit. A PTY
+    /// child's capture ends at most 2 s after the child has exited and its
+    /// output has been read, even while other processes hold the terminal.
     ///
     /// # Errors
     /// [`SidecarFailure`] when the exit cannot be observed. The child is
@@ -482,6 +484,12 @@ impl RunCore {
             }
         };
         self.capture_output(log);
+        // A PTY child's capture may have ended at the holder grace, with the
+        // child exited and other processes still holding its terminal.
+        #[cfg(unix)]
+        if let Some(warning) = self.child.terminal_holders_warning() {
+            self.meta.add_warning(warning);
+        }
 
         // End: an exit that cannot be observed cannot be classified.
         self.step = SidecarStep::ChildWait;

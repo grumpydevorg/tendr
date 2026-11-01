@@ -42,6 +42,18 @@ impl SupervisedChild {
             None
         }
     }
+
+    /// Once capture has ended: a run warning if it ended at the holder grace
+    /// (see [`PtyReader`]) while other processes still held the terminal,
+    /// naming them where the platform can list them. `None` for a pipe
+    /// session, or when the terminal closed on its own.
+    pub fn terminal_holders_warning(&self) -> Option<String> {
+        let hold = self.pty_hold.as_ref()?;
+        hold.0
+            .cut_short
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| hold.holders_warning())
+    }
 }
 
 /// Lightweight kill handle for Unix. Carries the ProcessIdentity
@@ -941,12 +953,38 @@ pub fn set_nonblocking(fd: &impl rustix::fd::AsFd) -> io::Result<()> {
 /// restarts output stopped by `^S`, and gives the hold up at once when it is
 /// forced or no reader is running, so no exit waits on a reader that cannot
 /// drain. A graceful stop with this reader running keeps the hold, so what
-/// the child writes as it stops is captured. Once the slave is
-/// released, end of stream comes as before: when every other holder
-/// (descendants that inherited the terminal) has closed it.
+/// the child writes as it stops is captured.
+///
+/// Once the slave is released, other processes may still hold the terminal:
+/// a background job the child left in another session (`setsid`, a tool's
+/// session-leader shell), which no hangup reaches. Such a holder would keep
+/// end of stream, and so the run, waiting for as long as it lives, with the
+/// child an unreaped zombie. So the reader goes on reading what they write
+/// for at most `HOLDER_GRACE` (2 s) after the release, then ends the stream
+/// itself and records that it cut capture short (see
+/// [`SupervisedChild::terminal_holders_warning`]).
 pub struct PtyReader {
     file: File,
-    drain: Option<DrainWatch>,
+    drain: Drain,
+}
+
+/// How long capture keeps reading a PTY after its child has exited and the
+/// master has been drained, while other processes still hold the terminal.
+const HOLDER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Where a [`PtyReader`] is in its child's life.
+enum Drain {
+    /// No child to watch: end of stream comes when the terminal closes.
+    Plain,
+    /// Holding the slave until the child has exited and the master is drained.
+    Holding(DrainWatch),
+    /// The child has exited, the master was drained and the slave released.
+    /// Read what other holders write until the terminal closes or the
+    /// deadline passes, whichever is first.
+    Released {
+        hold: SlaveHold,
+        deadline: std::time::Instant,
+    },
 }
 
 /// What a holding [`PtyReader`] needs to release its hold once drained.
@@ -980,14 +1018,44 @@ struct HoldState {
     slave: std::sync::Mutex<Option<OwnedFd>>,
     /// Capture is reading the master, so it will drain what the child leaves.
     reader_running: std::sync::atomic::AtomicBool,
+    /// Capture ended at [`HOLDER_GRACE`], with the terminal still open.
+    cut_short: std::sync::atomic::AtomicBool,
+    /// The slave's device number, to find the processes that hold it.
+    #[cfg(target_os = "linux")]
+    device: Option<u64>,
 }
 
 impl SlaveHold {
     fn new(slave: OwnedFd) -> Self {
         Self(std::sync::Arc::new(HoldState {
+            #[cfg(target_os = "linux")]
+            device: rustix::fs::fstat(&slave).ok().map(|stat| stat.st_rdev),
             slave: std::sync::Mutex::new(Some(slave)),
             reader_running: std::sync::atomic::AtomicBool::new(false),
+            cut_short: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// The run warning for capture cut short at [`HOLDER_GRACE`]: on Linux,
+    /// with the pids of the processes that hold the terminal now. Other
+    /// platforms do not list them. On macOS the child's exit, as the
+    /// session leader, revokes the terminal from every process, so this
+    /// should not happen there.
+    fn holders_warning(&self) -> String {
+        let grace = HOLDER_GRACE.as_secs();
+        let lead = format!("capture ended {grace} s after the child exited");
+        #[cfg(target_os = "linux")]
+        {
+            let pids = self.0.device.map(terminal_holders).unwrap_or_default();
+            if !pids.is_empty() {
+                let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+                return format!(
+                    "{lead}: processes still hold the terminal: pids {}",
+                    pids.join(", ")
+                );
+            }
+        }
+        format!("{lead}: another process still held the terminal")
     }
 
     fn slave(&self) -> std::sync::MutexGuard<'_, Option<OwnedFd>> {
@@ -1028,7 +1096,10 @@ impl SlaveHold {
 impl PtyReader {
     #[must_use]
     pub fn new(file: File) -> Self {
-        Self { file, drain: None }
+        Self {
+            file,
+            drain: Drain::Plain,
+        }
     }
 
     /// A reader that holds `hold` until the pipe read by `exited` reports
@@ -1036,7 +1107,7 @@ impl PtyReader {
     fn holding_slave(file: File, hold: SlaveHold, exited: File) -> Self {
         Self {
             file,
-            drain: Some(DrainWatch {
+            drain: Drain::Holding(DrainWatch {
                 hold,
                 exited,
                 exit_seen: false,
@@ -1047,8 +1118,8 @@ impl PtyReader {
     /// Capture has taken this reader: from now on a graceful stop keeps the
     /// hold, since this reader will drain what the child leaves.
     fn mark_running(&self) {
-        if let Some(drain) = &self.drain {
-            drain
+        if let Drain::Holding(watch) = &self.drain {
+            watch
                 .hold
                 .0
                 .reader_running
@@ -1056,26 +1127,53 @@ impl PtyReader {
         }
     }
 
+    /// Whether the holder grace has passed, so the stream ends here. Records
+    /// that capture was cut short.
+    fn grace_over(&self) -> bool {
+        let Drain::Released { hold, deadline } = &self.drain else {
+            return false;
+        };
+        let over = std::time::Instant::now() >= *deadline;
+        if over {
+            hold.0
+                .cut_short
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        over
+    }
+
     /// Called when a read would block: wait until the master may be readable,
     /// or, while the slave is held, until the child exits. A read that would
     /// block after the exit was seen means the master is drained, so the slave
-    /// is released instead and the next read sees the end of stream once no
-    /// other process holds the terminal.
+    /// is released instead and the holder grace starts; after that the wait
+    /// ends at the grace's deadline at the latest.
     fn wait_readable(&mut self) -> io::Result<()> {
         use rustix::event::{PollFd, PollFlags, poll};
 
-        let Some(drain) = &mut self.drain else {
-            wait_for(&self.file, PollFlags::IN, None)?;
-            return Ok(());
+        let watch = match &mut self.drain {
+            Drain::Plain => {
+                wait_for(&self.file, PollFlags::IN, None)?;
+                return Ok(());
+            }
+            Drain::Released { deadline, .. } => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                wait_for(&self.file, PollFlags::IN, Some(left))?;
+                return Ok(());
+            }
+            Drain::Holding(watch) => watch,
         };
-        if drain.exit_seen {
+        if watch.exit_seen {
+            let hold = watch.hold.clone();
             // Dropping the watch releases the hold.
-            self.drain = None;
+            self.drain = Drain::Released {
+                hold,
+                deadline: std::time::Instant::now() + HOLDER_GRACE,
+            };
             return Ok(());
         }
         let mut fds = [
             PollFd::new(&self.file, PollFlags::IN),
-            PollFd::new(&drain.exited, PollFlags::IN),
+            PollFd::new(&watch.exited, PollFlags::IN),
         ];
         loop {
             match poll(&mut fds, None) {
@@ -1084,7 +1182,7 @@ impl PtyReader {
                 Err(e) => return Err(e.into()),
             }
         }
-        drain.exit_seen = !fds[1].revents().is_empty();
+        watch.exit_seen = !fds[1].revents().is_empty();
         Ok(())
     }
 }
@@ -1092,6 +1190,11 @@ impl PtyReader {
 impl Read for PtyReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
+            // Checked before each read, so a holder that keeps writing after
+            // the release cannot extend the grace.
+            if self.grace_over() {
+                return Ok(0);
+            }
             match self.file.read(buf) {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.wait_readable()?,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -1099,6 +1202,32 @@ impl Read for PtyReader {
             }
         }
     }
+}
+
+/// The pids of the processes that have the terminal device `device` open,
+/// found through `/proc/*/fd`. Processes whose descriptors this user cannot
+/// read are missed.
+#[cfg(target_os = "linux")]
+fn terminal_holders(device: u64) -> Vec<u32> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let holds = |pid: u32| {
+        std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|fds| {
+            fds.filter_map(Result::ok).any(|fd| {
+                std::fs::metadata(fd.path())
+                    .is_ok_and(|m| m.file_type().is_char_device() && m.rdev() == device)
+            })
+        })
+    };
+    let mut pids: Vec<u32> = procs
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|&pid| holds(pid))
+        .collect();
+    pids.sort_unstable();
+    pids
 }
 
 /// Observes a child's exit without reaping it, so `child_wait` still collects
