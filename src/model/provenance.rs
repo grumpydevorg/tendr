@@ -16,6 +16,9 @@ pub enum Evidence {
     ChildExitObserved,
     /// The child failed to spawn (syscall or platform error).
     SpawnFailedSyscall,
+    /// A PTY session's private attach socket could not be bound, so the child
+    /// was never spawned.
+    AttachSocketFailed,
     /// A declared `--after` dependency did not satisfy.
     DependencyFailed,
     /// Reconciliation: the session lock was released without a terminal write.

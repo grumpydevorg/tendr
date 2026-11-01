@@ -34,6 +34,10 @@
   exe.dev's init leaks two terminal masters into every SSH command, and tendr
   passed them on to the sidecar and the child, keeping those terminals open
   for the run's life. The sidecar now inherits only stdio and its ready pipe.
+- **A socket bind failure no longer looks like a failed spawn.** When a PTY
+  session's attach socket cannot be bound, the run still ends `SpawnFailed`,
+  but its evidence is now `attach_socket_failed`, not `spawn_failed_syscall`.
+  Nothing was spawned.
 - **A lost sidecar no longer leaves its recording "Recording".** When
   reconciliation finds a PTY run's sidecar gone, it now marks the recording
   `Stopped` with reason `sidecar_lost` and logs `recording.stopped` before

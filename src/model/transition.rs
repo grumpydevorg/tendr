@@ -63,12 +63,29 @@ impl Meta {
         &mut self,
         ended_at: EpochTimestamp,
     ) -> Result<(), TransitionError> {
+        self.spawn_failed(ended_at, Evidence::SpawnFailedSyscall)
+    }
+
+    /// Transition Starting → SpawnFailed because a PTY session's attach
+    /// socket could not be bound: the child was never spawned.
+    pub fn transition_attach_socket_failed(
+        &mut self,
+        ended_at: EpochTimestamp,
+    ) -> Result<(), TransitionError> {
+        self.spawn_failed(ended_at, Evidence::AttachSocketFailed)
+    }
+
+    fn spawn_failed(
+        &mut self,
+        ended_at: EpochTimestamp,
+        cause: Evidence,
+    ) -> Result<(), TransitionError> {
         match self.status() {
             RunStatus::Starting => {
                 *self.status_mut() = RunStatus::SpawnFailed { ended_at };
                 self.set_transition_provenance(TransitionProvenance::direct(&[
                     Evidence::SidecarWrite,
-                    Evidence::SpawnFailedSyscall,
+                    cause,
                 ]));
                 Ok(())
             }

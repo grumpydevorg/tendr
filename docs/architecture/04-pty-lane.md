@@ -163,7 +163,8 @@ A `push` to a pipe session that is not running exits 1.
   [02-session-storage.md](02-session-storage.md#pty-attach-socket)).
 - The socket is bound, and `a.sock.path` written, before the child is
   spawned. An unsafe directory, an overlong path, or an existing path fails
-  the start as `SpawnFailed`. The session never runs without a listener.
+  the start as `SpawnFailed`, with `attach_socket_failed` evidence. The
+  session never runs without a listener.
 - After spawn, the lifecycle guard owns the socket. If the recorder, input
   writer or listener cannot start, the guard stops the child and records
   `SidecarFailed { step: attach_bind }`

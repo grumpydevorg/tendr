@@ -1251,7 +1251,8 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
     // --- Spawn child (with SpawnFailed handling inline) ---
     // A PTY session's private attach socket is bound and published before the
     // child exists, so a PTY session never runs without its listener. A bind
-    // failure is a spawn failure: there is no child yet. Dropping the endpoint
+    // failure ends the run as `SpawnFailed` (there is no child yet), with
+    // `attach_socket_failed` evidence rather than a spawn syscall's. Dropping the endpoint
     // removes the socket and its breadcrumb: here if the spawn fails, otherwise
     // in the lifecycle guard before it releases the session lock.
     #[cfg(unix)]
@@ -1266,7 +1267,7 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
             }),
             Err(e) => {
                 meta.add_warning(format!("attach socket unavailable: {e}"));
-                meta.transition_spawn_failed(EpochTimestamp::now())?;
+                meta.transition_attach_socket_failed(EpochTimestamp::now())?;
                 lifecycle.emit(&mut meta, true);
                 session::write_meta_atomic(&session, &meta)?;
                 signal_readiness(&session, ready, &mut meta);

@@ -102,7 +102,7 @@ evidence. A `Starting` meta has no `transition_provenance`.
 | Transition | `kind` | `evidence` |
 |---|---|---|
 | `Running` | `direct` | `sidecar_write`, `child_spawned` |
-| `SpawnFailed` | `direct` | `sidecar_write`, `spawn_failed_syscall` |
+| `SpawnFailed` | `direct` | `sidecar_write`, then `spawn_failed_syscall`, or `attach_socket_failed` when a PTY session's attach socket could not be bound (nothing was spawned) |
 | `Exited` (child exit, kill, timeout) | `direct` | `sidecar_write`, `child_exit_observed` |
 | `Exited` with `SidecarFailed` | `direct` | `sidecar_write`, `supervision_failed` |
 | `DependencyFailed` | `direct` | `sidecar_write`, `dependency_failed` |

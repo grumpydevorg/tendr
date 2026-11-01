@@ -2271,6 +2271,12 @@ fn an_unsafe_socket_directory_fails_start_loudly() {
         std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
         "nothing was created through the symlink"
     );
+    // Nothing was spawned: the evidence names the socket, not a spawn syscall.
+    let evidence = meta["transition_provenance"]["evidence"].to_string();
+    assert!(
+        evidence.contains("attach_socket_failed") && !evidence.contains("spawn_failed_syscall"),
+        "evidence: {evidence}"
+    );
 }
 
 #[test]
