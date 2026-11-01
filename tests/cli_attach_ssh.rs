@@ -3,12 +3,13 @@
 //!
 //! The tests need an sshd and are opt-in. `TENDR_TEST_SSH_HOST` names the ssh
 //! destination; it must accept `BatchMode` logins, for example with a key in
-//! the agent. Without it each test prints one line saying it was skipped.
-//! `TENDR_TEST_SSH_TENDR` is the path of tendr on that host. It defaults to
-//! this build, which is right for `localhost`:
+//! the agent. Without it each test passes at once, printing one line saying
+//! it was skipped (shown with `--nocapture`). `TENDR_TEST_SSH_TENDR` is the
+//! path of tendr on that host. It defaults to this build, which is right for
+//! `localhost`:
 //!
 //! ```text
-//! TENDR_TEST_SSH_HOST=localhost cargo test --test cli_attach_ssh -- --test-threads=1
+//! TENDR_TEST_SSH_HOST=localhost cargo test --test cli_attach_ssh
 //! ```
 //!
 //! Each test keeps its remote state in a fresh `mktemp -d` directory, used as
@@ -29,11 +30,13 @@ use tempfile::TempDir;
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// What the session's child turns on, replayed to every client that attaches.
-const MODES_ON: &str = "\x1b[?1049h\x1b[?1003h";
+const MODES_ON: &str = "\x1b[?1049h\x1b[?1003h\x1b[?2004h";
 /// What a client writes to its terminal to turn those modes off when it leaves.
-const MODES_OFF: &str = "\x1b[?1049l\x1b[?1003l";
-/// A child that turns the modes on, says `set`, then echoes its input visibly.
-const MODES_CAT: &str = r#"stty raw -echo; printf '\033[?1049h\033[?1003h'; echo set; exec cat -v"#;
+const MODES_OFF: &str = "\x1b[?1049l\x1b[?1003l\x1b[?2004l";
+/// A child that turns the modes on, bracketed paste included, says `set`,
+/// then echoes its input visibly.
+const MODES_CAT: &str =
+    r#"stty raw -echo; printf '\033[?1049h\033[?1003h\033[?2004h'; echo set; exec cat -v"#;
 
 /// Options for every ssh: no prompts, and no shared connection, so each ssh
 /// is its own connection and stopping one stops only that one.
@@ -47,14 +50,13 @@ const SSH_OPTIONS: [&str; 6] = [
 ];
 
 /// Run `command` on `host` through the remote login shell, without a terminal.
-fn ssh_batch(host: &str, command: &str) -> Output {
+fn ssh_batch(host: &str, command: &str) -> std::io::Result<Output> {
     assert_cmd::Command::new("ssh")
         .arg("-T")
         .args(SSH_OPTIONS)
         .args([host, command])
         .timeout(CMD_DEADLINE)
         .output()
-        .unwrap()
 }
 
 /// The ssh host and a private remote HOME for one test. Dropping it kills the
@@ -75,7 +77,8 @@ impl Remote {
             return None;
         };
         let tendr = nonempty("TENDR_TEST_SSH_TENDR").unwrap_or_else(tendr_bin);
-        let output = ssh_batch(&host, "mktemp -d");
+        let output = ssh_batch(&host, "mktemp -d")
+            .unwrap_or_else(|e| panic!("ssh {host} mktemp -d did not run: {e}"));
         assert!(
             output.status.success(),
             "ssh {host} mktemp -d failed: {}",
@@ -105,7 +108,9 @@ impl Remote {
     }
 
     fn tendr(&self, args: &[&str]) -> Output {
-        ssh_batch(&self.host, &self.tendr_command(args))
+        let command = self.tendr_command(args);
+        ssh_batch(&self.host, &command)
+            .unwrap_or_else(|e| panic!("ssh {} {command} did not run: {e}", self.host))
     }
 
     /// Start a PTY session running [`MODES_CAT`] and wait until it has set its
@@ -170,8 +175,8 @@ impl Drop for Remote {
             .map(|s| self.tendr_command(&["kill", "--force", s]))
             .collect();
         steps.push(shell_words::join(["rm", "-rf", "--", &self.home]));
-        // Ignored: a session may already be gone, and a panic while unwinding
-        // would abort the test binary.
+        // Ignored, failure included: a session may already be gone, and a
+        // panic while unwinding would abort the test binary.
         let _ = ssh_batch(&self.host, &steps.join("; "));
     }
 }
@@ -261,43 +266,23 @@ fn ssh_paste_with_prefixes_reaches_the_child() {
     remote.start_modes_cat("ssh-paste");
     let mut wrapped = attach(&root, &remote, "paste", "ssh-paste");
 
-    // A prefix followed by another key forwards both.
+    // The child has bracketed paste on, so every byte of a paste is text: a
+    // pasted prefix is not a prefix, and a pasted `Ctrl-\ d` does not detach.
     wrapped.cli.type_bytes(b"\x1b[200~a\x1cb\x1b[201~");
     wrapped.wait_output_contains("^[[200~a^\\b^[[201~");
-    // A doubled prefix forwards one.
     wrapped.cli.type_bytes(b"\x1b[200~c\x1c\x1ce\x1b[201~");
-    wrapped.wait_output_contains("^[[200~c^\\e^[[201~");
-    assert!(!wrapped.exited(), "neither paste detaches");
-    remote.wait_control("ssh-paste", "HumanControl");
-
-    // A paste holding the detach sequence. Recorded, not asserted: the escape
-    // parser does not know about bracketed paste.
+    wrapped.wait_output_contains("^[[200~c^\\^\\e^[[201~");
     wrapped.cli.type_bytes(b"\x1b[200~f\x1cdg\x1b[201~");
-    let outcome = poll_until(Duration::from_secs(10), Duration::from_millis(20), || {
-        if wrapped.exited() {
-            Observation::Ready("detached")
-        } else if wrapped.cli.output().contains("f^\\dg") {
-            Observation::Ready("forwarded the paste intact")
-        } else {
-            Observation::Pending("neither detached nor forwarded".to_owned())
-        }
-    })
-    .unwrap_or_else(|e| panic!("a paste holding Ctrl-\\ d did nothing visible: {e}"));
+    wrapped.wait_output_contains("^[[200~f^\\dg^[[201~");
+    assert!(!wrapped.exited(), "no paste detaches");
+    // Typed outside a paste, a doubled prefix forwards one.
+    wrapped.cli.type_bytes(b"h\x1c\x1ci");
+    wrapped.wait_output_contains("h^\\i");
+    assert!(!wrapped.exited(), "a doubled prefix does not detach");
 
-    if outcome == "detached" {
-        assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
-        remote.wait_control("ssh-paste", "AgentControl");
-    } else {
-        wrapped.cli.type_bytes(b"\x1cd");
-        assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
-    }
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
     wrapped.assert_terminal_restored_but_pendin();
-    let log =
-        String::from_utf8_lossy(&remote.tendr(&["log", "ssh-paste", "--raw"]).stdout).into_owned();
-    let third = log.rsplit("e^[[201~").next().unwrap_or_default();
-    eprintln!(
-        "finding: a bracketed paste holding Ctrl-\\ d {outcome}; after the second paste the child got {third:?}"
-    );
 }
 
 #[test]
@@ -317,11 +302,17 @@ fn ssh_takeover_over_a_stopped_first_client() {
     let takeover = remote.attach_argv("ssh-takeover", &["--takeover"]);
     let mut second = WrappedAttach::spawn_argv(&root, "take-2", &takeover);
     second.wait_output_contains(MODES_ON);
-    remote.wait_control("ssh-takeover", "HumanControl");
     second.cli.type_bytes(b"second");
     second.wait_output_contains("second");
     remote.wait_log_contains("ssh-takeover", "second");
-
+    // The first client is still stalled: it has neither ended nor turned the
+    // modes off. Only resuming its ssh lets it see the takeover.
+    assert!(!first.exited(), "the stopped client ended early");
+    assert!(
+        !after_modes_on(&first.cli.output()).contains(MODES_OFF),
+        "the stopped client turned the modes off early: {:?}",
+        first.cli.output()
+    );
     first.signal(libc::SIGCONT);
     assert_eq!(
         first.wait_exit(Duration::from_secs(15)),

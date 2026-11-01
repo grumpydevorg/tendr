@@ -45,7 +45,7 @@ Run `sync-vm.sh` again after changing a script.
 | `halfopen.sh`, `heal.sh` | VM | Drop one SSH client's packets with `iptables` for N seconds and time when the server notices; the rule is removed four separate ways |
 | `halfopen-exe.sh` | Mac | Freeze the local `ssh` of an attached client with SIGSTOP (exe.dev's own SSH path) |
 | `halfopen-loopback.sh` | Mac | Attach as `acc` over the VM's OpenSSH and run `halfopen.sh` against that connection |
-| `nested-ssh.sh` | Mac | Drive `ssh -t <vm> tendr attach` from a PTY: typing, resize, `Ctrl-]` passthrough, `Ctrl-\ d`, terminal restore |
+| `nested-ssh.sh` | Mac | Resize over `ssh -t <vm> tendr attach` from a PTY with `TERM=xterm-ghostty`. [`tests/cli_attach_ssh.rs`](../../tests/cli_attach_ssh.rs) covers the rest: detach, `Ctrl-]`, paste, terminal restore, takeover |
 | `ptydrive.py` | both | Runs a command in a fresh PTY from a step file (`expect`, `quiet`, `send`, `resize`) with bounded waits |
 | `lib.sh` | VM | Shared settings and helpers; sourced, not run |
 
