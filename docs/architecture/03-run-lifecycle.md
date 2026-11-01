@@ -277,12 +277,16 @@ observed exit means the sidecar reaped the child, and `SpawnFailed` or
   `status` and `start` handles this. It kills the breadcrumb's child by the
   same identity rule and removes the directory without a record. The only
   copy of the failure record is then the lost+found one.
-- **Descriptors opened while `start` lists them.** Where `close_range` is
-  missing (macOS, Linux before 5.11), `start` lists its fds in `/dev/fd`
-  before forking the sidecar. A non-close-on-exec fd another thread opens in
-  that window would reach the sidecar. `start`'s own fds are all
-  close-on-exec, so only a caller's leaked fd is at stake, and that is open
-  before `start` runs.
+- **Descriptors opened while `start` lists them.** `close_range` exists from
+  Linux 5.9, and its `CLOSE_RANGE_CLOEXEC` flag from 5.11. Where the call or
+  the flag is missing (macOS, older Linux) or seccomp denies it, `start` lists
+  its fds in `/dev/fd` before forking the sidecar. A non-close-on-exec fd
+  another thread opens in that window would reach the sidecar. `start`'s own
+  fds are all close-on-exec, so only a caller's leaked fd is at stake, and
+  that is open before `start` runs. If `/dev/fd` cannot be read either,
+  `start` marks every fd from 3 below the soft `RLIMIT_NOFILE`, capped at
+  2^20. An fd above that bound, left from before the limit was lowered,
+  would get through.
 
 Covered elsewhere:
 

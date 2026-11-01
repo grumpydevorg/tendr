@@ -34,10 +34,11 @@ Notes:
   [03-run-lifecycle.md](03-run-lifecycle.md#dependency-wait-start---after).
 - If spawn fails, the sidecar sends a `SpawnFailed` snapshot over the ready
   pipe and the CLI exits non-zero.
-- The sidecar inherits only stdio (on `/dev/null`) and the ready fd. Before
-  exec, `spawn_sidecar` marks every other fd above 2 close-on-exec: one
-  `close_range(CLOSE_RANGE_CLOEXEC)` on Linux 5.11 and later, else the fds
-  listed in `/dev/fd` before the fork. So a descriptor the caller leaked
+- On Unix, the sidecar inherits only stdio (on `/dev/null`) and the ready
+  fd. Before exec, `spawn_sidecar` marks every other fd above 2
+  close-on-exec: one `close_range(CLOSE_RANGE_CLOEXEC)` on Linux 5.11 and
+  later, else the fds listed in `/dev/fd` before the fork, else every fd
+  below the soft `RLIMIT_NOFILE`. So a descriptor the caller leaked
   reaches neither the sidecar nor the child, whose spawn inherits only the
   sidecar's own fds, all opened close-on-exec.
 - Readiness only informs the CLI; the run never depends on it. If the CLI

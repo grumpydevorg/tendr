@@ -16,7 +16,8 @@
 
 ### Fixed
 
-- **A descriptor leaked into `tendr start` no longer reaches the run.**
+- **A descriptor leaked into `tendr start` or `tendr run` no longer reaches
+  the run.**
   exe.dev's init leaks two terminal masters into every SSH command, and tendr
   passed them on to the sidecar and the child, keeping those terminals open
   for the run's life. The sidecar now inherits only stdio and its ready pipe.

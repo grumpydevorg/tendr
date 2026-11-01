@@ -77,7 +77,7 @@ flags:
 |`--on-exit <command>`|Run a command after the child exits. Repeatable.|
 
 The sidecar and the child get no descriptor above stderr from the shell that
-ran `start`. A descriptor left open there, such as a terminal leaked by a
+ran `start` or `run`. A descriptor left open there, such as a terminal leaked by a
 VM's init, does not reach them. `wrap` runs inline, so its command keeps the
 caller's descriptors.
 
