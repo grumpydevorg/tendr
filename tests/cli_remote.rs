@@ -203,11 +203,27 @@ fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
     // The leftover holds only ssh's stderr, as a ProxyCommand does (its stdout
     // is the ssh connection, not ours).
     let tmp = fake_ssh("leftover 30\nerr ssh: connection closed\\n\nexit 255");
-    let (output, took) = host_call(&tmp, "1", &["status", "job"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // tendr's stdout and stderr go to files, so `took` is when tendr exits,
+    // not when the last holder of a pipe lets go. On Windows a child inherits
+    // every inheritable handle, so ssh and the leftover also hold tendr's own
+    // stdio; that is not what this test is about.
+    let out_dir = TempDir::new().unwrap();
+    let stderr_path = out_dir.path().join("stderr");
+    let started = Instant::now();
+    let status = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        .args(["--host", "box", "status", "job"])
+        .env("PATH", tmp.path())
+        .env("TENDR_SSH_CONNECT_TIMEOUT", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(out_dir.path().join("stdout")).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .status()
+        .unwrap();
+    let took = started.elapsed();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
 
     assert!(took < Duration::from_secs(10), "took {took:?}: {stderr}");
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("ssh: connection closed"), "{stderr}");
     assert!(stderr.contains("exit 255"), "{stderr}");
 }
