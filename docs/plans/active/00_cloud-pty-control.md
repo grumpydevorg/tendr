@@ -5,8 +5,8 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 11–15 remain: fixes that step 9's acceptance run on the VM
-called for. Steps 12b and 14 need the VM to verify; the others are local.
+**Status:** steps 12b, 12c and 16 remain. Step 12b needs the VM to verify;
+the others are local.
 
 ## Goal
 
@@ -28,28 +28,6 @@ back is [PTY replay](../backlog/pty-replay.md).
 
 ## Remaining steps (one PR each)
 
-- **Step 11. A dead child ends its run** (local). After the child exits,
-  capture waits for end of output, which waits for every process holding the
-  terminal. A `setsid`, `(cmd &)` or `disown` job, or a tool process omp
-  starts (it leaks the terminal on fds 28 and 30), then keeps the run
-  `Running` with the child an unreaped zombie; `tendr kill` waits about 20 s
-  and prints `kill_sent` with exit 0, and `ended_at` records the holder's
-  exit. Repro: `tendr start x --pty -- sh -c "setsid sleep 45 & exec sleep
-  600"`, then `tendr kill x`. Fix: once the child has exited and its output
-  drained, end capture after a bounded wait (2 s), reap, and add a warning
-  naming the pids that still hold the terminal. `kill` does not report
-  success for a run that did not end. (`supervise` in
-  `src/sidecar/supervised_run.rs`; `PtyReader` in `src/platform/unix.rs`;
-  `src/commands/kill.rs`.)
-- **Step 12a. `--timeout` stops gracefully** (local). Today it sends SIGKILL
-  to the group at once (`setup_timeout` in `src/sidecar.rs` calls
-  `kill_child(…, true)`). Make it `kill`'s sequence: a PTY run is hung up
-  first, a pipe run gets SIGTERM; then SIGTERM after at most 1 s and SIGKILL
-  after at most 5 s more, as for `kill`, so a timed-out run can end up to
-  about 6 s past its deadline. The data: Claude Code and a shell cleaned up
-  their children after a hangup but not after SIGKILL. Update the guide's
-  Lifecycle line "`kill --force` and `--timeout` send SIGKILL at once", the
-  run lifecycle's Limits, and the changelog.
 - **Step 12b. Stop the whole run on Linux** (local; verify on the VM). The
   sidecar is a child subreaper (`PR_SET_CHILD_SUBREAPER`), so every process
   the run starts stays its descendant, and it reaps adopted orphans by pid
@@ -77,35 +55,12 @@ back is [PTY replay](../backlog/pty-replay.md).
   `proc_pidinfo` and `getsid` worked for same-user processes in another
   session on macOS 27, so the EPERM noted in `src/platform/unix.rs` needs
   rechecking.
-- **Step 13. Close inherited descriptors** (local). exe.dev's `exe-init`
-  leaks two `/dev/ptmx` masters (fds 23 and 25) into every SSH command, and
-  tendr passed them on to the sidecar and the child. `spawn_sidecar` closes
-  every inherited fd above 2 except the ready pipe.
-- **Step 14. A client taken over while stalled exits 81** (local; verify on
-  the VM). An old client that had stopped reading during a flood, was taken
-  over, and resumed after the new client had detached exited 0 with no
-  "another client took over" note (3 of 3 runs); with the new client still
-  attached it exited 81. This reverses a recorded choice: `retire_connection`
-  (`src/sidecar.rs`) does not send `MSG_RETIRED` to a client whose output is
-  stalled, since it could not read it behind the queued output (PR #68), and
-  the client learns of a takeover only from that frame. The fix must tell
-  such a client another way, for example by checking at end of stream
-  whether control moved to a newer epoch. Repro: `scripts/pty-vm/rep_exit.py`.
-  A frozen old client also stays alive after the takeover until it is
-  resumed, blocked writing to its terminal; that is a limit to document.
-- **Step 15. Small fixes found in step 9** (local, one PR):
-   - After `SidecarLost`, `meta.json` still says the recording is
-     `Recording`, with no `recording.stopped` event.
-   - A socket bind failure is recorded as `spawn_failed_syscall` though
-     nothing was spawned.
-   - `tendr status` panics with "Broken pipe" when its reader exits early.
-   - Only `~/.tendr/sockets` is checked, not its parent: another user who can
-     write the parent can make the owner's attach and next start fail
-     (denial of service only; no bytes reached them).
-   - Input the child has not read yet when its controller detaches is
-     revoked, as on a takeover (`pty.input_revoked` after `control_changed
-     trigger=detach`; 17 bytes in step 9). The guide and the PTY lane say so
-     for a takeover only: say it for a detach too.
+- **Step 16. A healed run stops its recording** (local). When a sidecar dies
+  between writing its terminal event and writing `meta.json`, the next CLI
+  call heals the run from the event (`heal_terminal_from_event` in
+  `src/model/transition.rs`), but leaves `pty.recording.state` as
+  `Recording` on the ended run. Mark the recording stopped there too, as
+  `SidecarLost` reconciliation now does.
 
 ## Gates
 
@@ -120,11 +75,11 @@ bracketed-paste-safe escape), Claude Code 2.1.316, omp 18.14.0 and Ghostty
 | Invariant | Result |
 |-----------|--------|
 | Same Claude pid throughout | Pass: pid 17435 through agent push, human typing in Ghostty, agent push, an exe.dev takeover and two reattaches |
-| Old epochs cannot write after an acknowledged takeover | Pass on both half-open paths (SIGSTOP of the Mac's ssh; `iptables` drop on the VM's own sshd): bytes typed into the frozen client never reached the child; the new client had control in 0.5–0.7 s; the old one exited 81 after resuming or healing. Exception: step 14 |
+| Old epochs cannot write after an acknowledged takeover | Pass on both half-open paths (SIGSTOP of the Mac's ssh; `iptables` drop on the VM's own sshd): bytes typed into the frozen client never reached the child; the new client had control in 0.5–0.7 s; the old one exited 81 after resuming or healing. A client taken over while stalled exited 0 instead of 81 until #141 |
 | Viewers cannot block capture or control | Pass: with input full and a stalled viewer during a 250–320 KB/s flood, takeover took 0.071 s on the VM (0.79 s from the Mac), and the recording had no sequence or line gaps. Input still queued at takeover was dropped (50 KB in the `slowread` runs) |
 | Reconnects do not accumulate stale clients | Pass: through 32 idle half-open takeovers the sidecar went from 13 fds, 8 threads, 0 clients to 17/10/1 (one live client) 3 s after the last takeover, unchanged after the heal, and back to 13/8/0 once that client left; no SSH timeout involved |
 | A surviving run stays attachable after logout | Pass with `KillUserProcesses=no`, lingering off and on: same run and pid after relogin. With `KillUserProcesses=yes` logind removed the session 9 ms after the disconnect, and the sidecar and child were gone at the first check 1.4 s later; only a lingering user's `systemd-run --user --scope tendr start …` survived |
-| Terminal bytes stay within the owner's account | Pass with two accounts: every attempt by `intruder` on `acc`'s socket was refused by permissions; with the socket made reachable, the sidecar answered `REJECTED` before reading the hello, and the CLI exits 85 on a foreign listener. Symlinked or foreign `sockets` directories and every bind failure tested (file, symlink, foreign directory, over-long path, EPERM, EROFS) failed the start with no child. Not reachable on the VM, so covered only by the unit test in `src/attach_socket.rs`: an existing file at the computed socket path. Open gaps: step 15 |
+| Terminal bytes stay within the owner's account | Pass with two accounts: every attempt by `intruder` on `acc`'s socket was refused by permissions; with the socket made reachable, the sidecar answered `REJECTED` before reading the hello, and the CLI exits 85 on a foreign listener. Symlinked or foreign `sockets` directories and every bind failure tested (file, symlink, foreign directory, over-long path, EPERM, EROFS) failed the start with no child. Not reachable on the VM, so covered only by the unit test in `src/attach_socket.rs`: an existing file at the computed socket path. The unchecked parent of `sockets/` was fixed in #140 |
 | Detach leaves ordinary Claude input alone | Pass from Ghostty in legacy, kitty and `modifyOtherKeys` modes: `Ctrl-]` passes, prefix then a key forwards both, a doubled prefix forwards one, modes come back on reattach. Ghostty turns a pasted `Ctrl-\` into a space, so the paste case ran over nested `ssh -t`, where it arrived intact. `TENDR_TEST_SSH_HOST=tendr-pty.exe.xyz TENDR_TEST_SSH_TENDR=/usr/local/bin/tendr cargo test --test cli_attach_ssh` (tests at `b2a4e3d`): 4 ran, 4 passed, 12 s |
 | Query handling supports the measured workflow | Pass: no stall started detached; modes replayed on attach; each same-size reattach recorded a repaint pair with a 1.7–1.9 KB redraw about 16 ms later. The full recording: 134 output and 12 resize records, sequence 1–146, no gaps, clean end |
 
