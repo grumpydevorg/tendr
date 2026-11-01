@@ -388,8 +388,9 @@ default ssh shell: `cmd.exe`, PowerShell and POSIX shells only ever run a fixed
 `tendr` command, so they cannot act on a value. A PowerShell login shell
 reports any failure as ssh exit 1, so the remote `tendr` also sends its exit
 code as its last stderr line, which tendr reads and hides: exit codes come
-through PowerShell too. That output and exit codes match through `cmd.exe`
-and PowerShell as they do through a POSIX shell is still being verified.
+through PowerShell too. CI checks values, output and exit codes against a
+real Windows OpenSSH server on x64 and ARM64, under `cmd.exe` and Windows
+PowerShell 5.1.
 Values are carried exactly, not translated, so a Windows session takes
 Windows commands and paths. If you wrap a local-only command in `ssh`
 yourself, quote for the remote shell, for example with
