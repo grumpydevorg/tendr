@@ -375,44 +375,57 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
     }
 }
 
-/// An ssh that exits without a hello while something it started still holds
-/// its stderr (a ProxyCommand that ignores the hangup) does not keep the call
-/// open past the deadline: the exit status is reported.
+/// An ssh that exits without a hello while something it started lingers (a
+/// ProxyCommand that ignores the hangup) does not keep the call open past the
+/// deadline: the exit status is reported, and the caller's stderr reaches end
+/// of file when tendr exits. tendr does not give ssh its stderr, so nothing
+/// ssh starts may hold it; on Windows, where a child is handed every
+/// inheritable handle and not just the stdio it is given, that takes tendr
+/// keeping its own stdio from being inherited.
 #[test]
 fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    // The leftover is given ssh's stderr but not its stdout, as a ProxyCommand
-    // is (its stdout is the ssh connection, not ours).
-    // The leftover runs from the built fake, not the linked `ssh` copy, so it
-    // does not keep that copy (and its temp dir) in use on Windows.
-    let tmp = fake_ssh(&format!(
-        "leftover 30 {}\nerr ssh: connection closed\\n\nexit 255",
-        assert_cmd::cargo::cargo_bin("fake_ssh").display()
-    ));
-    // tendr's stdout and stderr go to files, so `took` is when tendr exits,
-    // not when the last holder of a pipe lets go. On Windows a child inherits
-    // every inheritable handle, so ssh and the leftover also hold tendr's own
-    // stdio; that is not what this test is about.
-    let out_dir = TempDir::new().unwrap();
-    let stderr_path = out_dir.path().join("stderr");
-    let started = Instant::now();
-    let status = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args(["--host", "box", "status", "job"])
-        .env("PATH", tmp.path())
-        .env("TENDR_SSH_CONNECT_TIMEOUT", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::fs::File::create(out_dir.path().join("stdout")).unwrap())
-        .stderr(std::fs::File::create(&stderr_path).unwrap())
-        .status()
-        .unwrap();
-    let took = started.elapsed();
-    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    for args in [&["status", "job"][..], &["exec", "shell", "--", "true"][..]] {
+        // The leftover is given ssh's stderr but not its stdout, as a
+        // ProxyCommand is (its stdout is the ssh connection, not ours).
+        // The leftover runs from the built fake, not the linked `ssh` copy, so
+        // it does not keep that copy (and its temp dir) in use on Windows.
+        let tmp = fake_ssh(&format!(
+            "leftover 30 {}\nerr ssh: connection closed\\n\nexit 255",
+            assert_cmd::cargo::cargo_bin("fake_ssh").display()
+        ));
+        // tendr gives ssh its stdout, for remote output to stream straight
+        // through, and the fake ssh, like an ssh without a handle allow-list,
+        // lets the leftover inherit it: stdout goes to a file. Stderr is
+        // piped, so `took` is when the last holder of the caller's stderr
+        // lets go.
+        let out_dir = TempDir::new().unwrap();
+        let started = Instant::now();
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+            .args(["--host", "box"])
+            .args(args)
+            .env("PATH", tmp.path())
+            .env("TENDR_SSH_CONNECT_TIMEOUT", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(out_dir.path().join("stdout")).unwrap())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let took = started.elapsed();
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(took < Duration::from_secs(10), "took {took:?}: {stderr}");
-    assert_eq!(status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("ssh: connection closed"), "{stderr}");
-    assert!(stderr.contains("exit 255"), "{stderr}");
+        assert!(
+            took < Duration::from_secs(10),
+            "{args:?} took {took:?}: {stderr}"
+        );
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("ssh: connection closed"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains("exit 255"), "{args:?}: {stderr}");
+    }
 }
 
 /// Once the remote tendr has said hello the deadline no longer applies: a
