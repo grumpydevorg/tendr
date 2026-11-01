@@ -26,9 +26,11 @@
   stopped after it (next entry).
 - **A stop ends every process the run started.** Before, `kill`,
   `kill --force` and `--timeout` reached only the child's process group, and
-  in step 9 of the cloud PTY plan most of what an interactive shell or Claude
-  Code had started survived: `setsid`, `nohup`, `(cmd &)` and `disown` jobs,
-  a shell's jobs after SIGKILL, and Claude Code's tool shells, which run in
+  on a Linux VM
+  ([`scripts/pty-vm`](scripts/pty-vm/README.md#what-survives-a-stop)) most of
+  what an interactive shell or Claude Code had started survived: `setsid`,
+  `nohup`, `(cmd &)` and `disown` jobs, a shell's jobs after SIGKILL, and
+  Claude Code's tool shells, which run in
   sessions of their own. After stopping the child, the sidecar now finds the
   rest of the run. On Linux it adopts every process the run orphans, reaps
   them while the run lasts, and searches its descendants. On macOS it
