@@ -1668,6 +1668,15 @@ fn cli_bracketed_paste_with_the_escape_inside_does_not_detach() {
 
     let mut cli = CliAttach::spawn(&root, &["pty-bpaste"]);
     cli.type_until_logged(&root, "pty-bpaste", "bpaste-ready\n");
+    // The client has seen the child turn bracketed paste on.
+    poll_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        if cli.output().contains("\x1b[?2004h") {
+            Observation::Ready(())
+        } else {
+            Observation::Pending("no ?2004h yet".to_owned())
+        }
+    })
+    .unwrap();
 
     // Over the CLI's 4 KiB read buffer, so the paste spans several reads.
     let a = "A".repeat(3000);

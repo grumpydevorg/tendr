@@ -191,8 +191,13 @@ impl EscapeParser {
     /// `ESC [ 200 ~` a paste's start; turning it off ends a paste.
     pub fn set_bracketed_paste(&mut self, on: bool) {
         self.bracketed_paste = on;
-        if !on {
+        if !on && self.pasting {
             self.pasting = false;
+            // A possible paste end held without a deadline becomes an
+            // ordinary unfinished sequence.
+            if !self.partial.is_empty() {
+                self.partial_since = Some(Instant::now());
+            }
         }
     }
 
