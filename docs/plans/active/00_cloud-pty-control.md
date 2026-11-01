@@ -5,9 +5,7 @@ depends_on: []
 
 # Cloud PTY control
 
-**Status:** steps 8 and 9 remain. Step 5's measurement (below) settled step
-6's design, and step 6 shipped: attach restores the terminal's modes and
-nudges a redraw. Step 10, `--unset-env`, shipped too. Step 8 needs any sshd
+**Status:** steps 8 and 9 remain. Step 8 needs any sshd
 (`TENDR_TEST_SSH_HOST`); step 9 the VM.
 
 ## Goal

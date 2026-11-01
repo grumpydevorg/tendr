@@ -108,7 +108,8 @@ Any other `kind` → `Invalid(UnknownKind)`.
 
 - `0x01` = `USER`: a client resize. `correlation` must be `0`.
 - `0x02` = `REPAINT`: a repaint nudge, which shrinks the window and restores it.
-  `correlation` must be nonzero, and both records of the pair share it.
+  `correlation` must be nonzero, and both records of the pair share it. A
+  shrink stands alone when a resize overtook the restore.
 
 Any other cause → `Invalid(UnknownResizeCause)`. A `RESIZE` records a geometry
 that the owner actually applied. Repaint records are tagged, never omitted.

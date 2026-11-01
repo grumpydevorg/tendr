@@ -624,6 +624,10 @@ mod tests {
             Frame::decode(MSG_RESIZE, vec![0, 0, 0, 80]),
             Err(ProtocolError::Malformed("resize"))
         );
+        assert_eq!(
+            Frame::decode(MSG_REPAINT, vec![1]),
+            Err(ProtocolError::Malformed("repaint"))
+        );
         // Unknown and malformed frames leave the stream in sync: the next
         // frame reads.
         let mut bytes = Vec::new();

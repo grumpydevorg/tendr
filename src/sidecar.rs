@@ -2459,13 +2459,13 @@ fn start_repaint(
     static CORRELATION: AtomicU32 = AtomicU32::new(1);
     let correlation = std::num::NonZeroU32::new(CORRELATION.fetch_add(1, Ordering::Relaxed))
         .unwrap_or(std::num::NonZeroU32::MIN);
-    let Some(base) = writer.repaint_shrink(handle, correlation) else {
+    if !writer.repaint_shrink(handle, correlation) {
         return;
-    };
-    let (writer, sink, key) = (writer.clone(), Arc::clone(sink), handle.key());
+    }
+    let (writer, sink) = (writer.clone(), Arc::clone(sink));
     std::thread::spawn(move || {
         wait_for_quiet_output(&sink, REPAINT_QUIET, REPAINT_MAX);
-        writer.repaint_restore(key, base, correlation);
+        writer.repaint_restore(correlation);
     });
 }
 
@@ -2698,6 +2698,38 @@ mod tests {
             request_reject_class(&RequestError::WriterGone),
             RejectClass::Runtime
         );
+    }
+
+    #[test]
+    fn a_repaint_waits_for_quiet_output_but_not_past_its_bound() {
+        use std::time::{Duration, Instant};
+        let quiet = Duration::from_millis(50);
+        let max = Duration::from_millis(300);
+
+        // Nothing written: done once `quiet` has passed.
+        let sink: AttachSink = Arc::default();
+        let start = Instant::now();
+        wait_for_quiet_output(&sink, quiet, max);
+        let waited = start.elapsed();
+        assert!(waited >= quiet && waited < max, "{waited:?}");
+
+        // Output that never stops: done at `max`.
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer = {
+            let (sink, writing) = (Arc::clone(&sink), Arc::clone(&writing));
+            std::thread::spawn(move || {
+                while writing.load(std::sync::atomic::Ordering::SeqCst) {
+                    lock(&sink).last_output = Some(Instant::now());
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let start = Instant::now();
+        wait_for_quiet_output(&sink, quiet, max);
+        let waited = start.elapsed();
+        writing.store(false, std::sync::atomic::Ordering::SeqCst);
+        writer.join().unwrap();
+        assert!(waited >= max, "{waited:?}");
     }
 
     #[test]

@@ -3130,10 +3130,10 @@ fn reattach_at_a_new_size_records_only_a_user_resize() {
         &resize_payload(Geometry::new(30, 100).unwrap()),
     );
     write_msg(&mut human, MSG_REPAINT, &[]);
+    // The sidecar decides on the repaint before it reads this data, and the
+    // shrink would be recorded before the data's echo.
     write_msg(&mut human, MSG_DATA, b"after-repaint\n");
     wait_log_contains(&root, "pty-no-repaint", "after-repaint");
-    // Longer than a repaint's wait for quiet output, so one would be recorded.
-    std::thread::sleep(Duration::from_millis(700));
     write_msg(&mut human, MSG_DETACH, &[]);
     drop(human);
     tendr(&root)

@@ -93,18 +93,16 @@ enum Control {
         key: HandleKey,
         size: Geometry,
     },
-    /// Shrink the PTY by one row so its child redraws; replies with the size
-    /// to restore, or `None` if this repaint does not apply.
+    /// Shrink the PTY by one row so its child redraws; replies whether it
+    /// did.
     RepaintShrink {
         key: HandleKey,
         correlation: NonZeroU32,
-        reply: SyncSender<Option<Geometry>>,
+        reply: SyncSender<bool>,
     },
-    /// Restore `base` after [`Control::RepaintShrink`], if the PTY is still at
-    /// the shrunk size.
+    /// Restore the size the shrink with `correlation` left, if nothing has
+    /// resized the PTY since.
     RepaintRestore {
-        key: HandleKey,
-        base: Geometry,
         correlation: NonZeroU32,
     },
     /// Release now and cancel everything the holder still has queued.
@@ -227,32 +225,23 @@ impl InputWriter {
     /// Start a repaint: shrink the PTY by one row, recorded as
     /// [`ResizeCause::Repaint`], if `handle` authorizes and its last resize
     /// left the size unchanged (a new size already makes the child redraw).
-    /// At most once per such resize. Returns the size
-    /// [`InputWriter::repaint_restore`] puts back, or `None` if nothing was
-    /// shrunk.
-    pub fn repaint_shrink(
-        &self,
-        handle: &ControllerHandle,
-        correlation: NonZeroU32,
-    ) -> Option<Geometry> {
+    /// At most once per such resize. Returns whether it shrank the PTY; if
+    /// so, [`InputWriter::repaint_restore`] must follow.
+    pub fn repaint_shrink(&self, handle: &ControllerHandle, correlation: NonZeroU32) -> bool {
         let (reply, rx) = sync_channel(1);
         self.push_control(Control::RepaintShrink {
             key: handle.key(),
             correlation,
             reply,
         });
-        rx.recv().ok().flatten()
+        rx.recv().unwrap_or(false)
     }
 
-    /// Finish a repaint: restore `base` if `key` still authorizes and the PTY
-    /// is still at the size [`InputWriter::repaint_shrink`] left, so a resize
-    /// or takeover in between wins.
-    pub fn repaint_restore(&self, key: HandleKey, base: Geometry, correlation: NonZeroU32) {
-        self.push_control(Control::RepaintRestore {
-            key,
-            base,
-            correlation,
-        });
+    /// Finish the repaint started with `correlation`: put back the size it
+    /// shrank, unless a resize has applied since. Not tied to control: the
+    /// client may have left, but the shrink must not outlive it.
+    pub fn repaint_restore(&self, correlation: NonZeroU32) {
+        self.push_control(Control::RepaintRestore { correlation });
     }
 
     /// Queue `bytes` and wait for the outcome. Empty input is a no-op.
@@ -396,8 +385,7 @@ fn writer_loop<P: WritablePty, H: ControlHooks>(
     mut hooks: H,
 ) {
     let mut current: Option<Current> = None;
-    // The holder whose last resize left the size unchanged, until it repaints.
-    let mut repaint_due: Option<HolderId> = None;
+    let mut repaint = RepaintState::default();
 
     loop {
         // Take all controls, and the next input if nothing is being written.
@@ -437,7 +425,7 @@ fn writer_loop<P: WritablePty, H: ControlHooks>(
                     &mut next_end,
                 );
             } else {
-                apply_control(control, &mut arbiter, &pty, &mut hooks, &mut repaint_due);
+                apply_control(control, &mut arbiter, &pty, &mut hooks, &mut repaint);
             }
         }
 
@@ -554,12 +542,23 @@ fn disconnect<P: WritablePty, H: ControlHooks>(
     }
 }
 
+/// The writer's view of the repaint nudge.
+#[derive(Default)]
+struct RepaintState {
+    /// The controller whose last resize left the size unchanged, until it
+    /// repaints.
+    due: Option<HandleKey>,
+    /// The size a shrink took away, and its correlation, until restored or
+    /// overtaken by a resize.
+    pending: Option<(Geometry, NonZeroU32)>,
+}
+
 fn apply_control<P: WritablePty, H: ControlHooks>(
     control: Control,
     arbiter: &mut InputArbiter,
     pty: &P,
     hooks: &mut H,
-    repaint_due: &mut Option<HolderId>,
+    repaint: &mut RepaintState,
 ) {
     match control {
         Control::Claim {
@@ -590,7 +589,8 @@ fn apply_control<P: WritablePty, H: ControlHooks>(
             if arbiter.authorize(key).is_ok() {
                 let unchanged = pty.size() == Some(size);
                 pty.resize(size, ResizeCause::User);
-                *repaint_due = unchanged.then_some(key.holder());
+                repaint.due = unchanged.then_some(key);
+                repaint.pending = None;
             }
         }
         Control::RepaintShrink {
@@ -598,27 +598,25 @@ fn apply_control<P: WritablePty, H: ControlHooks>(
             correlation,
             reply,
         } => {
-            let due = arbiter.authorize(key).is_ok() && *repaint_due == Some(key.holder());
-            if due {
-                *repaint_due = None;
+            let mut shrunk = false;
+            if arbiter.authorize(key).is_ok() && repaint.due == Some(key) {
+                repaint.due = None;
+                if let Some(base) = pty.size() {
+                    if let Some(smaller) = Geometry::new(base.rows() - 1, base.cols()) {
+                        pty.resize(smaller, ResizeCause::Repaint { correlation });
+                        repaint.pending = Some((base, correlation));
+                        shrunk = true;
+                    }
+                }
             }
-            let shrink = due
-                .then(|| pty.size())
-                .flatten()
-                .and_then(|base| Some((base, Geometry::new(base.rows() - 1, base.cols())?)));
-            let _ = reply.send(shrink.map(|(base, shrunk)| {
-                pty.resize(shrunk, ResizeCause::Repaint { correlation });
-                base
-            }));
+            let _ = reply.send(shrunk);
         }
-        Control::RepaintRestore {
-            key,
-            base,
-            correlation,
-        } => {
-            let shrunk = Geometry::new(base.rows().saturating_sub(1), base.cols());
-            if arbiter.authorize(key).is_ok() && shrunk.is_some() && pty.size() == shrunk {
-                pty.resize(base, ResizeCause::Repaint { correlation });
+        Control::RepaintRestore { correlation } => {
+            if let Some((base, pending)) = repaint.pending {
+                if pending == correlation {
+                    repaint.pending = None;
+                    pty.resize(base, ResizeCause::Repaint { correlation });
+                }
             }
         }
         Control::Disconnect { .. } => {
@@ -858,18 +856,17 @@ mod tests {
         writer.resize(&old, geometry(24, 80));
         let new = writer.takeover(writer.next_holder()).unwrap().handle;
 
-        assert_eq!(
-            writer.repaint_shrink(&old, correlation(1)),
-            None,
+        assert!(
+            !writer.repaint_shrink(&old, correlation(1)),
             "a superseded client cannot shrink the PTY"
         );
         writer.resize(&new, geometry(24, 80));
-        let base = writer
-            .repaint_shrink(&new, correlation(2))
-            .expect("an attach at the PTY's size repaints");
-        assert_eq!(base, geometry(24, 80));
-        writer.repaint_restore(old.key(), base, correlation(1));
-        writer.repaint_restore(new.key(), base, correlation(2));
+        assert!(
+            writer.repaint_shrink(&new, correlation(2)),
+            "an attach at the PTY's size repaints"
+        );
+        writer.repaint_restore(correlation(1));
+        writer.repaint_restore(correlation(2));
         served(&writer);
 
         let repaint = ResizeCause::Repaint {
@@ -895,17 +892,53 @@ mod tests {
             .unwrap();
 
         writer.resize(&human, geometry(30, 100));
-        assert_eq!(
-            writer.repaint_shrink(&human, correlation(1)),
-            None,
+        assert!(
+            !writer.repaint_shrink(&human, correlation(1)),
             "a new size already redraws"
         );
         writer.resize(&human, geometry(30, 100));
-        assert!(writer.repaint_shrink(&human, correlation(2)).is_some());
-        assert_eq!(
-            writer.repaint_shrink(&human, correlation(3)),
-            None,
+        assert!(writer.repaint_shrink(&human, correlation(2)));
+        assert!(
+            !writer.repaint_shrink(&human, correlation(3)),
             "one repaint per resize that kept the size"
+        );
+    }
+
+    #[test]
+    fn a_one_row_terminal_is_not_shrunk() {
+        let pty = SizedPty::default();
+        let writer = InputWriter::spawn(RunId::new(), pty.clone(), Recorded::default());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+        writer.resize(&human, geometry(1, 80));
+        writer.resize(&human, geometry(1, 80));
+        assert!(!writer.repaint_shrink(&human, correlation(1)));
+        assert_eq!(pty.sizes().len(), 2);
+    }
+
+    #[test]
+    fn a_client_that_leaves_mid_repaint_still_gets_its_size_restored() {
+        let pty = SizedPty::default();
+        let writer = InputWriter::spawn(RunId::new(), pty.clone(), Recorded::default());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+        writer.resize(&human, geometry(24, 80));
+        assert!(writer.repaint_shrink(&human, correlation(1)));
+        writer.disconnect(human);
+        writer.repaint_restore(correlation(1));
+        served(&writer);
+
+        assert_eq!(
+            pty.sizes().last(),
+            Some(&(
+                geometry(24, 80),
+                ResizeCause::Repaint {
+                    correlation: correlation(1)
+                }
+            )),
+            "the shrink does not outlive the client"
         );
     }
 
@@ -917,9 +950,9 @@ mod tests {
             .claim(writer.next_holder(), ControllerKind::Human)
             .unwrap();
         writer.resize(&human, geometry(24, 80));
-        let base = writer.repaint_shrink(&human, correlation(1)).unwrap();
+        assert!(writer.repaint_shrink(&human, correlation(1)));
         writer.resize(&human, geometry(40, 120));
-        writer.repaint_restore(human.key(), base, correlation(1));
+        writer.repaint_restore(correlation(1));
         served(&writer);
 
         assert_eq!(
