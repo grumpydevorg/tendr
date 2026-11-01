@@ -367,6 +367,15 @@ impl Platform for UnixPlatform {
     fn adopt_orphans() -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         {
+            // Without the children files a stop could not find what the
+            // sidecar adopts, which would only pile up as zombies.
+            let main_task = std::process::id();
+            if !Path::new(&format!("/proc/{main_task}/task/{main_task}/children")).exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the kernel does not list children (no CONFIG_PROC_CHILDREN)",
+                ));
+            }
             rustix::process::set_child_subreaper(Some(rustix::process::getpid()))?;
             Ok(true)
         }
@@ -378,13 +387,21 @@ impl Platform for UnixPlatform {
 
     fn reap_orphans(child: &ProcessIdentity) {
         #[cfg(target_os = "linux")]
-        for pid in children(std::process::id()) {
-            if pid == child.pid.get() {
-                continue;
-            }
-            if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
-                // NOHANG: one still running is left for a later pass.
-                let _ = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG);
+        {
+            // A child reaped while a stop reads the children files can make
+            // the kernel skip entries there, so no pass during a stop.
+            let Ok(_walk) = TREE_WALK.try_lock() else {
+                return;
+            };
+            for pid in children(std::process::id()) {
+                if pid == child.pid.get() {
+                    continue;
+                }
+                if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+                    // NOHANG: one still running is left for a later pass.
+                    let _ =
+                        rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG);
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -520,6 +537,10 @@ fn pipe() -> io::Result<(File, File)> {
     Ok((File::from(read_fd), File::from(write_fd)))
 }
 
+/// The hidden subcommand that runs a sidecar (`main.rs`), its first
+/// argument; a stop finds other sessions' sidecars by it.
+const SIDECAR_ARG: &str = "_sidecar";
+
 /// Spawn the sidecar as a detached process.
 /// Returns the sidecar's PID. The sidecar will signal readiness via ready_fd.
 ///
@@ -529,7 +550,7 @@ fn spawn_sidecar(tendr_bin: &Path, session_dir: &Path, ready_write_fd: &File) ->
     let write_fd_raw = ready_write_fd.as_raw_fd();
 
     let mut cmd = Command::new(tendr_bin);
-    cmd.arg("_sidecar")
+    cmd.arg(SIDECAR_ARG)
         .arg("--session-dir")
         .arg(session_dir)
         .env("TENDR_READY_FD", write_fd_raw.to_string());
@@ -979,6 +1000,18 @@ fn children(pid: u32) -> Vec<u32> {
         .collect()
 }
 
+/// Whether `pid` is a tendr sidecar: a session of its own, started from
+/// inside the run, which a stop of the run must leave alone.
+#[cfg(target_os = "linux")]
+fn is_sidecar(pid: u32) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .is_ok_and(|cmdline| cmdline.split(|&b| b == 0).nth(1) == Some(SIDECAR_ARG.as_bytes()))
+}
+
+/// Held by a stop's search and by each reaping pass, which then skips.
+#[cfg(target_os = "linux")]
+static TREE_WALK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// How long a graceful [`stop_descendants`] gives the run's other processes
 /// to exit on SIGTERM. Short of the PTY holder grace (2 s), so a terminal
 /// holder that exits on it, or is then killed, closes the terminal before
@@ -987,28 +1020,35 @@ fn children(pid: u32) -> Vec<u32> {
 const TREE_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long [`stop_descendants`] goes on killing before giving up on
-/// processes that do not die, such as one stuck in uninterruptible sleep.
+/// processes that do not die, such as one in uninterruptible sleep, which
+/// dies only once it wakes.
 #[cfg(target_os = "linux")]
 const TREE_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// End every live descendant of this process except `child` (whose own
 /// descendants are included). The sidecar is a child subreaper, so what the
-/// run orphans stays its descendant.
+/// run orphans stays its descendant. Another tendr sidecar, a session
+/// started from inside the run, is left alone with its whole tree.
 ///
 /// Unless `force`, those found first get SIGTERM (except the members of
-/// `child`'s process group, which the stop has already signalled) and up to
-/// [`TREE_TERM_GRACE`] to exit; a process they start meanwhile, such as a
-/// cleanup helper, is not signalled. Then, until a search finds none, each
-/// process is sent SIGSTOP as it is found, before its children are listed,
-/// so it cannot start more unseen, and all found are sent SIGKILL. A process
-/// started before its parent stopped, or left to this process by a dying
-/// parent, is found by the next search.
+/// `child`'s process group, which the stop has already signalled), then
+/// SIGCONT so a stopped job can act on it, and up to [`TREE_TERM_GRACE`] to
+/// exit; a process they start meanwhile, such as a cleanup helper, is not
+/// signalled. Then each process is sent SIGSTOP as it is found, before its
+/// children are listed, so it cannot start more unseen, and all found are
+/// sent SIGKILL. A process started before its parent stopped, or left to
+/// this process by a dying parent, is found by a later search. The kernel
+/// may skip a child in a list it is changing, so this ends only after two
+/// searches in a row find none.
 #[cfg(target_os = "linux")]
 fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
     use rustix::process::Signal;
 
+    let _walk = TREE_WALK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Processes this user may not signal (a setuid program): reported, not
-    // searched for again.
+    // signalled again, though their children still are.
     let mut refused = BTreeSet::new();
     if !force {
         let group = rustix::process::Pid::from_raw(child as i32);
@@ -1024,7 +1064,9 @@ fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
                     .is_err_and(|e| e.raw_os_error() == Some(libc::EPERM))
             {
                 refused.insert(pid);
+                continue;
             }
+            let _ = send_signal_direct(pid as i32, Signal::CONT);
         }
         while std::time::Instant::now() < deadline
             && !live_descendants(child, &refused, |_| {}).is_empty()
@@ -1034,23 +1076,26 @@ fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
     }
 
     let deadline = std::time::Instant::now() + TREE_STOP_LIMIT;
-    loop {
+    let mut empty_searches = 0;
+    while empty_searches < 2 {
         let found = live_descendants(child, &refused, |pid| {
             let _ = send_signal_direct(pid as i32, Signal::STOP);
         });
         if found.is_empty() {
-            break;
-        }
-        for &pid in &found {
-            if send_signal_direct(pid as i32, Signal::KILL)
-                .is_err_and(|e| e.raw_os_error() == Some(libc::EPERM))
-            {
-                refused.insert(pid);
+            empty_searches += 1;
+        } else {
+            empty_searches = 0;
+            for &pid in &found {
+                if send_signal_direct(pid as i32, Signal::KILL)
+                    .is_err_and(|e| e.raw_os_error() == Some(libc::EPERM))
+                {
+                    refused.insert(pid);
+                }
             }
-        }
-        if std::time::Instant::now() >= deadline {
-            refused.extend(found);
-            break;
+            if std::time::Instant::now() >= deadline {
+                refused.extend(found);
+                break;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1065,18 +1110,26 @@ fn stop_descendants(child: u32, force: bool) -> io::Result<()> {
 }
 
 /// The live descendants of this process, except `child` (whose own
-/// descendants are included) and those in `skip`. Calls `found` on each as
-/// it is found, before its children are listed.
+/// descendants are included) and those in `skip` (whose descendants are).
+/// Another tendr sidecar and its descendants are not included. Calls
+/// `found` on each as it is found, before its children are listed.
 #[cfg(target_os = "linux")]
 fn live_descendants(child: u32, skip: &BTreeSet<u32>, mut found: impl FnMut(u32)) -> BTreeSet<u32> {
     let mut live = BTreeSet::new();
+    let mut seen = BTreeSet::new();
     let mut queue = children(std::process::id());
     while let Some(pid) = queue.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
         if pid != child {
-            if skip.contains(&pid) || !is_live(pid) || !live.insert(pid) {
+            if is_sidecar(pid) || !is_live(pid) {
                 continue;
             }
-            found(pid);
+            if !skip.contains(&pid) {
+                live.insert(pid);
+                found(pid);
+            }
         }
         queue.extend(children(pid));
     }

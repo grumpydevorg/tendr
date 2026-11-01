@@ -585,7 +585,9 @@ impl RunCore {
         self.watch_cancel.store(true, Ordering::Relaxed);
         // A stop under way ends every process the run started before the
         // end is recorded.
-        self.stops.close();
+        for warning in self.stops.close() {
+            self.meta.add_warning(warning);
+        }
         let dir = self.session_dir().to_path_buf();
 
         // Capture has drained the PTY: close the recording at what it holds.
@@ -669,7 +671,9 @@ impl RunCore {
         self.watch_cancel.store(true, Ordering::Relaxed);
 
         let stopped = terminate_and_reap(&mut self.child, &self.kill_handle, &self.identity);
-        self.stops.close();
+        for warning in self.stops.close() {
+            self.meta.add_warning(warning);
+        }
         self.finish_recording();
 
         let dir = self.session_dir().to_path_buf();

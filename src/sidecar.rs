@@ -310,7 +310,8 @@ fn pty_term(spec: &LaunchSpec) -> String {
 /// ended, and ending it ([`StopGate::close`]) waits for those under way. So
 /// a stop has ended every process the run started before the end is
 /// recorded, and neither touches the sidecar's later children: the
-/// `--on-exit` hooks, which run after the end.
+/// `--on-exit` hooks, which run after the end. What a stop could not do is
+/// kept for the run's warnings.
 #[derive(Clone, Default)]
 struct StopGate(Arc<(Mutex<GateState>, std::sync::Condvar)>);
 
@@ -319,6 +320,8 @@ struct GateState {
     ended: bool,
     /// Stops and reaping passes under way.
     active: usize,
+    /// Run warnings from stops.
+    warnings: Vec<String>,
 }
 
 /// Leaves the gate when dropped, so a panic cannot hold the run's end.
@@ -346,10 +349,22 @@ impl StopGate {
         Some(f())
     }
 
+    /// [`stop_run`], unless the run has ended; a failure becomes a run
+    /// warning.
+    fn stop(&self, kill_handle: &<Current as Platform>::ChildKillHandle, force: bool) {
+        self.enter(|| {
+            if let Err(e) = stop_run(kill_handle, force) {
+                lock(&self.0.0)
+                    .warnings
+                    .push(format!("stopping the run: {e}"));
+            }
+        });
+    }
+
     /// End the run: refuse new stops and reaping, and wait for those under
     /// way. Each is bounded: a stop by its grace periods and
-    /// [`Platform::stop_run_tree`]'s limit.
-    fn close(&self) {
+    /// [`Platform::stop_run_tree`]'s limit. Returns the stops' warnings.
+    fn close(&self) -> Vec<String> {
         let (state, changed) = &*self.0;
         let mut state = lock(state);
         state.ended = true;
@@ -358,6 +373,7 @@ impl StopGate {
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        std::mem::take(&mut state.warnings)
     }
 }
 
@@ -409,7 +425,7 @@ fn setup_timeout(
         // run gets SIGTERM, and SIGKILL follows if it does not exit. The
         // live kill handle keeps the stop tree-aware (Job Object on Windows,
         // process group on Unix).
-        let _ = stops.enter(|| stop_run(&kill_handle, false));
+        stops.stop(&kill_handle, false);
     });
     timed_out
 }
@@ -464,7 +480,7 @@ fn setup_kill_watcher(
                 }
 
                 // Use the live kill handle for tree-aware kill.
-                let _ = stops.enter(|| stop_run(&kill_handle, force));
+                stops.stop(&kill_handle, force);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));

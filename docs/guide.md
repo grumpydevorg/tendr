@@ -277,9 +277,10 @@ processes, and tool shells that Claude Code starts in sessions of their own.
 `kill` and `--timeout` send each SIGTERM and give it up to 1 s to exit;
 then, and at once for `kill --force`, each one left is stopped and killed.
 The run's end is recorded after that, so `kill` returns with them gone.
+A session you start with `tendr start` from inside the run is left running.
 A stop cannot reach processes started through another manager, such as
-`systemd-run --user`, `at` or an already running `tmux` server, nor a setuid
-program (run lifecycle,
+`systemd-run --user`, `at` or an already running `tmux` server, nor end a
+setuid program; a run warning names what it could not end (run lifecycle,
 [Limits](architecture/03-run-lifecycle.md#limits)). On macOS a stop reaches
 only the process group: a member that ignores SIGTERM can outlive a leader
 that exits, a shell cannot pass SIGKILL on, so its background jobs keep

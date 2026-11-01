@@ -40,10 +40,12 @@
   killed, at once for `kill --force`. The run's end is recorded after that,
   so a stopped PTY run no longer ends with a warning about processes still
   holding its terminal, and a stopped pipe run no longer waits for a
-  process that holds its output. A stop still cannot reach processes
-  started through another manager (`systemd-run --user`, `at`, an already
-  running `tmux` server), a setuid program, or anything left after the
-  sidecar itself died. On macOS a stop still reaches only the process group.
+  process that holds its output. A tendr session started from inside the
+  run is left running. A stop still cannot reach processes started through
+  another manager (`systemd-run --user`, `at`, an already running `tmux`
+  server) or anything left after the sidecar itself died, nor end a setuid
+  program; a run warning names processes it could not end. On macOS a stop
+  still reaches only the process group.
 
 ### Fixed
 

@@ -258,17 +258,25 @@ of the run (`stop_run` in `src/sidecar.rs`).
    (`PR_SET_CHILD_SUBREAPER`). Every process the run starts then stays a
    descendant of the sidecar, even after its own parent has exited. The
    sidecar reaps these orphans by pid while the run lasts, never with
-   `waitpid(-1)`, which would race the wait for the child. Once the child
-   has exited, or been sent SIGKILL, the sidecar lists its descendants
-   through `/proc/<sidecar>/task/*/children`.
+   `waitpid(-1)`, which would race the wait for the child, and not while a
+   stop is searching. Once the child has exited, or been sent SIGKILL, the
+   sidecar lists its descendants through `/proc/<sidecar>/task/*/children`.
    - A graceful stop sends SIGTERM to each of them outside the child's
-     group, which has had it already, and gives them all up to 1 s to exit.
+     group, which has had it already, then SIGCONT to all of them, so a
+     stopped job can act on it, and gives them up to 1 s to exit.
    - Then each process left is sent SIGSTOP as it is found, so it cannot
-     start more, and then SIGKILL. The search repeats until it finds none,
-     for at most 5 s.
+     start more, and then SIGKILL. The search repeats until two searches in
+     a row find none, for at most 5 s: the kernel may skip a child in a list
+     that is changing as it is read.
    - This reaches a job-control shell's jobs, `nohup` jobs, `setsid`
      processes, `(cmd &)` and `disown` jobs, and programs a child starts in
      sessions of their own, such as Claude Code's Bash tool shells.
+   - A tendr session started from inside the run is a session of its own.
+     The stop leaves its sidecar, found by its `_sidecar` argument, and
+     everything below it alone.
+   - Processes the stop could not signal, or that outlived its 5 s, are
+     named in a run warning `stopping the run: processes the run started
+     outlived the stop: pids …`.
 3. **Then the end is recorded.** The run's end waits until a stop under way
    has finished. So a process the stop ended no longer holds the terminal
    or the output pipes, and capture ends with them. The `--on-exit` hooks
@@ -286,6 +294,8 @@ only the sidecar holds the kill-on-close Job Object.
   (recovered with a warning). While meta is absent or `Starting`,
   reconciliation then has nothing to find. On Windows the Job Object still
   kills the child.
+- **What a stop does not touch.** A tendr session started from inside the
+  run, with its whole tree (above).
 - **What a stop cannot reach.** A stop ends only what it can find.
   - On Linux, it cannot reach:
     - processes started through another manager rather than as the run's
@@ -295,11 +305,17 @@ only the sidecar holds the kill-on-close Job Object.
     - anything left after the sidecar itself died, since reconciliation
       kills only the child's process group (see
       [True crashes](#true-crashes-reconciliation-kills-the-orphan));
-    - a process this user may not signal, such as a setuid program;
-    - a process that SIGKILL does not end within 5 s, such as one stuck in
-      uninterruptible sleep.
+    - anything at all on a kernel built without `CONFIG_PROC_CHILDREN`,
+      which has no children lists. The sidecar then does not adopt orphans
+      either, and the run gets a warning `a stop may miss processes the
+      child leaves behind`.
 
-    These are left running, and the stop does not report them.
+    It also cannot end a process this user may not signal, such as a
+    setuid program, though it reaches that process's children. A process
+    in uninterruptible sleep dies only once it wakes, which may be after
+    the stop's 5 s. The run warning above names both kinds.
+  - Adoption is visible: a process the run daemonises sees the sidecar as
+    its parent (`getppid()`), not pid 1, while the run lasts.
   - On macOS a stop reaches only the child's process group and what its
     hangup reaches. A shell killed with SIGKILL (by `kill --force` or the
     escalation) passes nothing on, so its jobs survive. `(cmd &)` and

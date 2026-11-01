@@ -128,14 +128,35 @@ fn running(pid: i32) -> bool {
     !matches!(state, Some("Z" | "X"))
 }
 
+/// A session's meta as it is on disk, if readable.
+fn read_meta(root: &TempDir, namespace: &str, session: &str) -> Option<serde_json::Value> {
+    let path = root
+        .path()
+        .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
 /// Stop a run with `stop` and return its terminal meta. `kill` returns once
 /// the run's end is recorded; a timed-out run is waited for.
 fn stop_run(root: &TempDir, session: &str, stop: Stop) -> serde_json::Value {
-    let args: &[&str] = match stop {
-        Stop::Kill => &["kill", session],
-        Stop::Force => &["kill", "--force", session],
-        Stop::Timeout => return harness::wait_terminal(root, session),
-    };
+    let args: &[&str] =
+        match stop {
+            Stop::Kill => &["kill", session],
+            Stop::Force => &["kill", "--force", session],
+            Stop::Timeout => {
+                return poll_until(Duration::from_secs(20), Duration::from_millis(50), || {
+                    match read_meta(root, "default", session) {
+                        Some(meta)
+                            if !matches!(meta["status"].as_str(), Some("Starting" | "Running")) =>
+                        {
+                            Observation::Ready(meta)
+                        }
+                        other => Observation::Pending(format!("{other:?}")),
+                    }
+                })
+                .unwrap_or_else(|e| panic!("{session} did not time out: {e}"));
+            }
+        };
     let out = tendr(root).args(args).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -156,7 +177,7 @@ fn every_kind_ends_with_the_run(stop: Stop, session: &str, reason: &str) {
     let mut start = tendr(&root);
     start.args(["start", session, "--pty"]);
     if let Stop::Timeout = stop {
-        start.args(["--timeout", "4"]);
+        start.args(["--timeout", "8"]);
     }
     start
         .args(["--", "bash", "-c", PTY_RUN, "bash"])
@@ -217,9 +238,9 @@ exec sleep 600"#;
     assert!(survivors.is_empty(), "{survivors:?}: {meta}");
 }
 
-/// Traps SIGTERM with a cleanup that takes 0.5 s and then writes `$2`;
+/// Traps SIGTERM with a cleanup that takes 0.3 s and then writes `$2`;
 /// writes its pid to `$1` once the trap is set.
-const CLEANS_UP: &str = r#"trap 'sleep 0.5; echo cleaned > "$2"; exit 0' TERM
+const CLEANS_UP: &str = r#"trap 'sleep 0.3; echo cleaned > "$2"; exit 0' TERM
 echo $$ > "$1.tmp" && mv "$1.tmp" "$1"
 while :; do sleep 0.1; done"#;
 
@@ -259,6 +280,61 @@ wait"#;
     }
     let survivors = kinds.running(&["member", "escapee"]);
     assert!(survivors.is_empty(), "{survivors:?}: {meta}");
+}
+
+/// Force-kills the session `nest/inner` when dropped.
+struct InnerSession<'a>(&'a TempDir);
+
+impl Drop for InnerSession<'_> {
+    fn drop(&mut self) {
+        let _ = tendr(self.0)
+            .args(["kill", "--force", "--namespace", "nest", "inner"])
+            .timeout(harness::CMD_DEADLINE)
+            .output();
+    }
+}
+
+/// A tendr session started from inside a run is a session of its own. Its
+/// sidecar is orphaned once `tendr start` returns, so the outer sidecar
+/// adopts it, but stopping the outer run must leave it and its child
+/// running, as it would have before adoption, when init took it.
+#[test]
+fn a_stop_leaves_a_session_started_inside_the_run_running() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let started = root.path().join("inner-started");
+
+    let script = r#""$1" start --namespace nest inner -- sleep 300 >/dev/null && touch "$2"
+exec sleep 600"#;
+    tendr(&root)
+        .args(["start", "outer", "--pty", "--", "sh", "-c", script, "sh"])
+        .arg(assert_cmd::cargo::cargo_bin("tendr"))
+        .arg(&started)
+        .assert()
+        .success();
+    let _outer = SessionGuard::new(&root, "outer");
+    let _inner = InnerSession(&root);
+    harness::poll_path_exists(&started, Duration::from_secs(10), Duration::from_millis(20))
+        .unwrap_or_else(|e| panic!("the inner session never started: {e}"));
+    harness::wait_running_ns(&root, "nest", "inner");
+    let before = read_meta(&root, "nest", "inner").expect("inner meta");
+    let inner_child = before["child"]["pid"].as_i64().expect("inner child pid") as i32;
+
+    let meta = stop_run(&root, "outer", Stop::Kill);
+    assert_eq!(meta["reason"], "Killed", "{meta}");
+    // Long enough for a dying sidecar to be noticed.
+    std::thread::sleep(Duration::from_millis(500));
+    let out = tendr(&root)
+        .args(["status", "--namespace", "nest", "inner"])
+        .output()
+        .unwrap();
+    let after: serde_json::Value = serde_json::from_slice(&out.stdout).expect("status prints meta");
+    assert_eq!(after["status"], "Running", "{after}");
+    assert_eq!(after["child"]["pid"], before["child"]["pid"], "{after}");
+    assert!(
+        running(inner_child),
+        "inner child {inner_child} died: {after}"
+    );
 }
 
 /// The sidecar adopts what the run orphans, so it must also reap it while
