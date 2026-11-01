@@ -7,13 +7,19 @@
 //!
 //! ```text
 //! args              print each argv entry as `ARG:<value>` on stdout
-//! out <text>        write <text> to stdout (`\n` in <text> is a newline)
+//! out <text>        write <text> to stdout (`\n` is a newline, `\\` a backslash)
 //! err <text>        write <text> to stderr (likewise)
-//! pidfile <path>    write this process's id to <path>
+//! stdin <path>      copy all of stdin to <path>
+//! pidfile <path>    write this process's id to <path>, atomically
 //! touch <path>      create an empty file at <path>
 //! reject-hello      if `--hello` is in argv: clap's error on stderr, exit 2
-//! leftover <secs>   start a process that sleeps <secs> holding only our stderr
-//!                   (as a ProxyCommand that ignores the hangup does)
+//! leftover <secs> <exe>
+//!                   start <exe> (this fixture's built binary) sleeping <secs>,
+//!                   given our stderr and null stdin and stdout, as a
+//!                   ProxyCommand that ignores the hangup is. On Windows it
+//!                   also holds every inheritable handle our caller passed
+//!                   down, so a caller timing tendr must give tendr files,
+//!                   not pipes.
 //! close-stderr      close our stderr
 //! sleep <secs>      sleep
 //! exit <code>       exit with <code>
@@ -31,8 +37,15 @@ const ENV: &str = "FAKE_SSH";
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let script = std::env::var(ENV).unwrap_or_else(|_| {
-        let exe = std::env::current_exe().unwrap();
-        std::fs::read_to_string(exe.with_file_name("fake-ssh-actions")).unwrap_or_default()
+        let actions = std::env::current_exe()
+            .expect("fake ssh: current_exe")
+            .with_file_name("fake-ssh-actions");
+        std::fs::read_to_string(&actions).unwrap_or_else(|e| {
+            panic!(
+                "fake ssh: no FAKE_SSH and cannot read {}: {e}",
+                actions.display()
+            )
+        })
     });
     for line in script.lines().filter(|l| !l.trim().is_empty()) {
         let (action, value) = line.split_once(' ').unwrap_or((line, ""));
@@ -54,7 +67,16 @@ fn main() {
                 err.write_all(unescape(value).as_bytes()).unwrap();
                 err.flush().unwrap();
             }
-            "pidfile" => std::fs::write(value, std::process::id().to_string()).unwrap(),
+            "stdin" => {
+                let mut file = std::fs::File::create(value).unwrap();
+                std::io::copy(&mut std::io::stdin().lock(), &mut file).unwrap();
+            }
+            "pidfile" => {
+                // Written then renamed, so a reader never sees a partial pid.
+                let tmp = format!("{value}.tmp");
+                std::fs::write(&tmp, std::process::id().to_string()).unwrap();
+                std::fs::rename(&tmp, value).unwrap();
+            }
             "touch" => std::fs::write(value, "").unwrap(),
             "reject-hello" => {
                 if argv.iter().any(|a| a == "--hello") {
@@ -63,12 +85,14 @@ fn main() {
                 }
             }
             "leftover" => {
+                let (secs, exe) = value
+                    .split_once(' ')
+                    .expect("fake ssh: leftover <secs> <exe>");
                 // Deliberately not waited for: it must outlive us, as the
                 // background `sleep` of the shell fake it replaces did.
-                stdin_stdout_not_inheritable();
                 #[allow(clippy::zombie_processes)]
-                let _leftover = Command::new(std::env::current_exe().unwrap())
-                    .env(ENV, format!("sleep {value}"))
+                let _leftover = Command::new(exe)
+                    .env(ENV, format!("sleep {secs}"))
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::inherit())
@@ -84,8 +108,26 @@ fn main() {
     }
 }
 
+/// `\n` becomes a newline and `\\` a backslash; any other backslash stays.
 fn unescape(text: &str) -> String {
-    text.replace("\\n", "\n")
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Emulate `ssh` handing the remote command to a POSIX login shell: drop the
@@ -123,7 +165,7 @@ fn exec(mut cmd: Command) -> ! {
     panic!("fake ssh: exec failed: {err}");
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn exec(mut cmd: Command) -> ! {
     let status = cmd.status().expect("fake ssh: spawn failed");
     std::process::exit(status.code().unwrap_or(1));
@@ -143,21 +185,4 @@ fn close_stderr() {
     // SAFETY: closes this process's own stderr handle; nothing in this
     // process writes to stderr afterwards.
     unsafe { CloseHandle(GetStdHandle(STD_ERROR_HANDLE)) };
-}
-
-/// On Unix only the configured stdio reaches a child.
-#[cfg(unix)]
-fn stdin_stdout_not_inheritable() {}
-
-/// Windows hands a child every inheritable handle, not just its configured
-/// stdio, and the stdio this process inherited is inheritable: without this
-/// the leftover would also hold our caller's stdin and stdout.
-#[cfg(windows)]
-fn stdin_stdout_not_inheritable() {
-    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
-    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE] {
-        // SAFETY: clears a flag on this process's own std handle.
-        unsafe { SetHandleInformation(GetStdHandle(which), HANDLE_FLAG_INHERIT, 0) };
-    }
 }

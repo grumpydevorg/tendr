@@ -37,30 +37,61 @@ fn fake_ssh_noop() -> TempDir {
     fake_ssh("exit 0")
 }
 
-/// Whether process `pid` is still running.
+/// A running process, watched from while it is known to be alive so a later
+/// check cannot be fooled by its pid being reused.
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 only probes whether the process still exists.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+struct ProcessWatch(i32);
+
+#[cfg(unix)]
+impl ProcessWatch {
+    fn new(pid: u32) -> Self {
+        Self(i32::try_from(pid).unwrap())
+    }
+
+    /// Whether the process is still running.
+    fn alive(&self) -> bool {
+        // SAFETY: signal 0 only probes whether the process still exists.
+        // Pids are reused only after the counter wraps, which a test lasting
+        // a few seconds does not reach in practice.
+        unsafe { libc::kill(self.0, 0) == 0 }
+    }
 }
 
-/// Whether process `pid` is still running.
+/// A running process, watched from while it is known to be alive so a later
+/// check cannot be fooled by its pid being reused.
 #[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    // SAFETY: the handle is checked before use and closed after.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return false;
-        }
+struct ProcessWatch(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl ProcessWatch {
+    fn new(pid: u32) -> Self {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: plain FFI call; the result is checked.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(!handle.is_null(), "open process {pid}");
+        Self(handle)
+    }
+
+    /// Whether the process is still running. The open handle pins the
+    /// process object, so this is the same process even if the pid is reused.
+    fn alive(&self) -> bool {
+        use windows_sys::Win32::Foundation::STILL_ACTIVE;
+        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
         let mut code = 0u32;
-        let ok = GetExitCodeProcess(handle, &mut code) != 0;
-        CloseHandle(handle);
-        ok && code == STILL_ACTIVE as u32
+        // SAFETY: `self.0` is a valid process handle until drop.
+        let ok = unsafe { GetExitCodeProcess(self.0, &mut code) } != 0;
+        assert!(ok, "GetExitCodeProcess");
+        code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessWatch {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from OpenProcess and is closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
     }
 }
 
@@ -175,7 +206,29 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
         let pid_file = pid_file.path().join("ssh.pid");
         let close = if close_stderr { "close-stderr\n" } else { "" };
         let tmp = fake_ssh(&format!("pidfile {}\n{close}sleep 30", pid_file.display()));
-        let (output, took) = host_call(&tmp, "1", args);
+        let started = Instant::now();
+        let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+            .args(["--host", "box"])
+            .args(args)
+            .env("PATH", tmp.path())
+            .env("TENDR_SSH_CONNECT_TIMEOUT", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The fake ssh writes its pidfile atomically before it stalls.
+        let ssh = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                break ProcessWatch::new(pid.trim().parse().unwrap());
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{args:?}: the fake ssh never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let took = started.elapsed();
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert_eq!(output.status.code(), Some(82), "{args:?}: {stderr}");
@@ -184,12 +237,7 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
             stderr.contains("box") && stderr.contains("did not reach"),
             "{args:?}: the error names the host: {stderr}"
         );
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(!process_alive(pid), "{args:?}: the stalled ssh was killed");
+        assert!(!ssh.alive(), "{args:?}: the stalled ssh was killed");
     }
 }
 
@@ -200,9 +248,14 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
 fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    // The leftover holds only ssh's stderr, as a ProxyCommand does (its stdout
-    // is the ssh connection, not ours).
-    let tmp = fake_ssh("leftover 30\nerr ssh: connection closed\\n\nexit 255");
+    // The leftover is given ssh's stderr but not its stdout, as a ProxyCommand
+    // is (its stdout is the ssh connection, not ours).
+    // The leftover runs from the built fake, not the linked `ssh` copy, so it
+    // does not keep that copy (and its temp dir) in use on Windows.
+    let tmp = fake_ssh(&format!(
+        "leftover 30 {}\nerr ssh: connection closed\\n\nexit 255",
+        assert_cmd::cargo::cargo_bin("fake_ssh").display()
+    ));
     // tendr's stdout and stderr go to files, so `took` is when tendr exits,
     // not when the last holder of a pipe lets go. On Windows a child inherits
     // every inheritable handle, so ssh and the leftover also hold tendr's own
@@ -1214,6 +1267,33 @@ fn host_exec_frame_stdin_passes_through() {
     );
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(envelope["stdout"].as_str().unwrap().contains("piped frame"));
+}
+
+/// The frame reaches ssh's stdin byte for byte: nothing is added, dropped or
+/// re-encoded on the way.
+#[test]
+fn host_exec_frame_stdin_reaches_ssh_unchanged() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    let captured = TempDir::new().unwrap();
+    let captured = captured.path().join("stdin");
+    let tmp = fake_ssh(&format!("stdin {}\nexit 0", captured.display()));
+    let frame = "{\"v\":1,\"session\":\"shell\",\"cmd\":[\"echo\",\"it's \\\"q\\\" \u{e9}\"]}\n";
+    let output = harness::tendr(&root)
+        .args(["--host", "box", "exec", "--frame-from-stdin"])
+        .env("PATH", shim_path_env(&tmp))
+        .write_stdin(frame)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&captured).unwrap(), frame.as_bytes());
 }
 
 #[test]
