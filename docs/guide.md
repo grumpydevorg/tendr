@@ -119,11 +119,20 @@ tendr exec ddb -- "$SQL" | jq -e '.exit_code == 0' >/dev/null || { echo FAIL; ex
 
 `--timeout <sec>` limits how long the client waits. It is client-side only: the
 command may still be running in the session after a timeout. A timed-out
-`exec` exits 124.
+`exec` prints its result and exits 124 at the deadline.
 
 A session runs one `exec` at a time. A second concurrent `exec` fails with
 "another exec is already running on this session". Start a second session
 (`ddb2`, `py2`) for parallel work.
+
+After a timeout, the session is still busy with that command. Until it
+finishes, a later `exec` sends nothing and exits 1 with a message naming the
+earlier exec's token, start time and command. Sending it would let the
+running command read it as input, and mix the late output into the new
+result. Wait for the command to finish (`tendr log dev -f` shows its output)
+and retry, or stop the session with `tendr kill dev`. The same applies when
+an `exec` client dies before its result. An NDJSON session is the
+exception; see below.
 
 The JSON result always holds the full output. The matching `output.log` line
 is shortened when it would be too large. At worst it becomes an

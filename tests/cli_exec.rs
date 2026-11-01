@@ -2469,3 +2469,210 @@ fn exec_result_shape_of_other_targets_is_unchanged() {
         .clone();
     assert_eq!(result_keys(&output.stdout), EXEC_RESULT_KEYS);
 }
+
+// ── exec after a timeout ────────────────────────────────────────────────
+
+/// The token of the session's timed-out exec, from its `agent.exec`
+/// annotation in output.log.
+fn timed_out_token(root: &tempfile::TempDir, session: &str) -> String {
+    let log = std::fs::read_to_string(
+        root.path()
+            .join(format!(".tendr/sessions/default/{session}/output.log")),
+    )
+    .unwrap();
+    log.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|l| l["tag"] == "A" && l["content"]["data"]["timed_out"] == true)
+        .and_then(|l| {
+            l["content"]["data"]["sentinel"]
+                .as_str()?
+                .strip_prefix("TENDR_EXEC_")
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| panic!("no timed-out exec annotation in {session}: {log}"))
+}
+
+/// Assert `output` is a refusal to send an exec while an earlier one is
+/// unfinished: it failed without timing out, printed no result, explained
+/// itself rather than with a bare OS error, and named `token` if given.
+fn assert_refused(output: &std::process::Output, token: Option<&str>) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && output.status.code() != Some(124),
+        "{output:?}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a refusal prints no result: {output:?}"
+    );
+    assert!(!stderr.contains("os error"), "{stderr}");
+    if let Some(token) = token {
+        assert!(stderr.contains(token), "names the earlier exec: {stderr}");
+    }
+}
+
+/// Run `cmd` on `session`, retrying while the earlier exec is unfinished
+/// (each refusal checked by [`assert_refused`]), and return the result of the
+/// exec that ran it.
+fn exec_once_earlier_finishes(
+    root: &tempfile::TempDir,
+    session: &str,
+    cmd: &[&str],
+    token: Option<&str>,
+) -> serde_json::Value {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let output = harness::tendr(root)
+            .args(["exec", session, "--timeout", "20", "--"])
+            .args(cmd)
+            .assert_within_deadline()
+            .get_output()
+            .clone();
+        if output.status.success() {
+            return json(&output.stdout);
+        }
+        assert_refused(&output, token);
+        assert!(
+            std::time::Instant::now() < until,
+            "the earlier exec never finished: {output:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// A timed-out Python REPL exec returns at its deadline. Until its frame
+/// finishes, the next exec is refused with a message that names it, and
+/// nothing is sent; afterwards the next exec gets only its own result, and
+/// the late result file is cleaned up.
+#[test]
+fn exec_after_python_timeout_waits_for_the_earlier_frame() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    harness::tendr(&root)
+        .args(python_start_args("py"))
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "py");
+    harness::wait_running(&root, "py");
+
+    let started = std::time::Instant::now();
+    let slow = harness::tendr(&root)
+        .args([
+            "exec",
+            "py",
+            "--timeout",
+            "1",
+            "--",
+            "import time; time.sleep(12); print('late-py')",
+        ])
+        .assert_within_deadline()
+        .get_output()
+        .clone();
+    assert_eq!(slow.status.code(), Some(124), "{slow:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(6),
+        "returns at its deadline, not when the frame ends: {:?}",
+        started.elapsed()
+    );
+    let token = timed_out_token(&root, "py");
+
+    let too_soon = harness::tendr(&root)
+        .args(["exec", "py", "--timeout", "10", "--", "print('too-soon')"])
+        .assert_within_deadline()
+        .get_output()
+        .clone();
+    assert_refused(&too_soon, Some(&token));
+
+    let next = exec_once_earlier_finishes(&root, "py", &["print('next')"], Some(&token));
+    assert_eq!(
+        next["stdout"].as_str().unwrap().trim_end(),
+        "next",
+        "{next}"
+    );
+    let leftovers: Vec<_> =
+        std::fs::read_dir(root.path().join(".tendr/sessions/default/py/exec-results"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the late result is removed, and no refused exec ran: {leftovers:?}"
+    );
+}
+
+/// A timed-out shell exec returns at its deadline. Until the shell finishes
+/// the command, the next exec is refused with a message that names it; the
+/// command's late stdout and stderr never reach a later exec's result.
+#[test]
+#[cfg(unix)]
+fn exec_after_shell_timeout_never_gets_the_late_output() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let _session = posix_shell(&root, "shell");
+
+    let started = std::time::Instant::now();
+    let slow = harness::tendr(&root)
+        .args(["exec", "shell", "--timeout", "1", "--", "bash", "-c"])
+        .arg("sleep 10; echo late-out; echo late-err >&2")
+        .assert_within_deadline()
+        .get_output()
+        .clone();
+    assert_eq!(slow.status.code(), Some(124), "{slow:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "returns at its deadline, not when the command ends: {:?}",
+        started.elapsed()
+    );
+    let token = timed_out_token(&root, "shell");
+
+    let too_soon = harness::tendr(&root)
+        .args(["exec", "shell", "--timeout", "10", "--", "echo", "too-soon"])
+        .assert_within_deadline()
+        .get_output()
+        .clone();
+    assert_refused(&too_soon, Some(&token));
+
+    let next = exec_once_earlier_finishes(&root, "shell", &["echo", "next"], Some(&token));
+    assert_eq!(next["stdout"], "next", "{next}");
+    assert_eq!(next["stderr"], "", "{next}");
+}
+
+/// An exec whose client dies before the result (killed, or its SSH link
+/// dropped) leaves the same guard as a timeout: the next exec is refused
+/// until the shell finishes, so the late output is never taken as its own.
+#[test]
+#[cfg(unix)]
+fn exec_after_a_killed_client_never_gets_the_late_output() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let _session = posix_shell(&root, "shell");
+
+    let mut client = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        .env("HOME", root.path())
+        .args([
+            "exec",
+            "shell",
+            "--",
+            "bash",
+            "-c",
+            "sleep 5; echo late-out",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // The record is written just before the frame is sent.
+    harness::poll_path_exists(
+        &root
+            .path()
+            .join(".tendr/sessions/default/shell/exec.pending.json"),
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_millis(10),
+    )
+    .unwrap_or_else(|e| panic!("waiting for the exec to send its frame: {e}"));
+    client.kill().unwrap();
+    client.wait().unwrap();
+
+    let next = exec_once_earlier_finishes(&root, "shell", &["echo", "next"], None);
+    assert_eq!(next["stdout"], "next", "{next}");
+}
