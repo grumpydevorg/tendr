@@ -23,7 +23,9 @@ pub const SOCKET_DIR: &str = "sockets";
 pub enum SocketError {
     #[error("cannot locate the tendr state root for {0}")]
     NoStateRoot(PathBuf),
-    #[error("socket directory {path} is not a private directory owned by this user: {reason}")]
+    #[error(
+        "{path} is unsafe for attach sockets: {reason}; it must be a directory owned by this user"
+    )]
     UnsafeDirectory { path: PathBuf, reason: &'static str },
     #[error("socket path {path} is {len} bytes; this platform allows at most {max}")]
     PathTooLong {
@@ -109,6 +111,43 @@ pub fn prepare_private_dir(dir: &Path) -> Result<(), SocketError> {
     Ok(())
 }
 
+/// Verify the state root (`~/.tendr`) that holds `sockets/`: a directory,
+/// symlinks followed, owned by the effective user. Anyone who can write it
+/// can rename `sockets/` away and break the owner's attach and next start,
+/// so group and other write permission is removed from a root we own. Other
+/// bits are left alone. Run before `sockets/` is created or used.
+///
+/// # Errors
+///
+/// [`SocketError::UnsafeDirectory`] for a root that is not a directory or is
+/// owned by another user; [`SocketError::Io`] if it cannot be read or
+/// tightened.
+fn secure_state_root(root: &Path) -> Result<(), SocketError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let io_err = |source| SocketError::Io {
+        path: root.to_path_buf(),
+        source,
+    };
+    let unsafe_dir = |reason| SocketError::UnsafeDirectory {
+        path: root.to_path_buf(),
+        reason,
+    };
+    let meta = std::fs::metadata(root).map_err(io_err)?;
+    if !meta.is_dir() {
+        return Err(unsafe_dir("it is not a directory"));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(unsafe_dir("it is owned by another user"));
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode & !0o022))
+            .map_err(io_err)?;
+    }
+    Ok(())
+}
+
 /// The socket path for a run, checked against the platform's `sun_path` limit.
 ///
 /// # Errors
@@ -153,6 +192,7 @@ pub fn bind_for_session(session_dir: &Path, run_id: RunId) -> Result<BoundSocket
 
     let root = state_root_for(session_dir)
         .ok_or_else(|| SocketError::NoStateRoot(session_dir.to_path_buf()))?;
+    secure_state_root(&root)?;
     prepare_private_dir(&root.join(SOCKET_DIR))?;
     let path = socket_path(&root, session_dir, run_id)?;
     // Never adopt or remove what is already there. `bind` below also refuses an
@@ -524,6 +564,44 @@ mod tests {
         let breadcrumb = std::fs::read_to_string(session.join("a.sock.path")).unwrap();
         assert_eq!(PathBuf::from(breadcrumb.trim()), bound.path);
         assert!(!session.join("a.sock.path.tmp").exists());
+    }
+
+    /// Another user who can write the state root could rename `sockets/`
+    /// away and break the owner's attach and next start. Binding closes that
+    /// door on a root we own.
+    #[test]
+    fn bind_stops_others_writing_the_state_root() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ts")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let session = fake_session(tmp.path());
+        let root = state_root_for(&session).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        bind_for_session(&session, RunId::new()).unwrap();
+        assert_eq!(
+            mode(&root),
+            0o755,
+            "group and other write removed, nothing else"
+        );
+    }
+
+    /// A state root owned by another user is refused: its owner controls
+    /// where the sockets live.
+    #[test]
+    fn bind_refuses_a_state_root_owned_by_another_user() {
+        if rustix::process::geteuid().is_root() {
+            return; // root owns the system directory used below
+        }
+        // A session dir whose state root is `/usr`, which root owns. Nothing
+        // under it is created: the root is checked first.
+        let session = Path::new("/usr/sessions/default/work");
+        let err = bind_for_session(session, RunId::new()).err().unwrap();
+        assert!(
+            matches!(err, SocketError::UnsafeDirectory { ref path, .. } if path == Path::new("/usr")),
+            "{err}"
+        );
     }
 
     #[test]

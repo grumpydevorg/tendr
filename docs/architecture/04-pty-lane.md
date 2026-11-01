@@ -161,6 +161,11 @@ A `push` to a pipe session that is not running exits 1.
 - The socket is bound in `~/.tendr/sockets` (owner-only directory, `0600`
   socket, short name derived from the session and run;
   [02-session-storage.md](02-session-storage.md#pty-attach-socket)).
+- Its parent, `~/.tendr`, is checked first. Anyone who can write it could
+  rename `sockets/` away and break the owner's attach and next start. It must
+  be a directory (symlinks followed) owned by the user. The sidecar removes
+  group and other write permission from it and leaves the other bits alone.
+  A root owned by another user fails the start.
 - The socket is bound, and `a.sock.path` written, before the child is
   spawned. An unsafe directory, an overlong path, or an existing path fails
   the start as `SpawnFailed`, with `attach_socket_failed` evidence. The

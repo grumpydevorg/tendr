@@ -34,6 +34,11 @@
   exe.dev's init leaks two terminal masters into every SSH command, and tendr
   passed them on to the sidecar and the child, keeping those terminals open
   for the run's life. The sidecar now inherits only stdio and its ready pipe.
+- **The attach socket's parent directory is checked too.** Before, only
+  `~/.tendr/sockets` was checked. Another user who could write `~/.tendr`
+  could rename it away and make the owner's attach and next start fail. A PTY
+  start now refuses a `~/.tendr` owned by another user, and removes group and
+  other write permission from one the user owns.
 - **Piping into a reader that exits early no longer panics.** `tendr status
   x | head -c1` crashed with "Broken pipe". Now `status`, `list`, `log`,
   `wait`, `kill`, `start`, `prune` and the other commands drop the rest of

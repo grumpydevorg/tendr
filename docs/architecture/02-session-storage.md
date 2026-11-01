@@ -93,6 +93,8 @@ The attach socket is not in the session dir. It is
 `~/.tendr/sockets/<name>.sock`, where `<name>` is 12 hex characters of a
 SHA-256 over the session path and run ID (`src/attach_socket.rs`). The
 `sockets/` directory is owner-only (`0700`) and the socket is `0600`.
+`~/.tendr` itself must be owned by the user; binding removes group and other
+write permission from it.
 `a.sock.path` in the session dir holds the socket's full path.
 
 Covered elsewhere:
