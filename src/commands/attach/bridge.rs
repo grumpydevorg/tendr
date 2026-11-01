@@ -101,8 +101,8 @@ mod unix {
         };
         let (ends, ended) = mpsc::channel();
         let outbox = Arc::new(Outbox::default());
-        // A failed write to the socket means the session closed it, which
-        // the output direction sees as well.
+        // A failed write to the socket means the session closed it: the
+        // output direction reports that end, a takeover included.
         spawn_sender(
             BufWriter::new(to_session),
             Arc::clone(&outbox),
@@ -111,8 +111,9 @@ mod unix {
         {
             let (outbox, ends) = (Arc::clone(&outbox), ends.clone());
             std::thread::spawn(move || {
-                forward_input(&outbox);
-                let _ = ends.send(End::Left);
+                if forward_input(&outbox) {
+                    let _ = ends.send(End::Left);
+                }
             });
         }
         std::thread::spawn(move || {
@@ -127,26 +128,28 @@ mod unix {
     }
 
     /// Client → session: input waits behind controls, and the client's
-    /// detach is passed on before the connection closes.
-    fn forward_input(outbox: &Outbox) {
+    /// detach is passed on before the connection closes. `true` if the client
+    /// ended its input; `false` if the outbox closed under it because the
+    /// session closed the connection, which the output direction reports.
+    fn forward_input(outbox: &Outbox) -> bool {
         let mut input = io::stdin().lock();
         loop {
             match attach_proto::read_frame(&mut input) {
                 Ok(Frame::Data(bytes)) => {
                     if !outbox.push_data_waiting(bytes) {
-                        return;
+                        return false;
                     }
                 }
                 Ok(frame @ (Frame::Resize(_) | Frame::Repaint)) => outbox.push_control(frame),
                 Ok(Frame::Detach) => {
                     outbox.push_control(Frame::Detach);
                     outbox.wait_controls_sent(DETACH_GRACE);
-                    return;
+                    return true;
                 }
                 // Frames a client does not send, and unknown or malformed
                 // ones, are ignored, as the sidecar ignores them.
                 Ok(_) | Err(FrameError::Malformed(_) | FrameError::Unknown(_)) => {}
-                Err(FrameError::Io(_)) => return,
+                Err(FrameError::Io(_)) => return true,
             }
         }
     }

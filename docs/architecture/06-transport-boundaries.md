@@ -156,23 +156,26 @@ the other operations, and keeps the terminal on the client
   through a queue in which controls go first: at most one resize waits (a
   newer one replaces it), and a repaint or detach is sent once. Input data
   waits behind them, bounded at 1 MiB, past which the bridge stops reading
-  ssh stdin. So a stalled client's resize and detach still reach the
-  session, and a takeover by another client, which arrives on its own
-  connection, never waits for it.
+  ssh stdin. So a client that stops reading its output still has its resize
+  and detach reach the session, and a takeover by another client, which
+  arrives on its own connection, never waits for it. A detach that cannot
+  get past 1 MiB of backed-up input ends the connection instead (below),
+  which the session also treats as a detach.
 - A client taken over while it was not reading cannot read the
   `MSG_RETIRED` queued behind its output. When the session ends the
   connection without one, the remote tendr reads the run's event log as a
   local attach does and, if a takeover granted the next epoch and no detach
   released this one, sends `MSG_RETIRED` itself and exits 81. The client
   reads it once it reads again, and exits 81.
-- When the client leaves (detach, its keyboard closing), it closes ssh stdin;
-  the remote tendr passes on a detach, closes the socket and exits. The
-  client waits at most 1 s for ssh to end, then stops it; the session treats
-  a lost connection as a detach either way. When the session closes the
-  connection, the client takes ssh's exit within 5 s: a lost connection
-  (ssh's 255 without a trailer) exits 1, as before. If the client hangs up
-  while both directions are blocked, the remote tendr notices within 0.2 s
-  (ssh's stdin or stdout reports a hang-up) and closes the socket.
+- When the client leaves, it closes ssh stdin, after a `MSG_DETACH` if the
+  user detached; the remote tendr passes the detach on, closes the socket
+  and exits. The client waits at most 1 s for ssh to end, then stops it; the
+  session treats a lost connection as a detach either way. When the session
+  closes the connection, the client takes ssh's exit within 5 s: a lost
+  connection (ssh's 255 without a trailer) exits 1, as before. If the client
+  hangs up while both directions are blocked, the remote tendr notices within
+  0.2 s (ssh's stdin or stdout reports a hang-up), gives a detach just before
+  it 0.2 s more to pass, and closes the socket.
 - Session and namespace names travel as data in the frame, so the plain-name
   rule of the `ssh -t` command line does not apply.
 

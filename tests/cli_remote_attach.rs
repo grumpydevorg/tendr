@@ -53,24 +53,38 @@ impl Remote {
 
     /// `tendr --host box attach <args>` in a fresh terminal.
     fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
-        let argv: Vec<String> = [tendr_bin(), "--host".into(), "box".into(), "attach".into()]
-            .into_iter()
-            .chain(args.iter().map(|a| (*a).to_owned()))
-            .collect();
-        let path = shim_path_env(&self.ssh);
-        let tendr = tendr_bin();
-        WrappedAttach::spawn_argv_env(
-            root,
-            label,
-            &argv,
-            &[
-                ("PATH", path.to_str().unwrap()),
-                ("TENDR_TEST_BIN", &tendr),
-                ("TENDR_SSH_CONNECT_TIMEOUT", "30"),
-            ],
-        )
+        attach_through(&self.ssh, "30", root, label, args)
     }
+}
 
+/// `tendr --host box attach <args>` in a fresh terminal, through the fake ssh
+/// in `ssh`, with a connect deadline of `deadline` seconds.
+fn attach_through(
+    ssh: &TempDir,
+    deadline: &str,
+    root: &TempDir,
+    label: &str,
+    args: &[&str],
+) -> WrappedAttach {
+    let argv: Vec<String> = [tendr_bin(), "--host".into(), "box".into(), "attach".into()]
+        .into_iter()
+        .chain(args.iter().map(|a| (*a).to_owned()))
+        .collect();
+    let path = shim_path_env(ssh);
+    let tendr = tendr_bin();
+    WrappedAttach::spawn_argv_env(
+        root,
+        label,
+        &argv,
+        &[
+            ("PATH", path.to_str().unwrap()),
+            ("TENDR_TEST_BIN", &tendr),
+            ("TENDR_SSH_CONNECT_TIMEOUT", deadline),
+        ],
+    )
+}
+
+impl Remote {
     /// The last call through this remote ran the constant ssh argv.
     fn assert_constant_argv(&self) {
         let recorded = std::fs::read_to_string(&self.argv).unwrap();
@@ -331,8 +345,11 @@ fn host_attach_keeps_the_exit_codes() {
     let (code, out) = host_attach_exit(&root, &remote, "held", &["host-held"]);
     assert_eq!(code, 81, "{out}");
     assert!(out.contains("human control"), "{out}");
+    // A signal ends a bridged attach as it ends a local one: exit 1.
     holder.signal(libc::SIGTERM);
-    holder.wait_exit(Duration::from_secs(15));
+    assert_eq!(holder.wait_exit(Duration::from_secs(15)), 1);
+    holder.assert_terminal_restored();
+    wait_control(&root, "host-held", "AgentControl");
 
     // A breadcrumb naming a socket nobody listens on.
     let _dead = SessionGuard::new(&root, "host-dead");
@@ -408,4 +425,45 @@ fn remote_attach_requires_its_hello() {
         control(&root, "host-hello").as_deref(),
         Some("AgentControl")
     );
+}
+
+/// The ssh failures keep the codes of every other `--host` command: a remote
+/// tendr that never says hello is stopped at the connect deadline (82), and
+/// ssh's own 255 without an exit trailer is a connection failure (1).
+#[test]
+fn host_attach_ssh_failures_keep_their_codes() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+
+    let silent = fake_ssh("sleep 30");
+    let wrapped = attach_through(&silent, "1", &root, "deadline", &["s"]);
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 82);
+    wrapped.assert_terminal_restored();
+    wrapped.wait_output_contains("did not reach the remote tendr");
+
+    let lost = fake_ssh(&format!("err {}\\n\nexit 255", tendr::ssh::HELLO_LINE));
+    let wrapped = attach_through(&lost, "30", &root, "lost", &["s"]);
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 1);
+    wrapped.assert_terminal_restored();
+    wrapped.wait_output_contains("ssh transport failed");
+}
+
+/// A client that vanishes without detaching (its tendr killed outright)
+/// gives the terminal back to the agent: the remote side sees its input end
+/// and closes the connection.
+#[test]
+fn host_attach_client_killed_gives_control_back() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-killed");
+    start_pty(&root, "host-killed", &["cat"]);
+    let remote = Remote::new();
+
+    let mut wrapped = remote.attach(&root, "killed", &["host-killed"]);
+    wrapped
+        .cli
+        .type_until_logged(&root, "host-killed", "before-kill");
+    wait_control(&root, "host-killed", "HumanControl");
+    wrapped.signal(libc::SIGKILL);
+    wait_control(&root, "host-killed", "AgentControl");
 }
