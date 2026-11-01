@@ -343,7 +343,8 @@ Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
   PTY a row short. Both records carry `REPAINT` and one correlation. Claude
   Code draws nothing on a same-size attach, on a same-size `TIOCSWINSZ`, or
   on SIGWINCH at an unchanged size, but redraws fully on each of the pair
-  (cloud PTY plan, step 5). A sidecar that predates the frame ignores it.
+  ([measured](../../scripts/pty-vm/README.md#claude-code-in-a-tendr-pty) on
+  an exe.dev VM). A sidecar that predates the frame ignores it.
 - Input is not recorded.
 - Sequencing never waits for storage. One recorder thread appends, rotates
   segments at 64 MiB, publishes each segment atomically, and syncs at most

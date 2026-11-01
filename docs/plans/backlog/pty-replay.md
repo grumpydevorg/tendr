@@ -7,7 +7,7 @@ depends_on: []
 
 **Status:** not started. It starts when someone needs to see what a past PTY
 session looked like, not just its bytes: for example, to review a Claude run
-from the [cloud PTY](../active/00_cloud-pty-control.md) acceptance.
+from the [cloud PTY acceptance](../../../scripts/pty-vm/README.md#results-2026-11-01).
 
 Every PTY run is recorded exactly
 ([PTY lane](../../architecture/04-pty-lane.md#recording),

@@ -314,10 +314,11 @@ impl Drop for InnerSession<'_> {
     }
 }
 
-/// A tendr session started from inside a run is a session of its own. Its
-/// sidecar is orphaned once `tendr start` returns, so the outer sidecar
-/// adopts it, but stopping the outer run must leave it and its child
-/// running, as it would have before adoption, when init took it.
+/// A tendr session started from inside a run is a session of its own, and
+/// stopping the outer run must leave it and its child running. Its sidecar
+/// is orphaned once `tendr start` returns: on Linux the outer sidecar adopts
+/// it, so the stop must pass it over; on macOS launchd takes it, and the
+/// stop must not find it through the `tendr start` that was in the run.
 #[test]
 fn a_stop_leaves_a_session_started_inside_the_run_running() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

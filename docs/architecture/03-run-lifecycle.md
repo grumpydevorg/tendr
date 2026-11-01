@@ -260,8 +260,9 @@ of the run (`Platform::stop_run` in `src/platform/`).
      child's group, which has had it already, then SIGCONT to all of them,
      so a stopped job can act on it, and gives them up to 1 s to exit.
    - Then each process left is sent SIGSTOP as it is found, so it cannot
-     start more, and then SIGKILL. The search repeats until two searches in
-     a row find none, for at most 5 s.
+     start more, and the search repeats until it finds nothing new; only
+     then are they all sent SIGKILL. These rounds repeat until two in a row
+     find nothing, for at most 5 s.
    - This reaches a job-control shell's jobs, `nohup` jobs, `setsid`
      processes, `(cmd &)` and `disown` jobs, and programs a child starts in
      sessions of their own, such as Claude Code's Bash tool shells, within
@@ -290,8 +291,8 @@ How the search finds the run:
   read.
 - **macOS.** Orphans go to launchd, so the search looks at every process
   of the same user (`proc_listallpids`, `proc_pidinfo`) and takes:
-  - those in the child's session, or in the sidecar's, which holds a pipe
-    run (`getsid`);
+  - those in the run's session (`getsid`): the child's for a PTY run; for a
+    pipe run the sidecar's, which it leads, and taken only if it does;
   - the sidecar's descendants, by parent pid;
   - before the child is signalled only, those holding the run's terminal
     (`PROC_PIDLISTFDS`, then each vnode descriptor's device);
@@ -337,19 +338,24 @@ since only the sidecar holds the kill-on-close Job Object.
   - Adoption is visible: a process the run daemonises sees the sidecar as
     its parent (`getppid()`), not pid 1, while the run lasts.
   - On macOS, it cannot reach:
-    - a process that left the child's session, has no parent left in the
-      run and holds no terminal descriptor: a `setsid` process orphaned
-      with its output redirected, such as Claude Code's
-      `(setsid tail -f /dev/null >/dev/null 2>&1 &)`. Started once the stop
-      has begun, even one that still holds the terminal is out of reach,
-      since the terminal is revoked;
+    - a process that left the run's session, has no parent left in the run
+      and holds no terminal descriptor: a process that called setsid(2),
+      was orphaned and has its output redirected. Claude Code's
+      `(setsid tail -f /dev/null >/dev/null 2>&1 &)` is one on Linux; macOS
+      has no `setsid` command, but a program can make the same call. Only
+      the listing before the child is signalled looks for terminal
+      holders, so such a process started after it is out of reach even if
+      it holds the terminal;
     - processes started through launchd or another manager, or by a server
       the run asks over a socket;
     - anything left after the sidecar itself died.
 
-    The search lists processes and then signals them, so a process that
-    forks in between is found only by the next search, which repeats until
-    two find none. A fork in the last moment before that can escape.
+    The search lists processes and then signals them, so a process can fork
+    in between. Its child stays below the stopped parent, and the search
+    repeats until it finds nothing new before it kills any of them, so the
+    child is found. What escapes is a child whose parent exits on its own in
+    that moment, if the child has also left the run's session: the first
+    case above.
 - **A terminal holder outlives a PTY child that exits on its own.** A
   process outside the child's session may still hold the terminal after the
   child has exited. Capture then reads what that process writes for at most

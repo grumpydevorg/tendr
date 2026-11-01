@@ -219,6 +219,7 @@ pub trait Platform {
     /// - Windows: only `kill_child`. The kill-on-close Job Object, which
     ///   only the sidecar holds, ends the rest of the tree when the sidecar
     ///   exits.
+    /// - Other Unix systems: only `kill_child`.
     fn stop_run(handle: &Self::ChildKillHandle, force: bool) -> io::Result<()>;
 
     /// Kill an orphaned process by persisted identity (no live handle).
