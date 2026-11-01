@@ -6,10 +6,12 @@ depends_on: []
 # Remote frame transport: make `--host` cross-platform
 
 **Status:** steps 0a, 1, 2, 3, 4, 6 and 7 are done: every `--host` operation
-but `attach` travels as a frame, checked on the Windows lanes under cmd.exe
-and PowerShell. Step 5 (the attach bridge, which the cloud PTY workflow needs;
-see the [VM scripts and results](../../../scripts/pty-vm/README.md)) is the
-only step left.
+but `attach` travels as a frame. The Windows lanes run `start`, `status`,
+`list`, `log`, `push`, `kill`, `wait` and `exec` through a real OpenSSH server
+under cmd.exe and Windows PowerShell 5.1; `watch` is covered only by the fake
+ssh. Step 5 (the attach bridge, which the cloud PTY workflow needs; see the
+[VM scripts and results](../../../scripts/pty-vm/README.md)) is the only step
+left.
 The current contract is in
 [transport boundaries](../../architecture/06-transport-boundaries.md#the-remote-frame).
 

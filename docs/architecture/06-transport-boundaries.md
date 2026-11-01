@@ -168,10 +168,11 @@ shell set in `HKLM:\SOFTWARE\OpenSSH\DefaultShell`. CI's `windows-openssh` job
 runs `tests/cli_remote_windows_ssh.rs` on the x64 and ARM64 lanes against a
 real sshd on the runner, once under cmd.exe and once under Windows PowerShell
 5.1. The tests send session names, child argv, `--cwd`, `--env` values,
-`log --since` and `push` bytes full of shell syntax, and check that the remote
-tendr received them verbatim, that the shell ran none of them, and that exit
-codes come back exactly. They also check that a run outlives the ssh session
-that started it. Locally they are opt-in; the file's header lists the setup.
+`log --since`, `push` bytes and an `exec` payload full of shell syntax, and
+check that the remote tendr received them verbatim, that the shell ran none of
+them, and that exit codes (0, 1, 2 for a refused request, 42) come back
+exactly. They also check that a run outlives the ssh session that started it.
+Locally they are opt-in; the file's header lists the setup.
 
 ## In-process logic
 

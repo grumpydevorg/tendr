@@ -30,8 +30,8 @@ pub enum SessionError {
 }
 
 /// The home directory tendr keeps its state under: `HOME`, or on Windows,
-/// when `HOME` is unset, `USERPROFILE`, which every Windows logon (an
-/// OpenSSH session included) sets.
+/// when `HOME` is unset, `USERPROFILE`. Windows sets `USERPROFILE` for every
+/// logon but does not set `HOME` (Windows OpenSSH sessions do).
 ///
 /// # Errors
 /// Returns an error if neither is set.

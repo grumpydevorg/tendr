@@ -221,8 +221,8 @@ fn windows_kill_graceful_cooperative() {
     );
 }
 
-/// With `HOME` unset, as in a Windows OpenSSH session, tendr keeps its state
-/// under `USERPROFILE`.
+/// With `HOME` unset, which is how Windows starts a process, tendr keeps its
+/// state under `USERPROFILE`.
 #[test]
 fn state_lives_under_userprofile_when_home_is_unset() {
     let profile = tempfile::TempDir::new().unwrap();

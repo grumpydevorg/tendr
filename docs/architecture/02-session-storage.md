@@ -1,7 +1,7 @@
 # Session Storage
 
 Tendr keeps its state under `~/.tendr/`, where `~` is `HOME`, or on Windows,
-when `HOME` is unset (as in an OpenSSH session), `USERPROFILE`. Each session
+when `HOME` is unset (Windows itself does not set it), `USERPROFILE`. Each session
 has one directory, `~/.tendr/sessions/<namespace>/<session>/`. Some files are
 the durable record. Others are short-lived control files, or exist only for
 one kind of session.

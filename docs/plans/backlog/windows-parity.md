@@ -17,8 +17,8 @@ child-tree ownership. Tendr does not translate Bash to PowerShell or Unix paths
 to Windows paths.
 
 Native Windows x64 and ARM64 test lanes already run in required CI. Remote
-`exec` against a Windows host was checked once by hand (2026-07-10, Tendr 0.2.0
-on an ARM Windows VM over SSH); no test covers it.
+`exec` into a PowerShell session on a Windows host is tested on both lanes
+through a real OpenSSH server (`tests/cli_remote_windows_ssh.rs`).
 
 ## Gaps a user hits today
 
@@ -41,8 +41,11 @@ Fix: launch independently by a supported mechanism, or make `start` fail with
 a clear error when it cannot guarantee the session outlives the caller.
 
 Measured on GitHub's Windows runners (2026-11-01; cmd.exe and powershell.exe
-5.1 login shells; x64 and ARM64): a run started over OpenSSH was still
-`Running` 10 s after the session closed (`tests/cli_remote_windows_ssh.rs`).
+5.1 login shells; x64 with the inbox `OpenSSH_9.5p2 for Windows`, ARM64 with
+the portable `OpenSSH_10.4p1 for Windows`, release `10.4.0.0p1-Preview`): a
+run started over OpenSSH was still `Running` 10 s after the session closed
+(`tests/cli_remote_windows_ssh.rs`,
+[run 41292804852](https://github.com/grumpydevorg/tendr/actions/runs/41292804852)).
 
 ### Orphan kill stops only the root process
 
