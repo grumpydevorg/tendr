@@ -3,10 +3,10 @@
 //! `--host` forwards the remote-capable commands (the binary's
 //! `RemoteOperation`) to a remote `tendr`, which runs the *same* local
 //! lifecycle on the far side. Ordinary commands are POSIX-shell-quoted into an
-//! `ssh -T` argv; `exec`
-//! instead rides the [`exec_frame`](crate::exec_frame) over SSH stdin so no
-//! user value ever reaches the remote argv. Destinations are validated
-//! ([`validate_destination`]) to fail closed against option-shaped hosts.
+//! `ssh -T` argv; `exec` instead rides the [`exec_frame`](crate::exec_frame)
+//! over SSH stdin so no user value ever reaches the remote argv. Destinations
+//! are validated ([`validate_destination`]) to fail closed against
+//! option-shaped hosts.
 
 use std::io;
 use std::process::{Command, Stdio};

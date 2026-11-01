@@ -111,7 +111,8 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Which escape the client recognizes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EscapeMode {
     /// `Ctrl-\ d` detaches.
     CtrlBackslash,

@@ -5,11 +5,12 @@ depends_on: []
 
 # Remote frame transport: make `--host` cross-platform
 
-**Status:** not started, apart from the `--host` destination guard (v0.2.1).
-Steps 0a and 1–7 remain. Step 5's Unix attach bridge is the part the cloud
-PTY workflow ([VM scripts and results](../../../scripts/pty-vm/README.md))
-needs first. It needs steps 0a and 2 (the fake-SSH harness and the codec), so
-it may land before steps 3 and 4.
+**Status:** step 1 (typed `RemoteOperation` + shared `dispatch`) is done; step 0a
+is in #149. Steps 2–4, 6 and 7 remain, and step 5 comes later. Step 5's Unix
+attach bridge is the part the cloud PTY workflow
+([VM scripts and results](../../../scripts/pty-vm/README.md)) needs first. It
+needs steps 0a and 2 (the fake-SSH harness and the codec), so it may land before
+steps 3 and 4.
 
 Goal: every `--host` command travels as a typed request over SSH stdin, as
 `exec` already does. No user- or host-derived value is rebuilt into a remote
@@ -56,14 +57,22 @@ fixed separately in v0.2.1 (`1ee737d`, `b80b510`); see step 0.
 pub enum RemoteOperation {
     Start(StartRequest), Status(StatusRequest), List(ListRequest),
     Log(LogRequest), Push(PushRequest), Kill(KillRequest),
-    Wait(WaitRequest), Watch(WatchRequest), Exec(ExecRequest), Attach(AttachRequest),
+    Wait(WaitRequest), Watch(WatchRequest), Attach(AttachRequest),
 }
 ```
+
+Decisions:
+
+- `exec` stays on its shipped frame (`tendr exec --frame-from-stdin`,
+  `ExecRequestFrame`) and is not a `RemoteOperation`.
+- `attach` stays on `ssh -t` (rebuilt argv) until the step 5 bridge.
+- Requests carry only what the user typed. Defaults (namespace) and `--after`
+  run-id binding resolve in `dispatch`, on the host that runs the command.
 
 Two constructors, one dispatcher:
 
 ```
-Clap Commands ──TryFrom──▶ RemoteOperation ──┐
+Clap &Commands ──TryFrom─▶ RemoteOperation ──┐
 JSON frame ──deserialize─▶ RemoteOperation ──┴─▶ fn dispatch(RemoteOperation) -> Result<()>
 ```
 
@@ -77,7 +86,7 @@ are stable protocol/domain DTOs.
 ### 2. Wire format — one hidden, constant entry point
 
 ```
-ssh -T host tendr _remote --frame-from-stdin
+ssh -T host tendr --hello _remote
 ```
 
 Nothing host- or user-derived appears after the SSH destination. The stream is:
@@ -156,17 +165,13 @@ network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
    records argv, captures and forwards stdin, emits configured stdout/stderr
    and exit code, and installs as `ssh`/`ssh.exe` on the temp PATH. It must land
    before step 3 moves any operation onto the frame.
-1. Add `RemoteOperation` request types + shared `dispatch`. **Pin every DTO's
-   completeness here, where it's defined.** `StartRequest` must mirror the FULL
-   start/`LaunchSpec` surface: session, namespace, argv, cwd, env, stdin, timeout,
-   `exec_target`, pty, replace, `on_exit`, after, `any_exit`, **and `boundary` +
-   `boundary_parent`** (added on this branch — the header example above predates
-   them). A missing field silently no-ops over `--host` (wrong Windows adapter,
-   dropped boundary). Route local commands through the typed layer first. **No SSH
-   behavior change yet.**
-2. Add the framed codec + hidden `_remote` endpoint (partial-read handling, header
-   limits, version check, semantic validation).
-3. Move `start, status, list, log, kill, wait, watch, exec` to the frame.
+1. **Done.** `RemoteOperation` request types + shared `dispatch` (`src/remote_op.rs`);
+   local commands route through them, SSH behaviour unchanged. A completeness
+   test pins every `start` flag through the round trip.
+2. Add the framed codec + hidden `tendr [--hello] _remote` endpoint
+   (partial-read handling, header limits, version check, semantic validation).
+3. Move `start, status, list, log, kill, wait, watch` to the frame (`exec`
+   already rides its own).
    **`start` is the security priority** — cwd, env, callbacks, child argv,
    `--boundary`/`--boundary-parent` labels, and (easy to miss) **`log --since`**
    are all currently shell-exposed.
@@ -201,7 +206,9 @@ network daemon, no gRPC/Tokio/mTLS**, and the current output contracts.
      the `ssh -t` path during transition if that case matters. The ConPTY
      backend and console frontend themselves are in
      [windows-parity](../backlog/windows-parity.md#no-pty-or-attach).
-6. Delete general POSIX remote-argv reconstruction. Keep shell quoting only for
+6. Delete general POSIX remote-argv reconstruction (`RemoteOperation::legacy_argv`).
+   From here `attach` accepts only plain session names and fixed flag values,
+   since it is the one op still on `ssh -t` until step 5. Keep shell quoting only for
    the human-facing copy/paste **fallback text** (verified: `local_fallback_args`
    is only `eprintln!`'d, never spawned) — label it "(POSIX shell)" so users don't
    paste POSIX-quoted text at a Windows host.
@@ -236,10 +243,11 @@ tests above.
   redacted implementation, or field wrapper types whose own `Debug` redacts;
   error/log rendering uses `Display`, which must not print those values.
 - **Local-only commands are unrepresentable.** `run` / `wrap` / `prune` /
-  `query` / `guide` / `skill` / `emit` / `events` cannot be constructed as a
-  `RemoteOperation` (`TryFrom<Commands>` returns `Err`) — replacing the runtime
-  `REMOTE_COMMANDS` string allowlist and the `unreachable!` in `remote_args`.
-- **Completeness test spans the whole round-trip.** One test drives all 15
+  `query` / `guide` / `skill` / `emit` / `events` (and `exec`, which has its own
+  frame) cannot be constructed as a `RemoteOperation`: `TryFrom<&Commands>`
+  returns a typed `LocalOnly` error. It borrows because the rejection path still
+  needs the command to print its copy-paste fallback.
+- **Completeness test spans the whole round-trip.** One test drives all 16
   `start` fields through `Commands → StartRequest → JSON → decode → dispatch` and
   asserts every field survives (the completeness test already pinned in step 1).
 - **Fake-SSH harness lands before any op migrates onto SSH.** The portable Rust
@@ -292,7 +300,7 @@ until the frame replaces reconstruction. Not a substitute for the frame.
 
 ## Acceptance criteria
 
-- All `REMOTE_COMMANDS` travel as typed frames; the remote SSH argv is constant
+- Every `RemoteOperation` travels as a typed frame; the remote SSH argv is constant
   and independent of any user/host value.
 - The reconstructed-argv execution path is deleted (quoting survives only as
   copy/paste fallback text).

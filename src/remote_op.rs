@@ -148,6 +148,8 @@ pub struct WatchRequest {
     pub logs: bool,
     pub annotations: bool,
     pub from_now: bool,
+    /// Consumed locally; never crosses the wire.
+    #[serde(skip)]
     pub ready_file: Option<PathBuf>,
 }
 
@@ -156,15 +158,7 @@ pub struct AttachRequest {
     pub session: String,
     pub namespace: Option<String>,
     pub takeover: bool,
-    pub escape: Escape,
-}
-
-/// The attach client's detach escape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Escape {
-    CtrlBackslash,
-    None,
+    pub escape: EscapeMode,
 }
 
 /// The remote operations, as listed when a local-only command is refused.
@@ -298,8 +292,8 @@ impl TryFrom<&Commands> for RemoteOperation {
                 namespace: namespace.clone(),
                 takeover: *takeover,
                 escape: match escape {
-                    AttachEscape::CtrlBackslash => Escape::CtrlBackslash,
-                    AttachEscape::None => Escape::None,
+                    AttachEscape::CtrlBackslash => EscapeMode::CtrlBackslash,
+                    AttachEscape::None => EscapeMode::Disabled,
                 },
             }),
             Commands::Run { .. } => return local("run"),
@@ -438,7 +432,7 @@ impl RemoteOperation {
                 args.push(r.session.clone());
                 namespace(&mut args, &r.namespace);
                 flag(&mut args, "takeover", r.takeover);
-                if r.escape == Escape::None {
+                if r.escape == EscapeMode::Disabled {
                     value(&mut args, "escape", "none".to_owned());
                 }
             }
@@ -459,7 +453,6 @@ fn exec_target_flag(target: ExecTarget) -> &'static str {
 }
 
 /// What `cmd_start` receives: a [`StartRequest`] with its defaults resolved.
-#[derive(Debug)]
 struct StartInputs {
     name: String,
     cmd: Vec<String>,
@@ -577,11 +570,7 @@ pub fn dispatch(operation: RemoteOperation) -> anyhow::Result<()> {
         }
         RemoteOperation::Attach(r) => {
             let ns = resolve_namespace(r.namespace)?;
-            let mode = match r.escape {
-                Escape::CtrlBackslash => EscapeMode::CtrlBackslash,
-                Escape::None => EscapeMode::Disabled,
-            };
-            commands::cmd_attach(&r.session, &ns, r.takeover, mode)
+            commands::cmd_attach(&r.session, &ns, r.takeover, r.escape)
         }
     }
 }
@@ -825,8 +814,39 @@ mod tests {
         ];
         for args in cases {
             let original = op(args);
-            assert_eq!(round_trip(&original), original, "{args:?}");
+            let mut expected = original.clone();
+            if let RemoteOperation::Watch(w) = &mut expected {
+                assert!(w.ready_file.is_some(), "the local request keeps it");
+                // Consumed locally; never crosses the wire.
+                w.ready_file = None;
+            }
+            assert_eq!(round_trip(&original), expected, "{args:?}");
         }
+    }
+
+    /// Each start bool lands in its own input: set one at a time.
+    #[test]
+    fn start_bools_do_not_swap() {
+        let flags = ["--stdin", "--pty", "--replace"];
+        for flag in flags {
+            let RemoteOperation::Start(request) = round_trip(&op(&["start", flag, "s", "x"]))
+            else {
+                panic!("not a start request");
+            };
+            let i = start_inputs(request).expect("resolves");
+            assert_eq!(
+                [i.stdin, i.pty, i.replace],
+                flags.map(|f| f == flag),
+                "{flag}"
+            );
+            assert!(!i.any_exit, "{flag}");
+        }
+        let RemoteOperation::Start(request) = round_trip(&op(&["start", "--after", "d", "s", "x"]))
+        else {
+            panic!("not a start request");
+        };
+        let i = start_inputs(request).expect("resolves");
+        assert!(!(i.stdin || i.pty || i.replace || i.any_exit));
     }
 
     /// The SSH argv derived from the typed operation, pinned byte for byte

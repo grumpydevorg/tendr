@@ -937,8 +937,16 @@ fn main() {
         },
         Commands::Sidecar { session_dir } => commands::cmd_sidecar(session_dir),
         // The remote-capable commands run through the same typed layer as
-        // `--host`; every other command has an arm above.
-        remote => remote_op::RemoteOperation::try_from(&remote)
+        // `--host`. Named, not a catch-all, so a new command must be classified.
+        remote @ (Commands::Start { .. }
+        | Commands::Status { .. }
+        | Commands::List { .. }
+        | Commands::Log { .. }
+        | Commands::Push { .. }
+        | Commands::Kill { .. }
+        | Commands::Wait { .. }
+        | Commands::Watch { .. }
+        | Commands::Attach { .. }) => remote_op::RemoteOperation::try_from(&remote)
             .map_err(anyhow::Error::from)
             .and_then(remote_op::dispatch),
     };
