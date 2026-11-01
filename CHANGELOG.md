@@ -24,8 +24,9 @@
   SIGKILL. A timed-out child can now exit up to about 6 s after the deadline.
   The run is still recorded as `TimedOut`. A process in the group that
   ignores SIGTERM can now outlive the timeout, which the old SIGKILL to the
-  group reached; while it holds the terminal or stdout the run does not end.
-  The run lifecycle's Limits describe this terminal holder.
+  group reached. While it holds a pipe run's stdout or stderr the run does
+  not end; a PTY run ends at most 2 s after its child (see below). The run
+  lifecycle's Limits describe both holders.
 
 ### Fixed
 

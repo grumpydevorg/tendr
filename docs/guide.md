@@ -264,11 +264,11 @@ after 5 s. A PTY session first gets SIGHUP and up to 1 s to act on it, as when
 a terminal window closes, so an interactive shell also hangs up its background
 jobs. `--timeout` stops the same way, so a timed-out child exits up to about
 6 s after the deadline. A process in the group that ignores SIGTERM can
-outlive the timeout, and while it holds the terminal or stdout the run does
-not end (see the run lifecycle's
-[Limits](architecture/03-run-lifecycle.md#limits)). `kill --force` sends
-SIGKILL at once. A shell cannot pass SIGKILL on, so its background jobs keep
-running.
+outlive the timeout. While it holds a pipe run's stdout or stderr, the run
+does not end; a PTY run ends at most 2 s after its child (below, and the run
+lifecycle's [Limits](architecture/03-run-lifecycle.md#limits)).
+`kill --force` sends SIGKILL at once. A shell cannot pass SIGKILL on, so its
+background jobs keep running.
 
 A PTY run ends with its child, even if a process the child started still holds
 the terminal, such as a `setsid` job. Once the child has exited, tendr captures
