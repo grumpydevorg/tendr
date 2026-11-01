@@ -103,7 +103,7 @@ pub fn cmd_wait(
                 .collect();
 
             let json = serde_json::to_string_pretty(&results)?;
-            println!("{json}");
+            outln!("{json}");
 
             // Derive exit code from the set.
             let exit_code = derive_exit_code(&results);

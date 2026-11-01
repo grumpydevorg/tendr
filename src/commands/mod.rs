@@ -1,3 +1,20 @@
+/// `print!` that tolerates a reader that has gone away: see [`write_stdout`].
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::commands::write_stdout(format_args!($($arg)*))
+    };
+}
+
+/// `println!` that tolerates a reader that has gone away: see [`write_stdout`].
+macro_rules! outln {
+    () => {
+        $crate::commands::write_stdout(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::commands::write_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
 mod attach;
 mod emit;
 mod events;
@@ -37,3 +54,20 @@ pub use status::cmd_status;
 pub use wait::cmd_wait;
 pub use watch::cmd_watch;
 pub use wrap::cmd_wrap;
+
+/// Write command output to stdout. A reader that exits early
+/// (`tendr status x | head -c1`) closes the pipe: the output is dropped and
+/// the command carries on, so its exit code still means what it says. Any
+/// other write failure ends the process with exit 1. `println!` would panic.
+pub(crate) fn write_stdout(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    match out.write_fmt(args).and_then(|()| out.flush()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => {
+            eprintln!("error: writing to stdout: {e}");
+            std::process::exit(1);
+        }
+    }
+}

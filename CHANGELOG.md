@@ -34,6 +34,11 @@
   exe.dev's init leaks two terminal masters into every SSH command, and tendr
   passed them on to the sidecar and the child, keeping those terminals open
   for the run's life. The sidecar now inherits only stdio and its ready pipe.
+- **Piping into a reader that exits early no longer panics.** `tendr status
+  x | head -c1` crashed with "Broken pipe". Now `status`, `list`, `log`,
+  `wait`, `kill`, `start`, `prune` and the other commands drop the rest of
+  their output quietly and keep their exit code, as `events` and `watch`
+  already did.
 - **A socket bind failure no longer looks like a failed spawn.** When a PTY
   session's attach socket cannot be bound, the run still ends `SpawnFailed`,
   but its evidence is now `attach_socket_failed`, not `spawn_failed_syscall`.

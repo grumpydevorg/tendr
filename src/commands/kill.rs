@@ -38,7 +38,7 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
     let session = match session::open(&root, namespace, &session_name)? {
         Some(s) => s,
         None => {
-            println!(
+            outln!(
                 "{}",
                 serde_json::json!({"session": name, "result": "not_found"})
             );
@@ -51,7 +51,7 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
     // Already terminal -- idempotent success
     if meta.status().is_terminal() {
         let json = serde_json::to_string_pretty(&meta)?;
-        println!("{json}");
+        outln!("{json}");
         return Ok(());
     }
 
@@ -65,12 +65,12 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
             if sidecar_alive {
                 if let Some(m) = signal_kill_request(&session, &meta, force, 80)? {
                     let json = serde_json::to_string_pretty(&m)?;
-                    println!("{json}");
+                    outln!("{json}");
                     return Ok(());
                 }
                 // Sidecar didn't act — fall through to report
             }
-            println!(
+            outln!(
                 "{}",
                 serde_json::json!({"session": name, "result": "no_child"})
             );
@@ -99,7 +99,7 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
         // stop, and 3s buffer for terminal state write.
         if let Some(m) = signal_kill_request(&session, &meta, force, 90)? {
             let json = serde_json::to_string_pretty(&m)?;
-            println!("{json}");
+            outln!("{json}");
             return Ok(());
         }
         // Sidecar didn't act in time -- fall through to direct kill.
@@ -122,14 +122,14 @@ pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Resul
             if m.status().is_terminal() {
                 super::wait::await_release(&session, name, "kill");
                 let json = serde_json::to_string_pretty(&m)?;
-                println!("{json}");
+                outln!("{json}");
                 return Ok(());
             }
         }
     }
 
     // Sidecar didn't write terminal state in time -- report what we know
-    println!(
+    outln!(
         "{}",
         serde_json::json!({"session": name, "result": "kill_sent", "force": force})
     );

@@ -90,8 +90,8 @@ fn report_version() -> anyhow::Result<()> {
         .output()
         .map_err(|e| duckdb_spawn_error(&e))?;
     let version = String::from_utf8_lossy(&out.stdout);
-    println!("DuckDB CLI: {}", version.trim());
-    println!("tendr query is developed against DuckDB {TESTED_DUCKDB}");
+    outln!("DuckDB CLI: {}", version.trim());
+    outln!("tendr query is developed against DuckDB {TESTED_DUCKDB}");
     Ok(())
 }
 

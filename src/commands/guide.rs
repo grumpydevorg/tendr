@@ -40,9 +40,9 @@ pub fn cmd_guide(topic: Option<&str>) -> anyhow::Result<()> {
 /// Print the entire guide, ensuring a trailing newline so the shell prompt lands
 /// cleanly even if the source file were to lack one.
 fn print_all() {
-    print!("{GUIDE}");
+    out!("{GUIDE}");
     if !GUIDE.ends_with('\n') {
-        println!();
+        outln!();
     }
 }
 
@@ -62,7 +62,7 @@ fn print_topic(topic: &str) -> anyhow::Result<()> {
     let section = slice_section(GUIDE, needle).ok_or_else(|| {
         anyhow::anyhow!("internal: guide topic '{topic}' has no matching section")
     })?;
-    println!("{section}");
+    outln!("{section}");
     Ok(())
 }
 

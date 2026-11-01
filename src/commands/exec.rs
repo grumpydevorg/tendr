@@ -273,7 +273,7 @@ pub fn cmd_exec(
     }
 
     let json = serde_json::to_string_pretty(&result)?;
-    println!("{json}");
+    outln!("{json}");
 
     if result.timed_out {
         eprintln!("exec timed out — command may still be running in the shell");
