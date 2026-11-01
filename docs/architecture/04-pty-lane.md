@@ -143,8 +143,10 @@ A `push` to a pipe session that is not running exits 1.
 
 ## Input arbitration
 
-- Input queued by a superseded controller is never written. It is recorded
-  as `pty.input_revoked`.
+- Input queued by a controller that is superseded (a takeover) or leaves (a
+  detach or a lost connection) is never written. It is recorded as
+  `pty.input_revoked`, after the `pty.control_changed` that ended its
+  control.
 - PTY `exec` frames arrive over the stdin FIFO. The FIFO forwarder is
   arbitrated the same way, but it cannot report an outcome:
   - It waits behind another agent's push.
