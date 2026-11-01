@@ -44,11 +44,12 @@ back is [PTY replay](../backlog/pty-replay.md).
 - **Step 12a. `--timeout` stops gracefully** (local). Today it sends SIGKILL
   to the group at once (`setup_timeout` in `src/sidecar.rs` calls
   `kill_child(…, true)`). Make it `kill`'s sequence: a PTY run is hung up
-  first, a pipe run gets SIGTERM; SIGKILL follows after 1 s and 5 s as for
-  `kill`, so a timed-out run can end up to about 6 s past its deadline. The
-  data: Claude Code and a shell cleaned up their children after a hangup but
-  not after SIGKILL. Update the guide's `--timeout` row and the run
-  lifecycle's Limits.
+  first, a pipe run gets SIGTERM; then SIGTERM after at most 1 s and SIGKILL
+  after at most 5 s more, as for `kill`, so a timed-out run can end up to
+  about 6 s past its deadline. The data: Claude Code and a shell cleaned up
+  their children after a hangup but not after SIGKILL. Update the guide's
+  Lifecycle line "`kill --force` and `--timeout` send SIGKILL at once", the
+  run lifecycle's Limits, and the changelog.
 - **Step 12b. Stop the whole run on Linux** (local; verify on the VM). The
   sidecar is a child subreaper (`PR_SET_CHILD_SUBREAPER`), so every process
   the run starts stays its descendant, and it reaps adopted orphans by pid

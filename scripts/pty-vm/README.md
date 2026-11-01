@@ -28,6 +28,10 @@ The VM needs Debian or Ubuntu with systemd, `python3` and passwordless `sudo`.
       settles Claude's first-run screens for `~/slice1/work` and `~/work`.
    4. `./install-helpers.sh`: installs the test children, `tsnap`, `iptables`,
       `jq` and `tmux`.
+   5. For `treekill/run-agent.sh … omp`: install omp 18.14.0 with `curl -fsSL
+      -o omp-linux-x64 https://github.com/can1357/oh-my-pi/releases/download/v18.14.0/omp-linux-x64
+      && install -m755 omp-linux-x64 ~/.local/bin/omp`, then start
+      `omp --profile s9k` once in a terminal and settle its setup screens.
 
 Run `sync-vm.sh` again after changing a script.
 
