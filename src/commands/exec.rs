@@ -89,13 +89,13 @@ impl ExecLock {
 /// seen to finish: `exec.pending.json`, written (temporary file, then rename)
 /// just before the frame is sent and removed once its result is read.
 ///
-/// A timed-out exec leaves it behind, as does one whose client dies. The next
-/// exec on the session checks it under the exec lock: once the frame's
-/// completion signal is in the session dir it removes the record and goes on;
-/// until then it refuses, naming this exec. Sending earlier would put the new
-/// frame on the stdin of a command that may read it as its own input, and its
-/// output after the next exec's log offset. NDJSON execs never write one:
-/// their replies are matched by id.
+/// A timed-out exec leaves it behind, as do an error after sending and a
+/// client that dies. The next exec on the session checks it under the exec
+/// lock: once the frame's completion signal is in the session dir it removes
+/// the record and goes on; until then it refuses, naming this exec. Sending
+/// earlier would put the new frame on the stdin of a command that may read it
+/// as its own input, and its output after the next exec's log offset. NDJSON
+/// execs never write one: their replies are matched by id.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PendingExec {
     token: String,
@@ -150,28 +150,33 @@ impl PendingExec {
         Ok(())
     }
 
-    fn clear(session: &SessionDir) {
+    /// Remove the record of exec `token`, then its result file if any. The
+    /// result file is the side-channel completion signal, so it must outlive
+    /// the record: a client that dies between the two leaves no record, not a
+    /// record whose signal is gone.
+    fn clear(session: &SessionDir, token: &str) {
         let _ = std::fs::remove_file(Self::path(session));
+        let _ = std::fs::remove_file(result_file(session, token));
     }
 
     /// Whether this exec's frame has finished in the session: its result
-    /// file exists (removed here, since its exec is gone), or its sentinel
-    /// and, for a POSIX shell, its stderr end marker are in `output.log`.
+    /// file exists, or its sentinel and, for a POSIX shell, its stderr end
+    /// marker are in `output.log`.
     fn is_finished(&self, session: &SessionDir, target: ExecTarget) -> anyhow::Result<bool> {
         match target {
             ExecTarget::PythonRepl | ExecTarget::PowerShell => {
-                let result_path = session
-                    .path()
-                    .join("exec-results")
-                    .join(format!("{}.json", self.token));
-                if !result_path.exists() {
-                    return Ok(false);
-                }
-                let _ = std::fs::remove_file(&result_path);
-                Ok(true)
+                Ok(result_file(session, &self.token).exists())
             }
             ExecTarget::PosixShell => self.sentinel_logged(session, true),
-            ExecTarget::DuckDb => self.sentinel_logged(session, false),
+            ExecTarget::DuckDb => {
+                let finished = self.sentinel_logged(session, false)?;
+                if finished {
+                    // As in drain_trailing_stderr: the statement's stderr may
+                    // be logged just after the sentinel.
+                    std::thread::sleep(DUCKDB_STDERR_GRACE);
+                }
+                Ok(finished)
+            }
             ExecTarget::Ndjson | ExecTarget::None => Ok(true),
         }
     }
@@ -233,6 +238,15 @@ impl PendingExec {
             self.token, self.started_at, self.command
         )
     }
+}
+
+/// `exec-results/<token>.json`: where a Python REPL or PowerShell frame
+/// writes its result.
+fn result_file(session: &SessionDir, token: &str) -> std::path::PathBuf {
+    session
+        .path()
+        .join("exec-results")
+        .join(format!("{token}.json"))
 }
 
 /// `tendr <verb> <session>`, with `--namespace` outside the default one, as
@@ -385,7 +399,7 @@ pub fn cmd_exec(
                 session_command("kill", &session_name, namespace),
             );
         }
-        PendingExec::clear(&session);
+        PendingExec::clear(&session, &pending.token);
     }
 
     // Validate cmd is non-empty (clap enforces this, but belt-and-suspenders)
@@ -426,10 +440,11 @@ pub fn cmd_exec(
         timeout,
         block_id,
     );
-    // A timed-out frame may still be running: its record stays, so the next
-    // exec checks that it has finished before sending anything.
-    if !result.as_ref().is_ok_and(|r| r.timed_out) {
-        PendingExec::clear(&session);
+    // A timed-out frame may still be running, and after an error it may not
+    // be known to have finished: the record stays, so the next exec checks
+    // before sending anything.
+    if result.as_ref().is_ok_and(|r| !r.timed_out) {
+        PendingExec::clear(&session, &token);
     }
     let result = result?;
 
@@ -598,7 +613,7 @@ fn run_exec(
         ExecTarget::PowerShell => {
             let results_dir = session.path().join("exec-results");
             std::fs::create_dir_all(&results_dir)?;
-            let result_path = results_dir.join(format!("{token}.json"));
+            let result_path = result_file(session, token);
             let result_path_str = result_path
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("session path is not valid UTF-8"))?;
@@ -612,7 +627,7 @@ fn run_exec(
             // Ensure exec-results dir exists
             let results_dir = session.path().join("exec-results");
             std::fs::create_dir_all(&results_dir)?;
-            let result_path = results_dir.join(format!("{token}.json"));
+            let result_path = result_file(session, token);
             let result_path_str = result_path
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("session path is not valid UTF-8"))?;
@@ -863,10 +878,7 @@ fn wait_side_channel_result(
     token: &str,
     deadline: Option<Instant>,
 ) -> anyhow::Result<ExecResult> {
-    let result_path = session
-        .path()
-        .join("exec-results")
-        .join(format!("{token}.json"));
+    let result_path = result_file(session, token);
 
     loop {
         if let Some(dl) = deadline {
@@ -887,7 +899,7 @@ fn wait_side_channel_result(
 
         if result_path.exists() {
             let content = std::fs::read_to_string(&result_path)?;
-            let _ = std::fs::remove_file(&result_path); // Clean up
+            // The file stays until cmd_exec clears the record (PendingExec::clear).
             let sc: SideChannelResult = serde_json::from_str(&content)
                 .map_err(|e| anyhow::anyhow!("invalid side-channel result: {e}"))?;
 
@@ -1024,6 +1036,9 @@ fn wait_ndjson_result(
     }
 }
 
+/// How long a DuckDB exec reads past its sentinel for trailing stderr.
+const DUCKDB_STDERR_GRACE: Duration = Duration::from_millis(100);
+
 /// After the sentinel has been found, re-scan the log for any 'E' (stderr)
 /// lines that arrived after the sentinel.
 ///
@@ -1032,7 +1047,8 @@ fn wait_ndjson_result(
 /// tags is not guaranteed: a child can write to stderr and then stdout nearly
 /// simultaneously, and the sidecar may flush the stdout ('O') sentinel line
 /// to the log before the stderr ('E') error line. This function accommodates
-/// that race by waiting up to 100ms after the sentinel for trailing stderr.
+/// that race by waiting up to DUCKDB_STDERR_GRACE after the sentinel for
+/// trailing stderr.
 fn drain_trailing_stderr(session: &SessionDir, cursor: u64) -> String {
     let log_path = session.path().join("output.log");
     let Ok(file) = std::fs::File::open(&log_path) else {
@@ -1043,7 +1059,7 @@ fn drain_trailing_stderr(session: &SessionDir, cursor: u64) -> String {
 
     let mut stderr_lines: Vec<String> = Vec::new();
     let mut buf = String::new();
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = Instant::now() + DUCKDB_STDERR_GRACE;
     let mut saw_sentinel = false;
 
     loop {
@@ -1319,8 +1335,8 @@ mod tests {
         );
     }
 
-    /// A side-channel frame is finished once its result file exists; nobody
-    /// will read that file, so the check removes it.
+    /// A side-channel frame is finished once its result file exists. Clearing
+    /// the record removes that file too.
     #[test]
     fn side_channel_frame_finishes_on_its_result_file() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1332,6 +1348,12 @@ mod tests {
 
         std::fs::write(results.join("tok.json"), "{}").unwrap();
         assert!(p.is_finished(&dir, ExecTarget::PowerShell).unwrap());
+        // Checking twice gives the same answer: the signal is not consumed.
+        assert!(p.is_finished(&dir, ExecTarget::PythonRepl).unwrap());
+
+        p.save(&dir).unwrap();
+        PendingExec::clear(&dir, "tok");
+        assert!(PendingExec::load(&dir).unwrap().is_none());
         assert!(!results.join("tok.json").exists());
     }
 
@@ -1346,8 +1368,8 @@ mod tests {
         let loaded = PendingExec::load(&dir).unwrap().unwrap();
         assert_eq!((loaded.token.as_str(), loaded.log_offset), ("tok", 7));
         assert!(loaded.describe().contains("tok") && loaded.describe().contains("sleep 9"));
-        PendingExec::clear(&dir);
-        PendingExec::clear(&dir);
+        PendingExec::clear(&dir, "tok");
+        PendingExec::clear(&dir, "tok");
         assert!(PendingExec::load(&dir).unwrap().is_none());
     }
 

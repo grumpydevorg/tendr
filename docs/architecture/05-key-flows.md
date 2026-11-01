@@ -71,7 +71,7 @@ sequenceDiagram
     FIFO->>Shell: inject command via stdin transport
     Shell->>Log: stdout/stderr or side-channel result
     CLI->>Log: wait for sentinel or result file
-    CLI->>Session: remove exec.pending.json (kept on timeout)
+    CLI->>Session: remove exec.pending.json, then result file (both kept on timeout or error)
     CLI->>Session: append exec.result event
     CLI->>Log: append exec annotation
     CLI-->>Caller: print structured ExecResult
@@ -112,8 +112,8 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
   base64-encodes the code and the result path. It runs the code, captures
   stdout, stderr, exit code and working directory, and writes them as JSON
   to `exec-results/<token>.json` (temporary file, then rename). `exec` polls
-  for the file, reads it, and deletes it. A Python traceback is appended to
-  stderr.
+  for the file and reads it; the file is removed with the exec's record (see
+  [Timeouts](#timeouts)). A Python traceback is appended to stderr.
 - **Request id (NDJSON).** The command is one JSON object; `exec` adds
   `"id": "<token>"` and writes it as one line. A request that is not one
   object, or already has an `id`, exits 2 before the exec lock or any event.
@@ -137,23 +137,27 @@ earlier frame is known to have finished.
 
 `exec.pending.json` carries that across processes. Just before sending a
 frame, `exec` writes it (temporary file, then rename) with the token, start
-time, a shortened command and the `output.log` offset. It removes the file
-once it has the result, or on an error, and keeps it on a timeout. A client
-that dies while waiting leaves it too.
+time, a shortened command and the `output.log` offset. Once it has the
+result, it removes the record and then the result file. The result file is
+the side-channel completion signal, so a client that dies between the two
+leaves no record rather than a record nothing can satisfy. A timeout keeps
+the record, as does an error after sending (the frame may still be running)
+or a client that dies while waiting.
 
 The next exec reads it under `exec.lock`, before any event or framing:
 
 | Exec target | The earlier frame has finished when |
 |---|---|
 | POSIX shell | its stdout sentinel and stderr end marker are in `output.log` after the offset; with the sentinel but no marker, after one more second |
-| DuckDB | its stdout sentinel is in `output.log` after the offset |
-| Python REPL, PowerShell | `exec-results/<token>.json` exists (the check deletes it) |
+| DuckDB | its stdout sentinel is in `output.log` after the offset, then 100 ms more for trailing stderr |
+| Python REPL, PowerShell | `exec-results/<token>.json` exists |
 
-If it has finished, the exec removes the record and runs as usual, taking its
-own offset after the old output. If not, it exits 1 without sending anything,
-naming the earlier exec's token, start time and command, and saying to wait
-or run `tendr kill`. A frame that never finishes therefore never wedges the
-session silently: each later exec says why it was refused and how to recover.
+If it has finished, the exec removes the record (and result file) and runs as
+usual, taking its own offset after the old output. If not, it exits 1
+without sending anything, naming the earlier exec's token, start time and
+command, and saying to wait or run `tendr kill`. A frame that never finishes
+therefore never wedges the session silently: each later exec says why it was
+refused and how to recover.
 
 A concurrent exec that finds `exec.lock` held fails at once, naming the
 running exec from `exec.pending.json` when that is already written. The

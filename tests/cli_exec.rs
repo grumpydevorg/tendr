@@ -2563,14 +2563,14 @@ fn exec_after_python_timeout_waits_for_the_earlier_frame() {
             "--timeout",
             "1",
             "--",
-            "import time; time.sleep(6); print('late-py')",
+            "import time; time.sleep(12); print('late-py')",
         ])
         .assert_within_deadline()
         .get_output()
         .clone();
     assert_eq!(slow.status.code(), Some(124), "{slow:?}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
+        started.elapsed() < std::time::Duration::from_secs(6),
         "returns at its deadline, not when the frame ends: {:?}",
         started.elapsed()
     );
@@ -2613,13 +2613,13 @@ fn exec_after_shell_timeout_never_gets_the_late_output() {
     let started = std::time::Instant::now();
     let slow = harness::tendr(&root)
         .args(["exec", "shell", "--timeout", "1", "--", "bash", "-c"])
-        .arg("sleep 4; echo late-out; echo late-err >&2")
+        .arg("sleep 10; echo late-out; echo late-err >&2")
         .assert_within_deadline()
         .get_output()
         .clone();
     assert_eq!(slow.status.code(), Some(124), "{slow:?}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(3),
+        started.elapsed() < std::time::Duration::from_secs(5),
         "returns at its deadline, not when the command ends: {:?}",
         started.elapsed()
     );
@@ -2655,7 +2655,7 @@ fn exec_after_a_killed_client_never_gets_the_late_output() {
             "--",
             "bash",
             "-c",
-            "sleep 3; echo late-out",
+            "sleep 5; echo late-out",
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

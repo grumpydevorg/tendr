@@ -85,8 +85,8 @@ once used.
 | `kill_acted` | Written by the sidecar when it acts on a graceful kill. | Removed when the run ends. |
 | `stdin.pipe` | Unix FIFO for `push` and `exec`. Windows uses a named pipe outside the session dir. | Removed when the run ends. |
 | `exec.lock` | Serializes `exec` calls on one session. | Stays; only the lock matters. |
-| `exec.pending.json` (via `exec.pending.json.tmp`) | The exec whose frame was sent and not yet seen to finish: token, start time, shortened command, `output.log` offset. A later exec refuses to send until that frame finishes ([05-key-flows.md](05-key-flows.md#timeouts)). | `exec` removes it once it has the result; kept after a timeout or a dead client until the next exec sees the frame finish. |
-| `exec-results/<token>.json` | Result file for a Python REPL or PowerShell exec. | `exec` deletes it after reading; after a timeout, the next exec deletes it once it appears. |
+| `exec.pending.json` (via `exec.pending.json.tmp`) | The exec whose frame was sent and not yet seen to finish. A later exec refuses to send until that frame finishes ([05-key-flows.md](05-key-flows.md#timeouts)). | `exec` removes it once it has the result; otherwise kept until the next exec sees the frame finish. |
+| `exec-results/<token>.json` | Result file for a Python REPL or PowerShell exec. | Removed with `exec.pending.json`. |
 | `events/append.lock` | Unix advisory lock for event appends. | Stays; only the lock matters. |
 | `a.sock.path` (via `a.sock.path.tmp`) | Path of the PTY attach socket. | Removed with the socket when the run ends. |
 
