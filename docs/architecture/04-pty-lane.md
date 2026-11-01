@@ -185,7 +185,7 @@ A `push` to a pipe session that is not running exits 1.
 - The client keeps keyboard input, session writes and terminal output on
   separate paths:
   - The main thread polls the keyboard and terminal size and only queues
-    messages. Resize and detach go ahead of keystrokes.
+    messages. Resize, repaint and detach go ahead of keystrokes.
   - A sender thread writes the queued messages.
   - A reader thread writes output to the terminal.
 - `Ctrl-\ d` detaches. `Ctrl-\` twice sends one `Ctrl-\`. `--escape none`
@@ -287,6 +287,17 @@ Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
 - The input writer applies each resize while holding the recorder's
   sequencer. So output that follows a new size is always recorded after it.
 - A resize frame with a zero dimension does not parse and is ignored.
+- Repaint nudge: after its first resize the client sends `MSG_REPAINT` once.
+  If that resize left the PTY's size unchanged (a new size already makes the
+  child redraw) and the client still holds control, the input writer shrinks
+  the PTY by one row. The attach handler then waits until the child's output
+  has been quiet for 50 ms, at most 500 ms, and asks the writer to restore
+  the size. The restore applies unless a resize has applied since; it does
+  not depend on control, so a client that leaves meanwhile does not leave the
+  PTY a row short. Both records carry `REPAINT` and one correlation. Claude
+  Code draws nothing on a same-size attach, on a same-size `TIOCSWINSZ`, or
+  on SIGWINCH at an unchanged size, but redraws fully on each of the pair
+  (cloud PTY plan, step 5). A sidecar that predates the frame ignores it.
 - Input is not recorded.
 - Sequencing never waits for storage. One recorder thread appends, rotates
   segments at 64 MiB, publishes each segment atomically, and syncs at most

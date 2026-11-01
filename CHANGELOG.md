@@ -25,6 +25,12 @@
   interrupt. Attaching turns the session's modes on again before any output,
   so a session started detached gets the mouse and keyboard modes it asked
   for. Works with older versions on either side.
+- **Reattaching redraws the screen.** Claude Code draws nothing when a
+  terminal reattaches at the size it already has, so the screen stayed blank
+  or stale. `tendr attach` now asks for a repaint: the session is shrunk by
+  one row and restored once its output goes quiet, both recorded as `REPAINT`
+  resizes. An attach at a new size already redraws and gets no repaint. An
+  older sidecar ignores the request.
 
 ## v0.4.1 — capture fixes
 

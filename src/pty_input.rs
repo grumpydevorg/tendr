@@ -4,9 +4,9 @@
 //! write half. Every other thread — attach connections, the push forwarder —
 //! talks to it through [`InputWriter`], which carries two bounded queues:
 //!
-//! - **controls** (claim, takeover, release, resize) are always served before
-//!   the next input step, so a full PTY input buffer or a long queued push can
-//!   never delay a takeover;
+//! - **controls** (claim, takeover, release, resize, repaint) are always served
+//!   before the next input step, so a full PTY input buffer or a long queued
+//!   push can never delay a takeover;
 //! - **inputs** (write requests and end-of-input markers) are served in order,
 //!   one nonblocking write attempt at a time, and apply backpressure to their
 //!   senders when full.
@@ -18,6 +18,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -29,7 +30,7 @@ use crate::model::pty_control::{
     IncompleteReason, InputArbiter, InputOutcome, PendingInput, PtyInputSink, RequestId, Takeover,
     WriteStep,
 };
-use crate::recording::Geometry;
+use crate::recording::{Geometry, ResizeCause};
 
 /// Maximum queued control requests before senders wait.
 const CONTROL_CAPACITY: usize = 16;
@@ -47,8 +48,13 @@ pub trait WritablePty: PtyInputSink + Send + 'static {
     /// The descriptor's poll error.
     fn wait_writable(&self, timeout: Duration) -> io::Result<bool>;
 
-    /// Apply a window size to the PTY.
-    fn resize(&self, size: Geometry);
+    /// Apply a window size to the PTY, recorded with `cause`.
+    fn resize(&self, size: Geometry, cause: ResizeCause);
+
+    /// The PTY's window size, if it can be read.
+    fn size(&self) -> Option<Geometry> {
+        None
+    }
 }
 
 /// How a human took control.
@@ -86,6 +92,18 @@ enum Control {
     Resize {
         key: HandleKey,
         size: Geometry,
+    },
+    /// Shrink the PTY by one row so its child redraws; replies whether it
+    /// did.
+    RepaintShrink {
+        key: HandleKey,
+        correlation: NonZeroU32,
+        reply: SyncSender<bool>,
+    },
+    /// Restore the size the shrink with `correlation` left, if nothing has
+    /// resized the PTY since.
+    RepaintRestore {
+        correlation: NonZeroU32,
     },
     /// Release now and cancel everything the holder still has queued.
     Disconnect {
@@ -202,6 +220,28 @@ impl InputWriter {
             key: handle.key(),
             size,
         });
+    }
+
+    /// Start a repaint: shrink the PTY by one row, recorded as
+    /// [`ResizeCause::Repaint`], if `handle` authorizes and its last resize
+    /// left the size unchanged (a new size already makes the child redraw).
+    /// At most once per such resize. Returns whether it shrank the PTY; if
+    /// so, [`InputWriter::repaint_restore`] must follow.
+    pub fn repaint_shrink(&self, handle: &ControllerHandle, correlation: NonZeroU32) -> bool {
+        let (reply, rx) = sync_channel(1);
+        self.push_control(Control::RepaintShrink {
+            key: handle.key(),
+            correlation,
+            reply,
+        });
+        rx.recv().unwrap_or(false)
+    }
+
+    /// Finish the repaint started with `correlation`: put back the size it
+    /// shrank, unless a resize has applied since. Not tied to control: the
+    /// client may have left, but the shrink must not outlive it.
+    pub fn repaint_restore(&self, correlation: NonZeroU32) {
+        self.push_control(Control::RepaintRestore { correlation });
     }
 
     /// Queue `bytes` and wait for the outcome. Empty input is a no-op.
@@ -345,6 +385,7 @@ fn writer_loop<P: WritablePty, H: ControlHooks>(
     mut hooks: H,
 ) {
     let mut current: Option<Current> = None;
+    let mut repaint = RepaintState::default();
 
     loop {
         // Take all controls, and the next input if nothing is being written.
@@ -384,7 +425,7 @@ fn writer_loop<P: WritablePty, H: ControlHooks>(
                     &mut next_end,
                 );
             } else {
-                apply_control(control, &mut arbiter, &pty, &mut hooks);
+                apply_control(control, &mut arbiter, &pty, &mut hooks, &mut repaint);
             }
         }
 
@@ -501,11 +542,23 @@ fn disconnect<P: WritablePty, H: ControlHooks>(
     }
 }
 
+/// The writer's view of the repaint nudge.
+#[derive(Default)]
+struct RepaintState {
+    /// The controller whose last resize left the size unchanged, until it
+    /// repaints.
+    due: Option<HandleKey>,
+    /// The size a shrink took away, and its correlation, until restored or
+    /// overtaken by a resize.
+    pending: Option<(Geometry, NonZeroU32)>,
+}
+
 fn apply_control<P: WritablePty, H: ControlHooks>(
     control: Control,
     arbiter: &mut InputArbiter,
     pty: &P,
     hooks: &mut H,
+    repaint: &mut RepaintState,
 ) {
     match control {
         Control::Claim {
@@ -534,7 +587,36 @@ fn apply_control<P: WritablePty, H: ControlHooks>(
         }
         Control::Resize { key, size } => {
             if arbiter.authorize(key).is_ok() {
-                pty.resize(size);
+                let unchanged = pty.size() == Some(size);
+                pty.resize(size, ResizeCause::User);
+                repaint.due = unchanged.then_some(key);
+                repaint.pending = None;
+            }
+        }
+        Control::RepaintShrink {
+            key,
+            correlation,
+            reply,
+        } => {
+            let mut shrunk = false;
+            if arbiter.authorize(key).is_ok() && repaint.due == Some(key) {
+                repaint.due = None;
+                if let Some(base) = pty.size() {
+                    if let Some(smaller) = Geometry::new(base.rows() - 1, base.cols()) {
+                        pty.resize(smaller, ResizeCause::Repaint { correlation });
+                        repaint.pending = Some((base, correlation));
+                        shrunk = true;
+                    }
+                }
+            }
+            let _ = reply.send(shrunk);
+        }
+        Control::RepaintRestore { correlation } => {
+            if let Some((base, pending)) = repaint.pending {
+                if pending == correlation {
+                    repaint.pending = None;
+                    pty.resize(base, ResizeCause::Repaint { correlation });
+                }
             }
         }
         Control::Disconnect { .. } => {
@@ -574,7 +656,7 @@ mod tests {
             Ok(false)
         }
 
-        fn resize(&self, _size: Geometry) {}
+        fn resize(&self, _size: Geometry, _cause: ResizeCause) {}
     }
 
     /// A PTY that accepts one byte per attempt and records everything written.
@@ -593,7 +675,7 @@ mod tests {
             Ok(true)
         }
 
-        fn resize(&self, _size: Geometry) {}
+        fn resize(&self, _size: Geometry, _cause: ResizeCause) {}
     }
 
     /// Records hook calls in order.
@@ -697,9 +779,16 @@ mod tests {
         );
     }
 
-    /// Records applied window sizes; accepts all input.
+    /// Records applied window sizes and their causes; starts at 24×80 and
+    /// accepts all input.
     #[derive(Clone, Default)]
-    struct SizedPty(Arc<Mutex<Vec<Geometry>>>);
+    struct SizedPty(Arc<Mutex<Vec<(Geometry, ResizeCause)>>>);
+
+    impl SizedPty {
+        fn sizes(&self) -> Vec<(Geometry, ResizeCause)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
 
     impl PtyInputSink for SizedPty {
         fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -712,9 +801,33 @@ mod tests {
             Ok(true)
         }
 
-        fn resize(&self, size: Geometry) {
-            self.0.lock().unwrap().push(size);
+        fn resize(&self, size: Geometry, cause: ResizeCause) {
+            self.0.lock().unwrap().push((size, cause));
         }
+
+        fn size(&self) -> Option<Geometry> {
+            Some(
+                self.0
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map_or(Geometry::new(24, 80).unwrap(), |(size, _)| *size),
+            )
+        }
+    }
+
+    fn geometry(rows: u16, cols: u16) -> Geometry {
+        Geometry::new(rows, cols).unwrap()
+    }
+
+    fn correlation(n: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(n).unwrap()
+    }
+
+    /// Controls are served in order: a claim round-trip proves everything
+    /// queued before it was processed.
+    fn served(writer: &InputWriter) {
+        let _ = writer.claim(writer.next_holder(), ControllerKind::Agent);
     }
 
     #[test]
@@ -726,15 +839,126 @@ mod tests {
             .unwrap();
         let new = writer.takeover(writer.next_holder()).unwrap().handle;
 
-        writer.resize(&old, Geometry::new(10, 20).unwrap());
-        writer.resize(&new, Geometry::new(30, 40).unwrap());
-        // Controls are served in order; a claim round-trip proves both resizes
-        // were processed before asserting.
-        let _ = writer.claim(writer.next_holder(), ControllerKind::Agent);
+        writer.resize(&old, geometry(10, 20));
+        writer.resize(&new, geometry(30, 40));
+        served(&writer);
+
+        assert_eq!(pty.sizes(), [(geometry(30, 40), ResizeCause::User)]);
+    }
+
+    #[test]
+    fn a_repaint_is_authorized_like_input() {
+        let pty = SizedPty::default();
+        let writer = InputWriter::spawn(RunId::new(), pty.clone(), Recorded::default());
+        let old = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+        writer.resize(&old, geometry(24, 80));
+        let new = writer.takeover(writer.next_holder()).unwrap().handle;
+
+        assert!(
+            !writer.repaint_shrink(&old, correlation(1)),
+            "a superseded client cannot shrink the PTY"
+        );
+        writer.resize(&new, geometry(24, 80));
+        assert!(
+            writer.repaint_shrink(&new, correlation(2)),
+            "an attach at the PTY's size repaints"
+        );
+        writer.repaint_restore(correlation(1));
+        writer.repaint_restore(correlation(2));
+        served(&writer);
+
+        let repaint = ResizeCause::Repaint {
+            correlation: correlation(2),
+        };
+        assert_eq!(
+            pty.sizes(),
+            [
+                (geometry(24, 80), ResizeCause::User),
+                (geometry(24, 80), ResizeCause::User),
+                (geometry(23, 80), repaint),
+                (geometry(24, 80), repaint),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_resize_that_kept_the_size_is_followed_by_a_repaint_once() {
+        let pty = SizedPty::default();
+        let writer = InputWriter::spawn(RunId::new(), pty.clone(), Recorded::default());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+
+        writer.resize(&human, geometry(30, 100));
+        assert!(
+            !writer.repaint_shrink(&human, correlation(1)),
+            "a new size already redraws"
+        );
+        writer.resize(&human, geometry(30, 100));
+        assert!(writer.repaint_shrink(&human, correlation(2)));
+        assert!(
+            !writer.repaint_shrink(&human, correlation(3)),
+            "one repaint per resize that kept the size"
+        );
+    }
+
+    #[test]
+    fn a_one_row_terminal_is_not_shrunk() {
+        let pty = SizedPty::default();
+        let writer = InputWriter::spawn(RunId::new(), pty.clone(), Recorded::default());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+        writer.resize(&human, geometry(1, 80));
+        writer.resize(&human, geometry(1, 80));
+        assert!(!writer.repaint_shrink(&human, correlation(1)));
+        assert_eq!(pty.sizes().len(), 2);
+    }
+
+    #[test]
+    fn a_client_that_leaves_mid_repaint_still_gets_its_size_restored() {
+        let pty = SizedPty::default();
+        let writer = InputWriter::spawn(RunId::new(), pty.clone(), Recorded::default());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+        writer.resize(&human, geometry(24, 80));
+        assert!(writer.repaint_shrink(&human, correlation(1)));
+        writer.disconnect(human);
+        writer.repaint_restore(correlation(1));
+        served(&writer);
 
         assert_eq!(
-            pty.0.lock().unwrap().as_slice(),
-            &[Geometry::new(30, 40).unwrap()]
+            pty.sizes().last(),
+            Some(&(
+                geometry(24, 80),
+                ResizeCause::Repaint {
+                    correlation: correlation(1)
+                }
+            )),
+            "the shrink does not outlive the client"
+        );
+    }
+
+    #[test]
+    fn a_resize_between_shrink_and_restore_cancels_the_restore() {
+        let pty = SizedPty::default();
+        let writer = InputWriter::spawn(RunId::new(), pty.clone(), Recorded::default());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+        writer.resize(&human, geometry(24, 80));
+        assert!(writer.repaint_shrink(&human, correlation(1)));
+        writer.resize(&human, geometry(40, 120));
+        writer.repaint_restore(correlation(1));
+        served(&writer);
+
+        assert_eq!(
+            pty.sizes().last(),
+            Some(&(geometry(40, 120), ResizeCause::User)),
+            "the user's size stands"
         );
     }
 

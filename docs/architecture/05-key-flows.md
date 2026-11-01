@@ -196,7 +196,7 @@ sequenceDiagram
     CLI->>Socket: MSG_HELLO (mode attach)
     Sidecar->>Sidecar: switch PTY control to HumanControl
     Sidecar->>Socket: MSG_ACCEPTED
-    CLI->>Socket: MSG_RESIZE / MSG_DATA / MSG_DETACH
+    CLI->>Socket: MSG_RESIZE / MSG_REPAINT / MSG_DATA / MSG_DETACH
     Sidecar->>PTY: relay input and resize
     PTY->>Sidecar: terminal output
     Sidecar->>Socket: MSG_DATA back to attached client

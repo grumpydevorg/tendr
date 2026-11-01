@@ -136,7 +136,18 @@ fn run_viewer_sender(queue: &ViewerQueue, conn: &Mutex<Box<dyn Write + Send>>) {
 struct AttachTee {
     viewer: Option<AttachViewer>,
     modes: crate::term_modes::TermModes,
+    /// When the child last wrote output; a repaint waits for it to go quiet.
+    last_output: Option<std::time::Instant>,
 }
+
+/// A repaint restores the PTY's size once the child's output has been quiet
+/// this long after the shrink: Claude Code re-sends its mouse modes 0.25 ms
+/// after a resize and redraws 19 ms after it (plan 00, step 5).
+#[cfg(unix)]
+const REPAINT_QUIET: std::time::Duration = std::time::Duration::from_millis(50);
+/// The longest a repaint keeps the PTY shrunk.
+#[cfg(unix)]
+const REPAINT_MAX: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Shared sink for teeing PTY output to the attached client.
 type AttachSink = Arc<Mutex<AttachTee>>;
@@ -1591,6 +1602,7 @@ fn capture_stream_with_tee(
         // Offer raw bytes to the attached viewer's bounded queue; never block.
         let mut tee = lock(attach_sink);
         tee.modes.feed(&buf[..n]);
+        tee.last_output = Some(std::time::Instant::now());
         if let Some(viewer) = tee.viewer.as_ref() {
             if !viewer.queue.offer(&buf[..n]) {
                 (viewer.disconnect)();
@@ -1622,17 +1634,31 @@ impl crate::pty_input::WritablePty for UnixPtyInput {
         self.writer.wait_writable(timeout)
     }
 
-    fn resize(&self, size: crate::recording::Geometry) {
+    fn resize(&self, size: crate::recording::Geometry, cause: crate::recording::ResizeCause) {
         let Some(fd) = &self.resize else {
             return;
         };
         let apply = || apply_pty_resize(fd, size);
         let _ = match &self.recorder {
-            Some(recorder) => {
-                recorder.resize_applied(size, crate::recording::ResizeCause::User, apply)
-            }
+            Some(recorder) => recorder.resize_applied(size, cause, apply),
             None => apply(),
         };
+    }
+
+    fn size(&self) -> Option<crate::recording::Geometry> {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.resize.as_ref()?;
+        let mut ws = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: fd is a valid PTY master fd; TIOCGWINSZ fills a winsize.
+        if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) } == -1 {
+            return None;
+        }
+        crate::recording::Geometry::new(ws.ws_row, ws.ws_col)
     }
 }
 
@@ -2397,6 +2423,7 @@ fn handle_attach_connection(
                     }
                 }
                 Ok(Frame::Resize(size)) => writer.resize(&handle, size),
+                Ok(Frame::Repaint) => start_repaint(writer, attach_sink, &handle),
                 Ok(Frame::Detach) | Err(FrameError::Io(_)) => break,
                 // Other frames, unknown ones, and malformed ones such as a
                 // resize with a zero dimension, are ignored.
@@ -2417,6 +2444,46 @@ fn handle_attach_connection(
     }
     drop(tee);
     queue.close();
+}
+
+/// Shrink the PTY by one row for `handle`'s repaint, if it applies, and restore
+/// it from another thread once the child's output goes quiet, so this
+/// connection's input is not held up meanwhile.
+#[cfg(unix)]
+fn start_repaint(
+    writer: &crate::pty_input::InputWriter,
+    sink: &AttachSink,
+    handle: &crate::model::pty_control::ControllerHandle,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CORRELATION: AtomicU32 = AtomicU32::new(1);
+    let correlation = std::num::NonZeroU32::new(CORRELATION.fetch_add(1, Ordering::Relaxed))
+        .unwrap_or(std::num::NonZeroU32::MIN);
+    if !writer.repaint_shrink(handle, correlation) {
+        return;
+    }
+    let (writer, sink) = (writer.clone(), Arc::clone(sink));
+    std::thread::spawn(move || {
+        wait_for_quiet_output(&sink, REPAINT_QUIET, REPAINT_MAX);
+        writer.repaint_restore(correlation);
+    });
+}
+
+/// Wait until the child has written nothing for `quiet`, counted from now at
+/// the earliest, or until `max` has passed.
+#[cfg(unix)]
+fn wait_for_quiet_output(sink: &AttachSink, quiet: std::time::Duration, max: std::time::Duration) {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    loop {
+        let now = Instant::now();
+        let last = lock(sink).last_output.map_or(start, |t| t.max(start));
+        let silent = now.saturating_duration_since(last);
+        if silent >= quiet || now.saturating_duration_since(start) >= max {
+            return;
+        }
+        std::thread::sleep((quiet - silent).min(Duration::from_millis(10)));
+    }
 }
 
 #[cfg(unix)]
@@ -2631,6 +2698,40 @@ mod tests {
             request_reject_class(&RequestError::WriterGone),
             RejectClass::Runtime
         );
+    }
+
+    #[test]
+    fn a_repaint_waits_for_quiet_output_but_not_past_its_bound() {
+        use std::time::{Duration, Instant};
+        // Wide margins: the writer below must not miss a whole `quiet` window
+        // on a busy runner.
+        let quiet = Duration::from_millis(100);
+        let max = Duration::from_millis(300);
+
+        // Nothing written: done once `quiet` has passed.
+        let sink: AttachSink = Arc::default();
+        let start = Instant::now();
+        wait_for_quiet_output(&sink, quiet, max);
+        let waited = start.elapsed();
+        assert!(waited >= quiet && waited < max, "{waited:?}");
+
+        // Output that never stops: done at `max`.
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer = {
+            let (sink, writing) = (Arc::clone(&sink), Arc::clone(&writing));
+            std::thread::spawn(move || {
+                while writing.load(std::sync::atomic::Ordering::SeqCst) {
+                    lock(&sink).last_output = Some(Instant::now());
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let start = Instant::now();
+        wait_for_quiet_output(&sink, quiet, max);
+        let waited = start.elapsed();
+        writing.store(false, std::sync::atomic::Ordering::SeqCst);
+        writer.join().unwrap();
+        assert!(waited >= max, "{waited:?}");
     }
 
     #[test]
@@ -3007,7 +3108,8 @@ mod tests {
             Ok(true)
         }
 
-        fn resize(&self, _size: crate::recording::Geometry) {}
+        fn resize(&self, _size: crate::recording::Geometry, _cause: crate::recording::ResizeCause) {
+        }
     }
 
     /// Hooks with no side effects: a takeover supersedes the push without
