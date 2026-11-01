@@ -263,10 +263,11 @@ impl Platform for WindowsPlatform {
 
     fn reap_orphans(_child: &ProcessIdentity) {}
 
-    /// The Job Object is kill-on-close and only the sidecar holds it, so
-    /// the rest of the tree ends when the sidecar exits after the stop.
-    fn stop_run_tree(_handle: &ChildKillHandle, _force: bool) -> io::Result<()> {
-        Ok(())
+    /// Only `kill_child`: the Job Object is kill-on-close and only the
+    /// sidecar holds it, so the rest of the tree ends when the sidecar exits
+    /// after the stop.
+    fn stop_run(handle: &ChildKillHandle, force: bool) -> io::Result<()> {
+        Self::kill_child(handle, force)
     }
 
     fn kill_orphan(id: &ProcessIdentity, _force: bool) -> io::Result<()> {

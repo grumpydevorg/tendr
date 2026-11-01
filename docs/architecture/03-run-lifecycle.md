@@ -246,31 +246,26 @@ observed exit means the sidecar reaped the child, and `SpawnFailed` or
 ## Stopping a run
 
 `kill`, `kill --force` and `--timeout` stop the child first, then the rest
-of the run (`stop_run` in `src/sidecar.rs`).
+of the run (`Platform::stop_run` in `src/platform/`).
 
 1. **The child's process group.** A graceful stop (`kill`, `--timeout`)
    sends SIGTERM to the group, and SIGKILL after 5 s if the child is still
    alive. A PTY child's group first gets SIGHUP and up to 1 s to act on it,
    as when a terminal window closes, so an interactive shell passes the
    hangup on to its jobs as it exits. `kill --force` sends SIGKILL at once.
-2. **Every other process the run started (Linux).** Before it spawns the
-   child, the sidecar makes itself a child subreaper
-   (`PR_SET_CHILD_SUBREAPER`). Every process the run starts then stays a
-   descendant of the sidecar, even after its own parent has exited. The
-   sidecar reaps these orphans by pid while the run lasts, never with
-   `waitpid(-1)`, which would race the wait for the child, and not while a
-   stop is searching. Once the child has exited, or been sent SIGKILL, the
-   sidecar lists its descendants through `/proc/<sidecar>/task/*/children`.
-   - A graceful stop sends SIGTERM to each of them outside the child's
-     group, which has had it already, then SIGCONT to all of them, so a
-     stopped job can act on it, and gives them up to 1 s to exit.
+2. **Every other process the run started (Linux and macOS).** Once the
+   child has exited, or been sent SIGKILL, the sidecar searches for the rest
+   of the run (below).
+   - A graceful stop sends SIGTERM to each process found outside the
+     child's group, which has had it already, then SIGCONT to all of them,
+     so a stopped job can act on it, and gives them up to 1 s to exit.
    - Then each process left is sent SIGSTOP as it is found, so it cannot
      start more, and then SIGKILL. The search repeats until two searches in
-     a row find none, for at most 5 s: the kernel may skip a child in a list
-     that is changing as it is read.
+     a row find none, for at most 5 s.
    - This reaches a job-control shell's jobs, `nohup` jobs, `setsid`
      processes, `(cmd &)` and `disown` jobs, and programs a child starts in
-     sessions of their own, such as Claude Code's Bash tool shells.
+     sessions of their own, such as Claude Code's Bash tool shells, within
+     the limits below.
    - A tendr session started from inside the run is a session of its own.
      The stop leaves its sidecar, found by its `_sidecar` argument, and
      everything below it alone.
@@ -282,10 +277,35 @@ of the run (`stop_run` in `src/sidecar.rs`).
    or the output pipes, and capture ends with them. The `--on-exit` hooks
    run after the end, so a stop never reaches them.
 
-On macOS a stop reaches only the child's process group, as in step 1. On
-Windows the child's Job Object holds the whole tree. A forced stop ends it;
-after a graceful one the rest of the tree ends when the sidecar exits, since
-only the sidecar holds the kill-on-close Job Object.
+How the search finds the run:
+
+- **Linux.** Before it spawns the child, the sidecar makes itself a child
+  subreaper (`PR_SET_CHILD_SUBREAPER`). Every process the run starts then
+  stays a descendant of the sidecar, even after its own parent has exited.
+  The sidecar reaps these orphans by pid while the run lasts, never with
+  `waitpid(-1)`, which would race the wait for the child, and not while a
+  stop is searching. The search lists the sidecar's descendants through
+  `/proc/<sidecar>/task/*/children`; it ends only after two empty searches
+  because the kernel may skip a child in a list that is changing as it is
+  read.
+- **macOS.** Orphans go to launchd, so the search looks at every process
+  of the same user (`proc_listallpids`, `proc_pidinfo`) and takes:
+  - those in the child's session, or in the sidecar's, which holds a pipe
+    run (`getsid`);
+  - the sidecar's descendants, by parent pid;
+  - before the child is signalled only, those holding the run's terminal
+    (`PROC_PIDLISTFDS`, then each vnode descriptor's device);
+  - the descendants of all these.
+
+  The child's exit as session leader revokes its terminal from every
+  holder and leaves its own children to launchd, after which neither can
+  be told apart from other processes. So the sidecar lists the run before
+  it signals the child, and every later search also takes whatever of that
+  list is still running with the same start time.
+
+On Windows the child's Job Object holds the whole tree. A forced stop ends
+it; after a graceful one the rest of the tree ends when the sidecar exits,
+since only the sidecar holds the kill-on-close Job Object.
 
 ## Limits
 
@@ -316,19 +336,20 @@ only the sidecar holds the kill-on-close Job Object.
     the stop's 5 s. The run warning above names both kinds.
   - Adoption is visible: a process the run daemonises sees the sidecar as
     its parent (`getppid()`), not pid 1, while the run lasts.
-  - On macOS a stop reaches only the child's process group and what its
-    hangup reaches. A shell killed with SIGKILL (by `kill --force` or the
-    escalation) passes nothing on, so its jobs survive. `(cmd &)` and
-    `disown` jobs survive any hangup, as they would a closed terminal
-    window. A `nohup` job ignores the hangup and has its own group. A
-    `setsid` process, and children a program starts in sessions of their
-    own, such as Claude Code's Bash tool shells, are outside the group: after
-    a hangup Claude's tasks were gone within half a second, and after
-    SIGKILL they survived. The kernel's own hangup, when the sidecar's end
-    of the terminal closes, goes to the session leader, which by then is
-    dead. Measured on Linux in the cloud PTY plan's step 9, before the stop
-    reached the whole run there
-    ([plan](../plans/active/00_cloud-pty-control.md)).
+  - On macOS, it cannot reach:
+    - a process that left the child's session, has no parent left in the
+      run and holds no terminal descriptor: a `setsid` process orphaned
+      with its output redirected, such as Claude Code's
+      `(setsid tail -f /dev/null >/dev/null 2>&1 &)`. Started once the stop
+      has begun, even one that still holds the terminal is out of reach,
+      since the terminal is revoked;
+    - processes started through launchd or another manager, or by a server
+      the run asks over a socket;
+    - anything left after the sidecar itself died.
+
+    The search lists processes and then signals them, so a process that
+    forks in between is found only by the next search, which repeats until
+    two find none. A fork in the last moment before that can escape.
 - **A terminal holder outlives a PTY child that exits on its own.** A
   process outside the child's session may still hold the terminal after the
   child has exited. Capture then reads what that process writes for at most
@@ -338,15 +359,15 @@ only the sidecar holds the kill-on-close Job Object.
   hold the terminal, found through `/proc/*/fd`; processes of another user
   are missed. A terminal that has closed by the time the 2 s pass is read to
   its end, with no warning. The holder is left running; its later writes to
-  the terminal fail once the sidecar has exited, and are not captured. On
-  Linux a stop ends such a holder before the end is recorded, so the
-  terminal closes and there is no warning. On macOS the child's exit revokes
-  the terminal from every process, so capture ends with the child and there
-  is no warning either.
+  the terminal fail once the sidecar has exited, and are not captured. A stop
+  ends such a holder before the end is recorded, on Linux and on macOS, so
+  the terminal closes and there is no warning. On macOS the child's exit
+  revokes the terminal from every process, so capture ends with the child
+  and there is no warning either.
 - **An output holder keeps a pipe run going.** A pipe run's capture ends when
   its stdout and stderr pipes close. A process that inherited them and
   outlives the child keeps the run `Running`, with the child unreaped, until
-  it exits. On Linux a stop ends it, and the run with it.
+  it exits. A stop ends it, on Linux and on macOS, and the run with it.
 - **`kill` fails if the run does not end.** `kill` waits for the end to be
   recorded: by the sidecar, or by reconciliation once no sidecar holds the
   session (recorded as `SidecarLost`). If the sidecar holds the session but
@@ -355,12 +376,8 @@ only the sidecar holds the kill-on-close Job Object.
 - **Graceful stop.** `kill` without `--force`, and `--timeout`, escalate to
   SIGKILL on the group only while the child itself is alive. A timed-out
   child therefore exits up to about 6 s after the deadline, and the run is
-  still recorded as `TimedOut`. On Linux the rest of the run then gets up
-  to 1 s to exit on SIGTERM before SIGKILL. On macOS a group member that
-  ignores SIGTERM can outlive a leader that exits promptly, and so the
-  timeout. While it holds a pipe run's stdout or stderr there, the run does
-  not end (see the output holder above); a PTY run ends at most 2 s after
-  its child.
+  still recorded as `TimedOut`. The rest of the run then gets up to 1 s to
+  exit on SIGTERM before SIGKILL, on Linux and on macOS.
 - **Crash before any meta.** The sidecar may crash, or fail to record its
   failure, before any meta was written. The orphan-directory cleanup in
   `status` and `start` handles this. It kills the breadcrumb's child by the

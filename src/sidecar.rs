@@ -349,11 +349,11 @@ impl StopGate {
         Some(f())
     }
 
-    /// [`stop_run`], unless the run has ended; a failure becomes a run
-    /// warning.
+    /// [`Platform::stop_run`], unless the run has ended; a failure becomes
+    /// a run warning.
     fn stop(&self, kill_handle: &<Current as Platform>::ChildKillHandle, force: bool) {
         self.enter(|| {
-            if let Err(e) = stop_run(kill_handle, force) {
+            if let Err(e) = Current::stop_run(kill_handle, force) {
                 lock(&self.0.0)
                     .warnings
                     .push(format!("stopping the run: {e}"));
@@ -362,8 +362,8 @@ impl StopGate {
     }
 
     /// End the run: refuse new stops and reaping, and wait for those under
-    /// way. Each is bounded: a stop by its grace periods and
-    /// [`Platform::stop_run_tree`]'s limit. Returns the stops' warnings.
+    /// way. Each is bounded by its grace periods and the tree search's
+    /// limit (see [`Platform::stop_run`]). Returns the stops' warnings.
     fn close(&self) -> Vec<String> {
         let (state, changed) = &*self.0;
         let mut state = lock(state);
@@ -375,16 +375,6 @@ impl StopGate {
         }
         std::mem::take(&mut state.warnings)
     }
-}
-
-/// Stop the whole run: the child and its process group by `kill_child`,
-/// then every other process the run started by `stop_run_tree`, gracefully
-/// unless `force`. The tree is stopped even if the child's kill failed, for
-/// one because the child had already exited. Returns the first error.
-fn stop_run(kill_handle: &<Current as Platform>::ChildKillHandle, force: bool) -> io::Result<()> {
-    let child = Current::kill_child(kill_handle, force);
-    let tree = Current::stop_run_tree(kill_handle, force);
-    child.and(tree)
 }
 
 /// Spawn a timeout thread that stops the run after `timeout_s` seconds,

@@ -1,12 +1,15 @@
 //! A stop ends every process the run started, wherever it went: out of the
 //! child's process group, into a session of its own, or orphaned. Each kind
-//! is one that survived a stop in the cloud PTY plan's step 9.
-#![cfg(target_os = "linux")]
+//! is one that survived a stop in the cloud PTY plan's step 9. On macOS,
+//! where nothing adopts orphans, each kind here is one a stop can still
+//! find: in the child's session, below a live parent, or holding the
+//! terminal.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod harness;
 
 use harness::{Observation, SessionGuard, poll_until, tendr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -17,6 +20,12 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// it empty), then becomes `sleep 300`, keeping the pid.
 const HOLD: &str = r#"echo $$ > "$1.tmp" && mv "$1.tmp" "$1" && exec sleep 300"#;
 
+/// Runs its arguments in a session of their own, as util-linux `setsid`
+/// does (macOS has no `setsid` command): a process group leader, which may
+/// not call `setsid`, forks first and exits, leaving the new session
+/// orphaned.
+const SETSID: &str = r#"exec perl -MPOSIX -e 'if (getpgrp() == $$) { fork and exit } POSIX::setsid() or die "setsid: $!"; exec @ARGV or die' "$@""#;
+
 /// A session leader whose parent stays alive, with a child of its own, as
 /// Claude Code starts each Bash tool shell: `hold.sh` as its child, then its
 /// own pid to `$1`.
@@ -25,15 +34,16 @@ const LEADER: &str =
 
 /// Every way out of the child's process group that step 9 measured, each
 /// named by the pid file its process writes. `session` is started before job
-/// control is on, so it is not a group leader and can call `setsid` without
-/// forking; the rest are jobs of a shell with job control, each in a process
-/// group of its own, as in an interactive shell.
+/// control is on, so it is not a group leader and gets its own session
+/// without forking; the rest are jobs of a shell with job control, each in a
+/// process group of its own, as in an interactive shell. `setsid` is
+/// orphaned in a session of its own, and holds the terminal.
 const PTY_RUN: &str = r#"
 d=$1
-setsid sh "$d/leader.sh" "$d/session" &
+sh "$d/setsid.sh" sh "$d/leader.sh" "$d/session" &
 set -m
 sh "$d/hold.sh" "$d/plain" &
-setsid sh "$d/hold.sh" "$d/setsid" &
+sh "$d/setsid.sh" sh "$d/hold.sh" "$d/setsid" &
 nohup sh "$d/hold.sh" "$d/nohup" >/dev/null 2>&1 &
 (sh "$d/hold.sh" "$d/subshell" &)
 sh "$d/hold.sh" "$d/disown" & disown
@@ -72,6 +82,7 @@ impl Kinds {
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("hold.sh"), HOLD).unwrap();
         std::fs::write(dir.join("leader.sh"), LEADER).unwrap();
+        std::fs::write(dir.join("setsid.sh"), SETSID).unwrap();
         Self(dir)
     }
 
@@ -117,15 +128,16 @@ impl Drop for Kinds {
     }
 }
 
-/// Whether `pid` is a live process: present and not a zombie.
+/// Whether `pid` is a live process: present and not a zombie, per `ps`.
 fn running(pid: i32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    let state = stat
-        .rfind(')')
-        .and_then(|i| stat[i + 1..].split_whitespace().next());
-    !matches!(state, Some("Z" | "X"))
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            let stat = stat.trim();
+            !stat.is_empty() && !stat.starts_with('Z')
+        })
 }
 
 /// A session's meta as it is on disk, if readable.
@@ -195,6 +207,14 @@ fn every_kind_ends_with_the_run(stop: Stop, session: &str, reason: &str) {
         survivors.is_empty(),
         "still running once the run's end was recorded: {survivors:?}: {meta}"
     );
+    // Everything was ended, so the stop has nothing to warn about.
+    let warned = meta["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|w| {
+            w.as_str()
+                .is_some_and(|w| w.starts_with("stopping the run"))
+        })
+    });
+    assert!(!warned, "a stop that ended everything warned: {meta}");
 }
 
 #[test]
@@ -221,7 +241,7 @@ fn kill_ends_a_pipe_run_whose_output_a_setsid_process_holds() {
     let root = TempDir::new().unwrap();
     let kinds = Kinds::new(&root);
 
-    let script = r#"setsid sh "$1/hold.sh" "$1/pipe-holder" &
+    let script = r#"sh "$1/setsid.sh" sh "$1/hold.sh" "$1/pipe-holder" &
 while [ ! -e "$1/pipe-holder" ]; do sleep 0.05; done
 exec sleep 600"#;
     tendr(&root)
@@ -258,7 +278,7 @@ fn kill_lets_every_process_clean_up_on_sigterm_first() {
     // The leader `sh` dies on SIGTERM at once, while the member is still
     // cleaning up.
     let script = r#"sh "$1/cleans-up.sh" "$1/member" "$1/member.cleaned" &
-setsid sh "$1/cleans-up.sh" "$1/escapee" "$1/escapee.cleaned" &
+sh "$1/setsid.sh" sh "$1/cleans-up.sh" "$1/escapee" "$1/escapee.cleaned" &
 while [ ! -e "$1/member" ] || [ ! -e "$1/escapee" ]; do sleep 0.05; done
 wait"#;
     tendr(&root)
@@ -339,6 +359,7 @@ exec sleep 600"#;
 
 /// The sidecar adopts what the run orphans, so it must also reap it while
 /// the run lasts: an orphan that exits on its own must not stay a zombie.
+#[cfg(target_os = "linux")]
 #[test]
 fn orphans_that_exit_during_the_run_are_reaped() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -372,7 +393,7 @@ touch "$1/orphaned"; exec sleep 600"#;
     poll_until(Duration::from_secs(5), Duration::from_millis(100), || {
         let left: Vec<String> = orphans
             .iter()
-            .filter(|pid| Path::new(&format!("/proc/{pid}")).exists())
+            .filter(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
             .map(|pid| {
                 format!(
                     "{pid} ({})",

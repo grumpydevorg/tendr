@@ -35,7 +35,7 @@ use super::{
     PtyRecordingRun, PtyTeardown, ReadyWriter, StopGate, capture_stream, capture_stream_with_tee,
     collect_warnings, deliver_ready, finished_recording, lock, run_on_exit_hooks,
     setup_kill_watcher, setup_orphan_reaper, setup_pty_stdin_forwarding, setup_stdin_forwarding,
-    setup_timeout, stop_run, stopped_state, test_abort_point, test_fault, test_pty_read_delay,
+    setup_timeout, stopped_state, test_abort_point, test_fault, test_pty_read_delay,
     test_unlock_gate,
 };
 #[cfg(unix)]
@@ -785,7 +785,7 @@ fn terminate_and_reap(
     let graceful = handle.clone();
     let killer = std::thread::Builder::new()
         .name("tendr-stop-child".to_owned())
-        .spawn(move || stop_run(&graceful, false));
+        .spawn(move || Current::stop_run(&graceful, false));
     let mut notes = Vec::new();
     let killer = match killer {
         Ok(killer) => Some(killer),
@@ -793,7 +793,7 @@ fn terminate_and_reap(
             notes.push(format!(
                 "no thread for a graceful stop ({e}); force-killing"
             ));
-            if let Err(e) = stop_run(handle, true) {
+            if let Err(e) = Current::stop_run(handle, true) {
                 notes.push(format!("force-killing the child failed: {e}"));
             }
             None
