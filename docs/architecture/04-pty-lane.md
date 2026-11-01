@@ -268,8 +268,12 @@ A `push` to a pipe session that is not running exits 1.
   from when the sidecar closes its descriptor, below). Capture then ends, the
   child is reaped and its exit recorded, and on Linux a run warning names
   the pids that still hold the terminal (found through `/proc/*/fd`). On
-  macOS the session leader's exit revokes the terminal from every process,
-  so capture ends with the child there.
+  Linux a stop ends every process the run started before the end is
+  recorded, holders included, so after a stop the terminal closes and
+  capture ends without the grace (run lifecycle,
+  [Stopping a run](03-run-lifecycle.md#stopping-a-run)). On macOS the
+  session leader's exit revokes the terminal from every process, so capture
+  ends with the child there.
 - The sidecar keeps its own descriptor for the PTY's slave side
   (close-on-exec, never its controlling terminal) until the child has exited
   and capture has read the master until it would block; then it closes it.

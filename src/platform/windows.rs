@@ -256,6 +256,19 @@ impl Platform for WindowsPlatform {
         terminate_job(&handle.job_object)
     }
 
+    /// The Job Object keeps every process the run starts, orphaned or not.
+    fn adopt_orphans() -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn reap_orphans(_child: &ProcessIdentity) {}
+
+    /// The Job Object is kill-on-close and only the sidecar holds it, so
+    /// the rest of the tree ends when the sidecar exits after the stop.
+    fn stop_run_tree(_handle: &ChildKillHandle, _force: bool) -> io::Result<()> {
+        Ok(())
+    }
+
     fn kill_orphan(id: &ProcessIdentity, _force: bool) -> io::Result<()> {
         // Without a Job Object handle (sidecar crashed or CLI-initiated kill),
         // we can only kill the individual process by PID — no descendant tree

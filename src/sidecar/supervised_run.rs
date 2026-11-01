@@ -32,10 +32,11 @@ use std::time::{Duration, Instant};
 
 use super::{
     AttachEndpoint, AttachSink, AttachSocketCleanup, LifecycleEvents, META_WRITE, PtyInput,
-    PtyRecordingRun, PtyTeardown, ReadyWriter, capture_stream, capture_stream_with_tee,
+    PtyRecordingRun, PtyTeardown, ReadyWriter, StopGate, capture_stream, capture_stream_with_tee,
     collect_warnings, deliver_ready, finished_recording, lock, run_on_exit_hooks,
-    setup_kill_watcher, setup_pty_stdin_forwarding, setup_stdin_forwarding, setup_timeout,
-    stopped_state, test_abort_point, test_fault, test_pty_read_delay, test_unlock_gate,
+    setup_kill_watcher, setup_orphan_reaper, setup_pty_stdin_forwarding, setup_stdin_forwarding,
+    setup_timeout, stop_run, stopped_state, test_abort_point, test_fault, test_pty_read_delay,
+    test_unlock_gate,
 };
 #[cfg(unix)]
 use super::{
@@ -102,6 +103,10 @@ struct RunCore {
     pty: Option<PtySide>,
     /// Stops the timeout and kill-request watchers once the run is ending.
     watch_cancel: Arc<AtomicBool>,
+    /// Orders stops and orphan reaping before the run's end.
+    stops: StopGate,
+    /// The sidecar adopts what the child orphans, and must reap it.
+    adopts_orphans: bool,
     timed_out: Arc<AtomicBool>,
     /// What the sidecar is doing now; recorded if the guard is dropped.
     step: SidecarStep,
@@ -157,7 +162,10 @@ fn end_attach_side(pty: StartedPty, _meta: &mut Meta) {
 impl SupervisedRun<Spawned> {
     /// Take ownership of a freshly spawned child. `ready` is the readiness
     /// channel if it has not been used yet (no `--after` dependencies);
-    /// `attach` is a PTY session's attach socket, bound before spawn.
+    /// `attach` is a PTY session's attach socket, bound before spawn;
+    /// `adopts_orphans` says whether the sidecar adopts what the child
+    /// orphans ([`Platform::adopt_orphans`]).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn adopt(
         child: SupervisedChild,
         session: SessionDir,
@@ -166,6 +174,7 @@ impl SupervisedRun<Spawned> {
         lifecycle: LifecycleEvents,
         ready: Option<ReadyWriter>,
         attach: Option<AttachEndpoint>,
+        adopts_orphans: bool,
     ) -> Self {
         let identity = Current::child_identity(&child);
         let kill_handle = Current::child_kill_handle(&child);
@@ -181,6 +190,8 @@ impl SupervisedRun<Spawned> {
                 stdin_errors: Arc::new(Mutex::new(Vec::new())),
                 pty: attach.map(PtySide::Bound),
                 watch_cancel: Arc::new(AtomicBool::new(false)),
+                stops: StopGate::default(),
+                adopts_orphans,
                 timed_out: Arc::new(AtomicBool::new(false)),
                 step: SidecarStep::Breadcrumb,
                 ended: false,
@@ -326,6 +337,7 @@ impl RunCore {
                 self.kill_handle.clone(),
                 timeout_s,
                 Arc::clone(&self.watch_cancel),
+                self.stops.clone(),
             );
         }
         setup_kill_watcher(
@@ -333,7 +345,15 @@ impl RunCore {
             self.kill_handle.clone(),
             self.meta.run_id(),
             Arc::clone(&self.watch_cancel),
+            self.stops.clone(),
         );
+        if self.adopts_orphans {
+            setup_orphan_reaper(
+                self.identity,
+                Arc::clone(&self.watch_cancel),
+                self.stops.clone(),
+            );
+        }
         Ok(())
     }
 
@@ -563,6 +583,11 @@ impl RunCore {
     fn finish(&mut self, how: ExitReason) -> anyhow::Result<()> {
         self.ended = true;
         self.watch_cancel.store(true, Ordering::Relaxed);
+        // A stop under way ends every process the run started before the
+        // end is recorded.
+        for warning in self.stops.close() {
+            self.meta.add_warning(warning);
+        }
         let dir = self.session_dir().to_path_buf();
 
         // Capture has drained the PTY: close the recording at what it holds.
@@ -646,6 +671,9 @@ impl RunCore {
         self.watch_cancel.store(true, Ordering::Relaxed);
 
         let stopped = terminate_and_reap(&mut self.child, &self.kill_handle, &self.identity);
+        for warning in self.stops.close() {
+            self.meta.add_warning(warning);
+        }
         self.finish_recording();
 
         let dir = self.session_dir().to_path_buf();
@@ -741,13 +769,14 @@ impl Stopped {
     }
 }
 
-/// Stop the child through the platform kill path (process group on Unix, Job
-/// Object on Windows): graceful first, forced after the grace period. The
-/// graceful kill runs on its own thread while this one reaps, because on Unix
-/// an unreaped child stays a zombie that the kill's liveness probe still sees.
-/// Panic-free: this runs from `Drop` during unwinding, where a second panic
-/// would abort before the child is stopped. If no thread can be created, the
-/// child is force-killed inline instead.
+/// Stop the run through the platform kill path (process group on Unix, Job
+/// Object on Windows), and then the rest of its tree: graceful first, forced
+/// after the grace period. The graceful stop runs on its own thread while
+/// this one reaps, because on Unix an unreaped child stays a zombie that the
+/// kill's liveness probe still sees. Panic-free: this runs from `Drop`
+/// during unwinding, where a second panic would abort before the child is
+/// stopped. If no thread can be created, the run is force-stopped inline
+/// instead.
 fn terminate_and_reap(
     child: &mut SupervisedChild,
     handle: &ChildKillHandle,
@@ -756,7 +785,7 @@ fn terminate_and_reap(
     let graceful = handle.clone();
     let killer = std::thread::Builder::new()
         .name("tendr-stop-child".to_owned())
-        .spawn(move || Current::kill_child(&graceful, false));
+        .spawn(move || stop_run(&graceful, false));
     let mut notes = Vec::new();
     let killer = match killer {
         Ok(killer) => Some(killer),
@@ -764,7 +793,7 @@ fn terminate_and_reap(
             notes.push(format!(
                 "no thread for a graceful stop ({e}); force-killing"
             ));
-            if let Err(e) = Current::kill_child(handle, true) {
+            if let Err(e) = stop_run(handle, true) {
                 notes.push(format!("force-killing the child failed: {e}"));
             }
             None

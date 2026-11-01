@@ -22,11 +22,30 @@
   So a child can clean up, and a shell hangs up its background jobs. Claude
   Code and a shell cleaned up their children after a hangup but not after
   SIGKILL. A timed-out child can now exit up to about 6 s after the deadline.
-  The run is still recorded as `TimedOut`. A process in the group that
-  ignores SIGTERM can now outlive the timeout, which the old SIGKILL to the
-  group reached. While it holds a pipe run's stdout or stderr the run does
-  not end; a PTY run ends at most 2 s after its child (see below). The run
-  lifecycle's Limits describe both holders.
+  The run is still recorded as `TimedOut`. On macOS a process in the group
+  that ignores SIGTERM can now outlive the timeout, which the old SIGKILL to
+  the group reached. While it holds a pipe run's stdout or stderr the run
+  does not end; a PTY run ends at most 2 s after its child (see below). The
+  run lifecycle's Limits describe both holders. On Linux the stop now ends
+  it (next entry).
+- **On Linux a stop ends every process the run started.** Before, `kill`,
+  `kill --force` and `--timeout` reached only the child's process group, and
+  in step 9 of the cloud PTY plan most of what an interactive shell or Claude
+  Code had started survived: `setsid`, `nohup`, `(cmd &)` and `disown` jobs,
+  a shell's jobs after SIGKILL, and Claude Code's tool shells, which run in
+  sessions of their own. Now the sidecar adopts every process the run
+  orphans, and reaps them while the run lasts. After stopping the child it
+  finds the rest of the run among its descendants. `kill` and `--timeout`
+  send each SIGTERM and give it up to 1 s; then each one left is stopped and
+  killed, at once for `kill --force`. The run's end is recorded after that,
+  so a stopped PTY run no longer ends with a warning about processes still
+  holding its terminal, and a stopped pipe run no longer waits for a
+  process that holds its output. A tendr session started from inside the
+  run is left running. A stop still cannot reach processes started through
+  another manager (`systemd-run --user`, `at`, an already running `tmux`
+  server) or anything left after the sidecar itself died, nor end a setuid
+  program; a run warning names processes it could not end. On macOS a stop
+  still reaches only the process group.
 
 ### Fixed
 
