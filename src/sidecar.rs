@@ -2060,7 +2060,8 @@ impl RunEffects {
 const PENDING_CONNECTIONS: usize = 5;
 
 /// Attaches, takeovers, resumes and pushes. A retiring controller keeps its
-/// connection up to [`TAKEOVER_RECORD_GRACE`], so repeated takeovers need a cap.
+/// connection about 2.4 s (its retirement write plus
+/// [`TAKEOVER_RECORD_GRACE`]), so repeated takeovers need a cap.
 #[cfg(unix)]
 const CONTROLLER_CONNECTIONS: usize = 8;
 
@@ -2659,7 +2660,7 @@ fn handle_attach_connection(
         deadline: std::time::Instant::now() + attach_proto::HELLO_TIMEOUT,
     });
     // The first frame is read: the pending slot is free for the next arrival
-    // before this connection waits for any slot of its own.
+    // before this connection takes any slot of its own.
     drop(pending);
     let (version, ask) = match hello {
         Ok(Frame::Hello {

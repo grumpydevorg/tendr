@@ -150,7 +150,7 @@ flowchart LR
   or resume) is read, then gives it back before taking the slot of the mode
   it asked for: attaches, takeovers, resumes and pushes share eight
   (`CONTROLLER_CONNECTIONS`; a retiring controller keeps its connection for
-  up to `TAKEOVER_RECORD_GRACE`, so repeated takeovers need the cap). A
+  up to about 2.4 s, so repeated takeovers need the cap). A
   connection that finds its pool full is refused with a runtime refusal.
   Five connections that never send a hello refuse every new connection for
   up to 5 s; four leave room. The socket is owner-only and peer-checked, so
