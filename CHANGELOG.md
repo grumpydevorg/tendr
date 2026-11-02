@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## v0.7.0 — read-only viewers, Windows console attach
+
+Works with 0.6.0 and 0.5.0 in both directions over `--host` for everything
+those versions do: an attach to a session started by an older `tendr` steps
+down to the attach protocol that session speaks. Watching (`--read-only`)
+needs 0.7.0 on both hosts and a session started by 0.7.0; anything older
+refuses it with 80, or 81 when an older remote finds someone attached, and
+never attaches it. Reconnecting still needs 0.6.0 on the remote and for the
+session. `tendr guide remote` lists each minimum.
 
 ### Added
 
