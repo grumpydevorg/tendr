@@ -9,9 +9,9 @@ depends_on: []
 ([remote frame](../../architecture/06-transport-boundaries.md#the-remote-frame)),
 and `attach` from a Unix client bridges the attach protocol over it
 ([attach bridge](../../architecture/06-transport-boundaries.md#the-attach-bridge)).
-What is left is resuming viewers, read-only viewers, and moving Windows
-clients off `ssh -t`. The cloud PTY workflow needs the first
-([VM scripts and results](../../../scripts/pty-vm/README.md)).
+What is left is the VM acceptance of resuming viewers, read-only viewers,
+and moving Windows clients off `ssh -t`. The cloud PTY workflow needs the
+first ([VM scripts and results](../../../scripts/pty-vm/README.md)).
 
 Goal: a viewer that loses its connection can resume where it left off, and no
 client needs a remote terminal or a rebuilt command line.
@@ -22,18 +22,23 @@ lifecycle hardening, PowerShell state) belongs to
 
 ## Steps
 
-1. **Resumable viewers.** A viewer reconnects with its run ID and the byte
-   offset of the output it has written, and gets the retained output from
-   that offset on, with no gap. History that is gone is reported with the
-   available range, and the viewer goes on from the head with a visible
-   notice; nothing is skipped silently. Input is never resent automatically.
-   Today the sidecar and the attach bridge resume a version 2 viewer, or say
-   its output is gone and name the range
-   ([PTY lane](../../architecture/04-pty-lane.md#resuming-a-viewer)), but
-   `attach --host` does not yet reconnect by itself. An
-   earlier design for typed PTY operations (send, resize, claim, release,
-   observe; reads retryable, bounded writes never retried automatically,
-   finite default deadlines) is slice 3 of the cloud PTY plan at `83f83ab`.
+1. **Resumable viewers: VM acceptance pending.** `attach --host` reconnects
+   by itself after a dropped link and resumes from the last byte its
+   terminal took, or says what was lost
+   ([PTY lane](../../architecture/04-pty-lane.md#attaching-over---host)).
+   The fake-ssh tests in `tests/cli_remote_attach.rs` cover it locally. Left:
+   a run through `scripts/pty-vm` with a real network drop (iptables drop,
+   or SIGSTOP of the link, then heal) and Claude Code running in the session,
+   showing
+   - no gap and no duplicate after the drop heals;
+   - a takeover while the link is stalled ends the reconnect with 81;
+   - the gone notice, mode reset and redraw after an outage longer than the
+     32 MiB ring holds;
+   - whether the keepalives apply on a ControlMaster mux client with Rick's
+     real ssh config; if not, `-o ControlPath=none` for attach, or a
+     documented limit.
+
+   This step is removed when that run passes.
 2. **Read-only viewers.** Up to eight per run, admitted through a separate
    bounded pool for pending hellos, so a full viewer set never refuses a
    replacement controller. Today one pool of eight holds every connection,

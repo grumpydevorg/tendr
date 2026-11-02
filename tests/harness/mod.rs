@@ -226,6 +226,31 @@ pub fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
     events
 }
 
+/// The PTY output of a default-namespace session's current run, as its
+/// recording holds it. Read it once the run has ended, so the recording is
+/// complete.
+#[allow(dead_code)]
+pub fn recorded_output(root: &TempDir, session: &str) -> Vec<u8> {
+    let session_dir = root
+        .path()
+        .join(format!(".tendr/sessions/default/{session}"));
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(session_dir.join("meta.json")).unwrap()).unwrap();
+    let dir = session_dir.join(meta["pty"]["recording"]["dir"].as_str().unwrap());
+    let files = tendr::recorder::DirectoryStore::segments(&dir).unwrap();
+    let bytes: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+    tendr::recording::decode_recording(bytes.iter().map(Vec::as_slice))
+        .expect("recording decodes")
+        .records
+        .iter()
+        .filter_map(|r| match &r.kind {
+            tendr::recording::RecordKind::Output(bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 // Polling. A wait on the filesystem or a process (meta.json, event logs, a
 // path, PID liveness, `try_wait`, `try_acquire`, `tendr log` or `status`
 // output) goes through `poll_until` or a wrapper below. The rules:

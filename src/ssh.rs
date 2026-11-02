@@ -62,6 +62,12 @@ pub enum SshError {
          to start tendr. Set TENDR_SSH_CONNECT_TIMEOUT to change the limit (0 for none)."
     )]
     ConnectDeadline { host: String, seconds: f64 },
+
+    /// An `attach --host` connection was stopped on purpose: the attach is
+    /// leaving while it reconnects.
+    #[cfg(unix)]
+    #[error("ssh was stopped: the attach is leaving")]
+    Cancelled,
 }
 
 impl SshError {
@@ -191,13 +197,41 @@ enum Streams {
     Request,
     /// A pipe each way: after the request, the attach protocol runs over them.
     #[cfg(unix)]
-    Attach,
+    Attach(Login),
 }
 
+/// Whether ssh may prompt on the terminal for an `attach --host` connection.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Login {
+    /// ssh may ask for a passphrase or about a host key: the first
+    /// connection, made before the terminal is in raw mode.
+    Interactive,
+    /// `BatchMode=yes`: ssh never prompts, so a login that needs a prompt
+    /// fails at once. A reconnect runs this way, because the terminal is in
+    /// raw mode and its keystrokes are the user's, not ssh's.
+    Batch,
+}
+
+/// The ssh options of every framed call. The keepalives make ssh notice a
+/// dead link within about 15 to 20 s and exit 255, instead of waiting on
+/// it for as long as TCP does.
+const FRAME_OPTIONS: [&str; 6] = [
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=3",
+];
+
 /// The argv of a framed call — constant by construction:
-/// `ssh -T -o ConnectTimeout=10 <host> tendr [--hello] --exit-trailer <entry>`.
-/// Nothing user-controlled rides in it, so there is no shell-quoting layer to
-/// traverse; the request travels on ssh's stdin as opaque bytes.
+/// `ssh -T -o ConnectTimeout=10 -o ServerAliveInterval=5 -o
+/// ServerAliveCountMax=3 <host> tendr [--hello] --exit-trailer <entry>`, with
+/// `-o BatchMode=yes` before the host for an attach's reconnect
+/// ([`Login::Batch`]). Nothing user-controlled rides in it, so there is no
+/// shell-quoting layer to traverse; the request travels on ssh's stdin as
+/// opaque bytes.
 ///
 /// - `--hello` asks the remote tendr to announce itself on stderr first
 ///   ([`HELLO_LINE`]), which ends the connect deadline; it is left out when
@@ -218,7 +252,12 @@ fn build_ssh_frame_command(
 ) -> Result<Command, SshError> {
     validate_destination(host)?;
     let mut cmd = Command::new("ssh");
-    cmd.args(["-T", "-o", "ConnectTimeout=10", host, "tendr"]);
+    cmd.arg("-T").args(FRAME_OPTIONS);
+    #[cfg(unix)]
+    if streams == Streams::Attach(Login::Batch) {
+        cmd.args(["-o", "BatchMode=yes"]);
+    }
+    cmd.args([host, "tendr"]);
     if connect_deadline().is_some() {
         cmd.arg("--hello");
     }
@@ -227,7 +266,7 @@ fn build_ssh_frame_command(
         Streams::Inherit => (Stdio::inherit(), Stdio::inherit()),
         Streams::Request => (Stdio::piped(), Stdio::inherit()),
         #[cfg(unix)]
-        Streams::Attach => (Stdio::piped(), Stdio::piped()),
+        Streams::Attach(_) => (Stdio::piped(), Stdio::piped()),
     };
     cmd.stdin(stdin).stdout(stdout).stderr(Stdio::piped());
     Ok(cmd)
@@ -297,11 +336,13 @@ fn run_framed(host: &str, entry: Entry, input: Input) -> Result<i32, SshError> {
         })
     });
 
-    let mut watch = Watch::start(&mut child, connect_deadline());
+    let mut watch = Watch::start(&mut child, connect_deadline(), Box::new(io::stderr()));
     let (status, trailer) = match watch.wait(host, &mut child, Until::Exit)? {
         Progress::Exited(status, trailer) => (status, trailer),
         #[cfg(unix)]
-        Progress::Connected | Progress::Limit => unreachable!("waited for the exit"),
+        Progress::Connected | Progress::Limit | Progress::Cancelled => {
+            unreachable!("waited for the exit, with nothing to cancel it")
+        }
     };
     // Once ssh is gone a frame write fails with EPIPE, so that join never
     // hangs. A body copy can be blocked reading local stdin, which ssh's exit
@@ -340,6 +381,17 @@ pub enum AttachStart {
     Ended(i32),
 }
 
+/// How [`AttachSsh::start`] connects, and what may stop it.
+#[cfg(unix)]
+pub struct Dial {
+    pub login: Login,
+    /// Where ssh's stderr goes, the hello and the exit trailer taken out.
+    pub stderr: Box<dyn io::Write + Send>,
+    /// Set from another thread to stop ssh: a start or finish under way
+    /// stops it within 20 ms and returns.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[cfg(unix)]
 impl AttachSsh {
     /// Start ssh, write `request` to its stdin, and wait under the connect
@@ -349,11 +401,12 @@ impl AttachSsh {
     /// its exit status says why.
     ///
     /// # Errors
-    /// As for [`exec_ssh_remote`].
-    pub fn start(host: &str, request: &[u8]) -> Result<AttachStart, SshError> {
+    /// As for [`exec_ssh_remote`], and `SshError::Cancelled` (ssh stopped)
+    /// once `dial.cancel` is set.
+    pub fn start(host: &str, request: &[u8], dial: Dial) -> Result<AttachStart, SshError> {
         use std::io::Write;
 
-        let mut cmd = build_ssh_frame_command(host, Entry::Remote, Streams::Attach)?;
+        let mut cmd = build_ssh_frame_command(host, Entry::Remote, Streams::Attach(dial.login))?;
         let mut child = spawn(&mut cmd).map_err(SshError::SpawnFailed)?;
         let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             unreachable!("both are piped for an attach");
@@ -361,7 +414,8 @@ impl AttachSsh {
         // A request of a few hundred bytes fits in any pipe's buffer, so this
         // cannot block on a remote that is still authenticating.
         let _ = stdin.write_all(request).and_then(|()| stdin.flush());
-        let mut watch = Watch::start(&mut child, connect_deadline());
+        let mut watch = Watch::start(&mut child, connect_deadline(), dial.stderr);
+        watch.cancel = Some(dial.cancel);
         match watch.wait(host, &mut child, Until::Connected)? {
             Progress::Connected => Ok(AttachStart::Running {
                 ssh: Self {
@@ -375,13 +429,15 @@ impl AttachSsh {
             Progress::Exited(status, trailer) => {
                 Ok(AttachStart::Ended(exit_code(status.code(), trailer)?))
             }
+            Progress::Cancelled => Err(SshError::Cancelled),
             Progress::Limit => unreachable!("no time limit"),
         }
     }
 
     /// Wait for ssh to end, and return the call's exit code as
     /// [`exec_ssh_remote`] does. With a `grace`, ssh is stopped once it has
-    /// passed, and this returns `None`.
+    /// passed, and this returns `None`; so it does once the dial's `cancel`
+    /// is set.
     ///
     /// # Errors
     /// `SshError::TransportFailed` on ssh exit 255 without an exit trailer;
@@ -394,6 +450,7 @@ impl AttachSsh {
                 stop(&mut self.child);
                 None
             }
+            Ok(Progress::Cancelled) => None,
             Ok(Progress::Connected) => unreachable!("waited for the exit"),
             Err(e) => Some(Err(e)),
         }
@@ -482,6 +539,9 @@ enum Progress {
     /// The limit passed with ssh still running.
     #[cfg(unix)]
     Limit,
+    /// The watch's `cancel` was set, and ssh has been stopped.
+    #[cfg(unix)]
+    Cancelled,
 }
 
 /// Watches `child`, an ssh to a remote `tendr [--hello] --exit-trailer
@@ -508,24 +568,42 @@ struct Watch {
     hello: bool,
     /// `Some` once stderr has ended.
     ended: Option<Ended>,
+    /// Once set, a wait stops ssh and returns [`Progress::Cancelled`].
+    #[cfg(unix)]
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Watch {
-    /// Start relaying `child`'s stderr; the deadline counts from now.
-    fn start(child: &mut std::process::Child, deadline: Option<Duration>) -> Self {
+    /// Start relaying `child`'s stderr to `out`; the deadline counts from
+    /// now.
+    fn start(
+        child: &mut std::process::Child,
+        deadline: Option<Duration>,
+        out: Box<dyn io::Write + Send>,
+    ) -> Self {
         let stderr = child
             .stderr
             .take()
             .expect("stderr is piped for a framed call");
         let (events_tx, events) = mpsc::channel();
-        std::thread::spawn(move || relay_stderr(stderr, events_tx));
+        std::thread::spawn(move || relay_stderr(stderr, events_tx, out));
         Self {
             events,
             started: Instant::now(),
             deadline,
             hello: false,
             ended: None,
+            #[cfg(unix)]
+            cancel: None,
         }
+    }
+
+    /// Whether the watch's `cancel` has been set.
+    #[cfg(unix)]
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Wait for what `until` names.
@@ -552,7 +630,18 @@ impl Watch {
                 poll.min(limit.saturating_duration_since(Instant::now()))
             })
         };
+        // A cancellable wait looks at its flag often, and never blocks on
+        // ssh's exit.
+        #[cfg(unix)]
+        let cancellable = self.cancel.is_some();
+        #[cfg(not(unix))]
+        let cancellable = false;
         loop {
+            #[cfg(unix)]
+            if self.cancelled() {
+                stop(child);
+                return Ok(Progress::Cancelled);
+            }
             // Only the hello proves ssh got through. An end of stream before it
             // proves nothing: a process can close its stderr and keep running.
             let awaiting_hello = self.deadline.is_some() && !self.hello;
@@ -567,7 +656,7 @@ impl Watch {
             match self.ended {
                 // Stderr has ended and no deadline is pending: only the exit
                 // is left to wait for.
-                Some(ended) if !awaiting_hello && limit.is_none() => {
+                Some(ended) if !awaiting_hello && limit.is_none() && !cancellable => {
                     let status = child.wait().map_err(SshError::SpawnFailed)?;
                     return Ok(self.exited(host, status, ended));
                 }
@@ -575,11 +664,13 @@ impl Watch {
                 // Wake for the relay, or to look at ssh and the deadline:
                 // often while a deadline is pending, rarely during a long
                 // call.
-                None => match self.events.recv_timeout(left(if awaiting_hello {
-                    PENDING_POLL
-                } else {
-                    RUNNING_POLL
-                })) {
+                None => match self
+                    .events
+                    .recv_timeout(left(if awaiting_hello || cancellable {
+                        PENDING_POLL
+                    } else {
+                        RUNNING_POLL
+                    })) {
                     Ok(Relay::Hello) => self.hello = true,
                     Ok(Relay::Done(done)) => self.ended = Some(done),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -800,16 +891,20 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Copy a framed call's stderr to ours through a [`TrailerFilter`], dropping
-/// the hello and reporting it. The hello ends a line but need not start one:
-/// anything a login shell's rc file wrote without a newline just before tendr
-/// ran is glued in front, and is passed through. Reports [`Relay::Done`] when
-/// stderr ends.
-fn relay_stderr(stderr: std::process::ChildStderr, events: mpsc::Sender<Relay>) {
+/// Copy a framed call's stderr to `out` through a [`TrailerFilter`],
+/// dropping the hello and reporting it. The hello ends a line but need not
+/// start one: anything a login shell's rc file wrote without a newline just
+/// before tendr ran is glued in front, and is passed through. Reports
+/// [`Relay::Done`] when stderr ends.
+fn relay_stderr(
+    stderr: std::process::ChildStderr,
+    events: mpsc::Sender<Relay>,
+    out: Box<dyn io::Write + Send>,
+) {
     use std::io::BufRead;
 
     let mut reader = io::BufReader::new(stderr);
-    let mut out = TrailerFilter::new(io::stderr());
+    let mut out = TrailerFilter::new(out);
     let mut old_tendr = false;
     let mut line = Vec::new();
     // Before the hello, line by line: the hello and an old tendr's parse
@@ -872,6 +967,10 @@ mod tests {
                 "-T",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=3",
                 "user@box",
                 "tendr",
                 "--hello",
@@ -883,30 +982,41 @@ mod tests {
     }
 
     /// Every operation but exec runs this one argv, `attach` from a Unix
-    /// client included; the request is not an input to it.
+    /// client included; the request is not an input to it. An attach's
+    /// reconnect adds only `BatchMode=yes`, so it never prompts.
     #[test]
     fn remote_frame_argv_is_constant() {
+        let remote = [
+            "-T",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=3",
+            "user@box",
+            "tendr",
+            "--hello",
+            "--exit-trailer",
+            "_remote",
+        ];
         let streams = [
             Streams::Request,
             #[cfg(unix)]
-            Streams::Attach,
+            Streams::Attach(Login::Interactive),
         ];
         for streams in streams {
             let cmd = build_ssh_frame_command("user@box", Entry::Remote, streams).unwrap();
-            assert_eq!(
-                argv(&cmd),
-                [
-                    "-T",
-                    "-o",
-                    "ConnectTimeout=10",
-                    "user@box",
-                    "tendr",
-                    "--hello",
-                    "--exit-trailer",
-                    "_remote"
-                ],
-                "{streams:?}"
-            );
+            assert_eq!(argv(&cmd), remote, "{streams:?}");
+        }
+        #[cfg(unix)]
+        {
+            let cmd =
+                build_ssh_frame_command("user@box", Entry::Remote, Streams::Attach(Login::Batch))
+                    .unwrap();
+            let mut batch = remote.to_vec();
+            batch.splice(7..7, ["-o", "BatchMode=yes"]);
+            assert_eq!(argv(&cmd), batch, "a reconnect");
         }
     }
 

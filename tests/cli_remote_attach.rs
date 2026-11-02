@@ -18,10 +18,14 @@ use tempfile::TempDir;
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// The ssh argv of every `--host` operation, attach included.
-const REMOTE_ARGV: [&str; 8] = [
+const REMOTE_ARGV: [&str; 12] = [
     "-T",
     "-o",
     "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=3",
     "box",
     "tendr",
     "--hello",
@@ -54,31 +58,6 @@ impl Remote {
     /// `tendr --host box attach <args>` in a fresh terminal.
     fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
         attach_through(&self.ssh, "30", root, label, args, &[])
-    }
-
-    /// [`Remote::attach`], resuming from `point` through the debug-build
-    /// driver `TENDR_TEST_ATTACH_RESUME` instead of attaching afresh.
-    fn resume(
-        &self,
-        root: &TempDir,
-        label: &str,
-        args: &[&str],
-        point: tendr::attach_proto::ResumePoint,
-    ) -> WrappedAttach {
-        let point = format!(
-            "{} {} {}",
-            point.run_id.as_uuid(),
-            point.epoch.get(),
-            point.offset
-        );
-        attach_through(
-            &self.ssh,
-            "30",
-            root,
-            label,
-            args,
-            &[("TENDR_TEST_ATTACH_RESUME", &point)],
-        )
     }
 }
 
@@ -963,144 +942,458 @@ fn remote_resume_with_a_sidecar_that_cannot_resume_is_refused() {
     );
 }
 
-/// A PTY session that prints `first-part` once `go1` exists, then
-/// `second-part` once `go2` does.
-fn start_two_parts(root: &TempDir, session: &str) {
-    let (go1, go2) = (root.path().join("go1"), root.path().join("go2"));
-    let script = "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; printf first-part; \
-         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; printf second-part; sleep 60";
-    let output = tendr(root)
-        .args(["start", session, "--pty"])
-        .arg("--env")
-        .arg(format!("GO1={}", go1.display()))
-        .arg("--env")
-        .arg(format!("GO2={}", go2.display()))
-        .args(["--", "sh", "-c", script])
-        .output()
-        .unwrap();
+/// A link that can be cut: a fake ssh that carries the remote tendr's
+/// streams on pipes, as real ssh does (`pump`), so killing it closes this
+/// side's pipes and leaves the remote side open, as a dropped network does.
+/// Every call is logged with its start time and argv. While the `prompt`
+/// file exists, a call is a login that needs a prompt: it writes an
+/// approval URL to stderr and, under `BatchMode=yes`, fails at once. While
+/// the `stall` file exists, a call stalls before the remote tendr starts.
+struct Flaky {
+    ssh: TempDir,
+    files: TempDir,
+}
+
+/// The URL a login that needs a prompt writes to stderr.
+const APPROVAL_URL: &str = "https://approve.invalid/a/1";
+
+impl Flaky {
+    fn new() -> Self {
+        let files = TempDir::new().unwrap();
+        let path = |name: &str| files.path().join(name).display().to_string();
+        let ssh = fake_ssh(&format!(
+            "append {}\npidfile {}\nneeds-prompt {}\nstall-if {}\npump",
+            path("calls"),
+            path("pid"),
+            path("prompt"),
+            path("stall")
+        ));
+        Self { ssh, files }
+    }
+
+    /// `tendr --host box attach <args>` in a fresh terminal.
+    fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
+        self.attach_with_deadline("30", root, label, args)
+    }
+
+    /// [`Flaky::attach`] with a connect deadline of `deadline` seconds; `0`
+    /// turns it off, so no hello marks the remote tendr's start.
+    fn attach_with_deadline(
+        &self,
+        deadline: &str,
+        root: &TempDir,
+        label: &str,
+        args: &[&str],
+    ) -> WrappedAttach {
+        attach_through(&self.ssh, deadline, root, label, args, &[])
+    }
+
+    /// Turn the `prompt` or `stall` behaviour on or off for later calls.
+    fn set(&self, name: &str, on: bool) {
+        let path = self.files.path().join(name);
+        if on {
+            std::fs::write(path, b"").unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    /// The pid of the latest call's ssh.
+    fn pid(&self) -> libc::pid_t {
+        std::fs::read_to_string(self.files.path().join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// Cut the link: kill the current call's ssh outright.
+    fn cut(&self) -> libc::pid_t {
+        let pid = self.pid();
+        // SAFETY: kill(2) takes a pid and a signal number.
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGKILL) },
+            0,
+            "kill ssh {pid}"
+        );
+        pid
+    }
+
+    /// The calls so far: when each started (ms since the epoch), and its argv.
+    fn calls(&self) -> Vec<(u128, String)> {
+        std::fs::read_to_string(self.files.path().join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let (millis, argv) = line.split_once(' ').unwrap();
+                (millis.parse().unwrap(), argv.to_owned())
+            })
+            .collect()
+    }
+
+    /// Wait until `n` calls have started.
+    fn wait_calls(&self, n: usize) -> Vec<(u128, String)> {
+        poll_until(Duration::from_secs(60), Duration::from_millis(50), || {
+            let calls = self.calls();
+            if calls.len() >= n {
+                Observation::Ready(calls)
+            } else {
+                Observation::Pending(format!("{} calls", calls.len()))
+            }
+        })
+        .unwrap_or_else(|e| panic!("never {n} ssh calls: {e}"))
+    }
+
+    /// Wait for a call whose ssh is not `old`, and return its pid.
+    fn wait_new_pid(&self, old: libc::pid_t) -> libc::pid_t {
+        poll_until(Duration::from_secs(30), Duration::from_millis(20), || {
+            match std::fs::read_to_string(self.files.path().join("pid"))
+                .ok()
+                .and_then(|p| p.trim().parse().ok())
+            {
+                Some(pid) if pid != old => Observation::Ready(pid),
+                other => Observation::Pending(format!("pid {other:?}")),
+            }
+        })
+        .unwrap_or_else(|e| panic!("no ssh call after {old}: {e}"))
+    }
+}
+
+/// Start a PTY session running `script` under `sh -c`. Each of `files` is
+/// set in its environment to that name's path in `root`, for the script to
+/// wait on; `env` goes to the sidecar.
+fn start_script(root: &TempDir, session: &str, script: &str, files: &[&str], env: &[(&str, &str)]) {
+    let mut start = tendr(root);
+    for (key, value) in env {
+        start.env(key, value);
+    }
+    start.args(["start", session, "--pty"]);
+    for name in files {
+        start
+            .arg("--env")
+            .arg(format!("{name}={}", root.path().join(name).display()));
+    }
+    let output = start.args(["--", "sh", "-c", script]).output().unwrap();
     assert!(output.status.success(), "start {session}: {output:?}");
     harness::wait_running(root, session);
 }
 
-/// `attach --host` resuming from the point a lost link reached shows only
-/// the output after it, then works as any attach, and the escape detaches.
+fn touch(root: &TempDir, name: &str) {
+    std::fs::write(root.path().join(name), b"").unwrap();
+}
+
+/// Wait until the run has granted control to `n` resumes.
+fn wait_resumes(root: &TempDir, session: &str, n: usize) {
+    poll_until(Duration::from_secs(60), Duration::from_millis(50), || {
+        let resumes = harness::read_events(root, session)
+            .into_iter()
+            .filter(|e| e["kind"] == "pty.control_changed" && e["data"]["trigger"] == "resume")
+            .count();
+        if resumes >= n {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("{resumes} resumes"))
+        }
+    })
+    .unwrap_or_else(|e| panic!("{session} was never resumed {n} times: {e}"));
+}
+
+/// What the terminal showed with the reconnect's status line taken out:
+/// every write of it is wrapped in a cursor save (`ESC 7`) and restore
+/// (`ESC 8`).
+fn without_status_line(shown: &str) -> String {
+    let mut out = String::new();
+    let mut rest = shown;
+    while let Some(start) = rest.find("\x1b7") {
+        out.push_str(&rest[..start]);
+        let end = rest[start..].find("\x1b8").expect("a status line ends") + start;
+        rest = &rest[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Numbered fields, about 40 KB/s, once `GO` exists and until `STOP` does,
+/// then a marker; the run ends once `END` exists.
+const NUMBERED_FLOOD: &str = "while [ ! -f \"$GO\" ]; do sleep 0.05; done; i=0; \
+     while [ ! -f \"$STOP\" ]; do j=0; while [ $j -lt 50 ]; do printf '%09d ' $i; \
+     i=$((i+1)); j=$((j+1)); done; sleep 0.01; done; printf FLOOD-END; \
+     while [ ! -f \"$END\" ]; do sleep 0.05; done";
+
+/// ssh dies mid-flood, closing this side's pipes while the old remote side
+/// stays open. The client reconnects by itself, without prompts, and the
+/// terminal gets every byte of the run's output exactly once, in order: the
+/// recording.
 #[test]
-fn host_resume_shows_only_the_output_it_missed() {
-    use tendr::attach_proto::{Frame, ResumePoint};
+fn host_attach_reconnects_when_ssh_dies_mid_flood_with_no_gap_or_duplicate() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-missed");
-    start_two_parts(&root, "host-missed");
+    let _kill = SessionGuard::new(&root, "host-cut");
+    start_script(
+        &root,
+        "host-cut",
+        NUMBERED_FLOOD,
+        &["GO", "STOP", "END"],
+        &[],
+    );
+    let link = Flaky::new();
 
-    let (mut lost, accepted) = attach_v2(&root, "host-missed");
-    std::fs::write(root.path().join("go1"), b"").unwrap();
-    let mut shown = Vec::new();
-    while !shown.ends_with(b"first-part") {
-        match lost.frame() {
-            Frame::Output { bytes, .. } => shown.extend(bytes),
-            other => panic!("{other:?}"),
+    let mut wrapped = link.attach(&root, "cut", &["host-cut"]);
+    wait_control(&root, "host-cut", "HumanControl");
+    touch(&root, "GO");
+    wrapped.wait_output_contains("000000500 ");
+    link.cut();
+    wait_resumes(&root, "host-cut", 1);
+    // The flood goes on over the new connection.
+    let resumed = wrapped.cli.output().len();
+    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        if wrapped.cli.output().len() > resumed + 20_000 {
+            Observation::Ready(())
+        } else {
+            Observation::Pending("no output since the resume".into())
         }
-    }
-    let reached = ResumePoint {
-        offset: accepted.offset + shown.len() as u64,
-        ..accepted
-    };
-
-    let remote = Remote::new();
-    let mut wrapped = remote.resume(&root, "missed", &["host-missed"], reached);
-    std::fs::write(root.path().join("go2"), b"").unwrap();
-    wrapped.wait_output_contains("second-part");
+    })
+    .unwrap();
+    touch(&root, "STOP");
+    wrapped.wait_output_contains("FLOOD-END");
     wrapped.cli.type_bytes(b"\x1cd");
     assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
     wrapped.assert_terminal_restored();
+
+    touch(&root, "END");
+    harness::wait_terminal(&root, "host-cut");
+    let recording = String::from_utf8(harness::recorded_output(&root, "host-cut")).unwrap();
+    let shown = without_status_line(&wrapped.cli.output());
+    if shown != recording {
+        let at = shown
+            .bytes()
+            .zip(recording.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap_or(shown.len().min(recording.len()));
+        let near = |s: &str| s[at.saturating_sub(40)..(at + 40).min(s.len())].to_owned();
+        panic!(
+            "the terminal showed {} bytes, the run wrote {}; first difference at {at}: \
+             shown {:?}, recorded {:?}",
+            shown.len(),
+            recording.len(),
+            near(&shown),
+            near(&recording)
+        );
+    }
+    let calls = link.calls();
+    assert!(calls.len() >= 2, "{calls:?}");
     assert!(
-        !wrapped.cli.output().contains("first-part"),
-        "output from before the resume point was shown again"
+        !calls[0].1.contains("BatchMode"),
+        "the first connection may prompt"
     );
-    wait_control(&root, "host-missed", "AgentControl");
-    remote.assert_constant_argv();
+    assert!(
+        calls[1..]
+            .iter()
+            .all(|(_, argv)| argv.contains("BatchMode=yes")),
+        "a reconnect never prompts: {calls:?}"
+    );
 }
 
-/// A resumed `attach --host` that stops reading is taken over like any
-/// other: the takeover cuts it off without `MSG_RETIRED`, and its remote
-/// side reads the takeover of its resumed epoch from the event log, so it
-/// exits 81, not 0.
+/// While logging in needs a prompt, every reconnect fails at once under
+/// BatchMode, rather than wait at a prompt it cannot show, and the pauses
+/// between attempts grow. ssh's stderr, with its approval URL, is on the
+/// screen. What is typed meanwhile is discarded, never sent late; once the
+/// login works again the attach resumes.
 #[test]
-fn host_resume_taken_over_while_stalled_exits_81() {
+fn host_reconnect_fails_fast_backs_off_and_discards_typing() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-resume-take");
-    let child = format!("({PACED_FLOOD}) & exec cat -v");
-    start_pty(&root, "host-resume-take", &["sh", "-c", &child]);
-    let remote = Remote::new();
+    let _kill = SessionGuard::new(&root, "host-backoff");
+    start_pty(&root, "host-backoff", &["cat"]);
+    let link = Flaky::new();
 
-    // A link that dropped after its acceptance; its end was noticed.
-    let (lost, accepted) = attach_v2(&root, "host-resume-take");
-    assert_eq!(lost.detach(), Some(0));
-    wait_control(&root, "host-resume-take", "AgentControl");
-
-    let first = remote.resume(&root, "take-1", &["host-resume-take"], accepted);
-    first.wait_output_contains("0000000000");
-    wait_control(&root, "host-resume-take", "HumanControl");
-    first.cli.pause_output();
-    std::thread::sleep(Duration::from_secs(3));
-
-    let mut second = remote.attach(&root, "take-2", &["host-resume-take", "--takeover"]);
-    second
+    let mut wrapped = link.attach(&root, "backoff", &["host-backoff"]);
+    wrapped
         .cli
-        .type_until_logged(&root, "host-resume-take", "second-client");
+        .type_until_logged(&root, "host-backoff", "before-the-drop\n");
+    link.set("prompt", true);
+    link.cut();
+    let calls = link.wait_calls(4);
+    // Between two starts: the failed attempt, then its pause. The pauses are
+    // at least 1 s, then 2 s: lower bounds, so a slow attempt cannot fail
+    // it.
+    let gaps: Vec<u128> = calls[1..4].windows(2).map(|w| w[1].0 - w[0].0).collect();
     assert!(
-        !first.exited(),
-        "a client that is not reading stays blocked"
+        gaps[0] >= 950 && gaps[1] >= 1950,
+        "the pauses between attempts grow: {gaps:?} ms"
     );
+    wrapped.wait_output_contains(APPROVAL_URL);
+    wrapped.cli.type_bytes(b"typed-in-the-gap\r");
 
-    first.cli.resume_output();
-    assert_eq!(
-        first.wait_exit(Duration::from_secs(30)),
-        81,
-        "the stalled resumed client was taken over"
+    link.set("prompt", false);
+    wait_resumes(&root, "host-backoff", 1);
+    wrapped
+        .cli
+        .type_until_logged(&root, "host-backoff", "after-the-gap\n");
+    let log = tendr(&root)
+        .args(["log", "host-backoff", "--raw"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&log.stdout).contains("typed-in-the-gap"),
+        "input typed while reconnecting reached the session"
     );
-    first.assert_terminal_restored();
-    first.wait_output_contains("another client took over this session");
-
-    second.cli.type_bytes(b"\x1cd");
-    assert_eq!(second.wait_exit(Duration::from_secs(15)), 0);
-    second.assert_terminal_restored();
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    wrapped.assert_terminal_restored();
+    let calls = link.calls();
+    assert!(
+        calls[1..]
+            .iter()
+            .all(|(_, argv)| argv.contains("BatchMode=yes")),
+        "{calls:?}"
+    );
 }
 
-/// `attach --host` resuming from output the session no longer holds goes
-/// on from the head: it shows nothing from before it.
+/// Hold a dropped attach in its reconnect: cut the link while logging in
+/// needs a prompt, and wait until it has tried once.
+fn hold_in_reconnect(link: &Flaky) {
+    link.set("prompt", true);
+    let calls = link.calls().len();
+    link.cut();
+    link.wait_calls(calls + 1);
+}
+
+/// Another client takes the session over while the attach is reconnecting:
+/// the reconnect is refused, and the attach exits 81 with the remote's
+/// reason on its terminal.
 #[test]
-fn host_resume_past_the_ring_goes_on_from_the_head() {
+fn host_reconnect_after_a_takeover_in_the_gap_exits_81() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-gap-take");
+    start_pty(&root, "host-gap-take", &["cat"]);
+    let link = Flaky::new();
+
+    let mut wrapped = link.attach(&root, "gap-take", &["host-gap-take"]);
+    wrapped
+        .cli
+        .type_until_logged(&root, "host-gap-take", "first-client\n");
+    hold_in_reconnect(&link);
+    let mut taker = WrappedAttach::spawn(&root, "taker", &["host-gap-take", "--takeover"]);
+    taker
+        .cli
+        .type_until_logged(&root, "host-gap-take", "second-client\n");
+
+    let before = wrapped.cli.output().len();
+    link.set("prompt", false);
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(30)), 81);
+    wrapped.assert_terminal_restored();
+    let said = without_status_line(&wrapped.cli.output()[before..]);
+    assert!(!said.trim().is_empty(), "the refusal says why");
+
+    taker.cli.type_bytes(b"\x1cd");
+    assert_eq!(taker.wait_exit(Duration::from_secs(15)), 0);
+    taker.assert_terminal_restored();
+}
+
+/// The run ends while the attach is reconnecting: the reconnect finds it
+/// not running, and the attach exits 81.
+#[test]
+fn host_reconnect_after_the_run_ended_exits_81() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-gap-end");
+    start_pty(&root, "host-gap-end", &["cat"]);
+    let link = Flaky::new();
+
+    let mut wrapped = link.attach(&root, "gap-end", &["host-gap-end"]);
+    wrapped
+        .cli
+        .type_until_logged(&root, "host-gap-end", "before-the-end\n");
+    hold_in_reconnect(&link);
+    let killed = tendr(&root)
+        .args(["kill", "host-gap-end", "--force"])
+        .output()
+        .unwrap();
+    assert!(killed.status.success(), "{killed:?}");
+    harness::wait_terminal(&root, "host-gap-end");
+
+    link.set("prompt", false);
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(30)), 81);
+    wrapped.assert_terminal_restored();
+}
+
+/// The escape and a signal still leave while the attach is reconnecting,
+/// and stop the ssh of the attempt under way: one waiting for the remote's
+/// hello, and one waiting for its answer with no hello to wait for (the
+/// connect deadline off).
+#[test]
+fn host_escape_or_signal_while_reconnecting_leaves_and_stops_ssh() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-gap-leave");
+    start_pty(&root, "host-gap-leave", &["cat"]);
+    let link = Flaky::new();
+
+    // The escape: exit 0.
+    let mut wrapped = link.attach_with_deadline("0", &root, "gap-escape", &["host-gap-leave"]);
+    wrapped
+        .cli
+        .type_until_logged(&root, "host-gap-leave", "escape-client\n");
+    link.set("stall", true);
+    let cut = link.cut();
+    let stalled = link.wait_new_pid(cut);
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    wrapped.assert_terminal_restored();
+    harness::wait_pid_dead(stalled);
+    link.set("stall", false);
+
+    // SIGTERM: exit 1. The old remote side, still open, holds the session,
+    // so this attach takes it over.
+    let mut wrapped = link.attach(&root, "gap-term", &["host-gap-leave", "--takeover"]);
+    wrapped
+        .cli
+        .type_until_logged(&root, "host-gap-leave", "term-client\n");
+    link.set("stall", true);
+    let cut = link.cut();
+    let stalled = link.wait_new_pid(cut);
+    wrapped.signal(libc::SIGTERM);
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 1);
+    wrapped.assert_terminal_restored();
+    harness::wait_pid_dead(stalled);
+}
+
+/// The output missed while reconnecting is no longer in the session's ring:
+/// the terminal gets a notice naming how much was missed, the reset of the
+/// modes it had, the session's modes again, then the live output, and none
+/// of what was missed.
+#[test]
+fn host_reconnect_past_the_ring_resets_the_modes_and_says_what_was_missed() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "host-gone");
-    let (go1, go2) = (root.path().join("go1"), root.path().join("go2"));
-    // About 2 MB of `x` lines, far past a 64 KiB ring, then markers. The
-    // pause keeps the flood out of the end marker's chunk: capture logs a
-    // chunk just before it adds it to the ring, so only that chunk can lag.
+    // About 2 MB of `x` lines, far past a 64 KiB ring, then a marker. The
+    // pause keeps the flood out of the marker's chunk: capture logs a chunk
+    // just before it adds it to the ring, so only that chunk can lag.
     let script = format!(
-        "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; yes {} | head -n 20000; \
+        "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; printf '\\033[?2004h'; printf first-part; \
+         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; yes {} | head -n 20000; \
          sleep 0.5; echo FLOOD-END; \
-         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; printf after-the-gap; sleep 60",
+         while [ ! -f \"$GO3\" ]; do sleep 0.05; done; printf after-the-gap; sleep 60",
         "x".repeat(100)
     );
-    let output = tendr(&root)
-        .env("TENDR_TEST_OUTPUT_RING_BYTES", "65536")
-        .args(["start", "host-gone", "--pty"])
-        .arg("--env")
-        .arg(format!("GO1={}", go1.display()))
-        .arg("--env")
-        .arg(format!("GO2={}", go2.display()))
-        .args(["--", "sh", "-c", &script])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    harness::wait_running(&root, "host-gone");
+    start_script(
+        &root,
+        "host-gone",
+        &script,
+        &["GO1", "GO2", "GO3"],
+        &[("TENDR_TEST_OUTPUT_RING_BYTES", "65536")],
+    );
+    let link = Flaky::new();
 
-    let (lost, accepted) = attach_v2(&root, "host-gone");
-    assert_eq!(lost.detach(), Some(0));
-    std::fs::write(&go1, b"").unwrap();
+    let mut wrapped = link.attach(&root, "gone", &["host-gone"]);
+    wait_control(&root, "host-gone", "HumanControl");
+    touch(&root, "GO1");
+    wrapped.wait_output_contains("first-part");
+    hold_in_reconnect(&link);
+    touch(&root, "GO2");
     // The flood has all been captured: its end marker is in the tail of
     // output.log, whose lines follow capture's reads, so they are joined.
     let log = root
@@ -1126,63 +1419,89 @@ fn host_resume_past_the_ring_goes_on_from_the_head() {
     })
     .unwrap();
 
-    let remote = Remote::new();
-    let mut wrapped = remote.resume(&root, "gone", &["host-gone"], accepted);
-    wait_control(&root, "host-gone", "HumanControl");
-    std::fs::write(&go2, b"").unwrap();
+    link.set("prompt", false);
+    wait_resumes(&root, "host-gone", 1);
+    touch(&root, "GO3");
     wrapped.wait_output_contains("after-the-gap");
     wrapped.cli.type_bytes(b"\x1cd");
     assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
     wrapped.assert_terminal_restored();
+
+    let killed = tendr(&root)
+        .args(["kill", "host-gone", "--force"])
+        .output()
+        .unwrap();
+    assert!(killed.status.success(), "{killed:?}");
+    harness::wait_terminal(&root, "host-gone");
+    let recording = harness::recorded_output(&root, "host-gone");
+    // What the attach had shown before the drop, and the head it went on
+    // from: everything but the last marker.
+    let asked = "\x1b[?2004hfirst-part".len();
+    let head = recording.len() - "after-the-gap".len();
+
+    let out = wrapped.cli.output();
+    let after = &out[out.find("first-part").unwrap() + "first-part".len()..];
+    let reset = after
+        .find("\x1b[?2004l")
+        .expect("the tracked modes are reset");
+    let replay = reset
+        + after[reset..]
+            .find("\x1b[?2004h")
+            .expect("the session's modes are replayed");
+    let live = after.find("after-the-gap").unwrap();
+    assert!(replay < live, "{after:?}");
     assert!(
-        !wrapped.cli.output().contains("xxxxxxxxxx"),
+        after[reset..replay].contains(&(head - asked).to_string()),
+        "the notice names the {} bytes missed: {:?}",
+        head - asked,
+        &after[reset..replay]
+    );
+    assert!(
+        !after.contains("xxxxxxxxxx"),
         "output from before the head was shown"
     );
 }
 
-/// What a resume sends a 0.5.0 remote tendr: the request, whose resume it
-/// ignores, then a resume frame where it requires the exact version 1 hello,
-/// so it refuses (80) rather than attach afresh.
+/// A reconnected `attach --host` that stops reading is taken over like any
+/// other: the takeover cuts it off without `MSG_RETIRED`, and its remote
+/// side reads the takeover of its resumed epoch from the event log, so it
+/// exits 81 rather than reconnect.
 #[test]
-fn host_resume_sends_what_an_old_remote_refuses() {
-    use tendr::attach_proto::{MSG_RESUME, ResumePoint};
+fn host_reconnected_attach_taken_over_while_stalled_exits_81() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
-    let sent = root.path().join("sent");
-    let ssh = fake_ssh(&format!("stdin {}", sent.display()));
-    let point = ResumePoint {
-        run_id: tendr::model::ids::RunId::new(),
-        epoch: tendr::model::pty_control::ControllerEpoch::new(4),
-        offset: 99,
-    };
-    let driver = format!(
-        "{} {} {}",
-        point.run_id.as_uuid(),
-        point.epoch.get(),
-        point.offset
-    );
-    let wrapped = attach_through(
-        &ssh,
-        "1",
-        &root,
-        "old-remote-resume",
-        &["s"],
-        &[("TENDR_TEST_ATTACH_RESUME", &driver)],
-    );
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 82);
-    wrapped.assert_terminal_restored();
+    let _kill = SessionGuard::new(&root, "host-resume-take");
+    let child = format!("({PACED_FLOOD}) & exec cat -v");
+    start_pty(&root, "host-resume-take", &["sh", "-c", &child]);
+    let link = Flaky::new();
 
-    let sent = std::fs::read(&sent).unwrap();
-    let len = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
-    let request: serde_json::Value = serde_json::from_slice(&sent[4..4 + len]).unwrap();
-    assert_eq!(
-        request["params"]["resume"],
-        serde_json::json!({
-            "run_id": point.run_id.as_uuid().to_string(),
-            "epoch": 4,
-            "offset": 99
-        })
+    let first = link.attach(&root, "take-1", &["host-resume-take"]);
+    first.wait_output_contains("0000000000");
+    link.cut();
+    wait_resumes(&root, "host-resume-take", 1);
+    first.cli.pause_output();
+    std::thread::sleep(Duration::from_secs(3));
+
+    let remote = Remote::new();
+    let mut second = remote.attach(&root, "take-2", &["host-resume-take", "--takeover"]);
+    second
+        .cli
+        .type_until_logged(&root, "host-resume-take", "second-client");
+    assert!(
+        !first.exited(),
+        "a client that is not reading stays blocked"
     );
-    assert_eq!(request["params"]["takeover"], false);
-    assert_eq!(sent[4 + len], MSG_RESUME, "not a hello");
+
+    first.cli.resume_output();
+    assert_eq!(
+        first.wait_exit(Duration::from_secs(30)),
+        81,
+        "the stalled reconnected client was taken over"
+    );
+    first.assert_terminal_restored();
+    first.wait_output_contains("another client took over this session");
+
+    second.cli.type_bytes(b"\x1cd");
+    assert_eq!(second.wait_exit(Duration::from_secs(15)), 0);
+    second.assert_terminal_restored();
 }

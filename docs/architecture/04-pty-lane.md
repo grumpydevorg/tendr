@@ -350,13 +350,41 @@ tendr that bridges them to the session's socket
 - When the sidecar ends the connection of a client taken over without
   `MSG_RETIRED`, the bridge checks the event log as the local client does
   and sends `MSG_RETIRED` itself, so the client exits 81 when it reads again.
-- The client can resume from that point over a new ssh connection
-  (`commands::attach::resume_host`): the request carries the point, and a
-  `MSG_RESUME` takes the hello's place on ssh's stdin, which the bridge
-  passes on ([Resuming a viewer](#resuming-a-viewer)). A gone answer
-  requires the client to turn off the modes it has tracked before it writes
-  the replay. The client does not yet reconnect by itself when the link
-  drops.
+- A version 2 client whose connection ends from the far side, without
+  `MSG_RETIRED` and without output outside the protocol, hands ssh's end to
+  a reconnect thread (`commands::attach::unix_relay::reconnect`;
+  [design](../design.md#a-dropped-attach---host-reconnects-by-itself-judged-by-sshs-exit)):
+  - It waits up to 5 s for ssh's exit. The remote's exit code ends the
+    attach with that code. ssh's 255 without an exit trailer, ssh killed by
+    a signal, or ssh still running then is a lost link.
+  - It joins the old connection's reader, so the offset is final, and
+    resumes from that point over a new ssh with `BatchMode=yes`
+    (`commands::attach::resume_host`): the request carries the point, and a
+    `MSG_RESUME` takes the hello's place on ssh's stdin, which the bridge
+    passes on ([Resuming a viewer](#resuming-a-viewer)).
+  - A transport failure (255 without a trailer, a signal, the connect
+    deadline) is tried again after 1 s, doubling to at most 30 s, with no
+    limit on the number of attempts. Any remote verdict ends it: a refusal
+    exits with its code (81 for the control rule or an ended run, 80 for a
+    session that cannot resume).
+  - Meanwhile the main thread keeps the keyboard: it discards keystrokes,
+    noting it once in the status line, and leaves on the escape, SIGHUP,
+    SIGTERM or SIGINT, which stop the reconnect's ssh (a flag polled every
+    20 ms by its wait, then SIGTERM and SIGKILL) for up to 2 s.
+  - The status goes on the terminal's last rows, written under the lock the
+    output is written under, with the cursor saved and restored (DECSC,
+    DECRC): tendr's line, and ssh's latest stderr line on the row below
+    (an approval URL), as printable ASCII cut to the width. It is erased
+    before the new connection's output is written. The stderr of the last
+    attempt is printed again once the terminal is restored, since it holds
+    the remote's reason for a refusal.
+  - On `MSG_RESUMED` the new connection relays from the same offset. On
+    `MSG_GONE` the client first writes the reset of the modes it tracked
+    and a notice of how many bytes it missed and how many the session no
+    longer held, then relays the replay and the output from the head; the
+    notice is printed again once the terminal is restored, since a program
+    on the alternate screen covers it. Either way it then sends its size and
+    the repaint nudge, the size first so the nudge can apply.
 - A Windows client still runs the remote `tendr attach` under `ssh -t`; the
   remote end then is the client described above, driving a remote terminal.
 
@@ -415,9 +443,8 @@ tendr that bridges them to the session's socket
   handshake](#the-attach-handshake)); why offsets and not recording sequence
   numbers: [design](../design.md#viewers-count-output-in-bytes-and-agree-the-version-in-the-request).
   A viewer that lost its connection can resume from its offset ([Resuming a
-  viewer](#resuming-a-viewer)); `attach --host` does not yet reconnect by
-  itself, which is step 1 of
-  [remote frame transport](../plans/active/01_remote-frame-transport.md).
+  viewer](#resuming-a-viewer)), which `attach --host` does by itself
+  ([Attaching over `--host`](#attaching-over---host)).
 - Capture also tracks the terminal modes the child's output turns on
   (`term_modes::TermModes`, which lists them): among them the alternate
   screen, mouse tracking, bracketed paste, kitty keyboard flags (one stack

@@ -7,7 +7,7 @@ mod harness;
 
 use harness::{Observation, SessionGuard, poll_until, read_events, tendr};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -223,24 +223,7 @@ fn wait_captured(root: &TempDir, session: &str, marker: &str) {
 fn finish(root: &TempDir, session: &str) -> Vec<u8> {
     touch(root, "end");
     harness::wait_terminal(root, session);
-    let meta: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(session_dir(root, session).join("meta.json")).unwrap(),
-    )
-    .unwrap();
-    let dir: &Path =
-        &session_dir(root, session).join(meta["pty"]["recording"]["dir"].as_str().unwrap());
-    let files = tendr::recorder::DirectoryStore::segments(dir).unwrap();
-    let bytes: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
-    tendr::recording::decode_recording(bytes.iter().map(Vec::as_slice))
-        .expect("recording decodes")
-        .records
-        .iter()
-        .filter_map(|r| match &r.kind {
-            tendr::recording::RecordKind::Output(bytes) => Some(bytes.clone()),
-            _ => None,
-        })
-        .flatten()
-        .collect()
+    harness::recorded_output(root, session)
 }
 
 fn run_id(root: &TempDir, session: &str) -> String {

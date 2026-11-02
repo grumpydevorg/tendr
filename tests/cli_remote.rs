@@ -104,10 +104,14 @@ fn host_flag_is_accepted_by_parser() {
 /// The ssh argv of every `--host` operation but exec (and a Windows client's
 /// attach): constant, so nothing the user typed reaches the remote login
 /// shell.
-const REMOTE_ARGV: [&str; 8] = [
+const REMOTE_ARGV: [&str; 12] = [
     "-T",
     "-o",
     "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=3",
     "box",
     "tendr",
     "--hello",
@@ -1423,6 +1427,10 @@ fn host_exec_remote_argv_carries_no_payload() {
             "-T",
             "-o",
             "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=3",
             "box",
             "tendr",
             "--hello",

@@ -288,8 +288,9 @@ concurrent `push` is refused, not interleaved.
   such as Claude Code redraws; scrollback is not restored.
 - `attach` is refused while another client holds the terminal. `--takeover`
   disconnects that client and drops any input it or an in-flight `push` had
-  queued but tendr had not yet written to the terminal. Use it to reconnect
-  after a dropped SSH connection. The client taken over exits 81 with
+  queued but tendr had not yet written to the terminal. Use it after a local
+  connection was lost, or when an `attach --host` gave up reconnecting. The
+  client taken over exits 81 with
   `tendr: another client took over this session`. If it was frozen at the
   time (a stopped terminal or SSH connection), it stays alive, without
   control, until it runs again, and then exits 81.
@@ -305,6 +306,42 @@ concurrent `push` is refused, not interleaved.
   `--takeover`. From Windows, attach still runs the remote `tendr attach`
   under `ssh -t`, so names must be plain (see
   [Reach remote hosts](#reach-remote-hosts-with---host)).
+
+**When an `attach --host` connection drops**, tendr reconnects by itself
+and carries on where your terminal stopped, with the screen as it was. The
+remote host must run this version or newer, and so must the session's
+sidecar; otherwise the attach ends as before, with ssh's exit.
+
+- ssh checks the link every 5 s and gives up after three unanswered checks,
+  so a dead network is noticed within about 15 to 20 s. Killing `ssh`, or a
+  remote host that drops the connection, is noticed at once.
+- While it reconnects, a line at the bottom of your terminal says so, and
+  ssh's latest error, such as a Tailscale approval URL to open in your
+  browser, goes on the last row below it. A reconnect never prompts (`ssh -o
+  BatchMode=yes`): a login that needs a passphrase or a host-key answer fails
+  at once and is tried again. Load the key into your agent, or approve the
+  URL, and the next attempt gets through.
+- Attempts follow each other with pauses of 1, 2, 4, 8 and 16 s, then every
+  30 s, for as long as it takes. `Ctrl-\ d`, SIGTERM, SIGHUP and SIGINT still
+  leave (0, or 1 for a signal), and stop the attempt under way. The old
+  connection may still hold the session until the remote host notices it is
+  gone; attach again with `--takeover` then.
+- Output the session wrote meanwhile arrives in full, once, as if the
+  connection had never dropped; then the program is asked to redraw at your
+  terminal's size. Input is never resent: what you typed before the drop and
+  had not reached the session is lost, and what you type while it reconnects
+  is discarded, with a note in the status line.
+- The session keeps the last 32 MiB of output. If more than that was written
+  while you were away, tendr says how many bytes you missed and how many the
+  session no longer held, turns off the terminal modes the program had set,
+  and shows the session from then on, with its current modes and a redraw.
+  A full-screen program covers that notice at once, so tendr repeats it when
+  the attach ends.
+- The reconnect is refused, ending the attach with 81 and the remote's
+  reason, if someone took the terminal (an attach, a takeover, or an agent's
+  `push` still running), or if the session's run has ended. A session started
+  by a `tendr` that cannot resume ends it with 80. Exit 82 or 255 from ssh
+  during a reconnect is not an end: it is tried again.
 
 The escape works with the legacy `Ctrl-\` byte, the kitty keyboard protocol
 (which Claude Code can switch Ghostty, kitty, WezTerm and foot to) and xterm's
@@ -508,7 +545,10 @@ host (`attach` from Windows has no deadline). Without it, a lapsed Tailscale
 SSH check-mode approval waits about 30 minutes with no prompt.
 
 - Once the remote `tendr` starts, the command runs as long as it needs, so
-  `wait --timeout 3600` and `log -f` are unaffected.
+  `wait --timeout 3600` and `log -f` are unaffected. `ssh` checks the link
+  every 5 s (`ServerAliveInterval=5`, `ServerAliveCountMax=3`), so a dead
+  network ends a command with ssh's 255 within about 15 to 20 s, instead of
+  leaving it hanging.
 - Time spent at an `ssh` prompt (passphrase, unknown host key) counts.
 - `TENDR_SSH_CONNECT_TIMEOUT` sets the limit in seconds; `0` turns it off.
 - A remote `tendr` too old for this client fails on the first flag it does
@@ -682,8 +722,8 @@ or an I/O error.
 |any|2|Usage error from argument parsing|
 |any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); an `attach` name that is not plain, from Windows; a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request (1 when the remote login shell is PowerShell)|
 |`events`, `emit` with `--host`|1|Not supported over SSH|
-|any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 without one from the remote is `ssh` failing to connect|
-|any, with `--host` except `attach` from Windows|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s)|
+|any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 without one from the remote is `ssh` failing to connect (`attach` from macOS or Linux reconnects instead, once it is attached)|
+|any, with `--host` except `attach` from Windows|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s); while `attach --host` reconnects, it tries again instead|
 |`start`|2, 5|The child failed to spawn; the sidecar failed|
 |`run`|the child's|The child's own code, or 2 spawn failed, 3 sidecar lost, 4 dependency failed, 5 sidecar failed, 124 timed out, 137 killed|
 |`wait`|1|`--timeout` passed before the sessions ended|
@@ -696,8 +736,8 @@ or an I/O error.
 |`wrap`|the child's|The wrapped command's code; 6 for an `--event` with a reserved prefix|
 |`query`|DuckDB's|DuckDB's exit code|
 |`guide`, `skill install`|2|Unknown topic; refusing to overwrite a modified skill file|
-|`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not within 10 s (an older or newer `tendr`), or an `attach --host` got output that does not follow on from the last|
-|`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach (also when the attach had stopped reading its output and learns of it only later), or the session's run has ended|
+|`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not within 10 s (an older or newer `tendr`), an `attach --host` got output that does not follow on from the last, or its reconnect reached a session that cannot resume|
+|`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach (also when the attach had stopped reading its output and learns of it only later), or the session's run has ended. An `attach --host` whose reconnect is refused exits 81 too: someone took the terminal while it was disconnected (an attach, a takeover, or an agent's `push` still running), or the run ended meanwhile (`not running`)|
 |`attach`, `push` to a PTY session|82, 83|Reserved, not used yet|
 |`attach`, `push` to a PTY session|84|Runtime or transport: the attach socket is missing or unreachable, the connection fails, or a push ended revoked or stopped with bytes unwritten (stderr gives the byte counts)|
 |`attach`, `push` to a PTY session|85|Identity: the socket's listener, or the connecting client, is another user|

@@ -2535,7 +2535,7 @@ fn reject_resume(
     use crate::pty_input::RequestError;
     let why = match error {
         RequestError::Control(ControlError::Stale { .. }) => {
-            "control has changed since that epoch".to_owned()
+            "control changed while disconnected; attach again".to_owned()
         }
         RequestError::Control(ControlError::Busy { .. }) => {
             "an agent's push holds the terminal".to_owned()
