@@ -440,15 +440,18 @@ tendr that bridges them to the session's socket
   a reconnect thread (`commands::attach::client::reconnect`;
   [design](../design.md#a-dropped-attach---host-reconnects-by-itself-judged-by-sshs-exit)):
   - It waits up to 5 s for ssh's exit. The remote's exit code ends the
-    attach with that code. ssh's 255 without an exit trailer, ssh killed by
-    a signal, or ssh still running then is a lost link.
+    attach with that code. ssh's 255 without an exit trailer, ssh killed
+    (by a signal; on Windows, an exit below), or ssh still running then is
+    a lost link. A leave the client has received but not yet read (a
+    signal, a console control event) wins over an end it raced: the same
+    signal or event can end ssh, which shares the terminal.
   - It joins the old connection's reader, so the offset is final, and
     resumes from that point over a new ssh with `BatchMode=yes`
     (`commands::attach::resume_host`): the request carries the point, and a
     `MSG_RESUME` takes the hello's place on ssh's stdin, which the bridge
     passes on ([Resuming a viewer](#resuming-a-viewer)). A watcher's
     request stays read-only, and its frame is `MSG_WATCH_RESUME`.
-  - A transport failure (255 without a trailer, a signal, the connect
+  - A transport failure (255 without a trailer, ssh killed, the connect
     deadline) is tried again after 1 s, doubling to at most 30 s, with no
     limit on the number of attempts. Any remote verdict ends it: a refusal
     exits with its code (81 for the control rule or an ended run, 80 for a
@@ -509,8 +512,17 @@ tendr that bridges them to the session's socket
     (`tendr: attach ended by CTRL_BREAK_EVENT`). The close event's handler
     waits, under Windows's 5 s limit, until the console has been put back.
   - Restoring discards typed-ahead input (`FlushConsoleInputBuffer`).
-  - Drop classification is shared: ssh's 255 without an exit trailer is a
-    lost link, and the attach reconnects.
+  - Drop classification is shared, with Windows's ways for ssh.exe to be
+    killed in place of a signal (`ssh::classify`): an NTSTATUS exit (the
+    two severity bits not both clear, such as `0xC000013A` after Ctrl-C or
+    Ctrl-Break, or a crash) and, for an attach, exit 1 without an exit
+    trailer (`TerminateProcess`, as Task Manager uses it, gives 1) are lost
+    links, and the attach reconnects. A remote tendr never ends with 1 and
+    no trailer: its wrapper writes one for every code
+    ([the exit trailer](06-transport-boundaries.md#the-exit-trailer)). A
+    Unix client keeps 1 as the remote's code. The status line, its backoff,
+    a resume, a gone answer and the escape mid-reconnect are tested under a
+    pseudo console (`tests/windows_attach_console.rs`).
 
 ## Output and viewers
 

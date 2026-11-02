@@ -21,9 +21,11 @@
 //! terminal is restored (without waiting for pending output to drain), and
 //! the process exits.
 //!
-//! The terminal layer's [`Leave`] (on Unix SIGHUP, SIGTERM and SIGINT) ends
-//! the relay like a detach, and its size notices (SIGWINCH) bring the next
-//! size check forward.
+//! The terminal layer's [`Leave`] (on Unix SIGHUP, SIGTERM and SIGINT; on
+//! Windows the console's control events) ends the relay like a detach, and
+//! its size notices (SIGWINCH) bring the next size check forward. A leave
+//! wins over a session end it raced: the same signal or control event can
+//! end ssh, which shares the terminal, and the user asked to leave.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -36,7 +38,7 @@ use tendr::attach_proto::{self, Frame, FrameError};
 use tendr::pty_exit::PtyExitCode;
 use tendr::term_modes::TermModes;
 
-use super::terminal::{Input, Leave, Output, Terminal};
+use super::terminal::{Input, Leave, Output, Raw, Terminal};
 
 mod reconnect;
 
@@ -261,7 +263,8 @@ pub(super) fn relay(
                 }
                 (end, old) => {
                     (host, connection) = (end, old);
-                    break Ending::SessionClosed;
+                    break pending_leave(terminal.as_mut(), &mut buf)
+                        .map_or(Ending::SessionClosed, Ending::Left);
                 }
             }
         }
@@ -275,6 +278,9 @@ pub(super) fn relay(
                     connection = Some(resumed);
                 }
                 reconnect::Outcome::Ended(result) => {
+                    if let Some(leave) = pending_leave(terminal.as_mut(), &mut buf) {
+                        break Ending::Left(leave);
+                    }
                     verdict = Some(result);
                     break Ending::SessionClosed;
                 }
@@ -462,6 +468,16 @@ fn send_keystrokes(
     let len = forward.len();
     if !connection.outbox.push_data(forward) {
         *dropped += len;
+    }
+}
+
+/// A leave that has arrived but not been read, checked without waiting
+/// when the session's end may have been caused by it. Anything typed with
+/// it is dropped: the attach is ending either way.
+fn pending_leave(terminal: &mut dyn Raw, buf: &mut [u8]) -> Option<Leave> {
+    match terminal.input(buf, Duration::ZERO) {
+        Input::Leave(leave) => Some(leave),
+        _ => None,
     }
 }
 

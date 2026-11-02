@@ -34,7 +34,10 @@ pub enum SshError {
     #[error("ssh transport failed: connection or authentication failure (exit 255)")]
     TransportFailed,
 
-    /// SSH process was killed by a signal or returned an unexpected OS error.
+    /// The ssh process ended without the remote's verdict other than by
+    /// failing to connect: killed by a signal (Unix), ended by Windows with
+    /// an NTSTATUS code, or, for an attach on Windows, exit 1 without an
+    /// exit trailer (see `classify`).
     #[error("ssh process terminated abnormally")]
     Abnormal,
 
@@ -289,7 +292,7 @@ fn run_framed(host: &str, entry: Entry, input: Input) -> Result<i32, SshError> {
     if let Some(writer) = writer.filter(|_| !body) {
         let _ = writer.join();
     }
-    exit_code(status.code(), trailer)
+    exit_code(status.code(), trailer, Call::Operation)
 }
 
 /// `attach --host`: ssh to the remote tendr's `_remote` entry point, with
@@ -361,9 +364,11 @@ impl AttachSsh {
                 stdin,
                 stdout,
             }),
-            Progress::Exited(status, trailer) => {
-                Ok(AttachStart::Ended(exit_code(status.code(), trailer)?))
-            }
+            Progress::Exited(status, trailer) => Ok(AttachStart::Ended(exit_code(
+                status.code(),
+                trailer,
+                Call::Attach,
+            )?)),
             Progress::Cancelled => Err(SshError::Cancelled),
             Progress::Limit => unreachable!("no time limit"),
         }
@@ -380,7 +385,9 @@ impl AttachSsh {
     pub fn finish(mut self, grace: Option<Duration>) -> Option<Result<i32, SshError>> {
         let until = grace.map_or(Until::Exit, |grace| Until::Limit(Instant::now() + grace));
         match self.watch.wait(&self.host, &mut self.child, until) {
-            Ok(Progress::Exited(status, trailer)) => Some(exit_code(status.code(), trailer)),
+            Ok(Progress::Exited(status, trailer)) => {
+                Some(exit_code(status.code(), trailer, Call::Attach))
+            }
             Ok(Progress::Limit) => {
                 stop(&mut self.child);
                 None
@@ -392,13 +399,48 @@ impl AttachSsh {
     }
 }
 
+/// Which call's exit [`exit_code`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Call {
+    /// A one-shot operation: `exec`, `ls`, `push` and the rest.
+    Operation,
+    /// An `attach --host` connection, whose lost link is reconnected.
+    Attach,
+}
+
 /// The call's exit code: the remote's exit trailer if it wrote one, else
-/// ssh's own `code`. Without a trailer, 255 is ssh failing to connect; with
-/// one, 255 is the remote's.
-fn exit_code(code: Option<i32>, trailer: Option<i32>) -> Result<i32, SshError> {
+/// ssh's own `code`, read as [`classify`] reads it on this client.
+fn exit_code(code: Option<i32>, trailer: Option<i32>, call: Call) -> Result<i32, SshError> {
+    classify(code, trailer, call, cfg!(windows))
+}
+
+/// The call's exit code from ssh's `code` and the remote's `trailer`. With
+/// a trailer, it is the remote's code, 255 and 1 included. Without one, it
+/// is ssh's own end:
+/// - 255 is ssh failing to connect or to stay connected;
+/// - no code (Unix: a signal) is ssh killed;
+/// - on a `windows` client, an NTSTATUS code (the top two, severity, bits
+///   not both clear, such as `0xC000013A` after Ctrl-C or Ctrl-Break) is
+///   ssh.exe ended by Windows, as a signal ends it on Unix;
+/// - on a `windows` client, 1 for an attach is ssh.exe's own end, a lost
+///   link: `TerminateProcess`, as Task Manager and `Child::kill` use it,
+///   gives 1, and no remote tendr ends that way without a trailer: its
+///   wrapper writes one for every code (06-transport-boundaries.md, "The
+///   exit trailer"), and parse errors exit 2. Other calls keep the 1, which
+///   a remote shell that could not run tendr may give, with its message;
+/// - any other code is passed on.
+fn classify(
+    code: Option<i32>,
+    trailer: Option<i32>,
+    call: Call,
+    windows: bool,
+) -> Result<i32, SshError> {
+    let ntstatus = |code: i32| (code as u32) >> 30 != 0;
     match (trailer, code) {
         (Some(code), _) => Ok(code),
         (None, Some(255)) => Err(SshError::TransportFailed),
+        (None, Some(code)) if windows && ntstatus(code) => Err(SshError::Abnormal),
+        (None, Some(1)) if windows && call == Call::Attach => Err(SshError::Abnormal),
         (None, Some(code)) => Ok(code),
         (None, None) => Err(SshError::Abnormal),
     }
@@ -1008,18 +1050,57 @@ mod tests {
 
     #[test]
     fn the_trailer_decides_the_exit_code() {
-        assert_eq!(exit_code(Some(1), Some(42)).unwrap(), 42);
-        assert_eq!(
-            exit_code(Some(255), Some(255)).unwrap(),
-            255,
-            "a remote 255"
-        );
+        for windows in [false, true] {
+            for call in [Call::Operation, Call::Attach] {
+                let read = |code, trailer| classify(code, trailer, call, windows);
+                assert_eq!(read(Some(1), Some(42)).unwrap(), 42);
+                assert_eq!(read(Some(1), Some(1)).unwrap(), 1, "a remote 1");
+                assert_eq!(read(Some(255), Some(255)).unwrap(), 255, "a remote 255");
+                assert!(matches!(
+                    read(Some(255), None),
+                    Err(SshError::TransportFailed)
+                ));
+                assert_eq!(read(Some(3), None).unwrap(), 3);
+                assert!(matches!(read(None, None), Err(SshError::Abnormal)));
+            }
+        }
+    }
+
+    /// An NTSTATUS exit (the severity bits set) is ssh.exe ended by Windows,
+    /// as a signal ends it on Unix: Ctrl-C or Ctrl-Break, a crash, a debugger.
+    #[test]
+    fn an_ntstatus_exit_on_windows_is_abnormal() {
+        for status in [0xC000_013A_u32, 0xC000_0005, 0x8000_0003, 0x4001_0004] {
+            let code = status as i32;
+            for call in [Call::Operation, Call::Attach] {
+                assert!(
+                    matches!(
+                        classify(Some(code), None, call, true),
+                        Err(SshError::Abnormal)
+                    ),
+                    "{status:#x}"
+                );
+                assert_eq!(
+                    classify(Some(code), Some(7), call, true).unwrap(),
+                    7,
+                    "the trailer still decides"
+                );
+            }
+        }
+    }
+
+    /// A remote tendr always writes a trailer, so ssh.exe's 1 without one is
+    /// ssh's own end (`TerminateProcess` gives 1): for an attach, a lost
+    /// link. Other calls, and Unix clients, keep the code.
+    #[test]
+    fn exit_1_without_a_trailer_is_a_lost_attach_on_windows_only() {
         assert!(matches!(
-            exit_code(Some(255), None),
-            Err(SshError::TransportFailed)
+            classify(Some(1), None, Call::Attach, true),
+            Err(SshError::Abnormal)
         ));
-        assert_eq!(exit_code(Some(3), None).unwrap(), 3);
-        assert!(matches!(exit_code(None, None), Err(SshError::Abnormal)));
+        assert_eq!(classify(Some(1), None, Call::Operation, true).unwrap(), 1);
+        assert_eq!(classify(Some(1), None, Call::Attach, false).unwrap(), 1);
+        assert_eq!(classify(Some(1), None, Call::Operation, false).unwrap(), 1);
     }
 
     #[test]

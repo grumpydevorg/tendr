@@ -20,8 +20,11 @@
   console without virtual terminal support ("Use legacy console") and
   mintty are refused before ssh starts. Closing the console window,
   Ctrl-Break, or a Ctrl-C event another program raises, ends it with exit
-  1; Ctrl-C typed at the keyboard goes to the session. The remote host needs
-  the attach bridge (0.5.0 or newer; 0.6.0 to reconnect).
+  1, even when it ended ssh too; Ctrl-C typed at the keyboard goes to the
+  session. ssh.exe ended by Windows (an NTSTATUS exit such as `0xC000013A`)
+  or killed (exit 1 without the remote's exit code) is a dropped connection,
+  and the attach reconnects. The remote host needs the attach bridge (0.5.0
+  or newer; 0.6.0 to reconnect).
 
 - **`attach --read-only` streams to a pipe.** With no terminal, it writes
   the session's output to stdout and every notice to stderr, never reads
@@ -50,6 +53,10 @@
 
 ### Fixed
 
+- **A signal that also ends ssh leaves `attach --host` as a signal does.**
+  SIGINT, SIGTERM or SIGHUP sent to the whole process group ends ssh too;
+  the attach could report ssh's end, or the end of a reconnect that end
+  started, instead of `attach ended by <signal>` with exit 1.
 - **On Windows, `tendr query` no longer lends DuckDB your pipes.** DuckDB,
   and anything it started that outlived it, held all of the stdin, stdout
   and stderr tendr was given, as `ssh` did before 0.5.0: Windows hands a

@@ -21,7 +21,8 @@ Native Windows x64 and ARM64 test lanes already run in required CI. Remote
 `exec` into a PowerShell session on a Windows host is tested on both lanes
 through a real OpenSSH server (`tests/cli_remote_windows_ssh.rs`). A Windows
 client attaches to a session on a Unix host over the attach bridge, from
-Windows Terminal or conhost (`tests/windows_attach_console.rs`).
+Windows Terminal or conhost, and reconnects after a dropped connection
+(`tests/windows_attach_console.rs`).
 
 ## Gaps a user hits today
 
