@@ -1,7 +1,7 @@
 //! A terminal driver for tests: runs a command in a PTY, types into it and
 //! captures what it writes, as a person at a terminal would.
 
-use super::{Observation, poll_path_exists, poll_until, tendr};
+use super::{Observation, logged_output, poll_path_exists, poll_until};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,20 +118,19 @@ impl CliAttach {
         assert_eq!(rc, 0, "resize the CLI's terminal");
     }
 
-    /// Type `line` until the session log shows it. Keystrokes typed before the CLI
-    /// enters raw mode are discarded (`TCSAFLUSH`), so a single write races the
-    /// handshake; the marker is idempotent, so retyping is safe.
+    /// Type `line` until the session's output shows it. Keystrokes typed before
+    /// the CLI enters raw mode are discarded (`TCSAFLUSH`), so a single write
+    /// races the handshake; the marker is idempotent, so retyping is safe. The
+    /// output is read joined ([`logged_output`]): a shell may echo the line in
+    /// pieces, and capture logs each piece it reads on lines of its own.
     pub fn type_until_logged(&mut self, root: &TempDir, session: &str, line: &str) {
         poll_until(Duration::from_secs(15), Duration::from_millis(200), || {
             self.type_bytes(line.as_bytes());
-            let output = tendr(root)
-                .args(["log", session, "--raw"])
-                .output()
-                .unwrap();
-            if String::from_utf8_lossy(&output.stdout).contains(line.trim_end()) {
+            let joined = logged_output(root, session);
+            if joined.contains(line.trim_end()) {
                 Observation::Ready(())
             } else {
-                Observation::Pending(format!("{session} log lacks {line:?}"))
+                Observation::Pending(format!("{session} output lacks {line:?}"))
             }
         })
         .unwrap_or_else(|e| {

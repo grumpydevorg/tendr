@@ -972,20 +972,11 @@ fn attach_as_human(sock_path: &std::path::Path) -> UnixStream {
 }
 
 /// Poll the PTY output until it contains `needle`, wherever capture split it,
-/// and return the output. `tendr log --raw` prints each captured chunk as its
-/// own line, so a needle that straddles two reads of the PTY never appears
-/// whole there. For a child whose output has no newlines of its own, joining
-/// the lines recovers the stream.
+/// and return the output joined as [`harness::logged_output`] joins it. For a
+/// child whose output has no newlines of its own, that is the stream.
 fn wait_output_contains(root: &TempDir, session: &str, needle: &str) -> String {
     poll_until(Duration::from_secs(15), Duration::from_millis(20), || {
-        let output = tendr(root)
-            .args(["log", session, "--raw"])
-            .output()
-            .unwrap();
-        let joined: String = String::from_utf8_lossy(&output.stdout)
-            .chars()
-            .filter(|&c| c != '\n')
-            .collect();
+        let joined = harness::logged_output(root, session);
         if joined.contains(needle) {
             Observation::Ready(joined)
         } else {
