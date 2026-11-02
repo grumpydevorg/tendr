@@ -268,11 +268,11 @@ tendr that bridges them to the session's socket
 - The sidecar keeps the controller epochs and the recording. The bridge only
   passes frames on; it decides nothing about control.
 - A client that stops reading backs up its output through ssh and the
-  bridge to the sidecar, which then treats it as above: the viewer queue
-  fills, and a takeover retires it through the event log. The bridge's
-  input and output directions are separate, so the stalled client's resize
-  and detach still reach the sidecar, and its controls go ahead of its input
-  on a bounded path.
+  bridge to the sidecar, which then treats it as above: it falls behind in
+  the output ring, and a takeover retires it through the event log. The
+  bridge's input and output directions are separate, so the stalled client's
+  resize and detach still reach the sidecar, and its controls go ahead of
+  its input on a bounded path.
 - When the sidecar ends the connection of a client taken over without
   `MSG_RETIRED`, the bridge checks the event log as the local client does
   and sends `MSG_RETIRED` itself, so the client exits 81 when it reads again.
@@ -283,7 +283,7 @@ tendr that bridges them to the session's socket
 
 - PTY output is merged and recorded as `O` lines in `output.log`.
 - For each chunk of output, capture first hands it to the recorder, then
-  writes it to `output.log`, then offers it to the attached viewer's queue.
+  writes it to `output.log`, then appends it to the run's output ring.
   The recorder does not wait for its storage, so a viewer can receive bytes
   before they are on disk. After a failed `output.log` write, capture skips
   the log for the rest of the run; the recorder and the viewer still get
@@ -322,9 +322,14 @@ tendr that bridges them to the session's socket
   output is then subject to the 0.65 s discard again. A reader that ends
   early (an error, a panic) also closes it. A child that exits while its
   output is stopped by `^S` stays exiting until `^Q` or a stop.
-- The viewer's queue holds at most 8 MiB. The viewer's own sender thread
-  drains it. A viewer that stops reading is disconnected and loses control. It
-  never stalls capture or the child.
+- Every output byte has an offset: the count of output bytes before it in
+  the run. Capture appends each chunk to one output ring per run, under the
+  attach sink's lock, so offsets are assigned in one place. The ring keeps
+  the last 32 MiB, from the first viewer on. A viewer is a cursor into it,
+  the offset of the next byte it gets; its own sender thread sends from
+  there. A viewer whose cursor the ring evicts (it fell 32 MiB behind) is
+  disconnected and loses control. Capture never waits for a viewer, so a
+  viewer never stalls capture or the child.
 - A viewer gets no recording sequence numbers, so a viewer that disconnects
   cannot resume from where it stopped. Resumable viewers are step 1 of
   [remote frame transport](../plans/active/01_remote-frame-transport.md).
@@ -332,9 +337,10 @@ tendr that bridges them to the session's socket
   (`term_modes::TermModes`, which lists them): among them the alternate
   screen, mouse tracking, bracketed paste, kitty keyboard flags (one stack
   per screen) and `modifyOtherKeys`. When a viewer is installed, the
-  sequences that turn those modes on are queued first, under the lock capture
-  holds while it offers output, so no output lands between them. A full reset
-  (`ESC c`) from the child clears the tracked modes.
+  sequences that turn those modes on are sent first, ahead of its cursor.
+  The replay and the cursor are both taken under the lock capture holds
+  while it appends, so no output lands between them. A full reset (`ESC c`)
+  from the child clears the tracked modes.
 - The client tracks the same modes over everything it writes to the terminal,
   and however the attach ends it writes their inverse once: each kitty
   keyboard stack popped as many times as it was pushed, the alternate screen

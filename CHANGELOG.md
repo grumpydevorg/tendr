@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **An attached viewer can now fall 32 MiB behind, up from 8 MiB**, before
+  the sidecar disconnects it and it loses control.
+
 ## v0.5.0 — framed `--host`, NDJSON exec, attach bridge
 
 Breaking over `--host`: a 0.5.0 client needs 0.5.0 or newer on the remote

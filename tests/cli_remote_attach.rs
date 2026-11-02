@@ -169,7 +169,7 @@ fn host_attach_types_sees_output_resizes_and_detaches() {
 }
 
 /// A paced flood: at most 800 KB/s, so a few seconds of stall stay well
-/// inside the sidecar's 8 MiB viewer queue and the client is never dropped
+/// inside the sidecar's 32 MiB output ring and the client is never dropped
 /// for falling behind, yet fill every buffer between the sidecar and a
 /// terminal that stopped reading.
 const PACED_FLOOD: &str = "stty raw -echo; line=$(printf '%01000d' 0); \

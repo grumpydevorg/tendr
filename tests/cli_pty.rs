@@ -2304,49 +2304,95 @@ fn takeover_after_a_silent_connection_reaches_the_same_running_process() {
         .ok();
 }
 
+/// A viewer that stops reading keeps every byte while it is less than the
+/// 32 MiB output ring behind, and is disconnected, losing control, once it
+/// falls further. Capture keeps up throughout.
 #[test]
-fn stalled_viewer_cannot_block_output_capture() {
+fn a_stalled_viewer_is_disconnected_only_once_a_ring_behind() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = harness::SessionGuard::new(&root, "pty-stalled");
-    let go = root.path().join("go");
+    let (go1, go2) = (root.path().join("go1"), root.path().join("go2"));
 
-    // After the go file appears, the child writes ~10 MiB — more than one
-    // viewer's queue budget — then a marker, then stays alive.
-    let script = "while [ ! -f \"$GO\" ]; do sleep 0.05; done; \
-                  yes 0123456789abcdef0123456789abcdef | head -c 10485760; \
-                  echo; echo ALL-OUTPUT-DONE; sleep 60";
+    // Long lines keep output.log's per-line cost down. 16,900 lines of 994
+    // bytes once the terminal adds CRs: about 16 MiB, half the ring. Then
+    // 44,000 more: about 42 MiB, well past the ring and the socket buffers.
+    let line = "0123456789abcdef".repeat(62);
+    const FIRST_LINES: usize = 16_900;
+    let script = format!(
+        "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; \
+         yes {line} | head -n {FIRST_LINES}; echo FIRST-DONE; \
+         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; \
+         yes {line} | head -n 44000; echo ALL-OUTPUT-DONE; sleep 60"
+    );
     tendr(&root)
         .args(["start", "pty-stalled", "--pty"])
         .arg("--env")
-        .arg(format!("GO={}", go.display()))
-        .args(["--", "sh", "-c", script])
+        .arg(format!("GO1={}", go1.display()))
+        .arg("--env")
+        .arg(format!("GO2={}", go2.display()))
+        .args(["--", "sh", "-c", &script])
         .output()
         .unwrap();
     harness::wait_running(&root, "pty-stalled");
     let sock_path = wait_for_attach_socket(&root, "pty-stalled");
-
-    // A viewer that attaches and then never reads.
-    let mut stalled = attach_as_human(&sock_path);
-    std::fs::write(&go, b"").unwrap();
-
-    // Capture must keep up regardless of the stalled viewer. Read output.log
-    // directly: `tendr log` would re-parse ~10 MiB on every poll.
+    // Capture must keep up regardless of the stalled viewer. Read the end of
+    // output.log directly: `tendr log` would re-parse tens of MiB every poll.
+    // Each read of the PTY is logged as its own lines, so a marker split
+    // between two reads is found only by joining the lines' text.
     let log_path = root
         .path()
         .join(".tendr/sessions/default/pty-stalled/output.log");
-    poll_until(Duration::from_secs(60), Duration::from_millis(200), || {
-        let log = std::fs::read(&log_path).unwrap_or_default();
-        if log.windows(15).any(|w| w == b"ALL-OUTPUT-DONE") {
-            Observation::Ready(())
-        } else {
-            Observation::Pending(format!("{} log bytes", log.len()))
-        }
-    })
-    .unwrap_or_else(|e| panic!("output capture stalled behind a viewer that never reads: {e}"));
+    let wait_captured = |marker: &str| {
+        poll_until(Duration::from_secs(60), Duration::from_millis(200), || {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut tail = Vec::new();
+            if let Ok(mut log) = std::fs::File::open(&log_path) {
+                let _ = log.seek(SeekFrom::End(-16384));
+                let _ = log.read_to_end(&mut tail);
+            }
+            let text: String = tail
+                .split(|&b| b == b'\n')
+                .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+                .filter_map(|l| l["content"].as_str().map(str::to_owned))
+                .collect();
+            if text.contains(marker) {
+                Observation::Ready(())
+            } else {
+                Observation::Pending(text)
+            }
+        })
+        .unwrap_or_else(|e| panic!("capture stalled behind a viewer that never reads: {e}"))
+    };
 
-    // The stalled viewer was disconnected rather than buffered without bound,
-    // and with it went its control.
+    // A viewer that attaches and stops reading while half a ring is written.
+    let mut stalled = attach_as_human(&sock_path);
+    std::fs::write(&go1, b"").unwrap();
+    wait_captured("FIRST-DONE");
+
+    // It was not disconnected: reading again, it gets every byte in order.
+    // EINVAL on macOS means the sidecar already shut the socket down; the
+    // reads below then report it.
+    let _ = stalled.set_read_timeout(Some(Duration::from_secs(10)));
+    let mut received = Vec::new();
+    while !received.ends_with(b"FIRST-DONE\r\n") {
+        let (msg_type, payload) = read_msg(&mut stalled).expect("the viewer is still connected");
+        assert_eq!(msg_type, MSG_DATA);
+        received.extend(payload);
+    }
+    let expected = format!("{line}\r\n").repeat(FIRST_LINES) + "FIRST-DONE\r\n";
+    assert!(
+        received == expected.as_bytes(),
+        "the viewer got {} bytes, not the {} written",
+        received.len(),
+        expected.len()
+    );
+    wait_for_pty_control(&root, "pty-stalled", "HumanControl");
+
+    // Stalled again while more than a ring is written: disconnected rather
+    // than buffered without bound, and with it went its control.
+    std::fs::write(&go2, b"").unwrap();
+    wait_captured("ALL-OUTPUT-DONE");
     let _ = read_until_closed(&mut stalled);
     wait_for_pty_control(&root, "pty-stalled", "AgentControl");
 }
@@ -3744,8 +3790,8 @@ fn cli_attach_taken_over_while_stalled_exits_81() {
     let root = TempDir::new().unwrap();
     let _kill = harness::SessionGuard::new(&root, "pty-x81-stalled");
     // A paced flood of 8000 bytes per 10 ms tick: at most 800 KB/s, so at
-    // most 3.2 MB in the 4 s stall, well inside the sidecar's 8 MiB viewer
-    // queue, and the client is never disconnected for falling behind. What
+    // most 3.2 MB in the 4 s stall, well inside the sidecar's 32 MiB output
+    // ring, and the client is never disconnected for falling behind. What
     // must fill for the sidecar's write to block is well under 1 MB: the
     // terminal's PTY buffer (tens of KB), the socket's buffers (16 KB on
     // macOS, about 2 × 208 KB on Linux) and the one output frame (at most
@@ -3801,10 +3847,11 @@ fn cli_attach_dropped_for_lag_then_taken_over_exits_0() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = harness::SessionGuard::new(&root, "pty-x0-lagged");
-    // Unpaced: far past the 8 MiB viewer queue within a few seconds.
+    // Unpaced: far past the 32 MiB output ring within a few seconds. Long
+    // lines keep output.log's per-line cost down.
     tendr(&root)
         .args(["start", "pty-x0-lagged", "--pty", "--stdin", "--"])
-        .args(["sh", "-c", "stty raw -echo; yes 0000000000"])
+        .args(["sh", "-c", "stty raw -echo; yes \"$(printf '%01000d' 0)\""])
         .output()
         .unwrap();
     harness::wait_running(&root, "pty-x0-lagged");
@@ -3814,8 +3861,9 @@ fn cli_attach_dropped_for_lag_then_taken_over_exits_0() {
     wrapped.wait_output_contains("0000000000");
     wait_for_pty_control(&root, "pty-x0-lagged", "HumanControl");
     wrapped.cli.pause_output();
-    // The sidecar drops the client once its queue overflows, releasing control.
-    // Under a loaded test run the flood can take a while to pass 8 MiB.
+    // The sidecar drops the client once the ring evicts its cursor, releasing
+    // control. Under a loaded test run the flood can take a while to pass
+    // 32 MiB.
     wait_for_pty_control_within(
         &root,
         "pty-x0-lagged",

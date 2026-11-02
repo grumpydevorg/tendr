@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 
+mod output_ring;
 mod supervised_run;
+use output_ring::OutputRing;
 use supervised_run::SupervisedRun;
 
 #[cfg(unix)]
@@ -45,89 +47,46 @@ type ReadyWriter = <Current as Platform>::ReadyWriter;
 /// The human viewer PTY output is teed to, tagged with its controller identity
 /// so a stale connection can never clear or replace its successor's viewer.
 ///
-/// Output capture never writes to the viewer's socket. It offers each chunk to
-/// the viewer's bounded [`ViewerQueue`], which the viewer's own sender thread
-/// drains; a viewer that falls a full budget behind is disconnected instead of
-/// stalling capture (and, through capture, the child).
+/// Output capture never writes to the viewer's socket. It appends each chunk
+/// to the run's [`OutputRing`], and the viewer's own sender thread sends from
+/// its cursor there; a viewer that falls a whole ring behind is disconnected
+/// instead of stalling capture (and, through capture, the child).
 struct AttachViewer {
     #[cfg(unix)]
     holder: crate::model::pty_control::HolderId,
-    queue: Arc<ViewerQueue>,
-    /// Shut the viewer's socket down (used when it overflows its queue).
+    cursor: Arc<output_ring::Cursor>,
+    /// Shut the viewer's socket down (used when its cursor is lost).
     disconnect: Box<dyn Fn() + Send>,
 }
 
-/// Queued output bytes one viewer may fall behind before it is disconnected.
-const VIEWER_QUEUE_BYTES: usize = 8 << 20;
+/// The most output one frame to a viewer carries: what capture reads at once.
+const PTY_READ_BYTES: usize = 4096;
 
-/// A byte-bounded queue of output chunks for one viewer.
-#[derive(Default)]
-struct ViewerQueue {
-    state: Mutex<ViewerQueueState>,
-    ready: std::sync::Condvar,
-}
-
-#[derive(Default)]
-struct ViewerQueueState {
-    chunks: std::collections::VecDeque<Vec<u8>>,
-    bytes: usize,
-    closed: bool,
-}
-
-impl ViewerQueue {
-    /// Queue `chunk` without blocking. `false` means the viewer is closed or has
-    /// just overflowed its budget; either way it must be dropped.
-    fn offer(&self, chunk: &[u8]) -> bool {
-        let mut state = lock(&self.state);
-        if state.closed {
-            return false;
-        }
-        if state.bytes + chunk.len() > VIEWER_QUEUE_BYTES {
-            state.closed = true;
-            state.chunks.clear();
-            state.bytes = 0;
-            drop(state);
-            self.ready.notify_all();
-            return false;
-        }
-        state.bytes += chunk.len();
-        state.chunks.push_back(chunk.to_vec());
-        drop(state);
-        self.ready.notify_all();
-        true
-    }
-
-    /// Wait for the next chunk; `None` once closed.
-    #[cfg(unix)]
-    fn next(&self) -> Option<Vec<u8>> {
-        let mut state = lock(&self.state);
-        loop {
-            if state.closed {
-                return None;
-            }
-            if let Some(chunk) = state.chunks.pop_front() {
-                state.bytes -= chunk.len();
-                return Some(chunk);
-            }
-            state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-
-    #[cfg(unix)]
-    fn close(&self) {
-        lock(&self.state).closed = true;
-        self.ready.notify_all();
-    }
-}
-
-/// Drain a viewer's queue into its connection until either closes.
+/// What a newly installed viewer's sender sends: the mode replay, then the
+/// output from its cursor on.
 #[cfg(unix)]
-fn run_viewer_sender(queue: &ViewerQueue, conn: &Mutex<Box<dyn Write + Send>>) {
+struct ViewerStart {
+    ring: Arc<OutputRing>,
+    cursor: Arc<output_ring::Cursor>,
+    replay: Vec<u8>,
+}
+
+/// Send a viewer its mode replay, then its output from the ring, until its
+/// cursor or its connection closes or the ring evicts its cursor.
+#[cfg(unix)]
+fn run_viewer_sender(viewer: ViewerStart, conn: &Mutex<Box<dyn Write + Send>>) {
     use crate::attach_proto::{Frame, write_frame};
-    while let Some(chunk) = queue.next() {
+    let ViewerStart {
+        ring,
+        cursor,
+        replay,
+    } = viewer;
+    if !replay.is_empty() && write_frame(&mut *lock(conn), &Frame::Data(replay)).is_err() {
+        return ring.close(&cursor);
+    }
+    while let output_ring::Next::Bytes(chunk) = ring.next(&cursor, PTY_READ_BYTES) {
         if write_frame(&mut *lock(conn), &Frame::Data(chunk)).is_err() {
-            queue.close();
-            return;
+            return ring.close(&cursor);
         }
     }
 }
@@ -137,6 +96,8 @@ fn run_viewer_sender(queue: &ViewerQueue, conn: &Mutex<Box<dyn Write + Send>>) {
 #[derive(Default)]
 struct AttachTee {
     viewer: Option<AttachViewer>,
+    /// The run's latest output, which viewers send from.
+    ring: Arc<OutputRing>,
     modes: crate::term_modes::TermModes,
     /// When the child last wrote output; a repaint waits for it to go quiet.
     last_output: Option<std::time::Instant>,
@@ -1695,7 +1656,7 @@ fn capture_stream_with_tee(
     attach_sink: &AttachSink,
     recorder: Option<&Recorder>,
 ) {
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; PTY_READ_BYTES];
     let mut logging = true;
     loop {
         let n = match stream.read(&mut buf) {
@@ -1722,15 +1683,14 @@ fn capture_stream_with_tee(
             }
         }
 
-        // Offer raw bytes to the attached viewer's bounded queue; never block.
+        // Append raw bytes to the ring the viewer sends from; never block. The
+        // chunk's offset is assigned here, under the tee's lock.
         let mut tee = lock(attach_sink);
         tee.modes.feed(&buf[..n]);
         tee.last_output = Some(std::time::Instant::now());
-        if let Some(viewer) = tee.viewer.as_ref() {
-            if !viewer.queue.offer(&buf[..n]) {
-                (viewer.disconnect)();
-                tee.viewer = None; // closed, or fell a full budget behind
-            }
+        let span = tee.ring.append(&buf[..n]);
+        if let Some(viewer) = tee.viewer.take_if(|v| v.cursor.is_lost(span)) {
+            (viewer.disconnect)(); // its sender failed, or it fell a whole ring behind
         }
     }
 }
@@ -2229,10 +2189,8 @@ fn retire_connection(
     }
     let _ = control.shutdown(std::net::Shutdown::Both);
     let mut tee = lock(sink);
-    if tee.viewer.as_ref().is_some_and(|v| v.holder == holder) {
-        if let Some(v) = tee.viewer.take() {
-            v.queue.close();
-        }
+    if let Some(viewer) = tee.viewer.take_if(|v| v.holder == holder) {
+        tee.ring.close(&viewer.cursor);
     }
 }
 
@@ -2394,26 +2352,43 @@ fn await_push_write(
     }
 }
 
-/// Install `viewer` unless its connection has been retired.
+/// Install `holder`'s viewer, with a cursor at the ring's head, unless its
+/// connection has been retired. Returns what its sender sends.
 ///
 /// The registry check and the install happen under the sink lock. Combined
 /// with retirement removing the holder from the registry synchronously (on the
 /// writer thread, before the successor is even granted control), a retired
 /// connection can never install its viewer over its successor's.
 #[cfg(unix)]
-fn install_viewer(registry: &ConnectionRegistry, sink: &AttachSink, viewer: AttachViewer) -> bool {
+fn install_viewer(
+    registry: &ConnectionRegistry,
+    sink: &AttachSink,
+    holder: crate::model::pty_control::HolderId,
+    disconnect: Box<dyn Fn() + Send>,
+) -> Option<ViewerStart> {
     let mut tee = lock(sink);
-    if !registry.contains(viewer.holder) {
-        return false;
+    if !registry.contains(holder) {
+        return None;
     }
-    // Under the tee's lock, so no output can land between the modes it has
-    // seen and the output that follows them.
+    // Under the tee's lock, which capture holds while it appends, so the
+    // modes replayed are exactly those of the output before the cursor: no
+    // output lands between the replay and the output that follows it.
     let replay = tee.modes.replay();
-    if !replay.is_empty() && !viewer.queue.offer(&replay) {
-        return false;
-    }
-    tee.viewer = Some(viewer);
-    true
+    let head = tee.ring.span().head;
+    let cursor = tee
+        .ring
+        .cursor_at(head)
+        .expect("a ring always holds its own head");
+    tee.viewer = Some(AttachViewer {
+        holder,
+        cursor: Arc::clone(&cursor),
+        disconnect,
+    });
+    Some(ViewerStart {
+        ring: Arc::clone(&tee.ring),
+        cursor,
+        replay,
+    })
 }
 
 #[cfg(unix)]
@@ -2567,27 +2542,20 @@ fn handle_attach_connection(
 
     // Reply before installing the viewer, so tee output never precedes it.
     let accepted = write_frame(&mut *lock(&conn), &Frame::Accepted(handle.epoch()));
-    let queue = Arc::new(ViewerQueue::default());
+    let mut installed = None;
     if accepted.is_ok() {
-        let sender = {
-            let (queue, conn) = (Arc::clone(&queue), Arc::clone(&conn));
-            std::thread::spawn(move || run_viewer_sender(&queue, &conn))
-        };
         if let Ok(shutdown) = stream.try_clone() {
+            let disconnect = Box::new(move || {
+                let _ = shutdown.shutdown(std::net::Shutdown::Both);
+            });
             // Refused if this connection was retired in the meantime.
-            install_viewer(
-                registry,
-                attach_sink,
-                AttachViewer {
-                    holder,
-                    queue: Arc::clone(&queue),
-                    disconnect: Box::new(move || {
-                        let _ = shutdown.shutdown(std::net::Shutdown::Both);
-                    }),
-                },
-            );
+            if let Some(viewer) = install_viewer(registry, attach_sink, holder, disconnect) {
+                installed = Some((Arc::clone(&viewer.ring), Arc::clone(&viewer.cursor)));
+                let conn = Arc::clone(&conn);
+                // Detached: exits when its cursor or its connection closes.
+                std::thread::spawn(move || run_viewer_sender(viewer, &conn));
+            }
         }
-        drop(sender); // detached: exits when the queue or connection closes
 
         loop {
             match read_frame(&mut stream) {
@@ -2621,7 +2589,9 @@ fn handle_attach_connection(
         tee.viewer = None;
     }
     drop(tee);
-    queue.close();
+    if let Some((ring, cursor)) = installed {
+        ring.close(&cursor);
+    }
 }
 
 /// Shrink the PTY by one row for `handle`'s repaint, if it applies, and restore
@@ -2940,16 +2910,11 @@ mod tests {
 
         // No waiting: the old connection may try to install at any instant after
         // the takeover is decided, including before any notification thread runs.
-        let installed = install_viewer(
-            &registry,
-            &sink,
-            AttachViewer {
-                holder: old,
-                queue: Arc::new(ViewerQueue::default()),
-                disconnect: Box::new(|| {}),
-            },
+        let installed = install_viewer(&registry, &sink, old, Box::new(|| {}));
+        assert!(
+            installed.is_none(),
+            "a retired connection installed its viewer"
         );
-        assert!(!installed, "a retired connection installed its viewer");
         assert!(lock(&sink).viewer.is_none());
     }
 
