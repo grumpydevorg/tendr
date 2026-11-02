@@ -12,6 +12,7 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::Context;
 use tendr::model::ids::Namespace;
+use tendr::platform::spawn_external;
 use tendr::session::{self, SessionRoot};
 
 /// DuckDB release this slice is developed and tested against. DuckDB's JSON
@@ -85,10 +86,15 @@ pub fn cmd_query(opts: QueryOptions) -> anyhow::Result<()> {
 
 /// Report the DuckDB CLI version tendr will use, plus the tested-against range.
 fn report_version() -> anyhow::Result<()> {
-    let out = Command::new("duckdb")
-        .arg("--version")
-        .output()
-        .map_err(|e| duckdb_spawn_error(&e))?;
+    let out = spawn_external(
+        Command::new("duckdb")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .and_then(|child| child.wait_with_output())
+    .map_err(|e| duckdb_spawn_error(&e))?;
     let version = String::from_utf8_lossy(&out.stdout);
     outln!("DuckDB CLI: {}", version.trim());
     outln!("tendr query is developed against DuckDB {TESTED_DUCKDB}");
@@ -199,9 +205,7 @@ fn resolve_sql(sql: Option<String>, file: Option<PathBuf>) -> anyhow::Result<Str
 /// stdout/stderr so the user sees DuckDB's native output. Propagates DuckDB's
 /// exit code so a failed query fails `tendr query`.
 fn run_query(preamble: &str, sql: &str) -> anyhow::Result<()> {
-    let mut child = Command::new("duckdb")
-        .stdin(Stdio::piped())
-        .spawn()
+    let mut child = spawn_external(Command::new("duckdb").stdin(Stdio::piped()))
         .map_err(|e| duckdb_spawn_error(&e))?;
 
     let script = format!("{preamble}\n{sql}\n");
@@ -217,10 +221,8 @@ fn run_query(preamble: &str, sql: &str) -> anyhow::Result<()> {
 /// Launch an interactive DuckDB shell with the `events` view pre-registered via
 /// `-cmd`. Inherits all stdio for the REPL.
 fn run_shell(preamble: &str) -> anyhow::Result<()> {
-    let status = Command::new("duckdb")
-        .arg("-cmd")
-        .arg(preamble)
-        .status()
+    let status = spawn_external(Command::new("duckdb").arg("-cmd").arg(preamble))
+        .and_then(|mut child| child.wait())
         .map_err(|e| duckdb_spawn_error(&e))?;
     propagate_exit(status)
 }

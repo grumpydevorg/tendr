@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::process::ExitStatus;
+use std::process::{Child, Command, ExitStatus};
 
 use crate::model::ids::ProcessIdentity;
 
@@ -24,6 +24,21 @@ pub mod windows;
 pub type Current = unix::UnixPlatform;
 #[cfg(windows)]
 pub type Current = windows::WindowsPlatform;
+
+/// Start an external program tendr runs on the caller's behalf (ssh,
+/// duckdb). Windows hands a child every inheritable handle in its parent, not
+/// just the stdio it is given, and the stdin, stdout and stderr tendr
+/// inherited from its caller are inheritable. So first they are made
+/// non-inheritable: otherwise the program, and anything it starts that
+/// outlives it (a ProxyCommand), holds the caller's pipes tendr did not give
+/// it, and they stay open after tendr exits. The stdio tendr does give it
+/// still reaches it: std passes a `Stdio::inherit()` stream as an inheritable
+/// duplicate of the std handle, whatever the flag on the original.
+pub fn spawn_external(cmd: &mut Command) -> io::Result<Child> {
+    #[cfg(windows)]
+    windows::std_handles_not_inheritable();
+    cmd.spawn()
+}
 
 /// Rows a PTY child starts with, until a client sets its size.
 pub const INITIAL_PTY_ROWS: u16 = 24;

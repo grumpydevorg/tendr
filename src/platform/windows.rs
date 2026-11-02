@@ -496,6 +496,19 @@ fn set_handle_inheritable(
     Ok(())
 }
 
+/// Clear the inheritable flag on this process's stdin, stdout and stderr, for
+/// [`super::spawn_external`]. A missing (null) handle makes the call fail,
+/// which is harmless: there is nothing to inherit.
+pub(super) fn std_handles_not_inheritable() {
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle only reads this process's own std handle.
+        let _ = set_handle_inheritable(unsafe { GetStdHandle(which) }, false);
+    }
+}
+
 // --- Sidecar spawn (raw CreateProcessW) ---
 
 /// Whether the calling process's job (if any) permits child breakaway.
