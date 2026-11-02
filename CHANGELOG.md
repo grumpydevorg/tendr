@@ -11,7 +11,17 @@
   full-screen program shows nothing new until it redraws, at the
   controlling terminal's size. A takeover leaves watchers attached, and
   watching never changes who holds the terminal. A session started by an
-  older `tendr` refuses it (80). Not yet over `--host` from a Unix client.
+  older `tendr` refuses it (80). Not yet over `--host`.
+- **Windows clients attach over the attach bridge.** `tendr --host <host>
+  attach` from Windows now keeps the console on your machine, as from macOS
+  and Linux: raw input, window resizes, the detach escape, mouse reporting,
+  the status line, and reconnecting after a dropped connection. It needs
+  Windows Terminal or a conhost window on Windows 10 1809 or later; a
+  console without virtual terminal support ("Use legacy console") and
+  mintty are refused before ssh starts. Closing the console window, or a
+  Ctrl-C or Ctrl-Break event another program raises, ends it with exit 1;
+  Ctrl-C typed at the keyboard goes to the session. The remote host needs
+  the attach bridge (0.5.0 or newer; 0.6.0 to reconnect).
 
 - **`attach --read-only` streams to a pipe.** With no terminal, it writes
   the session's output to stdout and every notice to stderr, never reads
@@ -20,6 +30,12 @@
 
 ### Changed
 
+- **`attach --host` from Windows takes any session name.** The `ssh -t`
+  path it used, and with it the rule that its session and namespace be
+  plain names (exit 2 otherwise), is gone: names travel as data in the
+  request, as from macOS and Linux. `attach --read-only --host` from
+  Windows is refused (2) as from macOS and Linux, until read-only viewers
+  work over `--host`.
 - **Connections stalled before their hello no longer starve attaches.** A
   sidecar now admits at most five connections waiting for their hello,
   apart from the eight attaches, takeovers, resumes and pushes it serves: four

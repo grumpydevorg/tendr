@@ -888,10 +888,9 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        // A Unix client keeps the terminal and speaks the attach protocol
-        // over the same constant command line; the remote tendr bridges it to
-        // the session's attach socket.
-        #[cfg(unix)]
+        // attach keeps the terminal and speaks the attach protocol over the
+        // same constant command line; the remote tendr bridges it to the
+        // session's attach socket.
         if let remote_op::RemoteOperation::Attach(request) = &operation {
             // The remote end does not bridge a read-only attach yet: refuse it
             // here, before ssh, rather than have the remote refuse its hello.
@@ -914,29 +913,15 @@ fn main() {
                 }
             }
         }
-        let sent = match operation {
-            // A Windows client has no local console frontend for the attach
-            // protocol yet, so attach runs under `ssh -t` with the remote
-            // tendr driving a remote terminal, and its command line takes
-            // plain names only.
-            #[cfg(windows)]
-            remote_op::RemoteOperation::Attach(request) => match request.ssh_argv() {
-                Ok(args) => tendr::ssh::exec_ssh_attach(host, &args),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(2);
-                }
-            },
-            operation => match remote_frame::encode(&operation) {
-                Ok(frame) => {
-                    let body = matches!(operation, remote_op::RemoteOperation::Push(_));
-                    tendr::ssh::exec_ssh_remote(host, frame, body)
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(2);
-                }
-            },
+        let sent = match remote_frame::encode(&operation) {
+            Ok(frame) => {
+                let body = matches!(operation, remote_op::RemoteOperation::Push(_));
+                tendr::ssh::exec_ssh_remote(host, frame, body)
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
         };
         match sent {
             Ok(code) => std::process::exit(code),

@@ -10,7 +10,7 @@ gone, the CLI's reconciliation step records what happened (see
 flowchart TD
     Agent["Agent / user / script"] --> CLI["tendr CLI"]
     Hook["Hook wrapper\n(tendr wrap)"] --> CLI
-    Remote["Remote caller"] --> SSH["ssh -T / ssh -t"]
+    Remote["Remote caller"] --> SSH["ssh -T"]
     SSH --> CLI
 
     CLI --> SessionDir["Session dir\n~/.tendr/sessions/<ns>/<session>/"]

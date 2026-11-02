@@ -18,7 +18,9 @@ to Windows paths.
 
 Native Windows x64 and ARM64 test lanes already run in required CI. Remote
 `exec` into a PowerShell session on a Windows host is tested on both lanes
-through a real OpenSSH server (`tests/cli_remote_windows_ssh.rs`).
+through a real OpenSSH server (`tests/cli_remote_windows_ssh.rs`). A Windows
+client attaches to a session on a Unix host over the attach bridge, from
+Windows Terminal or conhost (`tests/windows_attach_console.rs`).
 
 ## Gaps a user hits today
 
@@ -62,20 +64,17 @@ workaround is `$global:x`. The PowerShell frame also does not set
 between calls, clean up Tendr's own frame variables, and export
 `TENDR_BLOCK_ID`. Check under PowerShell 5.1 and 7.
 
-### No PTY or attach
+### No PTY or attach on a Windows host
 
 `--pty` fails with "PTY not supported on Windows yet"
-(`src/platform/windows.rs:183`), and `attach` fails with "attach is only
-supported on Unix" (`src/commands/attach.rs:23-27`, and as the attach
-bridge's remote end in `src/commands/attach/bridge.rs:30-34`). Needed:
+(`src/platform/windows.rs:183`), and `attach` to a session on a Windows host
+fails with "attach is only supported on Unix" (`src/commands/attach.rs`, and
+as the attach bridge's remote end in `src/commands/attach/bridge.rs`).
+Needed:
 
 - a ConPTY child backend (`CreatePseudoConsole`, `ResizePseudoConsole`), on the
   suspended launcher above;
-- a named-pipe carrier for the existing attach frames;
-- a Windows console frontend (raw mode, VT flags, resize, restore on exit).
-  A Unix client attaches over `ssh -T` through the attach bridge; a Windows
-  client still uses `ssh -t` until it has this frontend, and then moves to
-  the bridge (remote frame transport, step 2).
+- a named-pipe carrier for the existing attach frames.
 
 ## Acceptance
 

@@ -8,10 +8,8 @@
 //! whose attach protocol frames then follow on the same stdin and stdout),
 //! and `exec` runs `tendr [--hello] --exit-trailer exec --frame-from-stdin`
 //! with its own [`exec_frame`](crate::exec_frame) ([`exec_ssh_frame`]). So no
-//! user value reaches the remote login shell, whatever shell that is. A
-//! Windows client, which has no local console frontend for the attach
-//! protocol yet, still attaches under `ssh -t` with a rebuilt command line
-//! limited to plain names (`exec_ssh_attach`). Destinations are validated
+//! user value reaches the remote login shell, whatever shell that is, from a
+//! Unix client or a Windows one. Destinations are validated
 //! ([`validate_destination`]) to fail closed against option-shaped hosts.
 
 use std::io;
@@ -47,14 +45,6 @@ pub enum SshError {
     #[error("invalid --host destination {0:?}: must not be empty or begin with '-'")]
     InvalidDestination(String),
 
-    /// An `attach` argument that is neither a plain name (`is_plain_name`)
-    /// nor one of attach's flags: the remote login shell could act on it.
-    /// Rejected before ssh is ever spawned. Only a Windows client builds an
-    /// `attach` command line.
-    #[cfg(windows)]
-    #[error("refusing to send {0:?} to the remote shell: attach takes plain names only")]
-    UnsafeAttachArgument(String),
-
     /// ssh did not get through authentication and start the remote tendr
     /// (no [`HELLO_LINE`]) within the connect deadline, and was killed.
     #[error(
@@ -67,7 +57,6 @@ pub enum SshError {
 
     /// An `attach --host` connection was stopped on purpose: the attach is
     /// leaving while it reconnects.
-    #[cfg(unix)]
     #[error("ssh was stopped: the attach is leaving")]
     Cancelled,
 }
@@ -101,72 +90,12 @@ pub fn validate_destination(host: &str) -> Result<(), SshError> {
     Ok(())
 }
 
-/// Whether `value` is a plain name: `[A-Za-z][A-Za-z0-9_-]{0,254}`. No POSIX
-/// shell, cmd.exe or PowerShell treats any of these characters specially, so
-/// a plain name can go on a remote command line as it is. It starts with a
-/// letter because PowerShell reads a bare token that starts with a digit as a
-/// number (`0x1F` is 31, `1kb` is 1024) and passes the converted value.
-#[cfg(windows)]
-pub fn is_plain_name(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
-        && value.len() <= 255
-        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// The flags an `attach` command line may carry besides plain names.
-#[cfg(windows)]
-const ATTACH_FLAGS: [&str; 3] = ["--namespace", "--takeover", "--escape"];
-
-/// Build `ssh -t -o ConnectTimeout=10 <host> tendr <args>` for `attach` from a
-/// Windows client. Such a client has no local console frontend for the attach
-/// protocol yet, so the remote tendr drives a remote terminal instead of
-/// bridging frames (`AttachSsh` is the Unix client's path). Every arg must be
-/// a plain name or an attach flag; anything else is refused, so the remote
-/// shell sees no metacharacter. No hello: the remote stderr shares the
-/// terminal.
-#[cfg(windows)]
-fn build_ssh_attach_command(host: &str, args: &[String]) -> Result<Command, SshError> {
-    validate_destination(host)?;
-    if let Some(unsafe_arg) = args
-        .iter()
-        .find(|a| !is_plain_name(a) && !ATTACH_FLAGS.contains(&a.as_str()))
-    {
-        return Err(SshError::UnsafeAttachArgument(unsafe_arg.clone()));
-    }
-    let mut cmd = Command::new("ssh");
-    cmd.args(["-t", "-o", "ConnectTimeout=10", host, "tendr"])
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    Ok(cmd)
-}
-
-/// Run `tendr <args>` (an `attach`) on `host` under `ssh -t`, with every
-/// argument checked as a plain name or fixed token: a Windows client's
-/// attach. Returns the remote exit code.
-///
-/// # Errors
-/// `SshError::InvalidDestination`, `SshError::UnsafeAttachArgument` before
-/// ssh starts; `SshError::TransportFailed` on ssh exit 255;
-/// `SshError::SpawnFailed`/`Abnormal`.
-#[cfg(windows)]
-pub fn exec_ssh_attach(host: &str, args: &[String]) -> Result<i32, SshError> {
-    let mut cmd = build_ssh_attach_command(host, args)?;
-    let status = spawn_external(&mut cmd)
-        .and_then(|mut child| child.wait())
-        .map_err(SshError::SpawnFailed)?;
-    // attach shares the terminal and has no exit trailer.
-    exit_code(status.code(), None)
-}
-
 /// The remote tendr entry point of a framed call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Entry {
     /// `exec --frame-from-stdin`: the exec frame.
     Exec,
-    /// `_remote`: every other operation, `attach` from a Unix client included.
+    /// `_remote`: every other operation, `attach` included.
     Remote,
 }
 
@@ -198,12 +127,10 @@ enum Streams {
     /// A pipe tendr writes the request to, and tendr's stdout.
     Request,
     /// A pipe each way: after the request, the attach protocol runs over them.
-    #[cfg(unix)]
     Attach(Login),
 }
 
 /// Whether ssh may prompt on the terminal for an `attach --host` connection.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Login {
     /// ssh may ask for a passphrase or about a host key: the first
@@ -234,7 +161,6 @@ const FRAME_OPTIONS: [&str; 6] = [
 /// out the connect deadline rather than failing at `ConnectTimeout`. Other
 /// framed calls keep sharing: they are short, and a shared connection
 /// saves about 0.4 s each.
-#[cfg(unix)]
 const ATTACH_OPTIONS: [&str; 4] = ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
 
 /// The argv of a framed call — constant by construction:
@@ -266,7 +192,6 @@ fn build_ssh_frame_command(
     validate_destination(host)?;
     let mut cmd = Command::new("ssh");
     cmd.arg("-T").args(FRAME_OPTIONS);
-    #[cfg(unix)]
     if let Streams::Attach(login) = streams {
         cmd.args(ATTACH_OPTIONS);
         if login == Login::Batch {
@@ -281,7 +206,6 @@ fn build_ssh_frame_command(
     let (stdin, stdout) = match streams {
         Streams::Inherit => (Stdio::inherit(), Stdio::inherit()),
         Streams::Request => (Stdio::piped(), Stdio::inherit()),
-        #[cfg(unix)]
         Streams::Attach(_) => (Stdio::piped(), Stdio::piped()),
     };
     cmd.stdin(stdin).stdout(stdout).stderr(Stdio::piped());
@@ -355,7 +279,6 @@ fn run_framed(host: &str, entry: Entry, input: Input) -> Result<i32, SshError> {
     let mut watch = Watch::start(&mut child, connect_deadline(), Box::new(io::stderr()));
     let (status, trailer) = match watch.wait(host, &mut child, Until::Exit)? {
         Progress::Exited(status, trailer) => (status, trailer),
-        #[cfg(unix)]
         Progress::Connected | Progress::Limit | Progress::Cancelled => {
             unreachable!("waited for the exit, with nothing to cancel it")
         }
@@ -369,13 +292,12 @@ fn run_framed(host: &str, entry: Entry, input: Input) -> Result<i32, SshError> {
     exit_code(status.code(), trailer)
 }
 
-/// `attach --host` from a Unix client: ssh to the remote tendr's `_remote`
-/// entry point, with the same constant command line as every other
-/// operation. The request (the remote frame, then the attach hello) goes on
-/// ssh's stdin; after it, ssh's stdin and stdout carry the attach protocol,
-/// which the remote tendr bridges to the session's attach socket. Raw mode,
-/// resizes and the detach escape stay with the caller.
-#[cfg(unix)]
+/// `attach --host`: ssh to the remote tendr's `_remote` entry point, with
+/// the same constant command line as every other operation. The request
+/// (the remote frame, then the attach hello) goes on ssh's stdin; after it,
+/// ssh's stdin and stdout carry the attach protocol, which the remote tendr
+/// bridges to the session's attach socket. Raw mode, resizes and the detach
+/// escape stay with the caller.
 pub struct AttachSsh {
     host: String,
     child: std::process::Child,
@@ -383,7 +305,6 @@ pub struct AttachSsh {
 }
 
 /// How [`AttachSsh::start`] went.
-#[cfg(unix)]
 pub enum AttachStart {
     /// The remote tendr is running (it said hello, or the connect deadline is
     /// off). Its answer to the attach comes next on `stdout`.
@@ -398,7 +319,6 @@ pub enum AttachStart {
 }
 
 /// How [`AttachSsh::start`] connects, and what may stop it.
-#[cfg(unix)]
 pub struct Dial {
     pub login: Login,
     /// Where ssh's stderr goes, the hello and the exit trailer taken out.
@@ -408,7 +328,6 @@ pub struct Dial {
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[cfg(unix)]
 impl AttachSsh {
     /// Start ssh, write `request` to its stdin, and wait under the connect
     /// deadline until the remote tendr has said hello.
@@ -510,25 +429,20 @@ enum Until {
     Exit,
     /// The remote tendr's hello, or ssh's exit if that comes first. Without
     /// a deadline there is no hello to wait for, so this returns at once.
-    #[cfg(unix)]
     Connected,
     /// ssh's exit, but not past this instant.
-    #[cfg(unix)]
     Limit(Instant),
 }
 
 /// Where [`Watch::wait`] stopped.
 enum Progress {
     /// The remote tendr is running.
-    #[cfg(unix)]
     Connected,
     /// ssh exited: its status, and the remote's exit trailer if it wrote one.
     Exited(std::process::ExitStatus, Option<i32>),
     /// The limit passed with ssh still running.
-    #[cfg(unix)]
     Limit,
     /// The watch's `cancel` was set, and ssh has been stopped.
-    #[cfg(unix)]
     Cancelled,
 }
 
@@ -557,7 +471,6 @@ struct Watch {
     /// `Some` once stderr has ended.
     ended: Option<Ended>,
     /// Once set, a wait stops ssh and returns [`Progress::Cancelled`].
-    #[cfg(unix)]
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -581,13 +494,11 @@ impl Watch {
             deadline,
             hello: false,
             ended: None,
-            #[cfg(unix)]
             cancel: None,
         }
     }
 
     /// Whether the watch's `cancel` has been set.
-    #[cfg(unix)]
     fn cancelled(&self) -> bool {
         self.cancel
             .as_ref()
@@ -606,13 +517,10 @@ impl Watch {
         child: &mut std::process::Child,
         until: Until,
     ) -> Result<Progress, SshError> {
-        #[cfg(unix)]
         let limit = match until {
             Until::Limit(limit) => Some(limit),
             Until::Exit | Until::Connected => None,
         };
-        #[cfg(not(unix))]
-        let (limit, Until::Exit): (Option<Instant>, Until) = (None, until);
         let left = |poll: Duration| {
             limit.map_or(poll, |limit| {
                 poll.min(limit.saturating_duration_since(Instant::now()))
@@ -620,12 +528,8 @@ impl Watch {
         };
         // A cancellable wait looks at its flag often, and never blocks on
         // ssh's exit.
-        #[cfg(unix)]
         let cancellable = self.cancel.is_some();
-        #[cfg(not(unix))]
-        let cancellable = false;
         loop {
-            #[cfg(unix)]
             if self.cancelled() {
                 stop(child);
                 return Ok(Progress::Cancelled);
@@ -633,11 +537,9 @@ impl Watch {
             // Only the hello proves ssh got through. An end of stream before it
             // proves nothing: a process can close its stderr and keep running.
             let awaiting_hello = self.deadline.is_some() && !self.hello;
-            #[cfg(unix)]
             if matches!(until, Until::Connected) && !awaiting_hello {
                 return Ok(Progress::Connected);
             }
-            #[cfg(unix)]
             if limit.is_some_and(|limit| Instant::now() >= limit) {
                 return Ok(Progress::Limit);
             }
@@ -858,7 +760,9 @@ fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option
 
 /// Stop an ssh that missed the connect deadline: SIGTERM first, so ssh can
 /// restore a terminal it left mid-prompt and hang up its ProxyCommand, then
-/// SIGKILL if it is still there after a second.
+/// SIGKILL if it is still there after a second. Windows has no SIGTERM: ssh
+/// is terminated at once, and an attach client restores the console it
+/// shared with ssh itself.
 fn stop(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -991,107 +895,20 @@ mod tests {
         ];
         let cmd = build_ssh_frame_command("user@box", Entry::Remote, Streams::Request).unwrap();
         assert_eq!(argv(&cmd), remote);
-        #[cfg(unix)]
-        {
-            let mut attach = remote.to_vec();
-            attach.splice(7..7, ["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
-            let cmd = build_ssh_frame_command(
-                "user@box",
-                Entry::Remote,
-                Streams::Attach(Login::Interactive),
-            )
+        let mut attach = remote.to_vec();
+        attach.splice(7..7, ["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+        let cmd = build_ssh_frame_command(
+            "user@box",
+            Entry::Remote,
+            Streams::Attach(Login::Interactive),
+        )
+        .unwrap();
+        assert_eq!(argv(&cmd), attach, "an attach");
+        let mut batch = attach.clone();
+        batch.splice(11..11, ["-o", "BatchMode=yes"]);
+        let cmd = build_ssh_frame_command("user@box", Entry::Remote, Streams::Attach(Login::Batch))
             .unwrap();
-            assert_eq!(argv(&cmd), attach, "an attach");
-            let mut batch = attach.clone();
-            batch.splice(11..11, ["-o", "BatchMode=yes"]);
-            let cmd =
-                build_ssh_frame_command("user@box", Entry::Remote, Streams::Attach(Login::Batch))
-                    .unwrap();
-            assert_eq!(argv(&cmd), batch, "a reconnect");
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn attach_argv_is_the_plain_args_under_a_tty() {
-        let args: Vec<String> = ["attach", "s-1", "--namespace", "n_2", "--takeover"]
-            .map(str::to_owned)
-            .to_vec();
-        let cmd = build_ssh_attach_command("user@box", &args).unwrap();
-        assert_eq!(
-            argv(&cmd),
-            [
-                "-t",
-                "-o",
-                "ConnectTimeout=10",
-                "user@box",
-                "tendr",
-                "attach",
-                "s-1",
-                "--namespace",
-                "n_2",
-                "--takeover"
-            ]
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn attach_refuses_anything_but_plain_args() {
-        for bad in [
-            "x&calc",
-            "a b",
-            "$(id)",
-            "'q'",
-            "-x",
-            "--hello",
-            "caf\u{e9}",
-            "",
-        ] {
-            let args = vec!["attach".to_owned(), bad.to_owned()];
-            assert!(
-                matches!(
-                    build_ssh_attach_command("user@box", &args),
-                    Err(SshError::UnsafeAttachArgument(a)) if a == bad
-                ),
-                "{bad:?}"
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn plain_names_are_alphanumeric_dash_and_underscore() {
-        let long = "a".repeat(255);
-        for ok in ["a", "Z9", "build-1", "a_b-C", long.as_str()] {
-            assert!(is_plain_name(ok), "{ok:?}");
-        }
-        let too_long = "a".repeat(256);
-        for bad in [
-            "",
-            "-a",
-            "_a",
-            "a.b",
-            "a/b",
-            "a b",
-            "a&b",
-            "a|b",
-            "a;b",
-            "a$b",
-            "a`b",
-            "a'b",
-            "a\"b",
-            "a%b",
-            "a^b",
-            "0x1F",
-            "1kb",
-            "1e3",
-            "9",
-            "\u{e9}",
-            too_long.as_str(),
-        ] {
-            assert!(!is_plain_name(bad), "{bad:?}");
-        }
+        assert_eq!(argv(&cmd), batch, "a reconnect");
     }
 
     #[test]
@@ -1250,13 +1067,6 @@ mod tests {
                 assert!(build_ssh_frame_command(host, entry, Streams::Request).is_err());
             }
             assert!(build_ssh_frame_command("user@box", entry, Streams::Request).is_ok());
-        }
-        #[cfg(windows)]
-        {
-            let attach = vec!["attach".to_owned(), "s".to_owned()];
-            assert!(build_ssh_attach_command("-oProxyCommand=x", &attach).is_err());
-            assert!(build_ssh_attach_command("", &attach).is_err());
-            assert!(build_ssh_attach_command("user@box", &attach).is_ok());
         }
     }
 }

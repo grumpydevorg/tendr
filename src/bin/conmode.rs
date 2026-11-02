@@ -5,6 +5,13 @@
 //! conmode            print one report tagged `once`, then exit
 //! conmode --serve    print a report tagged `start`, then one per line read
 //!                    from stdin, tagged with that line; exit 0 on `quit` or EOF
+//! conmode --run [--env <name>=<value>]... [--break-on <path>] -- <program> [<arg>...]
+//!                    print a report tagged `before`, run <program> in this
+//!                    console with the environment given, then print a report
+//!                    tagged `after` and exit with its exit code. With
+//!                    `--break-on`, raise CTRL_BREAK_EVENT in the console
+//!                    once <path> exists, as a program sharing the console
+//!                    would; conmode itself ignores it.
 //! ```
 //!
 //! A report is one line with no spaces, because ConPTY renders what conhost
@@ -23,36 +30,111 @@
 fn main() {
     use std::io::{BufRead, Write};
 
-    let serve = match std::env::args().nth(1).as_deref() {
-        None => false,
-        Some("--serve") => true,
-        Some(other) => {
-            eprintln!("conmode: unknown argument {other:?}; usage: conmode [--serve]");
-            std::process::exit(2);
-        }
-    };
-
-    let mut out = std::io::stdout().lock();
-    let mut emit = |tag: &str| {
+    let emit = |tag: &str| {
         let line = report(tag);
         // One write per report, flushed, so the line is drawn whole.
+        let mut out = std::io::stdout().lock();
         let _ = out.write_all(line.as_bytes());
         let _ = out.flush();
     };
 
-    if !serve {
-        emit("once");
-        return;
-    }
-    emit("start");
-    for line in std::io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
-        let tag = line.trim();
-        if tag == "quit" {
-            break;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => emit("once"),
+        Some("--serve") if args.len() == 1 => {
+            emit("start");
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                let tag = line.trim();
+                if tag == "quit" {
+                    break;
+                }
+                emit(tag);
+            }
         }
-        emit(tag);
+        Some("--run") => run(&args[1..], emit),
+        Some(_) => {
+            eprintln!("conmode: unknown arguments {args:?}; usage: see src/bin/conmode.rs");
+            std::process::exit(2);
+        }
     }
+}
+
+/// `conmode --run`: report, run the program, report again, exit with its
+/// code.
+#[cfg(windows)]
+fn run(args: &[String], emit: impl Fn(&str)) -> ! {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+    };
+
+    unsafe extern "system" fn ignore(_: u32) -> i32 {
+        1
+    }
+
+    let usage = || -> ! {
+        eprintln!(
+            "conmode: usage: conmode --run [--env K=V]... [--break-on <path>] -- <program> [<arg>...]"
+        );
+        std::process::exit(2);
+    };
+    let mut command = None;
+    let mut break_on = None;
+    let mut env = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--env" => match rest.next().and_then(|kv| kv.split_once('=')) {
+                Some((name, value)) => env.push((name.to_owned(), value.to_owned())),
+                None => usage(),
+            },
+            "--break-on" => break_on = Some(rest.next().unwrap_or_else(|| usage()).clone()),
+            "--" => {
+                let program = rest.next().unwrap_or_else(|| usage());
+                let mut cmd = std::process::Command::new(program);
+                cmd.args(rest.by_ref())
+                    .envs(env.iter().map(|(k, v)| (k, v)));
+                command = Some(cmd);
+            }
+            _ => usage(),
+        }
+    }
+    let Some(mut command) = command else { usage() };
+
+    // A control event raised in the console reaches every program in it,
+    // this one too: it outlives the program it runs, to report after it.
+    // SAFETY: `ignore` has the handler signature; TRUE adds it.
+    if unsafe { SetConsoleCtrlHandler(Some(ignore), 1) } == 0 {
+        eprintln!(
+            "conmode: SetConsoleCtrlHandler: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(2);
+    }
+    emit("before");
+    if let Some(path) = break_on {
+        std::thread::spawn(move || {
+            while !std::path::Path::new(&path).exists() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // SAFETY: plain FFI call; group 0 is every process in this console.
+            if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) } == 0 {
+                eprintln!(
+                    "conmode: GenerateConsoleCtrlEvent: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        });
+    }
+    let code = match command.status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("conmode: cannot run the program: {e}");
+            2
+        }
+    };
+    emit("after");
+    std::process::exit(code);
 }
 
 /// One report line, newline-terminated.

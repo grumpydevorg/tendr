@@ -118,9 +118,8 @@ const REMOTE_ARGV: [&str; 12] = [
     "_remote",
 ];
 
-/// The ssh argv of a Unix client's attach: [`REMOTE_ARGV`] plus a connection
-/// of its own (no ControlMaster sharing).
-#[cfg(unix)]
+/// The ssh argv of an attach: [`REMOTE_ARGV`] plus a connection of its own
+/// (no ControlMaster sharing).
 const ATTACH_ARGV: [&str; 16] = [
     "-T",
     "-o",
@@ -153,8 +152,8 @@ fn printed_args(stdout: &[u8]) -> Vec<String> {
 }
 
 /// Every operation, with a hostile value in every place a value can go, runs
-/// the same ssh argv (a Unix client's attach its own constant one): the
-/// request itself travels on ssh's stdin.
+/// the same ssh argv (attach its own constant one): the request itself
+/// travels on ssh's stdin.
 #[test]
 fn every_host_operation_sends_the_same_constant_argv() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -240,18 +239,14 @@ fn every_host_operation_sends_the_same_constant_argv() {
         );
     }
 
-    // attach from a Unix client runs its own constant argv. It needs a
-    // terminal on stdin before ssh starts, so it runs in one, and its ssh
+    // attach runs its own constant argv. It needs a terminal before ssh
+    // starts, so it runs on the debug build's test terminal, and its ssh
     // stdout carries the attach protocol, so the argv goes to a file.
-    #[cfg(unix)]
-    {
-        use harness::{Observation, poll_until};
-        let recorded = TempDir::new().unwrap();
-        let argv_file = recorded.path().join("argv");
-        let tmp = fake_ssh(&format!("args {}\nexit 3", argv_file.display()));
-        let root = TempDir::new().unwrap();
-        let argv: Vec<String> = [
-            harness::terminal::tendr_bin().as_str(),
+    let recorded = TempDir::new().unwrap();
+    let argv_file = recorded.path().join("argv");
+    let tmp = fake_ssh(&format!("args {}\nexit 3", argv_file.display()));
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        .args([
             "--host",
             "box",
             "attach",
@@ -261,34 +256,20 @@ fn every_host_operation_sends_the_same_constant_argv() {
             "--escape",
             "none",
             h,
-        ]
-        .map(str::to_owned)
-        .to_vec();
-        let path = shim_path_env(&tmp);
-        let _cli = harness::terminal::CliAttach::spawn_argv_env(
-            &root,
-            &argv,
-            &[
-                ("PATH", path.to_str().unwrap()),
-                ("TENDR_SSH_CONNECT_TIMEOUT", "30"),
-            ],
-        );
-        let printed =
-            poll_until(
-                Duration::from_secs(15),
-                Duration::from_millis(20),
-                || match std::fs::read(&argv_file) {
-                    Ok(bytes)
-                        if printed_args(&bytes).last().map(String::as_str) == Some("_remote") =>
-                    {
-                        Observation::Ready(printed_args(&bytes))
-                    }
-                    _ => Observation::Pending("no argv yet".into()),
-                },
-            )
-            .expect("attach ran ssh");
-        assert_eq!(printed, ATTACH_ARGV, "attach");
-    }
+        ])
+        .env("PATH", tmp.path())
+        .env("TENDR_SSH_CONNECT_TIMEOUT", "30")
+        .env("TENDR_TEST_ATTACH_TERMINAL", "24x80")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let printed = printed_args(&std::fs::read(&argv_file).unwrap_or_default());
+    assert_eq!(
+        printed,
+        ATTACH_ARGV,
+        "attach: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// What crosses ssh's stdin: a 4-byte big-endian length, that many bytes of
@@ -890,91 +871,6 @@ fn host_flag_passes_through_stderr() {
         "remote stderr should pass through, got: {stderr}"
     );
     assert_eq!(output.status.code(), Some(1));
-}
-
-// -- attach from a Windows client: still `ssh -t` with a rebuilt argv, so
-//    plain names only --
-
-#[cfg(windows)]
-#[test]
-fn host_flag_attach_uses_tty_allocation() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let tmp = fake_ssh_echo();
-
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-        .args([
-            "--host",
-            "user@box",
-            "attach",
-            "--namespace",
-            "ns_1",
-            "--takeover",
-            "--escape",
-            "none",
-            "My-session_2",
-        ])
-        .env("PATH", tmp.path())
-        .output()
-        .unwrap();
-
-    assert_eq!(
-        printed_args(&output.stdout),
-        [
-            "-t",
-            "-o",
-            "ConnectTimeout=10",
-            "user@box",
-            "tendr",
-            "attach",
-            "My-session_2",
-            "--namespace",
-            "ns_1",
-            "--takeover",
-            "--escape",
-            "none"
-        ]
-    );
-}
-
-/// A Windows client's attach still rebuilds its remote command, so it takes
-/// only names that no shell acts on, and refuses the rest before ssh starts.
-#[cfg(windows)]
-#[test]
-fn host_attach_takes_only_plain_names() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let tmp = poison_ssh();
-    let long = "a".repeat(256);
-    for args in [
-        &["attach", "x&calc"][..],
-        &["attach", "x;id"],
-        &["attach", "x$(id)"],
-        &["attach", "it's"],
-        &["attach", "caf\u{e9}"],
-        &["attach", "_lead"],
-        &["attach", "0x1F"],
-        &["attach", "1kb"],
-        &["attach", "1e3"],
-        &["attach", "--namespace", "9", "s"],
-        &["attach", &long],
-        &["attach", "--namespace", "n&s", "s"],
-        &["attach", "--namespace", "n|s", "s"],
-    ] {
-        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
-            .args(["--host", "box"])
-            .args(args)
-            .env("PATH", tmp.path())
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
-        assert!(!stderr.contains("SSH_MUST_NOT_RUN"), "{args:?}: {stderr}");
-        assert!(
-            stderr.contains("attach over --host from Windows takes plain names"),
-            "{args:?}: {stderr}"
-        );
-    }
 }
 
 // -- Local-only verbs exit 2 with a pre-filled ssh fallback, before any

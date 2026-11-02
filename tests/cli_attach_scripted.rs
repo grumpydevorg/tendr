@@ -7,10 +7,9 @@
 //! piped stdin is its keyboard and piped stdout its screen.
 //!
 //! The real-remote tests (`cli_remote_attach.rs`) stay the oracle for the
-//! client and the sidecar agreeing. Unix only for now: a Windows client
-//! runs `attach --host` under `ssh -t` until it speaks the attach protocol
-//! itself.
-#![cfg(unix)]
+//! client and the sidecar agreeing; they need a Unix remote, while these run
+//! on every client platform. The Windows console layer under them has its
+//! own tests under a pseudo console (`windows_attach_console.rs`).
 
 mod harness;
 

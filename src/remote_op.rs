@@ -5,9 +5,7 @@
 //! and [`dispatch`] runs it. Locally that is the whole path. With `--host`
 //! the request travels as data in the remote frame ([`crate::remote_frame`])
 //! and the remote tendr dispatches it; for `attach` it bridges the attach
-//! protocol that follows the request instead. A Windows client still runs
-//! `attach` under `ssh -t`, with a command line of plain names
-//! (`AttachRequest::ssh_argv`).
+//! protocol that follows the request instead.
 //!
 //! A request holds only what the user typed. Defaults (the namespace) and
 //! bindings (`--after` run ids) resolve in [`dispatch`], on the host that runs
@@ -210,57 +208,6 @@ impl From<ResumeRequest> for tendr::attach_proto::ResumePoint {
             offset: request.offset,
         }
     }
-}
-
-#[cfg(windows)]
-impl AttachRequest {
-    /// The remote tendr argv for `attach --host` from a Windows client, which
-    /// has no local console frontend for the attach protocol yet and so runs
-    /// `attach` under `ssh -t` as a command line. Only plain names
-    /// ([`tendr::ssh::is_plain_name`]) and fixed flag values go in it, so no
-    /// remote shell acts on any of it.
-    ///
-    /// # Errors
-    /// [`NotPlainName`] for a session or namespace that is not a plain name.
-    pub fn ssh_argv(&self) -> Result<Vec<String>, NotPlainName> {
-        let plain = |what, value: &str| {
-            if tendr::ssh::is_plain_name(value) {
-                Ok(value.to_owned())
-            } else {
-                Err(NotPlainName {
-                    what,
-                    value: value.to_owned(),
-                })
-            }
-        };
-        let mut args = vec!["attach".to_owned(), plain("session", &self.session)?];
-        if let Some(ns) = &self.namespace {
-            args.extend(["--namespace".to_owned(), plain("namespace", ns)?]);
-        }
-        if self.takeover {
-            args.push("--takeover".to_owned());
-        }
-        if self.read_only {
-            args.push("--read-only".to_owned());
-        }
-        if self.escape == EscapeMode::Disabled {
-            args.extend(["--escape".to_owned(), "none".to_owned()]);
-        }
-        Ok(args)
-    }
-}
-
-/// A session or namespace that `attach --host` from a Windows client cannot
-/// put on its command line.
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "attach over --host from Windows takes plain names: \
-     {what} {value:?} must match [A-Za-z][A-Za-z0-9_-]{{0,254}}"
-)]
-pub struct NotPlainName {
-    what: &'static str,
-    value: String,
 }
 
 /// The remote operations, as listed when a local-only command is refused.
@@ -830,72 +777,6 @@ mod tests {
         };
         let i = start_inputs(request).expect("resolves");
         assert!(!(i.stdin || i.pty || i.replace || i.any_exit));
-    }
-
-    /// A Windows client's `ssh -t` command line for attach: the plain names
-    /// and fixed flags, in the order the remote parse expects.
-    #[cfg(windows)]
-    #[test]
-    fn attach_ssh_argv_is_plain() {
-        let cases: &[(&[&str], &[&str])] = &[
-            (&["attach", "s"], &["attach", "s"]),
-            (
-                &["attach", "s", "--escape", "ctrl-backslash"],
-                &["attach", "s"],
-            ),
-            (
-                &[
-                    "attach",
-                    "--takeover",
-                    "--escape",
-                    "none",
-                    "--namespace",
-                    "n-1",
-                    "S_2",
-                ],
-                &[
-                    "attach",
-                    "S_2",
-                    "--namespace",
-                    "n-1",
-                    "--takeover",
-                    "--escape",
-                    "none",
-                ],
-            ),
-            (
-                &["attach", "s", "--read-only"],
-                &["attach", "s", "--read-only"],
-            ),
-        ];
-        for (args, expected) in cases {
-            let RemoteOperation::Attach(request) = op(args) else {
-                panic!("not an attach");
-            };
-            assert_eq!(request.ssh_argv().unwrap(), strings(expected), "{args:?}");
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn attach_ssh_argv_refuses_names_a_shell_acts_on() {
-        for args in [
-            &["attach", "x&calc"][..],
-            &["attach", "a'b"],
-            &["attach", "_s"],
-            &["attach", "0x1F"],
-            &["attach", "--namespace", "n$(id)", "s"],
-        ] {
-            let RemoteOperation::Attach(request) = op(args) else {
-                panic!("not an attach");
-            };
-            let err = request.ssh_argv().expect_err("not plain");
-            assert!(
-                err.to_string()
-                    .starts_with("attach over --host from Windows takes plain names"),
-                "{err}"
-            );
-        }
     }
 
     #[test]

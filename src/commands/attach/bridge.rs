@@ -1,5 +1,5 @@
-//! The remote end of `attach --host` from a Unix client: `tendr _remote`
-//! with an attach request.
+//! The remote end of `attach --host`, from a Unix or a Windows client:
+//! `tendr _remote` with an attach request.
 //!
 //! The client keeps the terminal (raw mode, resizes, the detach escape) and
 //! speaks the attach protocol on ssh's stdin and stdout. This end connects

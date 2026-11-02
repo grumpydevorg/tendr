@@ -282,6 +282,9 @@ fn forward(argv: &[String]) -> ! {
 ///                session still holds the last n - 1
 /// output <text>  the session's output (`\n` is a newline): stamped from the
 ///                answer's offset under control, plain for a watcher
+/// output-hex <hex>
+///                the same for these bytes, two hex digits each, which need
+///                not be UTF-8
 /// retire         `Retired` at the next epoch: another client took over
 /// log <path>     from now on append the frames the client sent to <path>,
 ///                `{:?}` one per line, its first frame first
@@ -377,8 +380,16 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                     oldest: asked + 1,
                 });
             }
-            "output" => {
-                let bytes = unescape(value).into_bytes();
+            "output" | "output-hex" => {
+                let bytes = if step == "output" {
+                    unescape(value).into_bytes()
+                } else {
+                    (0..value.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&value[i..i + 2], 16))
+                        .collect::<Result<_, _>>()
+                        .expect("fake ssh: output-hex <hex>")
+                };
                 if section == "watch" {
                     send(Frame::Data(bytes));
                 } else {
