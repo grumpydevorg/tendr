@@ -259,10 +259,13 @@ fn ctrl_break_leaves_and_puts_the_console_back() {
 }
 
 /// Whether the first frame logged is a resume from `offset`: just past the
-/// output shown before the link dropped.
+/// output shown before the link dropped, in version 2's frame, the one the
+/// client always sends.
 fn resumed_from(frames: &[String], offset: usize) -> bool {
     frames.first().is_some_and(|first| {
-        first.starts_with("Resume(") && first.contains(&format!("offset: {offset} "))
+        first.starts_with("Resume {")
+            && first.contains(&format!("offset: {offset} "))
+            && first.ends_with("version: V2 }")
     })
 }
 
