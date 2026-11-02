@@ -1678,7 +1678,7 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
     let _kill = SessionGuard::new(&root, "host-ro-resume");
     // The flood passes the 4 KiB ring, but fits the pipes of the controller,
     // which does not read, so its sender never blocks. Capture never waits
-    // for a sender, though: it comes in 1100-byte steps, so a sender
+    // for a sender, though: it comes in 1200-byte steps (ONLCR), so a sender
     // briefly descheduled still copies each one before the ring drops it,
     // and the controller is never evicted.
     start_script(
