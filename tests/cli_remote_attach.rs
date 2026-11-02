@@ -394,7 +394,7 @@ fn host_attach_keeps_the_exit_codes() {
 /// its controller.
 #[test]
 fn remote_attach_requires_its_hello() {
-    use tendr::attach_proto::{Frame, Mode, write_frame};
+    use tendr::attach_proto::{Frame, Mode, Version, write_frame};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "host-hello");
@@ -404,7 +404,14 @@ fn remote_attach_requires_its_hello() {
     let mut request = u32::try_from(json.len()).unwrap().to_be_bytes().to_vec();
     request.extend_from_slice(json);
     let mut wrong_mode = request.clone();
-    write_frame(&mut wrong_mode, &Frame::Hello(Mode::Takeover)).unwrap();
+    write_frame(
+        &mut wrong_mode,
+        &Frame::Hello {
+            version: Version::V1,
+            mode: Mode::Takeover,
+        },
+    )
+    .unwrap();
     let mut not_a_hello = request.clone();
     write_frame(&mut not_a_hello, &Frame::Data(b"x".to_vec())).unwrap();
     for (what, stdin) in [
@@ -466,4 +473,346 @@ fn host_attach_client_killed_gives_control_back() {
     wait_control(&root, "host-killed", "HumanControl");
     wrapped.signal(libc::SIGKILL);
     wait_control(&root, "host-killed", "AgentControl");
+}
+
+/// The hello payloads (`[version, mode]`) a fake sidecar was sent, in order.
+type Hellos = std::sync::Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// Point `session`'s breadcrumb at a socket in `root` whose every connection,
+/// after its hello (recorded in the returned list), goes to `serve`.
+fn fake_listener(
+    root: &TempDir,
+    session: &str,
+    label: &str,
+    serve: impl Fn(std::os::unix::net::UnixStream, &[u8]) + Send + 'static,
+) -> Hellos {
+    let sock = root.path().join(format!("{label}.sock"));
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let hellos = Hellos::default();
+    let seen = std::sync::Arc::clone(&hellos);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().map_while(Result::ok) {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let Ok((_, hello)) = tendr::attach_proto::read_msg(&mut stream) else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(None);
+            seen.lock().unwrap().push(hello.clone());
+            serve(stream, &hello);
+        }
+    });
+    point_breadcrumb_at(root, session, &sock);
+    hellos
+}
+
+/// A sidecar started by tendr 0.5.0, emulated at the frame level: it refuses
+/// any hello but `[1, mode]` with the protocol class and the message 0.5.0
+/// sends, and serves a version 1 hello as the real sidecar at `real` does,
+/// by passing the connection through to it.
+fn v1_only_sidecar(root: &TempDir, session: &str) -> Hellos {
+    use std::io::Write;
+    use tendr::attach_proto::{Frame, RejectClass, write_frame};
+    let real = tendr::attach_proto::read_sock_path(
+        &root
+            .path()
+            .join(format!(".tendr/sessions/default/{session}")),
+    )
+    .unwrap();
+    fake_listener(root, session, "v1-only", move |mut client, hello| {
+        if hello[0] != 1 {
+            let refusal = Frame::Rejected {
+                class: RejectClass::Protocol,
+                reason: "unsupported attach protocol version or mode".to_owned(),
+            };
+            let _ = write_frame(&mut client, &refusal);
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        let mut sidecar = std::os::unix::net::UnixStream::connect(&real).unwrap();
+        tendr::attach_proto::write_msg(&mut sidecar, tendr::attach_proto::MSG_HELLO, hello)
+            .unwrap();
+        let (mut from_client, mut to_sidecar) =
+            (client.try_clone().unwrap(), sidecar.try_clone().unwrap());
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut from_client, &mut to_sidecar);
+            let _ = to_sidecar.shutdown(std::net::Shutdown::Both);
+        });
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut sidecar, &mut client);
+            let _ = client.flush();
+            let _ = client.shutdown(std::net::Shutdown::Both);
+        });
+    })
+}
+
+/// A new remote tendr whose session's sidecar was started by 0.5.0, so it
+/// speaks only version 1: the bridge's version 2 hello is refused, it says
+/// hello again in version 1, and the attach works as it did, plain output
+/// and all.
+#[test]
+fn host_attach_falls_back_to_v1_for_an_old_sidecar() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-old-sidecar");
+    start_pty(&root, "host-old-sidecar", &["sh"]);
+    let hellos = v1_only_sidecar(&root, "host-old-sidecar");
+    let remote = Remote::new();
+
+    let mut wrapped = remote.attach(&root, "old-sidecar", &["host-old-sidecar"]);
+    wrapped
+        .cli
+        .type_until_logged(&root, "host-old-sidecar", "echo old-$((40+2))\n");
+    wrapped.wait_output_contains("old-42");
+    wait_control(&root, "host-old-sidecar", "HumanControl");
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(
+        wrapped.wait_exit(Duration::from_secs(15)),
+        0,
+        "{}",
+        wrapped.cli.output()
+    );
+    wrapped.assert_terminal_restored();
+    wait_control(&root, "host-old-sidecar", "AgentControl");
+    assert_eq!(
+        *hellos.lock().unwrap(),
+        [vec![2, 1], vec![1, 1]],
+        "version 2 first, then version 1 once"
+    );
+}
+
+/// The bridge speaks version 2 to the sidecar and passes its acceptance and
+/// stamped output to the client, which writes output that follows on with no
+/// gap and refuses output that skips: a protocol failure (80), after which
+/// the terminal is restored.
+#[test]
+fn host_attach_tracks_offsets_and_refuses_output_that_skips() {
+    use tendr::attach_proto::{Frame, ResumePoint, write_frame};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-skip");
+    start_pty(&root, "host-skip", &["cat"]);
+    let hellos = fake_listener(&root, "host-skip", "skip", |mut client, _| {
+        let accept = Frame::AcceptedV2(ResumePoint {
+            run_id: tendr::model::ids::RunId::new(),
+            epoch: tendr::model::pty_control::ControllerEpoch::new(1),
+            offset: 100,
+        });
+        let output = |offset, bytes: &[u8]| Frame::Output {
+            offset,
+            bytes: bytes.to_vec(),
+        };
+        for frame in [
+            accept,
+            output(100, b"first-"),
+            output(106, b"second-"),
+            output(200, b"after-the-gap"),
+        ] {
+            write_frame(&mut client, &frame).unwrap();
+        }
+        // Held open: only the skip ends the attach.
+        let _ = std::io::copy(&mut client, &mut std::io::sink());
+    });
+    let remote = Remote::new();
+
+    let wrapped = remote.attach(&root, "skip", &["host-skip"]);
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 80);
+    wrapped.assert_terminal_restored();
+    let output = wrapped.cli.output();
+    assert!(output.contains("first-second-"), "{output}");
+    assert!(!output.contains("after-the-gap"), "{output}");
+    // The offset it expected: 100, then 6 and 7 bytes written.
+    assert!(output.contains("113") && output.contains("200"), "{output}");
+    assert_eq!(*hellos.lock().unwrap(), [vec![2, 1]]);
+}
+
+/// `tendr _remote` run by a client that speaks the attach protocol itself,
+/// at the frame level: `json` is its request, a version 1 hello follows.
+struct FrameClient {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::process::ChildStdout,
+}
+
+impl FrameClient {
+    fn start(root: &TempDir, json: &str) -> Self {
+        use std::io::Write;
+        use std::process::Stdio;
+        use tendr::attach_proto::{Frame, Mode, Version, write_frame};
+        let mut child = std::process::Command::new(tendr_bin())
+            .arg("_remote")
+            .env("HOME", root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut request = u32::try_from(json.len()).unwrap().to_be_bytes().to_vec();
+        request.extend_from_slice(json.as_bytes());
+        write_frame(
+            &mut request,
+            &Frame::Hello {
+                version: Version::V1,
+                mode: Mode::Attach,
+            },
+        )
+        .unwrap();
+        stdin.write_all(&request).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        Self {
+            child,
+            stdin: Some(stdin),
+            stdout,
+        }
+    }
+
+    fn read(&mut self) -> (u8, Vec<u8>) {
+        tendr::attach_proto::read_msg(&mut self.stdout).expect("the remote side sends a frame")
+    }
+
+    /// Detach, and the remote side's exit code.
+    fn detach(mut self) -> Option<i32> {
+        use tendr::attach_proto::{Frame, write_frame};
+        let mut stdin = self.stdin.take().unwrap();
+        write_frame(&mut stdin, &Frame::Detach).unwrap();
+        drop(stdin);
+        self.child.wait().unwrap().code()
+    }
+}
+
+/// A PTY session that prints `marker` once `go` exists, then waits.
+fn start_marker(root: &TempDir, session: &str, go: &std::path::Path, marker: &str) {
+    let script = format!("while [ ! -f \"$GO\" ]; do sleep 0.05; done; printf {marker}; sleep 60");
+    let output = tendr(root)
+        .args(["start", session, "--pty"])
+        .arg("--env")
+        .arg(format!("GO={}", go.display()))
+        .args(["--", "sh", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "start {session}: {output:?}");
+    harness::wait_running(root, session);
+}
+
+/// A client asking for version 2 gets the sidecar's version 2 acceptance,
+/// for this run, and its output stamped from the head offset there.
+#[test]
+fn remote_attach_passes_v2_through() {
+    use tendr::attach_proto::{MSG_ACCEPTED_V2, MSG_OUTPUT};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-v2");
+    let go = root.path().join("go");
+    start_marker(&root, "host-v2", &go, "v2-marker");
+
+    let mut client = FrameClient::start(
+        &root,
+        r#"{"v":1,"op":"attach","params":{"session":"host-v2","namespace":null,"takeover":false,"escape":"ctrl-backslash","protocol":2}}"#,
+    );
+    let (msg_type, accept) = client.read();
+    assert_eq!(msg_type, MSG_ACCEPTED_V2, "{accept:?}");
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            root.path()
+                .join(".tendr/sessions/default/host-v2/meta.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let run_id = uuid::Uuid::from_slice(&accept[8..24]).unwrap();
+    assert_eq!(run_id.to_string(), meta["run_id"].as_str().unwrap());
+    let head = u64::from_be_bytes(accept[24..32].try_into().unwrap());
+    assert_eq!(head, 0, "nothing was written before the attach");
+
+    std::fs::write(&go, b"").unwrap();
+    let mut next = head;
+    let mut shown = Vec::new();
+    while !shown.ends_with(b"v2-marker") {
+        let (msg_type, payload) = client.read();
+        assert_eq!(msg_type, MSG_OUTPUT);
+        let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
+        assert_eq!(offset, next);
+        next += (payload.len() - 8) as u64;
+        shown.extend_from_slice(&payload[8..]);
+    }
+    assert_eq!(shown, b"v2-marker");
+    assert_eq!(client.detach(), Some(0));
+    wait_control(&root, "host-v2", "AgentControl");
+}
+
+/// A 0.5.0 client's request (no `protocol`) and version 1 hello get what
+/// 0.5.0's remote tendr sent: the version 1 acceptance with the epoch, then
+/// plain output.
+#[test]
+fn remote_attach_answers_an_old_client_in_v1() {
+    use tendr::attach_proto::{MSG_ACCEPTED, MSG_DATA};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-v1");
+    let go = root.path().join("go");
+    start_marker(&root, "host-v1", &go, "v1-marker");
+
+    let mut client = FrameClient::start(
+        &root,
+        r#"{"v":1,"op":"attach","params":{"session":"host-v1","namespace":null,"takeover":false,"escape":"ctrl-backslash"}}"#,
+    );
+    assert_eq!(client.read(), (MSG_ACCEPTED, 1u64.to_be_bytes().to_vec()));
+    std::fs::write(&go, b"").unwrap();
+    let mut shown = Vec::new();
+    while !shown.ends_with(b"v1-marker") {
+        let (msg_type, payload) = client.read();
+        assert_eq!(msg_type, MSG_DATA);
+        shown.extend_from_slice(&payload);
+    }
+    assert_eq!(shown, b"v1-marker");
+    assert_eq!(client.detach(), Some(0));
+    wait_control(&root, "host-v1", "AgentControl");
+}
+
+/// What this client sends a 0.5.0 remote tendr is what that remote reads:
+/// the request under frame version 1, whose attach fields 0.5.0 knows (it
+/// ignores the rest), then the exact version 1 hello 0.5.0 requires. The
+/// remote's answers, a version 1 acceptance and plain output, are what
+/// [`host_attach_falls_back_to_v1_for_an_old_sidecar`] gives the client.
+#[test]
+fn host_attach_sends_what_an_old_remote_reads() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let sent = root.path().join("sent");
+    let ssh = fake_ssh(&format!("stdin {}", sent.display()));
+    let wrapped = attach_through(&ssh, "1", &root, "old-remote", &["s", "--takeover"]);
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 82);
+    wrapped.assert_terminal_restored();
+
+    /// 0.5.0's attach request, field for field.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct AttachRequest050 {
+        session: String,
+        namespace: Option<String>,
+        takeover: bool,
+        escape: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Frame050 {
+        v: u32,
+        op: String,
+        params: AttachRequest050,
+    }
+    let sent = std::fs::read(&sent).unwrap();
+    let len = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
+    let frame: Frame050 = serde_json::from_slice(&sent[4..4 + len]).unwrap();
+    assert_eq!((frame.v, frame.op.as_str()), (1, "attach"));
+    assert_eq!(
+        frame.params,
+        AttachRequest050 {
+            session: "s".to_owned(),
+            namespace: None,
+            takeover: true,
+            escape: "ctrl-backslash".to_owned(),
+        }
+    );
+    assert_eq!(
+        &sent[4 + len..],
+        [tendr::attach_proto::MSG_HELLO, 0, 0, 0, 2, 1, 2],
+        "a version 1 takeover hello"
+    );
 }

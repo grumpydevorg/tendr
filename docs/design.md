@@ -213,6 +213,27 @@ holds bytes, not capture's chunks, so a cursor can stand at any offset and
 tiny chunks cost no per-chunk overhead. Source: step 1 of
 [remote frame transport](plans/active/01_remote-frame-transport.md).
 
+### Viewers count output in bytes, and agree the version in the request
+
+*2026-11-02.* A version 2 viewer's position is a byte offset of the run's PTY
+output, not a recording sequence number. The recorder stops numbering when it
+stops (at its size limit, after a storage failure or a full backlog), numbers
+resizes as well as output, and may not run at all, so a sequence cannot name
+every byte a viewer was sent. A byte offset can: it is assigned under the
+same lock as the ring, the only place output is counted. A disk-backed resume
+can still map offsets onto the recording by summing output payloads, up to
+where recording stopped.
+
+`attach --host` agrees the attach protocol version in the remote frame's
+request, not in the hello it sends over ssh. Both the 0.5.0 remote tendr
+and sidecar take only the exact version 1 hello, so a version 2 hello from
+the client would fail against an old remote; an unknown request field is
+ignored there. The client always sends the version 1 hello and names the
+version it wants in the request; the remote tendr speaks it to the sidecar,
+and again in version 1 to a sidecar that refuses it. The client learns the
+outcome from the acceptance's message type. Source: step 1 of
+[remote frame transport](plans/active/01_remote-frame-transport.md).
+
 ### Windows uses Job Objects and a hidden console
 
 *2026-03 to 2026-04.* Windows has no SIGTERM. The sidecar runs the child in a

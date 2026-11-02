@@ -22,11 +22,12 @@ lifecycle hardening, PowerShell state) belongs to
 
 ## Steps
 
-1. **Resumable viewers.** A viewer reconnects with its run ID and the last
-   sequence it consumed, and gets the retained contiguous suffix of the
-   recording. History that is gone is an error with the available range (as
-   `events --from-cursor` exits 44); it never skips forward. Input is never
-   resent automatically. Today a viewer gets no sequence numbers
+1. **Resumable viewers.** A viewer reconnects with its run ID and the byte
+   offset of the output it has written, and gets the retained output from
+   that offset on, with no gap. History that is gone is an error with the
+   available range (as `events --from-cursor` exits 44); it never skips
+   forward. Input is never resent automatically. Today a version 2 viewer
+   (`attach --host`) gets its offsets but cannot resume yet
    ([PTY lane](../../architecture/04-pty-lane.md#output-and-viewers)). An
    earlier design for typed PTY operations (send, resize, claim, release,
    observe; reads retryable, bounded writes never retried automatically,
@@ -48,5 +49,5 @@ lifecycle hardening, PowerShell state) belongs to
 - On the VM (`scripts/pty-vm`), through the attach bridge from the laptop: a
   stalled viewer cannot delay a takeover (the fake-ssh test
   `host_takeover_while_the_first_client_is_stalled` covers it locally);
-  reattach after a dropped connection resumes from the last consumed sequence
+  reattach after a dropped connection resumes from the last offset written
   with no gap; a full set of read-only viewers does not block a controller.

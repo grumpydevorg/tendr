@@ -6,6 +6,12 @@
 
 - **An attached viewer can now fall 32 MiB behind, up from 8 MiB**, before
   the sidecar disconnects it and it loses control.
+- **The attach socket speaks protocol version 2 beside version 1.** A
+  version 2 viewer is told where in the run's output it starts and gets each
+  chunk with its byte offset. `attach --host` uses it when both hosts run
+  this version, and falls back to version 1 for a 0.5.0 remote tendr or a
+  session started by one. Nothing changes on screen yet: it is the ground
+  for resuming a dropped `attach --host`.
 
 ## v0.5.0 — framed `--host`, NDJSON exec, attach bridge
 

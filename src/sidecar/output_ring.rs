@@ -72,8 +72,9 @@ impl Cursor {
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Next {
-    /// The bytes from the cursor on; the cursor now follows them.
-    Bytes(Vec<u8>),
+    /// The bytes from the cursor on, which start at `offset`; the cursor now
+    /// follows them.
+    Bytes { offset: u64, bytes: Vec<u8> },
     /// The ring no longer holds the cursor's offset.
     Evicted,
     /// The cursor was closed.
@@ -178,7 +179,10 @@ impl OutputRing {
                     );
                 }
                 cursor.next.store(at + out.len() as u64, Ordering::SeqCst);
-                return Next::Bytes(out);
+                return Next::Bytes {
+                    offset: at,
+                    bytes: out,
+                };
             }
             state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
         }
@@ -202,12 +206,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Read every byte a cursor has, in reads of at most `max`.
+    /// Read every byte a cursor has, in reads of at most `max`, checking that
+    /// each read starts where the last one ended.
     fn drain(ring: &OutputRing, cursor: &Cursor, max: usize) -> Vec<u8> {
         let mut out = Vec::new();
+        let mut at = cursor.next.load(Ordering::SeqCst);
         while cursor.next.load(Ordering::SeqCst) < ring.span().head {
             match ring.next(cursor, max) {
-                Next::Bytes(bytes) => out.extend(bytes),
+                Next::Bytes { offset, bytes } => {
+                    assert_eq!(offset, at, "a read starts where the last ended");
+                    at += bytes.len() as u64;
+                    out.extend(bytes);
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -235,7 +245,13 @@ mod tests {
 
         let cursor = ring.cursor_at(12).unwrap();
         ring.append(b"!");
-        assert_eq!(ring.next(&cursor, 64), Next::Bytes(b"!".to_vec()));
+        assert_eq!(
+            ring.next(&cursor, 64),
+            Next::Bytes {
+                offset: 12,
+                bytes: b"!".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -255,7 +271,10 @@ mod tests {
         ring.append(b"after");
         assert_eq!(
             read.recv_timeout(Duration::from_secs(10)).unwrap(),
-            Next::Bytes(b"after".to_vec())
+            Next::Bytes {
+                offset: 6,
+                bytes: b"after".to_vec()
+            }
         );
         reader.join().unwrap();
     }

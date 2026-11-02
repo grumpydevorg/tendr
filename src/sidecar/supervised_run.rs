@@ -405,10 +405,14 @@ impl RunCore {
             ),
         };
         {
-            let (writer, registry, sink) =
-                (input.writer.clone(), registry.clone(), Arc::clone(&sink));
+            let (writer, registry, sink, run_id) = (
+                input.writer.clone(),
+                registry.clone(),
+                Arc::clone(&sink),
+                self.meta.run_id(),
+            );
             std::thread::spawn(move || {
-                run_attach_listener(&socket.listener, &writer, &registry, &sink);
+                run_attach_listener(&socket.listener, run_id, &writer, &registry, &sink);
             });
         }
         let started = StartedPty {

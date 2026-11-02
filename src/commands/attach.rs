@@ -32,13 +32,14 @@ pub fn cmd_attach(
         // terminal to drive.
         require_terminal()?;
         let mode = mode(takeover);
-        let (stream, epoch) = connect(session.path(), mode)?;
+        // A local attach does not reconnect, so it has no use for offsets.
+        let (stream, accept) = connect(session.path(), attach_proto::Version::V1, mode)?;
         let control = Control {
             session_dir: session.path().to_path_buf(),
             run_id: meta.run_id(),
-            epoch,
+            epoch: accept.epoch(),
         };
-        unix_relay::relay(unix_relay::Link::socket(stream)?, escape, &|| {
+        unix_relay::relay(unix_relay::Link::socket(stream)?, None, escape, &|| {
             control.taken_over_by().is_some()
         })
         .map(drop)
@@ -121,14 +122,21 @@ const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// local attach. The remote sidecar keeps the controller epochs and the
 /// recording.
 ///
+/// The version is agreed in the request, whose `protocol` names the newest
+/// this client speaks; the hello on ssh's stdin is always a version 1 hello,
+/// the only one a 0.5.0 remote tendr takes, and that remote ignores
+/// `protocol`. The answer's type says which version the session speaks: a
+/// version 2 acceptance starts the offsets this client tracks, a version 1
+/// one means plain output, as before.
+///
 /// Returns the exit code. The remote side's own failures (no such session,
 /// a refusal, an unreachable socket) arrive as its exit code, with its
 /// message passed through on stderr, so the codes are those of a local
 /// attach.
 ///
 /// # Errors
-/// A takeover of this attach (81), an answer outside the protocol (80), a
-/// remote that ended without answering (84), and the ssh failures of
+/// A takeover of this attach (81), an answer or output outside the protocol
+/// (80), a remote that ended without answering (84), and the ssh failures of
 /// [`tendr::ssh::AttachSsh`].
 #[cfg(unix)]
 pub fn cmd_attach_host(
@@ -137,11 +145,18 @@ pub fn cmd_attach_host(
     takeover: bool,
     escape: EscapeMode,
 ) -> anyhow::Result<i32> {
+    use tendr::attach_proto::Version;
     use tendr::ssh::{AttachSsh, AttachStart};
 
     // Before ssh starts: the request may take over.
     require_terminal()?;
-    attach_proto::write_frame(&mut request, &Frame::Hello(mode(takeover)))?;
+    attach_proto::write_frame(
+        &mut request,
+        &Frame::Hello {
+            version: Version::V1,
+            mode: mode(takeover),
+        },
+    )?;
     let (ssh, stdin, stdout) = match AttachSsh::start(host, &request)? {
         AttachStart::Running { ssh, stdin, stdout } => (ssh, stdin, stdout),
         AttachStart::Ended(code) => return unanswered(code),
@@ -149,8 +164,7 @@ pub fn cmd_attach_host(
     // The remote side's answer is the sidecar's acceptance; a refusal or a
     // failure of its own ends the connection, and its exit code says which.
     let mut reader = std::io::BufReader::new(stdout);
-    match attach_proto::read_frame(&mut reader) {
-        Ok(Frame::Accepted(_)) => {}
+    let accept = match attach_proto::read_frame(&mut reader) {
         Err(FrameError::Io(_)) => {
             drop(stdin);
             return match ssh.finish(None) {
@@ -158,13 +172,15 @@ pub fn cmd_attach_host(
                 None => unreachable!("no grace"),
             };
         }
-        reply => {
-            drop(stdin);
-            let _ = ssh.finish(Some(SSH_LEAVE_GRACE));
-            hello_reply(reply, "attach")?;
-            unreachable!("only an acceptance is accepted");
-        }
-    }
+        reply => match hello_reply(reply, "attach", Version::LATEST) {
+            Ok(accept) => accept,
+            Err(e) => {
+                drop(stdin);
+                let _ = ssh.finish(Some(SSH_LEAVE_GRACE));
+                return Err(e);
+            }
+        },
+    };
 
     let link = unix_relay::Link {
         reader: Box::new(reader),
@@ -175,7 +191,7 @@ pub fn cmd_attach_host(
     };
     // The remote side reports a takeover in band, even one that cut the
     // connection before the sidecar could say so.
-    let ending = unix_relay::relay(link, escape, &|| false);
+    let ending = unix_relay::relay(link, accept.resume_point(), escape, &|| false);
     let closed = matches!(ending, Ok(unix_relay::Ending::SessionClosed));
     let finished = ssh.finish(Some(if closed {
         SSH_CLOSE_GRACE
@@ -250,9 +266,51 @@ impl Control {
 #[cfg(unix)]
 const HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The sidecar's acceptance: version 1's controller epoch, or version 2's
+/// point in the run, from which a viewer's stamped output starts.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Accept {
+    V1(tendr::model::pty_control::ControllerEpoch),
+    V2(attach_proto::ResumePoint),
+}
+
+#[cfg(unix)]
+impl Accept {
+    /// The controller epoch granted.
+    fn epoch(self) -> tendr::model::pty_control::ControllerEpoch {
+        match self {
+            Self::V1(epoch) => epoch,
+            Self::V2(point) => point.epoch,
+        }
+    }
+
+    /// Where a version 2 viewer's output starts; `None` for version 1, whose
+    /// output carries no offsets.
+    fn resume_point(self) -> Option<attach_proto::ResumePoint> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(point) => Some(point),
+        }
+    }
+
+    /// The acceptance as the sidecar sent it.
+    fn frame(self) -> Frame {
+        match self {
+            Self::V1(epoch) => Frame::Accepted(epoch),
+            Self::V2(point) => Frame::AcceptedV2(point),
+        }
+    }
+}
+
 /// Connect to the session's attach socket, check that its listener is this
-/// user's, and complete the v1 hello in `mode`; `attach` and PTY `push` both
-/// start here. Returns the connection and the controller epoch it was granted.
+/// user's, and complete the hello in `mode`, speaking `version`; `attach`,
+/// PTY `push` and the attach bridge all start here. Returns the connection
+/// and the sidecar's acceptance.
+///
+/// A sidecar started by an older tendr may not speak `version`: it refuses
+/// the hello with the protocol class. Then this connects once more and
+/// speaks version 1, which every sidecar with a hello speaks.
 ///
 /// Every failure carries its PTY exit code ([`tendr::pty_exit`]): a socket
 /// that is missing or cannot be reached is a runtime failure (84), a listener
@@ -261,14 +319,42 @@ const HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 #[cfg(unix)]
 pub(super) fn connect(
     session_dir: &std::path::Path,
+    version: attach_proto::Version,
     mode: Mode,
-) -> anyhow::Result<(
-    std::os::unix::net::UnixStream,
-    tendr::model::pty_control::ControllerEpoch,
-)> {
+) -> anyhow::Result<(std::os::unix::net::UnixStream, Accept)> {
+    use attach_proto::{RejectClass, Version};
+    let mut stream = open_socket(session_dir)?;
+    let mut reply = exchange_hello(&mut stream, version, mode)?;
+    let mut version = version;
+    if version > Version::V1
+        && matches!(
+            reply,
+            Ok(Frame::Rejected {
+                class: RejectClass::Protocol,
+                ..
+            })
+        )
+    {
+        version = Version::V1;
+        stream = open_socket(session_dir)?;
+        reply = exchange_hello(&mut stream, version, mode)?;
+    }
+    let accept = hello_reply(reply, verb(mode), version)?;
+    // From here an attach waits for output, and a push as long as the terminal
+    // applies backpressure.
+    stream.set_read_timeout(None).map_err(|e| {
+        PtyExitCode::Runtime.error(anyhow::anyhow!("{} handshake failed: {e}", verb(mode)))
+    })?;
+    Ok((stream, accept))
+}
+
+/// Connect to the session's attach socket and check that its listener is
+/// this user's.
+#[cfg(unix)]
+fn open_socket(session_dir: &std::path::Path) -> anyhow::Result<std::os::unix::net::UnixStream> {
     let sock_path = attach_proto::read_sock_path(session_dir)
         .ok_or_else(|| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket not found")))?;
-    let mut stream = std::os::unix::net::UnixStream::connect(&sock_path).map_err(|e| {
+    let stream = std::os::unix::net::UnixStream::connect(&sock_path).map_err(|e| {
         PtyExitCode::Runtime.error(anyhow::anyhow!(
             "cannot connect to attach socket {}: {e}",
             sock_path.display()
@@ -282,23 +368,23 @@ pub(super) fn connect(
             sock_path.display()
         ))
     })?;
-
-    let epoch = hello(&mut stream, mode)?;
-    Ok((stream, epoch))
+    Ok(stream)
 }
 
-/// Send the v1 hello in `mode` and require the sidecar's acceptance.
+/// Send the hello in `version` and `mode`, and read the sidecar's reply under
+/// the reply deadline, for [`hello_reply`] to classify.
 ///
 /// The sidecar refuses a peer of another user, or a connection beyond its
 /// limit, before reading the hello, and closes the connection. If that lands
 /// first, the hello cannot be written, but the refusal is still waiting to be
 /// read: it, not the failed write, decides the outcome. The write's error is
-/// reported only when no frame can be read.
+/// the error only when no frame can be read.
 #[cfg(unix)]
-fn hello(
+fn exchange_hello(
     stream: &mut std::os::unix::net::UnixStream,
+    version: attach_proto::Version,
     mode: Mode,
-) -> anyhow::Result<tendr::model::pty_control::ControllerEpoch> {
+) -> anyhow::Result<Result<Frame, FrameError>> {
     let what = verb(mode);
     let transport = |e: std::io::Error| {
         PtyExitCode::Runtime.error(anyhow::anyhow!("{what} handshake failed: {e}"))
@@ -312,7 +398,8 @@ fn hello(
     if unbounded {
         stream.set_nonblocking(true).map_err(transport)?;
     }
-    let sent = timeout.and_then(|()| attach_proto::write_frame(stream, &Frame::Hello(mode)));
+    let sent =
+        timeout.and_then(|()| attach_proto::write_frame(stream, &Frame::Hello { version, mode }));
     // After a failed write the peer has closed its end, so this read returns
     // at once; otherwise it is bounded by the reply timeout.
     let reply = attach_proto::read_frame(stream);
@@ -324,11 +411,7 @@ fn hello(
             return Err(transport(e));
         }
     }
-    let epoch = hello_reply(reply, what)?;
-    // From here an attach waits for output, and a push as long as the terminal
-    // applies backpressure.
-    stream.set_read_timeout(None).map_err(transport)?;
-    Ok(epoch)
+    Ok(reply)
 }
 
 #[cfg(unix)]
@@ -339,20 +422,23 @@ fn verb(mode: Mode) -> &'static str {
     }
 }
 
-/// What the sidecar's reply to a hello means for the client.
+/// What the sidecar's reply to a hello means for the client, which speaks
+/// versions up to `upto`.
 ///
-/// A refusal exits with its class's code. A reply that is not a v1 reply, or
-/// none before the deadline (a sidecar from before the hello waits silently),
-/// is a protocol failure (80); a connection that ends first is a transport
-/// failure (84).
+/// A refusal exits with its class's code. An acceptance of a newer version
+/// than `upto`, any other reply, or none before the deadline (a sidecar from
+/// before the hello waits silently), is a protocol failure (80); a connection
+/// that ends first is a transport failure (84).
 #[cfg(unix)]
 fn hello_reply(
     reply: Result<Frame, FrameError>,
     what: &str,
-) -> anyhow::Result<tendr::model::pty_control::ControllerEpoch> {
+    upto: attach_proto::Version,
+) -> anyhow::Result<Accept> {
     let protocol = |message: String| Err(PtyExitCode::Protocol.error(anyhow::anyhow!(message)));
     match reply {
-        Ok(Frame::Accepted(epoch)) => Ok(epoch),
+        Ok(Frame::Accepted(epoch)) => Ok(Accept::V1(epoch)),
+        Ok(Frame::AcceptedV2(point)) if upto >= attach_proto::Version::V2 => Ok(Accept::V2(point)),
         Ok(Frame::Rejected { class, reason }) => {
             Err(PtyExitCode::from(class).error(anyhow::anyhow!("{what} refused: {reason}")))
         }
@@ -408,7 +494,7 @@ mod unix_relay {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
 
     use tendr::attach_escape::{Escape, EscapeMode, EscapeParser};
@@ -463,17 +549,28 @@ mod unix_relay {
     }
 
     /// Relay until the attach ends; how it ended, unless another client took
-    /// it over (an error, exit 81). `recorded_takeover` is asked when the
-    /// session closes the connection without saying so.
+    /// it over (an error, exit 81) or the session's output broke the protocol
+    /// (exit 80). `resume` is where a version 2 attach's stamped output starts;
+    /// `None` for version 1. `recorded_takeover` is asked when the session
+    /// closes the connection without saying so.
     pub(super) fn relay(
         link: Link,
+        resume: Option<attach_proto::ResumePoint>,
         escape: EscapeMode,
         recorded_takeover: &dyn Fn() -> bool,
     ) -> anyhow::Result<Ending> {
         let closed = Arc::new(AtomicBool::new(false));
         let retired = Arc::new(AtomicBool::new(false));
         let outbox = Arc::new(Outbox::default());
-        let screen = Arc::new(Screen::default());
+        let screen = Arc::new(Screen {
+            shown: Mutex::new(Shown {
+                modes: TermModes::default(),
+                resume,
+            }),
+            done: AtomicBool::new(false),
+            bracketed_paste: AtomicBool::new(false),
+            broken: OnceLock::new(),
+        });
 
         // Installed before raw mode, so no cancelling signal can arrive between
         // the two and leave the terminal raw; restored when dropped, after the
@@ -606,6 +703,11 @@ mod unix_relay {
         for note in notes {
             eprintln!("{note}");
         }
+        if ending == Ending::SessionClosed {
+            if let Some(why) = screen.broken.get() {
+                return Err(PtyExitCode::Protocol.error(anyhow::anyhow!("tendr: {why}")));
+            }
+        }
         if taken_over {
             // This client lost control: a controller conflict, which a script
             // must be able to tell from a detach.
@@ -654,17 +756,30 @@ mod unix_relay {
     }
 
     /// What the session's output has done to the user's terminal.
-    #[derive(Default)]
     struct Screen {
-        /// The modes turned on by everything written so far. Held while
-        /// writing, so a reset cannot interleave with output.
-        modes: Mutex<TermModes>,
+        /// What has been written to the terminal. Held while writing, so a
+        /// reset cannot interleave with output, and so the resume point moves
+        /// only past bytes the terminal took.
+        shown: Mutex<Shown>,
         /// Set by the main thread when leaving: the reader writes nothing
         /// more, so at most the chunk it is writing precedes the reset.
         done: AtomicBool,
         /// The child has bracketed paste on. Read by the keyboard loop
-        /// without taking `modes`, which a blocked write can hold.
+        /// without taking `shown`, which a blocked write can hold.
         bracketed_paste: AtomicBool,
+        /// Why the reader stopped on output outside the protocol, if it did.
+        /// Set before it marks the connection closed.
+        broken: OnceLock<String>,
+    }
+
+    /// The terminal as the session's output has left it.
+    struct Shown {
+        /// The modes turned on by everything written so far.
+        modes: TermModes,
+        /// For a version 2 attach, the run and epoch it was accepted at, and
+        /// the offset just past the last output byte written to the terminal:
+        /// where a reconnect would resume. `None` for version 1.
+        resume: Option<attach_proto::ResumePoint>,
     }
 
     /// Turn off the terminal modes the session turned on (the alternate
@@ -676,13 +791,13 @@ mod unix_relay {
         let (done, written) = std::sync::mpsc::channel();
         let screen = Arc::clone(screen);
         std::thread::spawn(move || {
-            let modes = screen.modes.lock().unwrap_or_else(|e| e.into_inner());
-            let reset = modes.reset();
+            let shown = screen.shown.lock().unwrap_or_else(|e| e.into_inner());
+            let reset = shown.modes.reset();
             if !reset.is_empty() {
                 let mut stdout = std::io::stdout().lock();
                 let _ = stdout.write_all(&reset).and_then(|()| stdout.flush());
             }
-            drop(modes);
+            drop(shown);
             let _ = done.send(());
         });
         let _ = written.recv_timeout(grace);
@@ -884,30 +999,66 @@ mod unix_relay {
     ) {
         std::thread::spawn(move || {
             loop {
-                match attach_proto::read_frame(&mut stream) {
-                    Ok(Frame::Data(payload)) => {
-                        let mut modes = screen.modes.lock().unwrap_or_else(|e| e.into_inner());
-                        if screen.done.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        // Track before writing: modes from a partial write are
-                        // still turned off when leaving.
-                        modes.feed(&payload);
-                        screen
-                            .bracketed_paste
-                            .store(modes.bracketed_paste(), Ordering::SeqCst);
-                        let mut stdout = std::io::stdout().lock();
-                        if stdout.write_all(&payload).is_err() || stdout.flush().is_err() {
-                            break;
-                        }
+                let shown = match attach_proto::read_frame(&mut stream) {
+                    Ok(Frame::Data(payload)) => show(&screen, None, &payload),
+                    Ok(Frame::Output { offset, bytes }) => show(&screen, Some(offset), &bytes),
+                    Ok(Frame::Retired(_)) => {
+                        retired.store(true, Ordering::SeqCst);
+                        Ok(true)
                     }
-                    Ok(Frame::Retired(_)) => retired.store(true, Ordering::SeqCst),
-                    Ok(_) | Err(FrameError::Malformed(_) | FrameError::Unknown(_)) => {}
-                    Err(FrameError::Io(_)) => break,
+                    Ok(_) | Err(FrameError::Malformed(_) | FrameError::Unknown(_)) => Ok(true),
+                    Err(FrameError::Io(_)) => Ok(false),
+                };
+                match shown {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(why) => {
+                        let _ = screen.broken.set(why);
+                        break;
+                    }
                 }
             }
             closed.store(true, Ordering::SeqCst);
         });
+    }
+
+    /// Write the session's output to the terminal: `Ok(true)` to go on,
+    /// `Ok(false)` once leaving or the terminal is gone. Stamped output
+    /// (`offset`) must start exactly where the last ended, or it is refused
+    /// unwritten, with why; it moves the resume point only once the terminal
+    /// has taken all of it. Unstamped output, such as the mode replay, moves
+    /// nothing.
+    fn show(screen: &Screen, offset: Option<u64>, bytes: &[u8]) -> Result<bool, String> {
+        let mut shown = screen.shown.lock().unwrap_or_else(|e| e.into_inner());
+        if screen.done.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        if let Some(offset) = offset {
+            match &shown.resume {
+                None => return Err("the session sent offsets to a version 1 attach".to_owned()),
+                Some(point) if point.offset != offset => {
+                    return Err(format!(
+                        "the session's output skipped from offset {} to {offset}",
+                        point.offset
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        // Track before writing: modes from a partial write are still turned
+        // off when leaving.
+        shown.modes.feed(bytes);
+        screen
+            .bracketed_paste
+            .store(shown.modes.bracketed_paste(), Ordering::SeqCst);
+        let mut stdout = std::io::stdout().lock();
+        if stdout.write_all(bytes).is_err() || stdout.flush().is_err() {
+            return Ok(false);
+        }
+        if let (Some(_), Some(point)) = (offset, shown.resume.as_mut()) {
+            point.offset += bytes.len() as u64;
+        }
+        Ok(true)
     }
 
     /// What woke the main thread's poll.
@@ -1252,16 +1403,24 @@ mod unix_relay {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{hello, hello_reply};
+    use super::{Accept, exchange_hello, hello_reply};
     use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
-    use tendr::attach_proto::{Frame, FrameError, ProtocolError, RejectClass};
-    use tendr::attach_proto::{Mode, write_frame};
+    use tendr::attach_proto::{Frame, FrameError, ProtocolError, RejectClass, ResumePoint};
+    use tendr::attach_proto::{Mode, Version, write_frame};
+    use tendr::model::ids::RunId;
     use tendr::model::pty_control::ControllerEpoch;
     use tendr::pty_exit::exit_code;
 
     fn code(reply: Result<Frame, FrameError>) -> Option<i32> {
-        hello_reply(reply, "attach").err().map(|e| exit_code(&e))
+        hello_reply(reply, "attach", Version::V1)
+            .err()
+            .map(|e| exit_code(&e))
+    }
+
+    /// The hello and its reply, as a client speaking `version` sees them.
+    fn hello(stream: &mut UnixStream, version: Version, mode: Mode) -> anyhow::Result<Accept> {
+        hello_reply(exchange_hello(stream, version, mode)?, "attach", version)
     }
 
     #[test]
@@ -1279,6 +1438,28 @@ mod tests {
             assert_eq!(code(Ok(refusal)), Some(expected), "{class:?}");
         }
         assert_eq!(code(Ok(Frame::Accepted(ControllerEpoch::new(1)))), None);
+    }
+
+    /// A version 2 acceptance is one only to a client that speaks version 2;
+    /// such a client also takes a version 1 acceptance, from a session that
+    /// speaks only version 1.
+    #[test]
+    fn a_v2_acceptance_is_accepted_only_by_a_v2_client() {
+        let point = ResumePoint {
+            run_id: RunId::new(),
+            epoch: ControllerEpoch::new(3),
+            offset: 42,
+        };
+        assert_eq!(code(Ok(Frame::AcceptedV2(point))), Some(80));
+        assert_eq!(
+            hello_reply(Ok(Frame::AcceptedV2(point)), "attach", Version::V2).unwrap(),
+            Accept::V2(point)
+        );
+        let epoch = ControllerEpoch::new(4);
+        assert_eq!(
+            hello_reply(Ok(Frame::Accepted(epoch)), "attach", Version::V2).unwrap(),
+            Accept::V1(epoch)
+        );
     }
 
     /// Anything but a v1 reply, or no reply before the deadline, is a
@@ -1326,7 +1507,7 @@ mod tests {
                 class,
                 reason: "refused first".to_owned(),
             }));
-            let err = hello(&mut client, Mode::Push).unwrap_err();
+            let err = hello(&mut client, Version::V1, Mode::Push).unwrap_err();
             assert_eq!(exit_code(&err), expected, "{class:?}: {err:#}");
             assert!(format!("{err:#}").contains("refused first"), "{err:#}");
         }
@@ -1337,7 +1518,7 @@ mod tests {
     #[test]
     fn a_hello_that_cannot_be_written_and_gets_no_reply_exits_84() {
         let mut client = closed_peer(None);
-        let err = hello(&mut client, Mode::Attach).unwrap_err();
+        let err = hello(&mut client, Version::V2, Mode::Attach).unwrap_err();
         assert_eq!(exit_code(&err), 84, "{err:#}");
         assert!(format!("{err:#}").contains("handshake failed"), "{err:#}");
     }

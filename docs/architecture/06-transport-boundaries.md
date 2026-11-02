@@ -137,14 +137,26 @@ the other operations, and keeps the terminal on the client
   `takeover`). After that, ssh stdin carries the client's frames and ssh
   stdout the session's, exactly as on the attach socket
   ([04-pty-lane.md](04-pty-lane.md)).
+- The attach protocol version is agreed in the request, not in that hello.
+  The request's `protocol` field names the newest version the client speaks
+  (2), and the hello on ssh stdin is always a version 1 hello. A remote
+  tendr from 0.5.0 takes only that hello and ignores the field, so it
+  answers as before, in version 1. A new remote tendr speaks the newest
+  version both know (`attach_proto::Version::negotiate`; a request without
+  the field, from a 0.5.0 client, means version 1) to the sidecar.
 - The remote tendr (`_remote`) makes the checks of a local attach (a PTY
   session, running, not under human control unless `--takeover`), reads the
   hello, which must name the request's mode (otherwise exit 80), and makes
-  the same connection a local attach makes: peer check, hello, the sidecar's
-  answer within 10 s. It then writes `MSG_ACCEPTED` with the granted epoch
-  to stdout. A failure before that is its exit code and stderr, as for a
-  local attach (1, 80, 81, 84, 85), and the client exits with it; a remote
-  that ends without answering and exits 0 is 84 on the client.
+  the same connection a local attach makes: peer check, a hello in the
+  agreed version with the client's mode, the sidecar's answer within 10 s.
+  A sidecar started by an older tendr refuses a version 2 hello with the
+  protocol class; the remote tendr then connects once more and says hello
+  in version 1. It passes the sidecar's acceptance to the client as it
+  came: `MSG_ACCEPTED_V2` for version 2, `MSG_ACCEPTED` for version 1, so
+  the client learns the version from its type. A failure before that is its
+  exit code and stderr, as for a local attach (1, 80, 81, 84, 85), and the
+  client exits with it; a remote that ends without answering and exits 0 is
+  84 on the client.
 - Raw mode, the size check and SIGWINCH, the detach escape, and restoring
   the terminal and its modes all happen on the client, as for a local attach.
   A resize is a `MSG_RESIZE` frame.

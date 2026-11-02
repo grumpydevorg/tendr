@@ -156,13 +156,19 @@ pub struct WatchRequest {
 }
 
 /// `attach`: `escape` is applied by the client's terminal, so over `--host`
-/// the remote tendr ignores it.
+/// the remote tendr ignores it. `protocol` is the newest attach protocol
+/// version the client speaks; the remote tendr speaks the newest both do
+/// ([`tendr::attach_proto::Version::negotiate`]). A request from a client that
+/// predates the field has none, which means version 1, and a remote tendr
+/// that predates it ignores it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachRequest {
     pub session: String,
     pub namespace: Option<String>,
     pub takeover: bool,
     pub escape: EscapeMode,
+    #[serde(default)]
+    pub protocol: u8,
 }
 
 #[cfg(windows)]
@@ -353,6 +359,7 @@ impl TryFrom<&Commands> for RemoteOperation {
                     AttachEscape::CtrlBackslash => EscapeMode::CtrlBackslash,
                     AttachEscape::None => EscapeMode::Disabled,
                 },
+                protocol: tendr::attach_proto::Version::LATEST as u8,
             }),
             Commands::Run { .. } => return local("run"),
             Commands::Exec { .. } => return local("exec"),
