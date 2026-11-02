@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **On Windows, `tendr query` no longer lends DuckDB your pipes.** DuckDB,
+  and anything it started that outlived it, held all of the stdin, stdout
+  and stderr tendr was given, as `ssh` did before 0.5.0: Windows hands a
+  child every inheritable handle. `query --version` passed all three, and a
+  query passed your stdin though tendr sends the SQL through a pipe of its
+  own. tendr now starts DuckDB as it starts ssh, giving it only what it
+  means to: its stdout and stderr for a query, all three for `--shell`.
+
 ## v0.6.0 — `attach --host` survives dropped connections
 
 Works with 0.5.0 in both directions over `--host`: an attach between a 0.6.0

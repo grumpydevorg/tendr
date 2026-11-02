@@ -1,5 +1,6 @@
 //! Test fixture: a portable stand-in for `ssh`, linked or copied into a temp
-//! PATH dir as `ssh` (`ssh.exe` on Windows) by `harness::fake_ssh` in `tests/`.
+//! PATH dir as `ssh` (`ssh.exe` on Windows) by `harness::fake_ssh` in `tests/`,
+//! or under another name, such as `duckdb`, by `harness::fake_program`.
 //!
 //! What it does is read from the file `fake-ssh-actions` beside it (the
 //! `FAKE_SSH` environment variable, if set, takes precedence). It holds one
@@ -21,6 +22,12 @@
 //!                   also inherits every inheritable handle we hold, our
 //!                   stdin and stdout among them, as the ProxyCommand of an
 //!                   ssh without a handle allow-list does.
+//! orphan <secs> <exe>
+//!                   start <exe> (this fixture's built binary) sleeping <secs>,
+//!                   given none of our stdio: our stdin, stdout and stderr
+//!                   are made non-inheritable first. So on Windows it holds
+//!                   only the handles we were handed but not given as stdio,
+//!                   which are our parent's to keep from us.
 //! close-stderr      close our stderr
 //! sleep <secs>      sleep
 //! exit <code>       exit with <code>
@@ -115,6 +122,22 @@ fn main() {
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap();
+            }
+            "orphan" => {
+                let (secs, exe) = value
+                    .split_once(' ')
+                    .expect("fake ssh: orphan <secs> <exe>");
+                #[cfg(windows)]
+                std_handles_not_inheritable();
+                // Deliberately not waited for: it must outlive us.
+                #[allow(clippy::zombie_processes)]
+                let _orphan = Command::new(exe)
+                    .env(ENV, format!("sleep {secs}"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
                     .spawn()
                     .unwrap();
             }
@@ -362,4 +385,19 @@ fn close_stderr() {
     // SAFETY: closes this process's own stderr handle; nothing in this
     // process writes to stderr afterwards.
     unsafe { CloseHandle(GetStdHandle(STD_ERROR_HANDLE)) };
+}
+
+/// Keep our own stdin, stdout and stderr from being inherited by what we
+/// start, so it holds only the other inheritable handles we were handed.
+#[cfg(windows)]
+fn std_handles_not_inheritable() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: only clears a flag on this process's own std handle; a
+        // missing one makes the call fail, harmlessly.
+        unsafe { SetHandleInformation(GetStdHandle(which), HANDLE_FLAG_INHERIT, 0) };
+    }
 }

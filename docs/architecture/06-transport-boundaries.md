@@ -298,8 +298,9 @@ before the remote tendr starts.
   A Windows client's `attach` gives ssh all three of tendr's streams.
 - No other stream of tendr's reaches ssh. Windows hands a child every
   inheritable handle in its parent, and the std handles tendr inherited are
-  inheritable, so `spawn` in `src/ssh.rs` clears `HANDLE_FLAG_INHERIT` on
-  them first. The streams tendr does give ssh are unaffected: std passes
+  inheritable, so `spawn_external` in `src/platform/mod.rs` clears
+  `HANDLE_FLAG_INHERIT` on them first; `tendr query` starts duckdb through
+  it too. The streams tendr does give ssh are unaffected: std passes
   each as an inheritable duplicate. Everything a `--host` call opens itself
   is already non-inheritable. Other inheritable handles the caller leaked into
   tendr (often the caller's own stdio) still pass through, as a leaked fd

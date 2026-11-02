@@ -236,3 +236,55 @@ fn query_tolerates_a_malformed_line() {
         .success()
         .stdout(predicate::str::contains("2"));
 }
+
+/// A duckdb that leaves something running (a process it started that does not
+/// get its stdio) does not keep the caller's stdin, stdout or stderr open once
+/// tendr exits. tendr gives duckdb a pipe for `--version`'s output and for the
+/// SQL, not the caller's handles. On Windows, where a child is handed every
+/// inheritable handle and not just the stdio it is given, that takes tendr
+/// keeping its own stdio from being inherited.
+#[test]
+fn query_is_not_held_open_by_what_duckdb_leaves_running() {
+    let root = TempDir::new().unwrap();
+    seed_mixed(&root);
+
+    for args in [&["query", "--version"][..], &["query", "SELECT 1"][..]] {
+        // The orphan runs from the built fake, not the linked `duckdb` copy,
+        // so it does not keep that copy (and its temp dir) in use on Windows.
+        let fake_dir = TempDir::new().unwrap();
+        let tmp = harness::fake_program(
+            "duckdb",
+            &format!(
+                "orphan 30 {}\nstdin {}\nout v1.4.0\\n",
+                assert_cmd::cargo::cargo_bin("fake_ssh").display(),
+                fake_dir.path().join("script").display()
+            ),
+        );
+        let started = std::time::Instant::now();
+        let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+            .args(args)
+            .env("HOME", root.path())
+            .env("PATH", tmp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let output = child.wait_with_output().unwrap();
+        let took = started.elapsed();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "{args:?} took {took:?}: {stderr}"
+        );
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        // Nothing reads the caller's stdin any more: a write to it fails.
+        use std::io::Write;
+        assert!(
+            stdin.write_all(b"x").and_then(|()| stdin.flush()).is_err(),
+            "{args:?}: the caller's stdin is still open for reading"
+        );
+    }
+}

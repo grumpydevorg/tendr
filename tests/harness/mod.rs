@@ -171,15 +171,22 @@ pub fn echo_env_cmd(path: &Path) -> String {
 /// PATH is in use.
 #[allow(dead_code)]
 pub fn fake_ssh(actions: &str) -> TempDir {
+    fake_program("ssh", actions)
+}
+
+/// A PATH dir holding only a fake `name` that runs `actions`, as `fake_ssh`
+/// does for ssh. Keep the TempDir alive while the PATH is in use.
+#[allow(dead_code)]
+pub fn fake_program(name: &str, actions: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();
-    let ssh = tmp
+    let program = tmp
         .path()
-        .join(format!("ssh{}", std::env::consts::EXE_SUFFIX));
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     let bin = assert_cmd::cargo::cargo_bin("fake_ssh");
     // A hard link never holds the executable open for writing, so a fork in
     // a parallel test cannot make exec fail with ETXTBSY; copy across devices.
-    if std::fs::hard_link(&bin, &ssh).is_err() {
-        std::fs::copy(&bin, &ssh).unwrap();
+    if std::fs::hard_link(&bin, &program).is_err() {
+        std::fs::copy(&bin, &program).unwrap();
     }
     std::fs::write(tmp.path().join("fake-ssh-actions"), actions).unwrap();
     tmp
