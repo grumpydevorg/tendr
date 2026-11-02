@@ -389,10 +389,11 @@ fn a_gone_resume_says_what_was_missed_and_resets_the_modes() {
     attach.wait_text("tendr: reconnected; 5 bytes of output were written");
     attach.wait_text("after-gone");
     // With the mode off a paste's start is a key like any other, and the
-    // escape after it detaches.
+    // escape after it detaches. The detach, a control, may overtake the
+    // key.
     attach.pty.write(&[PASTE_START, DETACH].concat());
     attach.wait_frames("the detach", |frames| {
-        frames.last().map(String::as_str) == Some("Detach")
+        frames.iter().any(|frame| frame == "Detach")
     });
     assert_eq!(attach.finish(), 0);
 }
