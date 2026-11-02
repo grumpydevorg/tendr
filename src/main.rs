@@ -892,12 +892,6 @@ fn main() {
         // same constant command line; the remote tendr bridges it to the
         // session's attach socket.
         if let remote_op::RemoteOperation::Attach(request) = &operation {
-            // The remote end does not bridge a read-only attach yet: refuse it
-            // here, before ssh, rather than have the remote refuse its hello.
-            if request.read_only {
-                eprintln!("error: attach --read-only does not support --host yet");
-                std::process::exit(2);
-            }
             let frame = remote_frame::encode(&operation).unwrap_or_else(|e| {
                 eprintln!("error: {e}");
                 std::process::exit(2);

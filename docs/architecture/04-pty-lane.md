@@ -194,8 +194,8 @@ flowchart LR
   the controller's size, not its own.
 - `attach --read-only` is the watcher client: it drops keystrokes, says so
   once on the status line at the first one, and still detaches with the
-  escape. With `--host` it is refused (exit 2) until the attach bridge
-  passes watchers through.
+  escape. With `--host` the attach bridge passes it through, and it
+  reconnects as a watcher ([Attaching over `--host`](#attaching-over---host)).
 - With no terminal (stdin or stdout is not one), `attach --read-only`
   streams instead: the client's no-terminal layer never reads stdin and
   waits only on the connection and the cancelling signals. stdout gets the
@@ -204,10 +204,11 @@ flowchart LR
   notice goes to stderr. When the sidecar closes the connection, the client
   reads `meta.json` for up to 2 s, or up to 30 s once the attach socket is
   gone (the run is ending and recording it): the run ended (0), or the
-  watcher was cut off, evicted a ring behind or shut by the sidecar (84). A
-  write to stdout that fails (a pipeline's
-  consumer gone) sends `MSG_DETACH` and exits 1; a cancelling signal exits
-  1 as for any attach.
+  watcher was cut off, evicted a ring behind or shut by the sidecar (84).
+  Over `--host` the remote tendr reads it and the client exits with its
+  verdict ([transport boundaries](06-transport-boundaries.md#the-attach-bridge)).
+  A write to stdout that fails (a pipeline's consumer gone) sends
+  `MSG_DETACH` and exits 1; a cancelling signal exits 1 as for any attach.
 
 ### Resuming a viewer
 
@@ -250,6 +251,16 @@ bytes ([design](../design.md#a-resume-decides-control-and-output-on-one-connecti
     treats that as a protocol failure (80), since its own count is broken.
 - A sidecar that predates resuming refuses `MSG_RESUME` with the protocol
   class, as it refuses anything that is not a hello.
+- A watcher resumes with its own frame, `MSG_WATCH_RESUME`: `[run id 16
+  bytes][offset u64]`, the encoding of `MSG_WATCHING`, with no epoch
+  ([design](../design.md#a-watch-resume-carries-no-epoch)). It takes a
+  watcher's slot and never reaches the input writer: a resume for another
+  run is refused (81), and otherwise the sidecar answers it as above, at
+  epoch 0, which names no control: `MSG_RESUMED` with the output from the
+  offset asked for, or `MSG_GONE` with the mode replay and the output from
+  the head. The watcher reads only the run and the offsets, and after a
+  gone answer sends no size and no repaint. A sidecar from before watch
+  resumes refuses the frame with the protocol class (80 on the client).
 
 ### Refusals
 
@@ -399,14 +410,15 @@ tendr that bridges them to the session's socket
   applies the 10 s reply deadline and classifies the reply, so refusals keep
   their exit codes. On success it passes the sidecar's acceptance to the
   client as it came.
-- On a version 2 attach, the client keeps the run, the epoch and the offset
-  just past the last output byte written to the terminal. It moves the
-  offset under the lock it writes the terminal under, once the write has
-  succeeded, so the offset never counts bytes the terminal did not take.
-  Stamped output that does not start at that offset, or any stamped output
-  on a version 1 attach, is a protocol failure: the client restores the
-  terminal and exits 80. The local `attach` speaks version 1: it does not
-  reconnect, so it has no use for offsets.
+- On a version 2 attach, the client keeps the run, the offset just past the
+  last output byte written to the terminal and, for a controller, the epoch;
+  a read-only attach is always version 2 over `--host`, and keeps the run
+  and offset. It moves the offset under the lock it writes the terminal
+  under, once the write has succeeded, so the offset never counts bytes the
+  terminal did not take. Stamped output that does not start at that offset,
+  or any stamped output on a version 1 attach, is a protocol failure: the
+  client restores the terminal and exits 80. The local `attach` speaks
+  version 1: it does not reconnect, so it has no use for offsets.
 - The sidecar keeps the controller epochs and the recording. The bridge only
   passes frames on; it decides nothing about control.
 - A client that stops reading backs up its output through ssh and the
@@ -429,7 +441,8 @@ tendr that bridges them to the session's socket
     resumes from that point over a new ssh with `BatchMode=yes`
     (`commands::attach::resume_host`): the request carries the point, and a
     `MSG_RESUME` takes the hello's place on ssh's stdin, which the bridge
-    passes on ([Resuming a viewer](#resuming-a-viewer)).
+    passes on ([Resuming a viewer](#resuming-a-viewer)). A watcher's
+    request stays read-only, and its frame is `MSG_WATCH_RESUME`.
   - A transport failure (255 without a trailer, a signal, the connect
     deadline) is tried again after 1 s, doubling to at most 30 s, with no
     limit on the number of attempts. Any remote verdict ends it: a refusal
@@ -455,8 +468,13 @@ tendr that bridges them to the session's socket
     and a notice of how many bytes it missed and how many the session no
     longer held, then relays the replay and the output from the head; the
     notice is printed again once the terminal is restored, since a program
-    on the alternate screen covers it. Either way it then sends its size and
-    the repaint nudge, the size first so the nudge can apply.
+    on the alternate screen covers it. Either way a controller then sends
+    its size and the repaint nudge, the size first so the nudge can apply;
+    a watcher sends neither.
+  - Without a terminal (a read-only attach streaming to stdout, Unix only),
+    stdout still gets only the session's output: the status lines and the
+    gone notice go to stderr, a line each, and so does ssh's stderr, as it
+    comes; no mode reset is written to stdout.
 - A Windows client drives its console through the Windows terminal layer
   (`src/commands/attach/terminal/windows.rs`), and ssh through
   `tendr::platform::spawn_external`, as every other ssh tendr starts:

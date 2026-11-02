@@ -42,16 +42,29 @@ struct Client {
 
 impl Client {
     fn spawn(root: &TempDir, path: &std::ffi::OsStr, args: &[&str]) -> Self {
-        let mut child = Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        Self::spawn_on(root, path, args, true)
+    }
+
+    /// `tendr` with `args`, on the test terminal if `terminal`, or else with
+    /// no terminal at all: stdin closed, stdout a pipe.
+    fn spawn_on(root: &TempDir, path: &std::ffi::OsStr, args: &[&str], terminal: bool) -> Self {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin("tendr"));
+        command
             .args(args)
             .env("HOME", root.path())
             .env("PATH", path)
-            .env("TENDR_TEST_ATTACH_TERMINAL", format!("{ROWS}x{COLS}"))
-            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        if terminal {
+            command
+                .env("TENDR_TEST_ATTACH_TERMINAL", format!("{ROWS}x{COLS}"))
+                .stdin(Stdio::piped());
+        } else {
+            command
+                .env_remove("TENDR_TEST_ATTACH_TERMINAL")
+                .stdin(Stdio::null());
+        }
+        let mut child = command.spawn().unwrap();
         let collect = |mut from: Box<dyn Read + Send>| {
             let into = Arc::new(Mutex::new(Vec::new()));
             let shared = Arc::clone(&into);
@@ -136,14 +149,29 @@ struct Remote {
 impl Remote {
     /// `script` with `{log}` standing for the frames log.
     fn new(script: &str) -> Self {
+        Self::after("", script)
+    }
+
+    /// [`Remote::new`], with the fake ssh's `actions` (each `{drop}`
+    /// standing for the file [`Remote::drop_link`] creates) run before the
+    /// script.
+    fn after(actions: &str, script: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let frames = dir.path().join("frames");
+        let drop = dir.path().join("drop");
         let script = script.replace("{log}", frames.to_str().unwrap());
+        let actions = actions.replace("{drop}", drop.to_str().unwrap());
         Self {
-            ssh: fake_ssh(&format!("script\n{script}")),
+            ssh: fake_ssh(&format!("{actions}\nscript\n{script}")),
             _dir: dir,
             frames,
         }
+    }
+
+    /// Lose the link of a remote made [`Remote::after`] `give-up-if {drop}`:
+    /// the call under way says ssh's keepalive timeout and exits 255.
+    fn drop_link(&self) {
+        std::fs::write(self.frames.with_file_name("drop"), b"").unwrap();
     }
 
     /// `tendr --host box attach s` against this remote.
@@ -152,6 +180,17 @@ impl Remote {
             root,
             &shim_path_env(&self.ssh),
             &["--host", "box", "attach", "s"],
+        )
+    }
+
+    /// `tendr --host box attach --read-only s` against this remote, on the
+    /// test terminal if `terminal`.
+    fn watch(&self, root: &TempDir, terminal: bool) -> Client {
+        Client::spawn_on(
+            root,
+            &shim_path_env(&self.ssh),
+            &["--host", "box", "attach", "--read-only", "s"],
+            terminal,
         )
     }
 
@@ -309,25 +348,136 @@ fn a_scripted_resume_that_is_gone_says_what_was_missed() {
 }
 
 /// A read-only attach drops what is typed and says so once on the screen,
-/// through the terminal layer like every write. `attach --host` refuses
-/// `--read-only` before ssh for now, so this one is local, against a real
-/// session, which needs a PTY: Unix only.
-#[cfg(unix)]
+/// through the terminal layer like every write, and sends the session
+/// nothing but its detach: no size, no repaint, no keystrokes.
 #[test]
 fn a_read_only_attach_says_typing_is_dropped() {
     let root = TempDir::new().unwrap();
-    let _kill = harness::SessionGuard::new(&root, "ro");
-    let started = harness::tendr(&root)
-        .args(["start", "ro", "--pty", "--stdin", "--", "sh"])
-        .output()
-        .unwrap();
-    assert!(started.status.success(), "{started:?}");
-    harness::wait_running(&root, "ro");
-
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut client = Client::spawn(&root, &path, &["attach", "--read-only", "ro"]);
+    let remote = Remote::new(
+        "watch log {log}\n\
+         watch answer\n\
+         watch output watched\n\
+         watch drain",
+    );
+    let mut client = remote.watch(&root, true);
+    client.wait_screen(&["watched"]);
     client.type_bytes(b"x");
     client.wait_screen(&["tendr: read-only attach; typed input is dropped"]);
     client.type_bytes(DETACH);
     assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+    assert_eq!(
+        remote.frames(),
+        debug(&[
+            Frame::Hello {
+                version: Version::V1,
+                mode: Mode::Watch,
+            },
+            Frame::Detach,
+        ])
+    );
+}
+
+/// A watcher whose link is lost resumes with its own frame, the watch
+/// resume, which carries no epoch, from just past the last byte shown; the
+/// output goes on from there, and the new connection, like the first, is
+/// sent no size and no repaint.
+#[test]
+fn a_scripted_watcher_resumes_with_a_watch_resume_and_never_sizes() {
+    let root = TempDir::new().unwrap();
+    let remote = Remote::after(
+        "give-up-if {drop}",
+        "watch answer\n\
+         watch output one\n\
+         watch drain\n\
+         watch-resume log {log}\n\
+         watch-resume answer\n\
+         watch-resume output two\n\
+         watch-resume drain",
+    );
+    let mut client = remote.watch(&root, true);
+    client.wait_screen(&["one"]);
+    remote.drop_link();
+    client.wait_screen(&["one", "two"]);
+    client.type_bytes(DETACH);
+    assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+
+    let frames = remote.frames();
+    assert_eq!(frames[1..], debug(&[Frame::Detach]), "{frames:?}");
+    assert!(
+        frames[0].starts_with("WatchResume(") && frames[0].contains("offset: 3 "),
+        "the watch resume asks for the offset past \"one\": {frames:?}"
+    );
+}
+
+/// A watcher's resume the session can no longer serve resets the modes the
+/// screen had, says how much output was missed, and goes on from the head,
+/// still sending no size and no repaint.
+#[test]
+fn a_scripted_watcher_resume_that_is_gone_says_what_was_missed() {
+    let root = TempDir::new().unwrap();
+    let remote = Remote::after(
+        "give-up-if {drop}",
+        "watch answer\n\
+         watch output-hex 1b5b3f32303034686f6e65\n\
+         watch drain\n\
+         watch-resume log {log}\n\
+         watch-resume gone 5\n\
+         watch-resume output two\n\
+         watch-resume drain",
+    );
+    let mut client = remote.watch(&root, true);
+    client.wait_screen(&["one"]);
+    remote.drop_link();
+    client.wait_screen(&[
+        "one",
+        "\x1b[?2004l",
+        "reconnected; 5 bytes of output were written while disconnected, \
+         and the session no longer held 1 of them",
+        "two",
+    ]);
+    client.type_bytes(DETACH);
+    assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+    assert_eq!(remote.frames()[1..], debug(&[Frame::Detach]));
+}
+
+/// Without a terminal, a watcher's stdout gets the session's output and
+/// nothing else across a lost link, a gone resume included: no mode resets,
+/// no status line, no notice. Those go to stderr. Its exit code is the
+/// remote's verdict on how the session ended it: 0 when the run ended, 84
+/// when the session cut it off. Only Unix has a no-terminal layer.
+#[cfg(unix)]
+#[test]
+fn a_scripted_watcher_without_a_terminal_keeps_stdout_to_the_output() {
+    for verdict in [0, 84] {
+        let root = TempDir::new().unwrap();
+        let remote = Remote::after(
+            "give-up-if {drop}",
+            &format!(
+                "watch answer\n\
+                 watch output-hex 1b5b3f32303034686f6e65\n\
+                 watch drain\n\
+                 watch-resume gone 5\n\
+                 watch-resume output two\n\
+                 watch-resume exit {verdict}"
+            ),
+        );
+        let mut client = remote.watch(&root, false);
+        poll_until(WAIT, Duration::from_millis(20), || {
+            if client.screen().ends_with("one") {
+                Observation::Ready(())
+            } else {
+                Observation::Pending(client.screen())
+            }
+        })
+        .unwrap();
+        remote.drop_link();
+        assert_eq!(client.wait_exit(), verdict, "{}", client.stderr());
+        assert_eq!(client.screen(), "\x1b[?2004honetwo");
+        let stderr = client.stderr();
+        assert!(
+            stderr.contains("tendr: connection lost, reconnecting")
+                && stderr.contains("the session no longer held 1 of them"),
+            "{stderr}"
+        );
+    }
 }

@@ -2733,8 +2733,9 @@ enum Ask {
 /// takeover or resume through the input writer; then relay input and
 /// resizes until detach, disconnect, or retirement. A version 2 viewer of
 /// the run `run_id` is told where its output starts and gets it stamped
-/// with offsets. A watch hello goes to [`handle_watch_connection`] instead,
-/// and a push to [`handle_push_connection`].
+/// with offsets. A watch hello or a watch resume goes to
+/// [`handle_watch_connection`] instead, and a push to
+/// [`handle_push_connection`].
 ///
 /// A resume decides control and output on this one connection: once the
 /// control rule grants it ([`crate::model::pty_control::InputArbiter::resume`]),
@@ -2789,7 +2790,41 @@ fn handle_attach_connection(
             };
             let _ = stream.set_read_timeout(None);
             let holder = writer.next_holder();
-            return handle_watch_connection(stream, run_id, version, holder, registry, attach_sink);
+            return handle_watch_connection(
+                stream,
+                run_id,
+                version,
+                None,
+                holder,
+                registry,
+                attach_sink,
+            );
+        }
+        // A watcher's resume: a watcher's slot, and never the input writer,
+        // whose control rule its point has no epoch to reach. Resuming is
+        // part of version 2.
+        Ok(Frame::WatchResume(point)) => {
+            let Some(_slot) = pools.watchers.take() else {
+                return reject_full(&mut stream);
+            };
+            let _ = stream.set_read_timeout(None);
+            if point.run_id != run_id {
+                return reject_connection(
+                    &mut stream,
+                    RejectClass::Control,
+                    "cannot resume: the run it was attached to is not running",
+                );
+            }
+            let holder = writer.next_holder();
+            return handle_watch_connection(
+                stream,
+                run_id,
+                Version::V2,
+                Some(point.offset),
+                holder,
+                registry,
+                attach_sink,
+            );
         }
         Ok(Frame::Hello {
             version,
@@ -2944,9 +2979,16 @@ fn handle_attach_connection(
 }
 
 /// One read-only viewer of the run `run_id`, registered as `holder`: told
-/// where its output starts ([`crate::attach_proto::Frame::Watching`]), sent
-/// that output (stamped for version 2) until it detaches, disconnects, falls
-/// a ring behind, or the run ends.
+/// where its output starts, then sent that output (stamped for version 2)
+/// until it detaches, disconnects, falls a ring behind, or the run ends.
+///
+/// A fresh watcher is told [`crate::attach_proto::Frame::Watching`] and
+/// starts at the head with the mode replay. One resuming from the offset
+/// `resume` is answered as a resuming controller is, at
+/// [`ControllerEpoch::ZERO`](crate::model::pty_control::ControllerEpoch::ZERO),
+/// which names no control: resumed, with the output from that offset and
+/// no mode replay, or gone, naming what the ring holds, with the mode
+/// replay and the output from the head.
 ///
 /// It never reaches the input writer: it asks for no control, so no
 /// control event records it and no takeover retires it, and its input,
@@ -2956,11 +2998,15 @@ fn handle_watch_connection(
     mut stream: std::os::unix::net::UnixStream,
     run_id: RunId,
     version: crate::attach_proto::Version,
+    resume: Option<u64>,
     holder: crate::model::pty_control::HolderId,
     registry: &ConnectionRegistry,
     attach_sink: &AttachSink,
 ) {
-    use crate::attach_proto::{Frame, FrameError, WatchPoint, read_frame, write_frame};
+    use crate::attach_proto::{
+        Frame, FrameError, ResumePoint, WatchPoint, read_frame, write_frame,
+    };
+    use crate::model::pty_control::ControllerEpoch;
 
     let (Ok(conn_stream), Ok(control), Ok(shutdown)) =
         (stream.try_clone(), stream.try_clone(), stream.try_clone())
@@ -2986,13 +3032,25 @@ fn handle_watch_connection(
         attach_sink,
         holder,
         Seat::Watcher,
-        None,
+        resume,
         disconnect,
     );
-    let reply = Frame::Watching(WatchPoint {
+    let point = ResumePoint {
         run_id,
+        epoch: ControllerEpoch::ZERO,
         offset: placement.from,
-    });
+    };
+    let reply = match (resume, placement.gone) {
+        (None, _) => Frame::Watching(WatchPoint {
+            run_id,
+            offset: placement.from,
+        }),
+        (Some(_), None) => Frame::Resumed(point),
+        (Some(_), Some(span)) => Frame::Gone {
+            point,
+            oldest: span.oldest,
+        },
+    };
     // Its sender starts only after the reply, so no output comes ahead of it.
     let accepted = write_frame(&mut *lock(&conn), &reply);
     let installed = viewer.map(|viewer| {
