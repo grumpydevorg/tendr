@@ -1,5 +1,6 @@
-# Written by the scripts: run output, the VM's sshd-accept host key, and the
-# processes treekill.py saw survive.
+# Written by the scripts: run output, the VM's sshd-accept host key, the
+# processes treekill.py saw survive, and readonly.py's import of resume.py.
 out/
 known_hosts.acc
 treekill/*.survivors
+__pycache__/

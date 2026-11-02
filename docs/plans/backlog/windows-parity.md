@@ -1,6 +1,6 @@
 ---
 id: windows-parity
-depends_on: [remote-frame-transport]
+depends_on: []
 ---
 
 # Windows parity
@@ -8,8 +8,9 @@ depends_on: [remote-frame-transport]
 **Status:** not started. Starts when a Windows user hits a gap below. Each gap
 is a separate change; none waits for
 another except ConPTY, which reuses the suspended launcher. General `--host` use
-against a Windows host is fixed by
-[remote frame transport](../active/01_remote-frame-transport.md), not here.
+against a Windows host already travels as
+[remote frames](../../architecture/06-transport-boundaries.md#the-remote-frame)
+and is not part of this plan.
 
 Goal: a Windows client or host keeps the same observable contracts as POSIX:
 commands, output shapes, exit codes, survival across disconnects, and

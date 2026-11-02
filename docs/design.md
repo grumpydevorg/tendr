@@ -210,8 +210,8 @@ so the bytes it missed and the live output join by construction, with no gap
 and no duplicate. It also keeps capture from ever waiting on a viewer, and
 bounds memory to one ring per run however many viewers it gets. The ring
 holds bytes, not capture's chunks, so a cursor can stand at any offset and
-tiny chunks cost no per-chunk overhead. Source: step 1 of
-[remote frame transport](plans/active/01_remote-frame-transport.md) at `d282062`.
+tiny chunks cost no per-chunk overhead. Source: step 1 of the remote frame
+transport plan (`docs/plans/active/01_remote-frame-transport.md`) at `d282062`.
 
 ### Viewers count output in bytes, and agree the version in the request
 
@@ -230,8 +230,8 @@ the sidecar, take only the exact version 1 hello, while the 0.5.0 remote
 ignores an unknown request field. So a new client keeps working against an
 old remote, and a new remote against a sidecar started by an old one; the
 steps are in [the attach bridge](architecture/06-transport-boundaries.md#the-attach-bridge).
-Source: step 1 of
-[remote frame transport](plans/active/01_remote-frame-transport.md) at `d282062`.
+Source: step 1 of the remote frame transport plan
+(`docs/plans/active/01_remote-frame-transport.md`) at `d282062`.
 
 ### A resume decides control and output on one connection
 
@@ -254,7 +254,8 @@ disconnect then releases nothing, and its queued input cannot be written.
 The change is recorded with its own trigger, `resume`, so a client checking
 the event log for a takeover of its epoch never mistakes a resume for one,
 while a takeover of the resumed client still reads as a takeover. Source:
-step 1 of [remote frame transport](plans/active/01_remote-frame-transport.md) at `d282062`.
+step 1 of the remote frame transport plan
+(`docs/plans/active/01_remote-frame-transport.md`) at `d282062`.
 
 ### A dropped `attach --host` reconnects by itself, judged by ssh's exit
 
@@ -298,8 +299,8 @@ end, at the 30 s connect deadline.
 Input typed while reconnecting is discarded with one notice, never queued:
 keystrokes sent seconds late to a program that has moved on can do harm, and
 the user cannot see what they would land on until the screen is back.
-Source: step 1 of
-[remote frame transport](plans/active/01_remote-frame-transport.md) at `d282062`.
+Source: step 1 of the remote frame transport plan
+(`docs/plans/active/01_remote-frame-transport.md`) at `d282062`.
 
 ### Watchers never touch control
 
@@ -312,8 +313,8 @@ detach. A human holding the session therefore does not keep a watcher out,
 locally or over `--host`, and a takeover never retires one. Taking control
 means attaching again with `--takeover` (Rick's decision), never upgrading
 a watcher in place, which would put a second path into the control rule.
-Source: step 1 of
-[remote frame transport](plans/active/01_remote-frame-transport.md) at `6612733`.
+Source: step 1 of the remote frame transport plan
+(`docs/plans/active/01_remote-frame-transport.md`) at `6612733`.
 
 ### A watch resume carries no epoch
 
@@ -329,7 +330,8 @@ epoch 0, which names no control, since the watcher reads only their run and
 offsets; the remote request still carries an `epoch` field, set to 0, only
 because a remote from before watch resumes requires the field to refuse
 the frame with 80 rather than reject the request with 2. Source: step 1 of
-[remote frame transport](plans/active/01_remote-frame-transport.md) at `6612733`.
+the remote frame transport plan
+(`docs/plans/active/01_remote-frame-transport.md`) at `6612733`.
 
 ### Windows uses Job Objects and a hidden console
 
