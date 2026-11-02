@@ -318,7 +318,9 @@ concurrent `push` is refused, not interleaved.
   reader; stderr says how many bytes of the run's output it had), and 1
   when its stdout closes (the reader gone), which detaches it. A session
   started by an older `tendr` cannot say whether the last of the output
-  arrived: then 0 means only that the run ended. Over
+  arrived: then 0 means only that the run ended. The run's own record
+  (`status`, its exit code) can land a moment after a 0; `tendr wait`
+  waits for it. Over
   `--host` the remote host tells 0 from 84, and a dropped connection
   reconnects without anything reaching stdout: the reconnect's status lines
   and notices go to stderr. Without `--read-only`, attach still needs a

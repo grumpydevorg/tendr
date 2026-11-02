@@ -121,7 +121,13 @@ flowchart LR
   - Once a viewer's sender has sent the run's last byte, it sends
     `MSG_OUTPUT_END`, `[final offset u64]`, and nothing more. A viewer cut
     off before then (evicted a ring behind, retired, or shut at the run's
-    end while still behind) never gets it.
+    end while still behind) never gets it. That includes one whose
+    connection took the last output but not the end itself before the
+    session stopped waiting: it has every byte, but cannot know it, and is
+    counted cut off.
+  - It comes as the session flushes its viewers, before the run's end is
+    recorded, so a client that exits on it may do so a moment before
+    `meta.json` and the event log say the run ended.
   - The viewer's output must have reached that offset; an end at any other
     is a protocol failure (80).
   - Only a version 3 hello or resume asks for it, so no client from before
@@ -138,9 +144,10 @@ flowchart LR
   `MSG_DATA`, version 2 `MSG_OUTPUT`, as for a controller, and version 3
   also `MSG_OUTPUT_END`. One accept serves every version: only a client
   that sends a watch hello receives it, and every such client knows it. A
-  sidecar from before watchers decodes `[2, 4]` as an unsupported hello and
-  refuses with the protocol class; the client then exits 80 saying so,
-  never trying version 1. A client refuses (80) a controller's accept to
+  sidecar from before watchers decodes `[3, 4]` and `[2, 4]` as
+  unsupported hellos and refuses each with the protocol class; the client
+  then exits 80 saying so, never trying version 1. A client refuses (80) a
+  controller's accept to
   its watch hello, so it never attaches with control it did not ask for.
 - Instead of a hello, a version 2 viewer whose connection was lost can send
   `MSG_RESUME` to regain its control and output

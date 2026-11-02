@@ -277,8 +277,9 @@ mod unix {
                     if attach_proto::write_frame(&mut io::stdout().lock(), &frame).is_err() {
                         return End::Left;
                     }
+                    // A takeover that landed as the run ended still wins.
                     if matches!(frame, Frame::OutputEnd(_)) {
-                        return End::Ended;
+                        return if retired { End::TakenOver } else { End::Ended };
                     }
                 }
                 Err(FrameError::Malformed(_) | FrameError::Unknown(_)) => {}
