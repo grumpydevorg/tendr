@@ -11,10 +11,8 @@ and `attach` from a Unix client bridges the attach protocol over it
 ([attach bridge](../../architecture/06-transport-boundaries.md#the-attach-bridge)).
 A dropped `attach --host` link resumes where its terminal left off, accepted
 on the VM on 2026-11-02
-([results](../../../scripts/pty-vm/README.md#resuming-attach---host)); one
-manual check that only Rick can run, the Tailscale approval URL in the
-status line, is pending there and does not block. What is left is
-read-only viewers and moving Windows clients off `ssh -t`.
+([results](../../../scripts/pty-vm/README.md#resuming-attach---host)). What
+is left is read-only viewers and moving Windows clients off `ssh -t`.
 
 Goal: a viewer that loses its connection can resume where it left off, and no
 client needs a remote terminal or a rebuilt command line.

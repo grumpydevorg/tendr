@@ -318,13 +318,15 @@ sidecar; otherwise the attach ends as before, with ssh's exit.
   makes its own ssh connection even where your ssh config shares one
   (`ControlMaster`), because a shared connection's checks are the master's.
 - While it reconnects, a line at the bottom of your terminal says so, and
-  ssh's latest error, such as its timeout or a Tailscale approval URL to
-  open in your browser, goes on the last row below it. What ssh says while
-  you are attached stays off the session's screen: the next reconnect shows
-  it there, or the attach prints it when it ends. A reconnect never prompts
-  (`ssh -o BatchMode=yes`): a login that needs a passphrase or a host-key
-  answer fails at once and is tried again. Load the key into your agent, or
-  approve the URL, and the next attempt gets through.
+  ssh's latest error, such as its timeout, goes on the last row below it.
+  What ssh says while you are attached stays off the session's screen: the
+  next reconnect shows it there, or the attach prints it when it ends. A
+  reconnect never prompts (`ssh -o BatchMode=yes`): a login that needs a
+  passphrase or a host-key answer fails at once and is tried again. Load the
+  key into your agent and the next attempt gets through. A lapsed Tailscale
+  SSH check-mode approval prints nothing; each attempt stops at the connect
+  deadline and is tried again, so the attach resumes on the first attempt
+  after the approval is renewed.
 - Attempts follow each other with pauses of 1, 2, 4, 8 and 16 s, then every
   30 s, for as long as it takes. `Ctrl-\ d`, SIGTERM, SIGHUP and SIGINT still
   leave (0, or 1 for a signal), and stop the attempt under way. The old

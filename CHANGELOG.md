@@ -8,7 +8,7 @@
   tendr reconnects by itself, keeps your terminal as it was, and shows every
   byte of output it missed, once, as if nothing had happened; then the
   program redraws. A status line at the bottom says it is reconnecting, with
-  ssh's error (such as its timeout or a Tailscale approval URL) below it;
+  ssh's latest error (such as its timeout) below it;
   what ssh says while you are attached never lands in the session's screen.
   It tries again after 1, 2, 4, 8 and 16 s, then every 30 s, until it gets
   through, the remote refuses, or you leave with `Ctrl-\ d` or a signal.
