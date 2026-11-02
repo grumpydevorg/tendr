@@ -209,6 +209,11 @@ flowchart LR
   verdict ([transport boundaries](06-transport-boundaries.md#the-attach-bridge)).
   A write to stdout that fails (a pipeline's consumer gone) sends
   `MSG_DETACH` and exits 1; a cancelling signal exits 1 as for any attach.
+- Accepted on an exe.dev VM over `--host` on 2026-11-03: eight watchers
+  and a controller with a ninth refused, four stalled hellos, takeovers
+  with watchers attached or stalled, a watcher's resume after a real drop,
+  and the no-terminal exits
+  ([results](../../scripts/pty-vm/README.md#read-only-viewers-over-attach---host)).
 
 ### Resuming a viewer
 

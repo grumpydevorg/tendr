@@ -9,7 +9,7 @@ drive the same PTY, with Claude the same process throughout and its output
 recorded exactly. What shipped for it is described in the
 [PTY lane](../../docs/architecture/04-pty-lane.md) and the
 [PTY recording format](../../docs/architecture/08-pty-recording-format.md).
-The last results are [below](#results-2026-11-02); a re-run starts there.
+The last results are [below](#results-2026-11-03); a re-run starts there.
 
 They were written on an exe.dev VM on 2026-09-26 and first used on
 2026-11-01, with tendr 0.4.1, Claude Code 2.1.316 and Ghostty 1.4.0.
@@ -62,6 +62,8 @@ Run `sync-vm.sh` again after changing a script.
 | `resume.py drop\|takeover\|gone` | Mac | Attaches with `tendr --host <alias> attach` from a fresh PTY, drops the link with `halfopen.sh` and checks the resume: the terminal's bytes, status rows taken out, against the recording; the reconnect's exit 81 after a takeover; the gone notice, mode reset and redraw after more than 32 MiB. Options: `--child claude\|sh`, `--drop N`, `--both yes`, `--master open\|none`, `--prompt TEXT`. Needs `VM_HOST`, `TENDR_BIN` and an `ssh` on `PATH` that resolves the alias (below) |
 | `recout.py <session> output\|len\|resizes` | VM | Reads a session's recording: its output bytes, their count, or its resize records with their output offsets |
 | `inject.py <session> <tag> <bytes> [<bytes_per_s>]` | VM | Writes numbered fields to the session's terminal (its PTY's slave side), which the sidecar captures as the child's output: known bytes in flight beside Claude Code |
+| `readonly.py admit\|stall\|resume\|takeover\|pipe` | Mac | Read-only viewers over `tendr --host <alias>` against a `keyprobe` session, each viewer's terminal checked against the recording: eight watchers and a controller with a ninth refused, then a takeover while watchers type (`admit`); watchers and controllers admitted beside four stalled hellos, refused beside five (`stall`); a watcher resuming after its own connection is dropped beside an untouched controller (`resume`); a takeover while the controller and a watcher are both stalled (`takeover`); no-terminal `attach --read-only` into a pipe, to the run's end and cut off (`pipe`). Option `--drop N`. Needs what `resume.py` needs |
+| `stall.py <session> <n> <seconds>` | VM | Holds n connections to the session's attach socket that never send a hello, reopening each the sidecar closes |
 | `treekill/treekill.py NAME MODE SETTLE [--timeout N] [--push DELAY:TEXT]… -- CMD…` | VM | Starts `CMD` in a PTY session tagged `S9K_TAG=NAME`, snapshots its process tree, stops it (`kill`, `force` or `timeout`) and reports, from 0 to 30 s after, which processes of the run (tagged, same session or group, or descendants) are still alive; writes `NAME.survivors` |
 | `treekill/run-shell.sh`, `treekill/run-agent.sh`, `treekill/devwrap.sh` | VM | The process-tree children of the [survivor table](#what-survives-a-stop): an interactive bash with `&`, `setsid`, `nohup`, `(cmd &)` and `disown` jobs; Claude Code or omp told to start a background and a `setsid` task; a dev server with forked workers |
 | `treekill/reap.py NAME…` | VM | Kills the survivors `treekill.py` recorded, if their pid and start time still match |
@@ -102,13 +104,43 @@ Host tvm
     ProxyJump <vm>.exe.xyz
 ```
 
+## Results (2026-11-03)
+
+### Read-only viewers over `attach --host`
+
+The acceptance of read-only viewers, the last step of the remote frame
+transport plan (`docs/plans/active/01_remote-frame-transport.md`), which this
+run closed and retired. On `tendr-pty.exe.xyz`: Ubuntu 24.04.5, kernel
+6.12.113, x86_64, 2 vCPU, OpenSSH 9.6p1 (`sshd` on `127.0.0.1:2222`). The
+client: macOS 27.0.1 (arm64), OpenSSH 10.3p1, `ssh` resolving `tvm` as
+[above](#scripts). tendr: main `0da4bf2` (0.6.0), release builds, on both
+ends.
+
+Every run: `PATH=/tmp/tvm/bin:$PATH VM_HOST=tendr-pty.exe.xyz
+TENDR_BIN=<checkout>/target/release/tendr readonly.py <scenario>`. The child
+is `keyprobe`, so every byte that reaches it is in the recording. Each
+viewer's terminal bytes, status rows taken out, are compared with the
+recording from the offset taken just before it attached. A watcher is
+admitted when its terminal gets the mode replay. A drop is `halfopen.sh
+--both --client-port` on one viewer's connection, singled out with `ss`
+before and after it attached, so only that connection is cut and the
+reconnect's new one is not; ssh's keepalives (5 s × 3) notice it.
+
+| Item | Result |
+|------|--------|
+| Eight watchers and a controller; a ninth refused (`admit`, two runs) | Pass. Each watcher was admitted 0.48–0.68 s after it started; sshd then held 8 connections, 9 with the controller. A ninth watcher exited 84 with `read-only attach refused: too many attach connections`, both before the controller attached and after. The controller got control 0.83–0.85 s after it started, with eight watchers attached |
+| Four stalled hellos (`stall`) | Pass. `stall.py` held connections to the session's socket that never sent a hello; the sidecar closed each after 5.12–5.24 s (`attach requires a protocol hello`) and `stall.py` reopened it within 0.5 ms. With five held, a watcher and a controller both exited 84 (`too many attach connections`). With four held, 5 of 5 rounds admitted a watcher (0.48–0.62 s) and a controller (control after 0.79–0.90 s), the controller's keystrokes reached the watcher, and both detached with 0; round 3 ran 0.3 s after the four were reopened |
+| A takeover with watchers attached; watchers' keystrokes (`admit`, two runs) | Pass. With eight watchers attached, `attach --takeover` over `--host` took control, and the first controller exited 81 (`another client took over this session`) 0.59–0.67 s after the takeover started. All eight watchers kept running and got both controllers' echoed keystrokes and 40 KB written after the takeover. Each showed the recording from its attach to the end (41,296 bytes) exactly and once, between the 8-byte mode replay and reset. Every watcher typed before and after the takeover; the child received only `@C1@@C2@`. Each watcher's status line said `tendr: read-only attach; typed input is dropped`. The event log's `pty.control_changed`: attach, takeover, detach, all the controllers' |
+| A watcher resumes after a real drop; the controller untouched (`resume --drop 30`, two runs; `inject.py` at 40 KB/s throughout) | Pass. The watcher noticed the drop after 19.25 s and 19.42 s and resumed 0.51 s and 0.61 s later, on a new connection while the old one was still dropped. It showed the recording from its attach on (3,000,053 bytes) exactly and once, with no injected field outside it. The controller showed its 3,000,086 bytes exactly, never saw a loss, kept control, and its keystrokes after the resume reached the child. The only `pty.control_changed`, before the drop and after the resume, was the controller's attach |
+| A takeover while the controller and a watcher are stalled (`takeover --drop 30`: both connections dropped, then 4 MiB written so both senders block) | Pass. The takeover over `--host` was admitted 0.57 s after it started and its keystrokes reached the child 1.17 s after it started. The watcher noticed the drop after 18.68 s, resumed 0.49 s later and showed its 4,196,431 bytes exactly and once. The old controller's reconnect was refused (`resume refused: cannot resume: control changed while disconnected; attach again`), exit 81. `pty.control_changed`: attach, takeover, detach |
+| No terminal (`pipe`, two runs) | Pass. `tendr --host tvm attach --read-only rp 2>err \| cat`, against a child that writes 4,000 lines and then `LAST-BYTES-OF-THE-RUN` and exits at once: exit 0 after 5.09–5.19 s, stdout the recording exactly (180,021 bytes, ending with the last bytes), stderr empty. Cut off: `\| (sleep 40; cat)` while 96 MiB were written in 2.7 s: exit 84 after 42.2 s with `tendr: the session cut this read-only attach off while the run was still running` on stderr, the run still running, and stdout exactly the recording's first 2,357,248 and 2,375,671 bytes (sha256) |
+
 ## Results (2026-11-02)
 
 ### Resuming `attach --host`
 
-The acceptance of resumable viewers (step 1 of the
-[remote frame transport plan](../../docs/plans/active/01_remote-frame-transport.md)
-at `d282062`, closed by this run),
+The acceptance of resumable viewers (step 1 of the remote frame transport
+plan at `d282062`, closed by this run),
 on `tendr-pty.exe.xyz`: Ubuntu 24.04.5, kernel 6.12.113, x86_64, 2 vCPU,
 OpenSSH 9.6p1 (`sshd` on `127.0.0.1:2222`), Claude Code 2.1.316 through
 exe.dev's LLM gateway. The client: macOS 27.0.1 (arm64), OpenSSH 10.3p1,
