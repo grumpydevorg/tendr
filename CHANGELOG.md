@@ -11,7 +11,7 @@
   full-screen program shows nothing new until it redraws, at the
   controlling terminal's size. A takeover leaves watchers attached, and
   watching never changes who holds the terminal. A session started by an
-  older `tendr` refuses it (80). Not yet over `--host`.
+  older `tendr` refuses it (80).
 - **Windows clients attach over the attach bridge.** `tendr --host <host>
   attach` from Windows now keeps the console on your machine, as from macOS
   and Linux: raw input, window resizes, the detach escape, mouse reporting,
@@ -28,14 +28,20 @@
   stdin, and exits 0 when the run ends, 84 when cut off, and 1 when its
   reader goes away, so an agent can watch a PTY session live.
 
+- **`attach --host --read-only` watches a remote session, and reconnects.**
+  A dropped connection resumes where the watcher stopped, with no gap and
+  no duplicate, and never touches who holds the terminal. Without a
+  terminal it streams to stdout as locally, with the reconnect's status on
+  stderr, and exits 0 when the run ends or 84 when the session cut it off.
+  An older remote `tendr` or session refuses it (80, or 81 when an old
+  remote's own check finds a human attached), and never attaches it.
+
 ### Changed
 
 - **`attach --host` from Windows takes any session name.** The `ssh -t`
   path it used, and with it the rule that its session and namespace be
   plain names (exit 2 otherwise), is gone: names travel as data in the
-  request, as from macOS and Linux. `attach --read-only --host` from
-  Windows is refused (2) as from macOS and Linux, until read-only viewers
-  work over `--host`.
+  request, as from macOS and Linux.
 - **Connections stalled before their hello no longer starve attaches.** A
   sidecar now admits at most five connections waiting for their hello,
   apart from the eight attaches, takeovers, resumes and pushes it serves: four
@@ -51,6 +57,12 @@
   query passed your stdin though tendr sends the SQL through a pipe of its
   own. tendr now starts DuckDB as it starts ssh, giving it only what it
   means to: its stdout and stderr for a query, all three for `--shell`.
+
+- **A client behind when the run ends gets the run's last output.** The
+  session closed every connection as soon as the run ended, so a client
+  still behind, a pipe consumer of `attach --read-only` included, could miss
+  the last bytes. It now sends every client everything first, waiting up to
+  2 s for one that is slow to read.
 
 ## v0.6.0 — `attach --host` survives dropped connections
 

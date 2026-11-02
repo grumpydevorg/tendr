@@ -172,7 +172,8 @@ impl Connection {
 /// --host`, the remote's when the remote ended it, otherwise 0. Another
 /// client taking it over is an error (exit 81), and so is session output
 /// that breaks the protocol (exit 80). `resume` is where a version 2
-/// attach's stamped output starts; `None` for version 1.
+/// attach's stamped output starts, a controller's or a watcher's; `None`
+/// for version 1.
 ///
 /// A read-only attach ([`Access::ReadOnly`]) sends no size, resize or
 /// repaint, and drops keystrokes, saying so once in the status line; the
@@ -181,12 +182,12 @@ impl Connection {
 /// A version 2 `attach --host` whose connection the far side ends, without
 /// a takeover or a broken protocol, hands ssh's end to a
 /// [`reconnect::Job`]: the remote's exit code ends the attach with it, and
-/// a lost link is resumed. Meanwhile keystrokes are discarded, with one
-/// notice in the status line; the escape and the signals still leave, and
-/// stop the reconnect's ssh.
+/// a lost link is resumed, a watcher's too. Meanwhile keystrokes are
+/// discarded, with one notice in the status line; the escape and the
+/// signals still leave, and stop the reconnect's ssh.
 pub(super) fn relay(
     link: Link,
-    resume: Option<attach_proto::ResumePoint>,
+    resume: Option<super::Point>,
     escape: EscapeMode,
     access: Access,
     peer: Peer<'_>,
@@ -215,9 +216,13 @@ pub(super) fn relay(
         terminal_gone: AtomicBool::new(false),
         output: terminal.output(),
     });
-    // From here on, what ssh says stays off the session's screen.
+    // From here on, what ssh says stays off the session's screen. With no
+    // status rows to show it on (no terminal), it goes to stderr as it
+    // comes, where the session's output is not.
     if let Some(end) = &host {
-        end.stderr.set(&status, &screen);
+        if screen.has_status_rows() {
+            end.stderr.set(&status, &screen);
+        }
     }
 
     let mut size = screen.size();
@@ -534,16 +539,24 @@ impl Screen {
     pub(super) fn is_terminal(&self) -> bool {
         self.output.is_terminal()
     }
+
+    /// Whether a reconnect's status can be drawn on the terminal's last
+    /// rows: there is a terminal of a known size. Without one (stdout not a
+    /// terminal, or a terminal stdout while stdin is not one, which leaves
+    /// the attach without a terminal layer) the status goes to stderr.
+    fn has_status_rows(&self) -> bool {
+        self.size().is_some()
+    }
 }
 
 /// The terminal as the session's output has left it.
 struct Shown {
     /// The modes turned on by everything written so far.
     modes: TermModes,
-    /// For a version 2 attach, the run and epoch it was accepted at, and
-    /// the offset just past the last output byte written to the terminal:
-    /// where a reconnect would resume. `None` for version 1.
-    resume: Option<attach_proto::ResumePoint>,
+    /// For a version 2 attach, its point in the run: the offset just past
+    /// the last output byte written to the terminal, where a reconnect
+    /// would resume, and a controller's epoch. `None` for version 1.
+    resume: Option<super::Point>,
 }
 
 /// Turn off the terminal modes the session turned on (the alternate
@@ -752,10 +765,10 @@ fn show(screen: &Screen, offset: Option<u64>, bytes: &[u8]) -> Result<bool, Stri
     if let Some(offset) = offset {
         match &shown.resume {
             None => return Err("the session sent offsets to a version 1 attach".to_owned()),
-            Some(point) if point.offset != offset => {
+            Some(point) if point.offset() != offset => {
                 return Err(format!(
                     "the session's output skipped from offset {} to {offset}",
-                    point.offset
+                    point.offset()
                 ));
             }
             Some(_) => {}
@@ -772,7 +785,7 @@ fn show(screen: &Screen, offset: Option<u64>, bytes: &[u8]) -> Result<bool, Stri
         return Ok(false);
     }
     if let (Some(_), Some(point)) = (offset, shown.resume.as_mut()) {
-        point.offset += bytes.len() as u64;
+        point.advance(bytes.len() as u64);
     }
     Ok(true)
 }

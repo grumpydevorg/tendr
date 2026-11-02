@@ -333,3 +333,74 @@ fn sigterm_ends_the_attach_with_1_while_stdin_would_block() {
         "the notice reached stdout"
     );
 }
+
+/// Every viewer that is behind when the run ends gets the run's last bytes:
+/// the session sends each, the controller and the watchers, everything up to
+/// the run's final offset before it closes their connections, waiting a
+/// moment for one slow to read.
+#[test]
+fn every_viewer_behind_at_the_runs_end_gets_its_last_bytes() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "ro-flush");
+    let go = root.path().join("go");
+    start(
+        &root,
+        "ro-flush",
+        &ticking_then(
+            &go,
+            &format!("yes {} | head -n 40000; printf LAST-BYTES", "y".repeat(62)),
+        ),
+        &[],
+    );
+    // A version 2 controller that reads nothing until the run has ended.
+    let mut controller = UnixStream::connect(socket(&root, "ro-flush")).unwrap();
+    write_frame(
+        &mut controller,
+        &Frame::Hello {
+            version: Version::V2,
+            mode: Mode::Attach,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut controller),
+        Ok(Frame::AcceptedV2(_))
+    ));
+
+    let mut child = attach(&root, "ro-flush", Stdio::null(), &[]);
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    // Behind at the end: nothing read until the run has written its last
+    // bytes and ended, then a moment more, well within the session's wait.
+    touch(&go);
+    harness::wait_log_tail(&root, "ro-flush", "LAST-BYTES");
+    std::thread::sleep(Duration::from_millis(500));
+    // Both read at once, as two clients would.
+    let controller = std::thread::spawn(move || {
+        let mut controlled = Vec::new();
+        while let Ok(frame) = read_frame(&mut controller) {
+            if let Frame::Output { bytes, .. } = frame {
+                controlled.extend(bytes);
+            }
+        }
+        controlled
+    });
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+    let controlled = controller.join().unwrap();
+
+    assert_eq!(code, Some(0), "the run ended; stderr: {stderr}");
+    let recording = harness::recorded_output(&root, "ro-flush");
+    for (who, got) in [("the watcher", &out), ("the controller", &controlled)] {
+        assert!(
+            got.ends_with(b"LAST-BYTES"),
+            "{who} ends short of the run's last bytes: {:?}",
+            String::from_utf8_lossy(&got[got.len().saturating_sub(80)..])
+        );
+        assert!(
+            recording.ends_with(got),
+            "{who} did not get the recording's end"
+        );
+    }
+}

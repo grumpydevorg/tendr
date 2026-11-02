@@ -15,14 +15,17 @@
 //! goes on a row of its own below it, so an approval URL is visible. They
 //! are drawn with the cursor saved and restored (DECSC, DECRC), and erased
 //! before any output follows. What ssh says while a connection is up is
-//! kept off the session's screen ([`SshStderr`]).
+//! kept off the session's screen ([`SshStderr`]). Without a terminal (a
+//! read-only attach streaming to stdout), stdout gets nothing but the
+//! session's output: the status and the notices go to stderr, a line each,
+//! and so does what ssh says.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::Duration;
 
-use tendr::attach_proto::ResumePoint;
+use super::super::Point;
 use tendr::ssh::SshError;
 use tendr::term_modes::TermModes;
 
@@ -326,12 +329,18 @@ impl Status {
 
     /// Draw the status as it stands, unless no reconnect is under way or
     /// the attach is leaving: tendr's line, and below it ssh's latest line,
-    /// on a row of its own so that an approval URL fits.
+    /// on a row of its own so that an approval URL fits. With no rows to
+    /// draw on (no terminal, or stdout a terminal but stdin not), tendr's
+    /// line goes to stderr instead, where ssh's lines already go.
     fn draw(&self, state: &mut State, screen: &Screen) {
         if !state.active {
             return;
         }
         let mut text = vec![state.text(self.discarded.load(Ordering::SeqCst))];
+        if !screen.has_status_rows() {
+            eprintln!("{}", text[0]);
+            return;
+        }
         text.extend(state.ssh_line.clone());
         let _shown = screen.lock();
         if screen.done.load(Ordering::SeqCst) {
@@ -355,9 +364,10 @@ impl Status {
     /// The session answered the resume from `asked`: erase the status, and
     /// make the terminal ready for what follows. After a gone answer, that
     /// is the reset of the modes tracked so far (the replay that follows only
-    /// turns modes on) and a notice of what was lost. Then the resume point
-    /// becomes the new connection's.
-    fn resumed(&self, screen: &Screen, asked: ResumePoint, resumption: Resumption) {
+    /// turns modes on) and a notice of what was lost; without a terminal,
+    /// the notice goes to stderr and stdout gets no reset, as when leaving.
+    /// Then the resume point becomes the new connection's.
+    fn resumed(&self, screen: &Screen, asked: Point, resumption: Resumption) {
         let mut state = self.lock();
         let mut shown = screen.lock();
         let mut out = self.erase(&mut state, screen);
@@ -368,14 +378,18 @@ impl Status {
             oldest,
         } = resumption
         {
-            out.extend(shown.modes.reset());
+            let notice = gone_notice(asked.offset(), oldest, head.offset);
+            if screen.is_terminal() {
+                out.extend(shown.modes.reset());
+                out.extend(notice.as_bytes());
+                self.notices().push(notice.trim().to_owned());
+            } else {
+                eprintln!("{}", notice.trim());
+            }
             shown.modes = TermModes::default();
             screen.bracketed_paste.store(false, Ordering::SeqCst);
-            let notice = gone_notice(asked.offset, oldest, head.offset);
-            out.extend(notice.as_bytes());
-            self.notices().push(notice.trim().to_owned());
         }
-        shown.resume = Some(resumption.point());
+        shown.resume = Some(asked.resumed(resumption.point()));
         screen.write_terminal(&out);
     }
 

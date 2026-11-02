@@ -165,7 +165,10 @@ pub struct WatchRequest {
 /// and travels again as the frame that replaces the hello.
 ///
 /// `read_only` asks for a read-only viewer, which holds no control. Left out
-/// when false, so a request without it reads as it always has.
+/// when false, so a request without it reads as it always has. A read-only
+/// request with `resume` is a watcher's resume: the remote reads only the
+/// run and offset, the client sends epoch zero, and the frame that replaces
+/// the hello is a watch resume, which no remote from before it accepts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachRequest {
     pub session: String,
@@ -181,8 +184,8 @@ pub struct AttachRequest {
 }
 
 /// Where a lost attach resumes from ([`tendr::attach_proto::ResumePoint`]):
-/// its run, the controller epoch it held, and the offset of the next output
-/// byte it did not get.
+/// its run, the controller epoch it held (zero for a watcher, which holds
+/// none), and the offset of the next output byte it did not get.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeRequest {
     pub run_id: tendr::model::ids::RunId,

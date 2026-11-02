@@ -36,6 +36,10 @@ struct RingState {
     head: u64,
     /// Whether appended output is kept; set by the first cursor.
     retaining: bool,
+    /// Set once the run's output has all been appended: a cursor at the
+    /// head has nothing more to wait for.
+    #[cfg(unix)]
+    finished: bool,
 }
 
 impl RingState {
@@ -79,6 +83,9 @@ pub(super) enum Next {
     Evicted,
     /// The cursor was closed.
     Closed,
+    /// The cursor is at the head of a finished ring: it has had all the
+    /// run's output.
+    Ended,
 }
 
 impl Default for OutputRing {
@@ -110,6 +117,8 @@ impl OutputRing {
                 capacity,
                 head: 0,
                 retaining: false,
+                #[cfg(unix)]
+                finished: false,
             }),
             ready: Condvar::new(),
         }
@@ -166,7 +175,8 @@ impl OutputRing {
     }
 
     /// Wait for output at `cursor`, then take up to `max` bytes of it and
-    /// move the cursor past them.
+    /// move the cursor past them; [`Next::Ended`] once it has had all of a
+    /// finished ring's output.
     #[cfg(unix)]
     pub(super) fn next(&self, cursor: &Cursor, max: usize) -> Next {
         let mut state = lock(&self.state);
@@ -199,6 +209,9 @@ impl OutputRing {
                     bytes: out,
                 };
             }
+            if state.finished {
+                return Next::Ended;
+            }
             state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -211,6 +224,40 @@ impl OutputRing {
         // so the notification cannot fall between its check and its wait.
         drop(lock(&self.state));
         self.ready.notify_all();
+    }
+
+    /// The run's output has all been appended: wake every sender waiting at
+    /// the head, which then ends ([`Next::Ended`]).
+    #[cfg(unix)]
+    pub(super) fn finish(&self) {
+        lock(&self.state).finished = true;
+        self.ready.notify_all();
+    }
+
+    /// Wait until every one of `cursors` is closed, or `until`; whether
+    /// they all were.
+    #[cfg(unix)]
+    pub(super) fn wait_closed(
+        &self,
+        cursors: &[std::sync::Arc<Cursor>],
+        until: std::time::Instant,
+    ) -> bool {
+        let mut state = lock(&self.state);
+        loop {
+            // Under the lock `close` takes before it notifies, so no close
+            // falls between this check and the wait.
+            if cursors.iter().all(|c| c.closed.load(Ordering::SeqCst)) {
+                return true;
+            }
+            let Some(left) = until.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            state = self
+                .ready
+                .wait_timeout(state, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     }
 }
 
@@ -306,6 +353,43 @@ mod tests {
         ring.close(&cursor);
         assert_eq!(reader.join().unwrap(), Next::Closed);
         assert!(cursor.is_lost(ring.span()));
+    }
+
+    /// A finished ring still gives a cursor behind the head the rest of
+    /// the output, then ends it; a sender waiting at the head is woken to
+    /// end. Waiting for the cursors to close sees each close.
+    #[test]
+    fn a_finished_ring_ends_each_cursor_once_it_has_everything() {
+        let ring = Arc::new(OutputRing::with_capacity(16));
+        let behind = ring.cursor_at(0).unwrap();
+        ring.append(b"last");
+        let waiting = ring.cursor_at(4).unwrap();
+        let reader = {
+            let (ring, cursor) = (Arc::clone(&ring), Arc::clone(&waiting));
+            std::thread::spawn(move || ring.next(&cursor, 64))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        ring.finish();
+        assert_eq!(reader.join().unwrap(), Next::Ended);
+        assert_eq!(drain(&ring, &behind, 2), b"last");
+        assert_eq!(ring.next(&behind, 64), Next::Ended);
+
+        let soon = std::time::Instant::now() + Duration::from_millis(50);
+        assert!(
+            !ring.wait_closed(&[Arc::clone(&behind), Arc::clone(&waiting)], soon),
+            "no cursor was closed"
+        );
+        ring.close(&waiting);
+        let closer = {
+            let (ring, cursor) = (Arc::clone(&ring), Arc::clone(&behind));
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                ring.close(&cursor);
+            })
+        };
+        let later = std::time::Instant::now() + Duration::from_secs(10);
+        assert!(ring.wait_closed(&[behind, waiting], later));
+        closer.join().unwrap();
     }
 
     #[test]

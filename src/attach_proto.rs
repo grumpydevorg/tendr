@@ -71,6 +71,16 @@ pub const MSG_GONE: u8 = 0x0e;
 /// watcher then gets its output stamped from the head; a version 1 watcher
 /// gets it plain. Only a client that sends a watch hello receives it.
 pub const MSG_WATCHING: u8 = 0x0f;
+/// Client → sidecar, in place of the hello: a watcher whose connection was
+/// lost asks for the output it had not yet received. Payload: a
+/// [`WatchPoint`], encoded as for [`MSG_WATCHING`]: the run and the offset
+/// of the next output byte it did not get. It carries no epoch, so no path
+/// can feed a watcher's point into the control rule. The sidecar answers
+/// [`MSG_RESUMED`] or [`MSG_GONE`] at epoch zero, which names no control,
+/// and the watcher reads only their run and offsets. A sidecar that
+/// predates it refuses it with the protocol class, as it refuses anything
+/// but a hello.
+pub const MSG_WATCH_RESUME: u8 = 0x10;
 
 /// The attach protocol version carried in [`MSG_HELLO`]. The discriminant is
 /// the wire byte.
@@ -378,6 +388,9 @@ pub enum Frame {
     InputDone(PushOutcome),
     /// Sidecar → watcher: admitted read-only, at this point of the run.
     Watching(WatchPoint),
+    /// Client → sidecar, in place of the hello: a watcher resumes from this
+    /// point.
+    WatchResume(WatchPoint),
 }
 
 /// A frame whose payload does not fit its type.
@@ -458,6 +471,7 @@ impl Frame {
             MSG_RETIRED => Self::Retired(epoch("retired")?),
             MSG_INPUT_DONE => Self::InputDone(PushOutcome::decode(&payload)?),
             MSG_WATCHING => Self::Watching(WatchPoint::decode(&payload, "watching")?),
+            MSG_WATCH_RESUME => Self::WatchResume(WatchPoint::decode(&payload, "watch resume")?),
             other => return Err(ProtocolError::UnknownType(other)),
         })
     }
@@ -495,6 +509,7 @@ pub fn write_frame(w: &mut impl Write, frame: &Frame) -> io::Result<()> {
         Frame::Retired(epoch) => write_msg(w, MSG_RETIRED, &epoch.get().to_be_bytes()),
         Frame::InputDone(outcome) => write_msg(w, MSG_INPUT_DONE, &outcome.encode()),
         Frame::Watching(point) => write_msg(w, MSG_WATCHING, &point.encode()),
+        Frame::WatchResume(point) => write_msg(w, MSG_WATCH_RESUME, &point.encode()),
     }
 }
 
@@ -699,41 +714,47 @@ mod tests {
                 run_id: point.run_id,
                 offset: 1 << 41,
             }),
+            Frame::WatchResume(WatchPoint {
+                run_id: point.run_id,
+                offset: 1 << 42,
+            }),
         ] {
             assert_eq!(round_trip(&frame), frame);
         }
     }
 
-    /// The watch accept is `[run id][head]`, big-endian, with no epoch; a
-    /// payload of another length, or whose run id is not a v7 UUID, does not
-    /// decode.
+    /// The watch accept and the watch resume are `[run id][offset]`,
+    /// big-endian, with no epoch; a payload of another length, or whose run
+    /// id is not a v7 UUID, does not decode.
     #[test]
-    fn the_watch_accept_keeps_its_wire_format() {
+    fn the_watch_frames_keep_their_wire_format() {
         let run_id = RunId::new();
-        let mut bytes = Vec::new();
-        write_frame(
-            &mut bytes,
-            &Frame::Watching(WatchPoint {
-                run_id,
-                offset: 0x0304,
-            }),
-        )
-        .unwrap();
+        let point = WatchPoint {
+            run_id,
+            offset: 0x0304,
+        };
         let mut payload = run_id.as_uuid().as_bytes().to_vec();
         payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 3, 4]);
-        assert_eq!(bytes, frame(0x0f, 24, &payload));
-
-        let mut not_v7 = payload.clone();
-        not_v7[..16].copy_from_slice(uuid::Uuid::from_u128(1).as_bytes());
-        for bad in [
-            payload[..23].to_vec(),
-            [payload, vec![0; 8]].concat(),
-            not_v7,
+        for (sent, msg_type, what) in [
+            (Frame::Watching(point), 0x0f, "watching"),
+            (Frame::WatchResume(point), 0x10, "watch resume"),
         ] {
-            assert_eq!(
-                Frame::decode(MSG_WATCHING, bad),
-                Err(ProtocolError::Malformed("watching"))
-            );
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &sent).unwrap();
+            assert_eq!(bytes, frame(msg_type, 24, &payload));
+
+            let mut not_v7 = payload.clone();
+            not_v7[..16].copy_from_slice(uuid::Uuid::from_u128(1).as_bytes());
+            for bad in [
+                payload[..23].to_vec(),
+                [payload.clone(), vec![0; 8]].concat(),
+                not_v7,
+            ] {
+                assert_eq!(
+                    Frame::decode(msg_type, bad),
+                    Err(ProtocolError::Malformed(what))
+                );
+            }
         }
     }
 

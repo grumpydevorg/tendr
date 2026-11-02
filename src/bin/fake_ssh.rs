@@ -269,25 +269,29 @@ fn forward(argv: &[String]) -> ! {
 /// on stderr if asked, skip the remote frame, read the client's first attach
 /// frame, and play the steps of `lines` for it. Each line is `<first>
 /// <step>`, where `<first>` names the first frame: `hello` (an attach or
-/// takeover hello), `watch` (a watch hello) or `resume`. Frames are built
-/// with `attach_proto`, so they are the protocol's own. The steps:
+/// takeover hello), `watch` (a watch hello), `resume` or `watch-resume`.
+/// Frames are built with `attach_proto`, so they are the protocol's own.
+/// The steps:
 ///
 /// ```text
 /// answer         accept it: `AcceptedV2` at epoch 1 and offset 0 of a new
 ///                run for a hello, `Watching` at offset 0 for a watch, and
-///                `Resumed` at the next epoch and the offset asked for, for
-///                a resume
-/// gone <n>       answer a resume `Gone` at the next epoch: the head is <n>
-///                (at least 1) bytes past the offset asked for, of which the
-///                session still holds the last n - 1
-/// output <text>  the session's output (`\n` is a newline): stamped from the
-///                answer's offset under control, plain for a watcher
+///                `Resumed` at the offset asked for, for a resume: at the
+///                next epoch, or at epoch zero for a watcher's
+/// gone <n>       answer a resume `Gone`, at the epoch `answer` gives: the
+///                head is <n> (at least 1) bytes past the offset asked for,
+///                of which the session still holds the last n - 1
+/// output <text>  the session's output (`\n` is a newline), stamped from
+///                the answer's offset, as the bridge sends it in version 2
 /// output-hex <hex>
 ///                the same for these bytes, two hex digits each, which need
 ///                not be UTF-8
 /// retire         `Retired` at the next epoch: another client took over
 /// log <path>     from now on append the frames the client sent to <path>,
 ///                `{:?}` one per line, its first frame first
+/// request <path> write to <path> what the client sent ahead of its later
+///                frames: the remote frame, then its first attach frame, as
+///                an old remote tendr would read them
 /// await <type>   read the client's frames until one of <type> (the name
 ///                of a `Frame` variant, such as `Repaint`) or the end of
 ///                its input: `await Repaint` waits until the client relays
@@ -341,7 +345,24 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
             mode: Mode::Watch, ..
         } => ("watch", fresh),
         Frame::Resume(asked) => ("resume", *asked),
+        Frame::WatchResume(asked) => (
+            "watch-resume",
+            ResumePoint {
+                run_id: asked.run_id,
+                epoch: ControllerEpoch::ZERO,
+                offset: asked.offset,
+            },
+        ),
         other => panic!("fake ssh: no script for a first frame {other:?}"),
+    };
+    // A resume's answer: a controller's at the next epoch, a watcher's at
+    // epoch zero, which names no control.
+    let answered = |epoch: ControllerEpoch| {
+        if section == "watch-resume" {
+            ControllerEpoch::ZERO
+        } else {
+            next(epoch)
+        }
     };
 
     let mut stdout = std::io::stdout().lock();
@@ -366,14 +387,14 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                     offset: point.offset,
                 }),
                 _ => {
-                    point.epoch = next(point.epoch);
+                    point.epoch = answered(point.epoch);
                     Frame::Resumed(point)
                 }
             }),
             "gone" => {
                 let skipped: u64 = value.parse().expect("fake ssh: gone <n>");
                 let asked = point.offset;
-                point.epoch = next(point.epoch);
+                point.epoch = answered(point.epoch);
                 point.offset = asked + skipped;
                 send(Frame::Gone {
                     point,
@@ -390,13 +411,9 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                         .collect::<Result<_, _>>()
                         .expect("fake ssh: output-hex <hex>")
                 };
-                if section == "watch" {
-                    send(Frame::Data(bytes));
-                } else {
-                    let offset = point.offset;
-                    point.offset += bytes.len() as u64;
-                    send(Frame::Output { offset, bytes });
-                }
+                let offset = point.offset;
+                point.offset += bytes.len() as u64;
+                send(Frame::Output { offset, bytes });
             }
             "retire" => send(Frame::Retired(next(point.epoch))),
             "log" => {
@@ -407,6 +424,12 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                     .unwrap();
                 writeln!(file, "{first:?}").unwrap();
                 log = Some(file);
+            }
+            "request" => {
+                let mut sent = len.to_vec();
+                sent.extend_from_slice(&header);
+                attach_proto::write_frame(&mut sent, &first).unwrap();
+                std::fs::write(value, sent).unwrap();
             }
             "await" => {
                 while let Some(frame) = receive(&mut stdin, log.as_mut()) {

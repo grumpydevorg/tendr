@@ -424,10 +424,14 @@ impl RunCore {
         }
         let started = StartedPty {
             _socket: cleanup,
-            sink,
+            sink: Arc::clone(&sink),
             recording: Some(recording),
             control,
-            teardown: PtyTeardown { registry, effects },
+            teardown: PtyTeardown {
+                registry,
+                effects,
+                sink,
+            },
         };
         Ok((started, input))
     }

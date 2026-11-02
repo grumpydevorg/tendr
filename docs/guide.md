@@ -304,7 +304,8 @@ concurrent `push` is refused, not interleaved.
   watchers attached. To take control, attach again with `--takeover` (it
   cannot be combined with
   `--read-only`). A session started by a `tendr` without read-only viewers
-  refuses it with 80. `--read-only` does not yet work with `--host` (2).
+  refuses it with 80. It works with `--host` too, and reconnects like any
+  `attach --host` (below).
 - With no terminal (stdin or stdout redirected), `attach --read-only`
   streams the session's output to stdout, for an agent or script watching a
   PTY session live: `tendr attach --read-only build | grep -m1 'error'`. It
@@ -313,8 +314,11 @@ concurrent `push` is refused, not interleaved.
   every notice on stderr. There is no escape; a signal ends it (1). It exits
   0 when the run ends, 84 if it was cut off while the run went on (it fell
   more than the session's output buffer behind, as with a stalled reader),
-  and 1 when its stdout closes (the reader gone), which detaches it. Without
-  `--read-only`, attach still needs a terminal.
+  and 1 when its stdout closes (the reader gone), which detaches it. Over
+  `--host` the remote host tells 0 from 84, and a dropped connection
+  reconnects without anything reaching stdout: the reconnect's status lines
+  and notices go to stderr. Without `--read-only`, attach still needs a
+  terminal.
 - SIGTERM, SIGHUP or SIGINT (closing the window sends SIGHUP) also detach. It
   exits 1 with `tendr: attach ended by SIGTERM` (or the signal received). On
   Windows, closing the console window, Ctrl-Break, or a Ctrl-C event that
@@ -360,7 +364,8 @@ sidecar; otherwise the attach ends as before, with ssh's exit.
   gone; attach again with `--takeover` then.
 - Output the session wrote meanwhile arrives in full, once, as if the
   connection had never dropped; then the program is asked to redraw at your
-  terminal's size. Input is never resent: what you typed before the drop and
+  terminal's size (not for `--read-only`, which never sizes the session).
+  Input is never resent: what you typed before the drop and
   had not reached the session is lost, and what you type while it reconnects
   is discarded, with a note in the status line.
 - The session keeps the last 32 MiB of output. If more than that was written
@@ -371,9 +376,14 @@ sidecar; otherwise the attach ends as before, with ssh's exit.
   the attach ends.
 - The reconnect is refused, ending the attach with 81 and the remote's
   reason, if someone took the terminal (an attach, a takeover, or an agent's
-  `push` still running), or if the session's run has ended. A session started
-  by a `tendr` that cannot resume ends it with 80. Exit 82 or 255 from ssh
+  `push` still running), or if the session's run has ended. A read-only
+  attach never holds the terminal, so only the run's end refuses it. A
+  session started by a `tendr` that cannot resume ends it with 80, and so
+  does one that cannot resume a read-only attach. Exit 82 or 255 from ssh
   during a reconnect is not an end: it is tried again.
+- When a run ends, everything it wrote reaches every attached client before
+  the session closes the connections, even one that was behind; a client
+  that has not taken it all within 2 s is cut off where it is.
 
 The escape works with the legacy `Ctrl-\` byte, the kitty keyboard protocol
 (which Claude Code can switch Ghostty, kitty, WezTerm and foot to) and xterm's
@@ -775,7 +785,7 @@ or an I/O error.
 |`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not within 10 s (an older or newer `tendr`), an `attach --host` got output that does not follow on from the last, or its reconnect reached a session that cannot resume, or an `attach --read-only` reached a session started by a `tendr` without read-only viewers|
 |`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach (also when the attach had stopped reading its output and learns of it only later), or the session's run has ended. An `attach --host` whose reconnect is refused exits 81 too: someone took the terminal while it was disconnected (an attach, a takeover, or an agent's `push` still running), or the run ended meanwhile (`not running`)|
 |`attach`, `push` to a PTY session|82, 83|Reserved, not used yet|
-|`attach`, `push` to a PTY session|84|Runtime or transport: the attach socket is missing or unreachable, the connection fails, the session already serves as many connections of that kind as it admits (eight read-only viewers, or eight attaches, takeovers, resumes and pushes), an `attach --read-only` without a terminal was cut off while the run went on, or a push ended revoked or stopped with bytes unwritten (stderr gives the byte counts)|
+|`attach`, `push` to a PTY session|84|Runtime or transport: the attach socket is missing or unreachable, the connection fails, the session already serves as many connections of that kind as it admits (eight read-only viewers, or eight attaches, takeovers, resumes and pushes), an `attach --read-only` without a terminal, or any `attach --host --read-only`, was cut off while the run went on, or a push ended revoked or stopped with bytes unwritten (stderr gives the byte counts)|
 |`attach`, `push` to a PTY session|85|Identity: the socket's listener, or the connecting client, is another user|
 
 With several sessions, `wait` returns the most severe code. A session that was

@@ -134,6 +134,7 @@ pub fn serve() -> anyhow::Result<()> {
                 &r.session,
                 &namespace,
                 r.takeover,
+                r.read_only,
                 version,
                 r.resume.map(Into::into),
             )

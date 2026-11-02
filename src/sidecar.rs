@@ -79,9 +79,11 @@ struct ViewerStart {
 }
 
 /// Send a viewer its mode replay, then its output from the ring, until its
-/// cursor or its connection closes or the ring evicts its cursor. A version 2
-/// viewer gets that output stamped with its offsets; the replay, which is
-/// not the run's output, is never stamped.
+/// cursor or its connection closes, the ring evicts its cursor, or it has
+/// sent all of a finished ring's output. A version 2 viewer gets that output
+/// stamped with its offsets; the replay, which is not the run's output, is
+/// never stamped. However it ends, it closes its cursor, which tells the
+/// run's end ([`flush_viewers`]) that it is done.
 #[cfg(unix)]
 fn run_viewer_sender(
     viewer: ViewerStart,
@@ -106,6 +108,7 @@ fn run_viewer_sender(
             return ring.close(&cursor);
         }
     }
+    ring.close(&cursor);
 }
 
 /// Tees PTY output to the attached clients, and tracks the terminal modes
@@ -1886,26 +1889,57 @@ impl ConnectionRegistry {
 }
 
 /// Ends a PTY session's attach side when its run ends, before the terminal
-/// record is written: every connection is shut down (PR #68 review, finding 1),
-/// and the run's side effects already decided are recorded, so they precede the
-/// terminal event and meta write. The effects thread then stops, so nothing
-/// reaches the session paths after the terminal record, when they may belong
-/// to a replacement run (finding 3; invalid-states review, findings 1 and 5).
+/// record is written: every viewer is first sent the run's output up to its
+/// last byte ([`flush_viewers`]), then every connection is shut down (PR #68
+/// review, finding 1), and the run's side effects already decided are
+/// recorded, so they precede the terminal event and meta write. The effects
+/// thread then stops, so nothing reaches the session paths after the
+/// terminal record, when they may belong to a replacement run (finding 3;
+/// invalid-states review, findings 1 and 5).
 #[cfg(unix)]
 struct PtyTeardown {
     registry: ConnectionRegistry,
     effects: RunEffects,
+    sink: AttachSink,
 }
 
 #[cfg(unix)]
 impl PtyTeardown {
     fn run(&self) {
+        flush_viewers(&self.sink, RUN_END_FLUSH);
         self.registry.close();
         self.effects.flush_and_stop();
     }
 }
 #[cfg(not(unix))]
 type PtyTeardown = std::convert::Infallible;
+
+/// How long the run's end waits for its viewers to be sent the last of its
+/// output before it shuts their connections: a viewer that is not reading
+/// is cut off then, and gets no more.
+#[cfg(unix)]
+const RUN_END_FLUSH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// At the run's end, once capture has appended its last output: finish the
+/// ring, so each viewer's sender ends once it has sent everything, and wait
+/// up to `within` for every viewer installed now (the controller's and the
+/// watchers') to have been sent it all. Shutting a connection before then
+/// would cut its client off short of the run's last bytes.
+#[cfg(unix)]
+fn flush_viewers(sink: &AttachSink, within: std::time::Duration) {
+    let (ring, cursors) = {
+        let tee = lock(sink);
+        let cursors: Vec<_> = tee
+            .viewer
+            .iter()
+            .chain(&tee.watchers)
+            .map(|viewer| Arc::clone(&viewer.cursor))
+            .collect();
+        (Arc::clone(&tee.ring), cursors)
+    };
+    ring.finish();
+    ring.wait_closed(&cursors, std::time::Instant::now() + within);
+}
 
 /// A change of who owns the PTY's input, with the controller epoch it
 /// concerns: the one granted, or the one released.
@@ -2699,8 +2733,9 @@ enum Ask {
 /// takeover or resume through the input writer; then relay input and
 /// resizes until detach, disconnect, or retirement. A version 2 viewer of
 /// the run `run_id` is told where its output starts and gets it stamped
-/// with offsets. A watch hello goes to [`handle_watch_connection`] instead,
-/// and a push to [`handle_push_connection`].
+/// with offsets. A watch hello or a watch resume goes to
+/// [`handle_watch_connection`] instead, and a push to
+/// [`handle_push_connection`].
 ///
 /// A resume decides control and output on this one connection: once the
 /// control rule grants it ([`crate::model::pty_control::InputArbiter::resume`]),
@@ -2755,7 +2790,41 @@ fn handle_attach_connection(
             };
             let _ = stream.set_read_timeout(None);
             let holder = writer.next_holder();
-            return handle_watch_connection(stream, run_id, version, holder, registry, attach_sink);
+            return handle_watch_connection(
+                stream,
+                run_id,
+                version,
+                None,
+                holder,
+                registry,
+                attach_sink,
+            );
+        }
+        // A watcher's resume: a watcher's slot, and never the input writer,
+        // whose control rule its point has no epoch to reach. Resuming is
+        // part of version 2.
+        Ok(Frame::WatchResume(point)) => {
+            let Some(_slot) = pools.watchers.take() else {
+                return reject_full(&mut stream);
+            };
+            let _ = stream.set_read_timeout(None);
+            if point.run_id != run_id {
+                return reject_connection(
+                    &mut stream,
+                    RejectClass::Control,
+                    "cannot resume: the run it was attached to is not running",
+                );
+            }
+            let holder = writer.next_holder();
+            return handle_watch_connection(
+                stream,
+                run_id,
+                Version::V2,
+                Some(point.offset),
+                holder,
+                registry,
+                attach_sink,
+            );
         }
         Ok(Frame::Hello {
             version,
@@ -2910,9 +2979,16 @@ fn handle_attach_connection(
 }
 
 /// One read-only viewer of the run `run_id`, registered as `holder`: told
-/// where its output starts ([`crate::attach_proto::Frame::Watching`]), sent
-/// that output (stamped for version 2) until it detaches, disconnects, falls
-/// a ring behind, or the run ends.
+/// where its output starts, then sent that output (stamped for version 2)
+/// until it detaches, disconnects, falls a ring behind, or the run ends.
+///
+/// A fresh watcher is told [`crate::attach_proto::Frame::Watching`] and
+/// starts at the head with the mode replay. One resuming from the offset
+/// `resume` is answered as a resuming controller is, at
+/// [`ControllerEpoch::ZERO`](crate::model::pty_control::ControllerEpoch::ZERO),
+/// which names no control: resumed, with the output from that offset and
+/// no mode replay, or gone, naming what the ring holds, with the mode
+/// replay and the output from the head.
 ///
 /// It never reaches the input writer: it asks for no control, so no
 /// control event records it and no takeover retires it, and its input,
@@ -2922,11 +2998,15 @@ fn handle_watch_connection(
     mut stream: std::os::unix::net::UnixStream,
     run_id: RunId,
     version: crate::attach_proto::Version,
+    resume: Option<u64>,
     holder: crate::model::pty_control::HolderId,
     registry: &ConnectionRegistry,
     attach_sink: &AttachSink,
 ) {
-    use crate::attach_proto::{Frame, FrameError, WatchPoint, read_frame, write_frame};
+    use crate::attach_proto::{
+        Frame, FrameError, ResumePoint, WatchPoint, read_frame, write_frame,
+    };
+    use crate::model::pty_control::ControllerEpoch;
 
     let (Ok(conn_stream), Ok(control), Ok(shutdown)) =
         (stream.try_clone(), stream.try_clone(), stream.try_clone())
@@ -2952,13 +3032,25 @@ fn handle_watch_connection(
         attach_sink,
         holder,
         Seat::Watcher,
-        None,
+        resume,
         disconnect,
     );
-    let reply = Frame::Watching(WatchPoint {
+    let point = ResumePoint {
         run_id,
+        epoch: ControllerEpoch::ZERO,
         offset: placement.from,
-    });
+    };
+    let reply = match (resume, placement.gone) {
+        (None, _) => Frame::Watching(WatchPoint {
+            run_id,
+            offset: placement.from,
+        }),
+        (Some(_), None) => Frame::Resumed(point),
+        (Some(_), Some(span)) => Frame::Gone {
+            point,
+            oldest: span.oldest,
+        },
+    };
     // Its sender starts only after the reply, so no output comes ahead of it.
     let accepted = write_frame(&mut *lock(&conn), &reply);
     let installed = viewer.map(|viewer| {
@@ -3537,12 +3629,17 @@ mod tests {
             Arc::clone(&control),
         );
         let registry = ConnectionRegistry::default();
+        let sink: AttachSink = Arc::default();
         let hooks = SidecarControlHooks {
             effects: effects.sender(),
             registry: registry.clone(),
-            attach_sink: Arc::default(),
+            attach_sink: Arc::clone(&sink),
         };
-        let teardown = PtyTeardown { registry, effects };
+        let teardown = PtyTeardown {
+            registry,
+            effects,
+            sink,
+        };
         (hooks, control, teardown)
     }
 

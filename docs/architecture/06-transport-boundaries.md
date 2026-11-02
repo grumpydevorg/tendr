@@ -170,6 +170,33 @@ command line as the other operations, and keeps the terminal on the client
   0.5.0 remote tendr ignores `resume` and refuses `MSG_RESUME` as not its
   hello (80), unless its own human-control check refuses first (81); it
   never attaches afresh either.
+- A read-only request (`read_only: true`, from `attach --read-only`) is a
+  watcher's ([read-only viewers](04-pty-lane.md#read-only-viewers)). A Unix
+  client needs no terminal for it: without one it streams the session's
+  output to stdout. The remote tendr skips the human-control check, since a
+  watcher never holds or changes control, requires a watch hello (`MSG_HELLO`
+  mode `watch`), passes it on in the agreed version, and passes the
+  sidecar's `MSG_WATCHING` back; a watch hello is never said again in
+  version 1. No takeover check runs for a watcher: it has no epoch to be
+  taken over. When the session ends a watcher's connection, the remote
+  tendr reads its own `meta.json` and exits 0 if the run ended, or 84 if the
+  session cut the watcher off while the run went on, waiting for the end to
+  be recorded as a local read-only attach does; the client exits with that
+  verdict, which it cannot read itself.
+- A watcher resuming after a lost link sends a read-only request whose
+  `resume` carries its run and offset with epoch 0, and the watch resume
+  (`MSG_WATCH_RESUME`: run id and offset, no epoch) where the hello would go.
+  The remote tendr builds the point it passes on from the run and offset
+  alone, and requires exactly that frame: a plain `MSG_RESUME` after a
+  read-only request exits 80, so nothing a watcher sends reaches the control
+  rule. It passes the sidecar's `MSG_RESUMED` or `MSG_GONE` (at epoch 0) back
+  as it came. A sidecar from before watch resumes refuses the frame with the
+  protocol class, and the remote tendr exits 80, saying it cannot resume a
+  read-only attach. A remote tendr from before read-only `--host` ignores
+  `read_only` and refuses the watch hello or the watch resume as not the
+  frame it requires (80), unless its own human-control check refuses first
+  (81), which it makes for a watch hello, and 0.5.0's for a watch resume
+  too, since it knows no `resume`; neither ever attaches.
 - Raw mode, the size check and SIGWINCH (`WINDOW_BUFFER_SIZE_EVENT` on
   Windows), the detach escape, and restoring the terminal and its modes all
   happen on the client, as for a local attach.

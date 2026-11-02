@@ -1450,30 +1450,8 @@ fn host_reconnect_past_the_ring_resets_the_modes_and_says_what_was_missed() {
     wrapped.wait_output_contains("first-part");
     hold_in_reconnect(&link);
     touch(&root, "GO2");
-    // The flood has all been captured: its end marker is in the tail of
-    // output.log, whose lines follow capture's reads, so they are joined.
-    let log = root
-        .path()
-        .join(".tendr/sessions/default/host-gone/output.log");
-    poll_until(Duration::from_secs(60), Duration::from_millis(100), || {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut tail = Vec::new();
-        if let Ok(mut file) = std::fs::File::open(&log) {
-            let _ = file.seek(SeekFrom::End(-4096));
-            let _ = file.read_to_end(&mut tail);
-        }
-        let text: String = tail
-            .split(|&b| b == b'\n')
-            .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
-            .filter_map(|l| l["content"].as_str().map(str::to_owned))
-            .collect();
-        if text.contains("FLOOD-END") {
-            Observation::Ready(())
-        } else {
-            Observation::Pending(text)
-        }
-    })
-    .unwrap();
+    // The flood has all been captured.
+    harness::wait_log_tail(&root, "host-gone", "FLOOD-END");
 
     link.set("prompt", false);
     wait_resumes(&root, "host-gone", 1);
@@ -1562,15 +1540,698 @@ fn host_reconnected_attach_taken_over_while_stalled_exits_81() {
     second.assert_terminal_restored();
 }
 
-/// A read-only `attach --host` is not bridged yet: it is refused as a usage
-/// error (2) before ssh runs, rather than sending a watch hello.
+/// The `pty.control_changed` events of `session` so far, as `(trigger,
+/// epoch)`.
+fn control_changes(root: &TempDir, session: &str) -> Vec<(String, u64)> {
+    harness::read_events(root, session)
+        .into_iter()
+        .filter(|e| e["kind"] == "pty.control_changed")
+        .map(|e| {
+            (
+                e["data"]["trigger"].as_str().unwrap_or_default().to_owned(),
+                e["data"]["epoch"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// A read-only `attach --host` beside a controller holding the session: no
+/// human-control check refuses it, and when ssh dies mid-flood it reconnects
+/// by itself, without prompts, and resumes as a watcher. Its terminal gets
+/// the run's output exactly once, in order, from where it attached; the
+/// controller is never touched: no control change but its own attach, and
+/// it detaches as it would have.
 #[test]
-fn a_read_only_host_attach_is_refused_before_ssh() {
+fn host_read_only_attach_resumes_beside_a_controller_with_no_gap_or_duplicate() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-cut");
+    start_script(
+        &root,
+        "host-ro-cut",
+        NUMBERED_FLOOD,
+        &["GO", "STOP", "END"],
+        &[],
+    );
+    let mut controller = WrappedAttach::spawn(&root, "ro-controller", &["host-ro-cut"]);
+    wait_control(&root, "host-ro-cut", "HumanControl");
+    let link = Flaky::new();
+
+    let mut watcher = link.attach(&root, "ro-cut", &["host-ro-cut", "--read-only"]);
+    touch(&root, "GO");
+    watcher.wait_output_contains("000000500 ");
+    link.cut();
+    link.wait_calls(2);
+    let resumed = watcher.cli.output().len();
+    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        if watcher.cli.output().len() > resumed + 20_000 {
+            Observation::Ready(())
+        } else {
+            Observation::Pending("no output since the resume".into())
+        }
+    })
+    .unwrap();
+    touch(&root, "STOP");
+    watcher.wait_output_contains("FLOOD-END");
+    watcher.cli.type_bytes(b"\x1cd");
+    assert_eq!(watcher.wait_exit(Duration::from_secs(15)), 0);
+    watcher.assert_terminal_restored();
+
+    assert_eq!(
+        control(&root, "host-ro-cut").as_deref(),
+        Some("HumanControl")
+    );
+    assert_eq!(
+        control_changes(&root, "host-ro-cut"),
+        [("attach".to_owned(), 1)],
+        "the watcher changed control"
+    );
+    controller.cli.type_bytes(b"\x1cd");
+    assert_eq!(controller.wait_exit(Duration::from_secs(15)), 0);
+    controller.assert_terminal_restored();
+    wait_control(&root, "host-ro-cut", "AgentControl");
+
+    touch(&root, "END");
+    harness::wait_terminal(&root, "host-ro-cut");
+    let recording = String::from_utf8(harness::recorded_output(&root, "host-ro-cut")).unwrap();
+    let shown = without_status_line(&watcher.cli.output());
+    assert!(
+        shown.len() > 20_000 && recording.ends_with(&shown),
+        "the watcher showed {} bytes that are not the end of the run's {}",
+        shown.len(),
+        recording.len()
+    );
+    let calls = link.calls();
+    assert!(
+        calls[1..]
+            .iter()
+            .all(|(_, argv)| argv.contains("BatchMode=yes")),
+        "a reconnect never prompts: {calls:?}"
+    );
+}
+
+/// This client's read-only attach request for `session`, resuming from
+/// `resume`: a watcher's resume carries epoch zero.
+fn watch_json(session: &str, resume: Option<tendr::attach_proto::WatchPoint>) -> String {
+    let resume = resume.map_or(String::new(), |p| {
+        format!(
+            r#","resume":{{"run_id":"{}","epoch":0,"offset":{}}}"#,
+            p.run_id.as_uuid(),
+            p.offset
+        )
+    });
+    format!(
+        r#"{{"v":1,"op":"attach","params":{{"session":"{session}","namespace":null,"takeover":false,"read_only":true,"escape":"ctrl-backslash","protocol":2{resume}}}}}"#
+    )
+}
+
+/// `_remote` run for a watcher's resume from `point`, with `first` in place
+/// of the hello.
+fn watch_resume(
+    root: &TempDir,
+    session: &str,
+    point: tendr::attach_proto::WatchPoint,
+    first: &tendr::attach_proto::Frame,
+) -> FrameClient {
+    FrameClient::start_with(root, &watch_json(session, Some(point)), first)
+}
+
+/// The remote side admits a read-only request beside a controller, and
+/// answers a watcher's resume as the sidecar does, at epoch zero, which
+/// names no control: resumed at the offset asked for while the ring holds
+/// it, gone with what it holds once it does not. A resume for another run
+/// is refused (81), and so is a plain resume frame after a read-only
+/// request (80), before any answer. The controller is untouched throughout.
+#[test]
+fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
+    use tendr::attach_proto::{Frame, Mode, ResumePoint, Version, WatchPoint};
+    use tendr::model::pty_control::ControllerEpoch;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-resume");
+    // The flood passes the 4 KiB ring, but fits the pipes of the controller,
+    // which does not read, so it is never cut off.
+    start_script(
+        &root,
+        "host-ro-resume",
+        "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; printf abc; \
+         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; yes xxxxxxxxxx | head -n 600; \
+         printf FLOOD-END; sleep 60",
+        &["GO1", "GO2"],
+        &[("TENDR_TEST_OUTPUT_RING_BYTES", "4096")],
+    );
+    let (controller, _) = attach_v2(&root, "host-ro-resume");
+    wait_control(&root, "host-ro-resume", "HumanControl");
+
+    let mut watcher = FrameClient::start_with(
+        &root,
+        &watch_json("host-ro-resume", None),
+        &Frame::Hello {
+            version: Version::V1,
+            mode: Mode::Watch,
+        },
+    );
+    let Frame::Watching(admitted) = watcher.frame() else {
+        panic!("the watcher was not admitted");
+    };
+    assert_eq!(admitted.offset, 0);
+    touch(&root, "GO1");
+    assert_eq!(
+        watcher.frame(),
+        Frame::Output {
+            offset: 0,
+            bytes: b"abc".to_vec()
+        }
+    );
+    assert_eq!(watcher.detach(), Some(0));
+
+    let asked = WatchPoint {
+        offset: 3,
+        ..admitted
+    };
+    let mut resumed = watch_resume(&root, "host-ro-resume", asked, &Frame::WatchResume(asked));
+    assert_eq!(
+        resumed.frame(),
+        Frame::Resumed(ResumePoint {
+            run_id: admitted.run_id,
+            epoch: ControllerEpoch::ZERO,
+            offset: 3,
+        })
+    );
+    assert_eq!(resumed.detach(), Some(0));
+
+    touch(&root, "GO2");
+    harness::wait_log_tail(&root, "host-ro-resume", "FLOOD-END");
+    let mut gone = watch_resume(&root, "host-ro-resume", asked, &Frame::WatchResume(asked));
+    match gone.frame() {
+        Frame::Gone { point, oldest } => {
+            assert_eq!(
+                (point.run_id, point.epoch),
+                (admitted.run_id, ControllerEpoch::ZERO)
+            );
+            assert!(
+                oldest > 3 && point.offset - oldest <= 4096,
+                "{point:?} {oldest}"
+            );
+        }
+        other => panic!("not gone: {other:?}"),
+    }
+    assert_eq!(gone.detach(), Some(0));
+
+    let elsewhere = WatchPoint {
+        run_id: tendr::model::ids::RunId::new(),
+        ..asked
+    };
+    let plain = Frame::Resume(ResumePoint {
+        run_id: asked.run_id,
+        epoch: ControllerEpoch::new(1),
+        offset: 3,
+    });
+    for (what, mut refused, code) in [
+        (
+            "another run",
+            watch_resume(
+                &root,
+                "host-ro-resume",
+                elsewhere,
+                &Frame::WatchResume(elsewhere),
+            ),
+            81,
+        ),
+        (
+            "a plain resume",
+            watch_resume(&root, "host-ro-resume", asked, &plain),
+            80,
+        ),
+    ] {
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut refused.stdout, &mut rest).unwrap();
+        assert!(rest.is_empty(), "{what}: no frame is sent");
+        assert_eq!(refused.child.wait().unwrap().code(), Some(code), "{what}");
+    }
+
+    assert_eq!(
+        control_changes(&root, "host-ro-resume"),
+        [("attach".to_owned(), 1)],
+        "a watcher changed control"
+    );
+    assert_eq!(controller.detach(), Some(0));
+    wait_control(&root, "host-ro-resume", "AgentControl");
+}
+
+/// `tendr --host box attach --read-only <session>` through the fake ssh in
+/// `ssh`, with no terminal: stdin closed, stdout and stderr piped.
+fn watch_without_terminal(ssh: &TempDir, root: &TempDir, session: &str) -> std::process::Child {
+    use std::process::Stdio;
+    std::process::Command::new(tendr_bin())
+        .args(["--host", "box", "attach", "--read-only", session])
+        .env("HOME", root.path())
+        .env("PATH", shim_path_env(ssh))
+        .env("TENDR_TEST_BIN", tendr_bin())
+        .env("TENDR_SSH_CONNECT_TIMEOUT", "30")
+        .env_remove("TENDR_TEST_ATTACH_TERMINAL")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Read `stdout` until what was read contains `marker`.
+fn read_until(stdout: &mut std::process::ChildStdout, marker: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut read = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&read).contains(marker) {
+        let n = stdout.read(&mut buf).unwrap();
+        assert!(n > 0, "stdout ended before {marker:?}: {read:?}");
+        read.extend_from_slice(&buf[..n]);
+    }
+    read
+}
+
+/// Wait for `child` to exit, killing it after a minute, and return its code
+/// and stderr.
+fn finish(mut child: std::process::Child) -> (Option<i32>, String) {
+    use std::io::Read;
+    let status = poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(20),
+        || match child.try_wait().unwrap() {
+            Some(status) => Observation::Ready(status),
+            None => Observation::Pending("attach still running".to_owned()),
+        },
+    )
+    .unwrap_or_else(|e| {
+        let _ = child.kill();
+        panic!("attach did not exit: {e}");
+    });
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status.code(), stderr)
+}
+
+/// A child that turns no terminal modes on: ticks until `GO` exists, then
+/// runs `then`.
+fn ticking_then(then: &str) -> String {
+    format!("while [ ! -f \"$GO\" ]; do echo tick; sleep 0.05; done; {then}")
+}
+
+/// Without a terminal, a read-only `attach --host` writes exactly the run's
+/// output from where it attached to stdout, and exits 0 when the run ends:
+/// the remote's verdict, from its own `meta.json`.
+#[test]
+fn host_read_only_without_a_terminal_writes_the_runs_output_and_exits_0() {
+    use std::io::Read;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-out");
+    start_script(
+        &root,
+        "host-ro-out",
+        &ticking_then(
+            "i=0; while [ $i -lt 200 ]; do echo line-$i; i=$((i+1)); done; echo ALL-DONE",
+        ),
+        &["GO"],
+        &[],
+    );
     let remote = Remote::new();
-    let wrapped = remote.attach(&root, "ro-host", &["any", "--read-only"]);
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 2);
-    wrapped.assert_terminal_restored();
-    assert!(!remote.argv.exists(), "ssh ran");
+
+    let mut child = watch_without_terminal(&remote.ssh, &root, "host-ro-out");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    touch(&root, "GO");
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+
+    assert_eq!(code, Some(0), "the run ended; stderr: {stderr}");
+    let recording = harness::recorded_output(&root, "host-ro-out");
+    assert!(
+        recording.ends_with(&out),
+        "stdout is not the recording from the attach on:\n{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(String::from_utf8_lossy(&out).contains("line-199\r\nALL-DONE\r\n"));
+}
+
+/// Without a terminal, a read-only `attach --host` whose consumer stalls
+/// while the run floods past the ring is cut off by the session; the remote
+/// reads that the run is still running and exits 84, which the client
+/// exits with, its notice on stderr and none on stdout.
+#[test]
+fn host_read_only_without_a_terminal_cut_off_exits_84() {
+    use std::io::Read;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-cutoff");
+    let line = "0123456789abcdef".repeat(62);
+    start_script(
+        &root,
+        "host-ro-cutoff",
+        &ticking_then(&format!(
+            "i=0; while [ $i -lt 300 ]; do yes {line} | head -n 10; i=$((i+1)); done; \
+             printf ALL-DONE; while [ ! -f \"$END\" ]; do sleep 0.05; done"
+        )),
+        &["GO", "END"],
+        &[("TENDR_TEST_OUTPUT_RING_BYTES", "1048576")],
+    );
+    let remote = Remote::new();
+
+    let mut child = watch_without_terminal(&remote.ssh, &root, "host-ro-cutoff");
+    let mut stdout = child.stdout.take().unwrap();
+    read_until(&mut stdout, "tick");
+    // Stall: read nothing while the run floods past the ring.
+    touch(&root, "GO");
+    harness::wait_log_tail(&root, "host-ro-cutoff", "ALL-DONE");
+    let mut out = Vec::new();
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+    touch(&root, "END");
+    harness::wait_terminal(&root, "host-ro-cutoff");
+
+    assert_eq!(
+        code,
+        Some(84),
+        "cut off while the run went on; stderr: {stderr}"
+    );
+    assert!(stderr.contains("cut this read-only attach off"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("tendr:"),
+        "a notice reached stdout"
+    );
+}
+
+/// The run's last bytes reach a watcher over `--host` that was behind when
+/// the run ended: the session sends a viewer everything up to the run's
+/// final offset before it closes the connection, waiting a moment for one
+/// that is slow to read.
+#[test]
+fn host_read_only_gets_the_runs_last_bytes_at_its_end() {
+    use std::io::Read;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-flush");
+    start_script(
+        &root,
+        "host-ro-flush",
+        &ticking_then(&format!(
+            "yes {} | head -n 40000; printf LAST-BYTES",
+            "y".repeat(62)
+        )),
+        &["GO"],
+        &[],
+    );
+    let remote = Remote::new();
+
+    let mut child = watch_without_terminal(&remote.ssh, &root, "host-ro-flush");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    // Behind at the end: nothing read until the run has written its last
+    // bytes and ended, then a moment more, well within the session's wait.
+    touch(&root, "GO");
+    harness::wait_log_tail(&root, "host-ro-flush", "LAST-BYTES");
+    std::thread::sleep(Duration::from_millis(500));
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+
+    assert_eq!(code, Some(0), "the run ended; stderr: {stderr}");
+    assert!(
+        out.ends_with(b"LAST-BYTES"),
+        "stdout ends short of the run's last bytes: {:?}",
+        String::from_utf8_lossy(&out[out.len().saturating_sub(80)..])
+    );
+    let recording = harness::recorded_output(&root, "host-ro-flush");
+    assert!(
+        recording.ends_with(&out),
+        "stdout is not the recording's end"
+    );
+}
+
+/// The first frames, type and payload, an emulated old sidecar was sent.
+type FirstFrames = std::sync::Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
+
+/// A sidecar started by an older tendr, emulated at the frame level in
+/// front of `session`'s real one: a connection whose first frame `decodes`
+/// takes is passed through to the real sidecar, which serves it as the old
+/// one would; any other is refused with the protocol class, as the old
+/// decoder refuses it.
+fn old_sidecar(
+    root: &TempDir,
+    session: &str,
+    label: &str,
+    decodes: fn(u8, &[u8]) -> bool,
+) -> FirstFrames {
+    use std::io::Write;
+    use tendr::attach_proto::{Frame, RejectClass, read_msg, write_frame, write_msg};
+    let real = tendr::attach_proto::read_sock_path(
+        &root
+            .path()
+            .join(format!(".tendr/sessions/default/{session}")),
+    )
+    .unwrap();
+    let sock = root.path().join(format!("{label}.sock"));
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let seen = FirstFrames::default();
+    let frames = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for mut client in listener.incoming().map_while(Result::ok) {
+            let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+            let Ok((msg_type, payload)) = read_msg(&mut client) else {
+                continue;
+            };
+            let _ = client.set_read_timeout(None);
+            frames.lock().unwrap().push((msg_type, payload.clone()));
+            if !decodes(msg_type, &payload) {
+                let reason = if msg_type == tendr::attach_proto::MSG_HELLO {
+                    "unsupported attach protocol version or mode"
+                } else {
+                    "attach requires a protocol hello"
+                };
+                let refusal = Frame::Rejected {
+                    class: RejectClass::Protocol,
+                    reason: reason.to_owned(),
+                };
+                let _ = write_frame(&mut client, &refusal);
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
+            let mut sidecar = std::os::unix::net::UnixStream::connect(&real).unwrap();
+            write_msg(&mut sidecar, msg_type, &payload).unwrap();
+            let (mut from_client, mut to_sidecar) =
+                (client.try_clone().unwrap(), sidecar.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut from_client, &mut to_sidecar);
+                let _ = to_sidecar.shutdown(std::net::Shutdown::Both);
+            });
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut sidecar, &mut client);
+                let _ = client.flush();
+                let _ = client.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    point_breadcrumb_at(root, session, &sock);
+    seen
+}
+
+/// The first frames a sidecar from before read-only viewers decodes: a
+/// hello of version 1 or 2 in modes 1 to 3 (attach, takeover, push), or a
+/// resume.
+fn decoded_before_watchers(msg_type: u8, payload: &[u8]) -> bool {
+    use tendr::attach_proto::{MSG_HELLO, MSG_RESUME};
+    match (msg_type, payload) {
+        (MSG_HELLO, [version, mode]) => (1..=2).contains(version) && (1..=3).contains(mode),
+        (MSG_RESUME, point) => point.len() == 32,
+        _ => false,
+    }
+}
+
+/// The first frames a sidecar from before watch resumes decodes: those of
+/// [`decoded_before_watchers`], and a watch hello.
+fn decoded_before_watch_resumes(msg_type: u8, payload: &[u8]) -> bool {
+    decoded_before_watchers(msg_type, payload)
+        || (msg_type == tendr::attach_proto::MSG_HELLO && matches!(payload, [1 | 2, 4]))
+}
+
+/// A watch hello to a sidecar started before read-only viewers is refused
+/// (80), once: it is not said again in version 1, and nothing attaches. The
+/// controller holding the session is untouched.
+#[test]
+fn host_watch_hello_to_a_sidecar_from_before_watchers_exits_80() {
+    use tendr::attach_proto::MSG_HELLO;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-old");
+    start_pty(&root, "host-ro-old", &["cat"]);
+    let mut controller = WrappedAttach::spawn(&root, "old-controller", &["host-ro-old"]);
+    wait_control(&root, "host-ro-old", "HumanControl");
+    let seen = old_sidecar(&root, "host-ro-old", "pre-watch", decoded_before_watchers);
+    let remote = Remote::new();
+
+    let (code, out) =
+        host_attach_exit(&root, &remote, "old-watch", &["host-ro-old", "--read-only"]);
+    assert_eq!(code, 80, "{out}");
+    assert!(out.contains("cannot serve read-only viewers"), "{out}");
+    assert_eq!(*seen.lock().unwrap(), [(MSG_HELLO, vec![2, 4])]);
+    assert_eq!(
+        control_changes(&root, "host-ro-old"),
+        [("attach".to_owned(), 1)]
+    );
+
+    controller.cli.type_bytes(b"\x1cd");
+    assert_eq!(controller.wait_exit(Duration::from_secs(15)), 0);
+    wait_control(&root, "host-ro-old", "AgentControl");
+}
+
+/// A watcher admitted by a sidecar started before watch resumes loses its
+/// link: its watch resume is refused (80), once, and it neither attaches
+/// afresh nor sends a controller's resume. The controller is untouched.
+#[test]
+fn host_watch_resume_to_a_sidecar_from_before_it_exits_80() {
+    use tendr::attach_proto::{MSG_HELLO, MSG_WATCH_RESUME};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-old-resume");
+    start_pty(
+        &root,
+        "host-ro-old-resume",
+        &["sh", "-c", "while :; do echo tick; sleep 0.2; done"],
+    );
+    let mut controller =
+        WrappedAttach::spawn(&root, "old-resume-controller", &["host-ro-old-resume"]);
+    wait_control(&root, "host-ro-old-resume", "HumanControl");
+    let seen = old_sidecar(
+        &root,
+        "host-ro-old-resume",
+        "pre-watch-resume",
+        decoded_before_watch_resumes,
+    );
+    let link = Flaky::new();
+
+    let watcher = link.attach(&root, "old-resume", &["host-ro-old-resume", "--read-only"]);
+    watcher.wait_output_contains("tick");
+    link.cut();
+    assert_eq!(watcher.wait_exit(Duration::from_secs(30)), 80);
+    watcher.assert_terminal_restored();
+    watcher.wait_output_contains("cannot resume a read-only attach");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(seen[0], (MSG_HELLO, vec![2, 4]));
+    assert_eq!(seen[1].0, MSG_WATCH_RESUME);
+    assert_eq!(
+        control_changes(&root, "host-ro-old-resume"),
+        [("attach".to_owned(), 1)]
+    );
+
+    controller.cli.type_bytes(b"\x1cd");
+    assert_eq!(controller.wait_exit(Duration::from_secs(15)), 0);
+    wait_control(&root, "host-ro-old-resume", "AgentControl");
+}
+
+/// A remote tendr from before read-only `--host`, emulated from its bridge:
+/// its exit code for `sent` (a request, then its first attach frame) while
+/// `human_control` holds the session, or `None` if it would go on to attach.
+/// `before_this` is this repository's bridge just before read-only `--host`
+/// (it knows `resume` and decodes every frame up to the watch accept);
+/// otherwise 0.5.0's, which knows no `resume` and takes only version 1
+/// hellos in modes 1 to 3. Both refuse a session under human control (81)
+/// before reading the frame, unless the request takes over or, to one that
+/// knows it, resumes; then the frame must be exactly the hello the request
+/// names, or after a resume its resume frame, or it is refused (80). Neither
+/// reads `read_only`.
+fn old_remote(sent: &[u8], human_control: bool, before_this: bool) -> Option<i32> {
+    use tendr::attach_proto::{MSG_HELLO, MSG_RESUME, read_msg};
+    let len = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
+    let request: serde_json::Value = serde_json::from_slice(&sent[4..4 + len]).unwrap();
+    let params = &request["params"];
+    let takeover = params["takeover"].as_bool().unwrap();
+    let resume = Some(&params["resume"]).filter(|r| before_this && !r.is_null());
+    if human_control && !takeover && resume.is_none() {
+        return Some(81);
+    }
+    let (msg_type, payload) = read_msg(&mut &sent[4 + len..]).unwrap();
+    let attaches = match resume {
+        None => {
+            let (versions, modes) = if before_this {
+                (1..=2, 1..=4)
+            } else {
+                (1..=1, 1..=3)
+            };
+            let mode = if takeover { 2 } else { 1 };
+            msg_type == MSG_HELLO
+                && matches!(payload.as_slice(), [v, m]
+                    if versions.contains(v) && modes.contains(m) && *m == mode)
+        }
+        Some(point) => {
+            let mut asked = point["epoch"].as_u64().unwrap().to_be_bytes().to_vec();
+            let run_id = uuid::Uuid::parse_str(point["run_id"].as_str().unwrap()).unwrap();
+            asked.extend_from_slice(run_id.as_bytes());
+            asked.extend_from_slice(&point["offset"].as_u64().unwrap().to_be_bytes());
+            msg_type == MSG_RESUME && payload == asked
+        }
+    };
+    (!attaches).then_some(80)
+}
+
+/// What a read-only `attach --host` sends a remote tendr, its watch hello
+/// and its watch resume, is refused by one from before read-only `--host`:
+/// 0.5.0's, or this repository's just before it. Each refuses with 81 when
+/// its own human-control check comes first, otherwise 80, and never goes on
+/// to attach, so never takes or changes control.
+#[test]
+fn a_watch_hello_and_watch_resume_are_refused_by_an_old_remote() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let files = TempDir::new().unwrap();
+    let path = |name: &str| files.path().join(name);
+    let ssh = fake_ssh(&format!(
+        "give-up-if {drop}\nscript\n\
+         watch request {fresh}\n\
+         watch answer\n\
+         watch output one\n\
+         watch drain\n\
+         watch-resume request {resumed}\n\
+         watch-resume exit 80",
+        drop = path("drop").display(),
+        fresh = path("fresh").display(),
+        resumed = path("resumed").display(),
+    ));
+    let watcher = attach_through(
+        &ssh,
+        "30",
+        &root,
+        "old-remote-ro",
+        &["s", "--read-only"],
+        &[],
+    );
+    watcher.wait_output_contains("one");
+    std::fs::write(path("drop"), b"").unwrap();
+    assert_eq!(watcher.wait_exit(Duration::from_secs(30)), 80);
+    watcher.assert_terminal_restored();
+
+    let fresh = std::fs::read(path("fresh")).unwrap();
+    let resumed = std::fs::read(path("resumed")).unwrap();
+    for before_this in [true, false] {
+        for human_control in [false, true] {
+            let at = format!("before_this={before_this} human_control={human_control}");
+            let checked = if human_control { 81 } else { 80 };
+            assert_eq!(
+                old_remote(&fresh, human_control, before_this),
+                Some(checked),
+                "hello, {at}"
+            );
+            // Only a remote that knows `resume` skips its check for one.
+            let resume = if before_this { 80 } else { checked };
+            assert_eq!(
+                old_remote(&resumed, human_control, before_this),
+                Some(resume),
+                "resume, {at}"
+            );
+        }
+    }
 }

@@ -33,21 +33,34 @@ use tendr::model::ids::Namespace;
 /// sidecar that cannot resume refuses it, and this end exits 80 saying so:
 /// it never attaches afresh instead.
 ///
+/// A `read_only` request is a watcher's, which never holds or changes
+/// control, so it skips the human-control check too. Its hello must be a
+/// watch hello, answered `Watching`. Its resume must be a watch resume
+/// ([`Frame::WatchResume`]), built from `resume`'s run and offset only: the
+/// epoch the request carries is ignored, and a plain resume frame after a
+/// read-only request is refused (80), so nothing a watcher sends can reach
+/// the control rule. When the session closes a watcher's connection, the
+/// run ended (0) or the session cut it off (84), as `meta.json` here says;
+/// the client has no other way to tell.
+///
 /// Its exit code is that of a local attach: the checks' and the sidecar's
 /// refusals keep their codes, and a client taken over exits 81 (after the
 /// `MSG_RETIRED` that tells it so).
 ///
 /// # Errors
 /// The local attach's errors, a request not followed by its hello or resume
-/// frame (80), and a session that cannot resume (80).
+/// frame (80), a session that cannot resume (80), and a watcher cut off
+/// (84).
 pub fn cmd_attach_bridge(
     name: &str,
     namespace: &Namespace,
     takeover: bool,
+    read_only: bool,
     version: Version,
     resume: Option<ResumePoint>,
 ) -> anyhow::Result<()> {
-    let (session, meta) = super::attachable(name, namespace, takeover || resume.is_some())?;
+    let (session, meta) =
+        super::attachable(name, namespace, takeover || read_only || resume.is_some())?;
 
     #[cfg(not(unix))]
     {
@@ -57,13 +70,24 @@ pub fn cmd_attach_bridge(
 
     #[cfg(unix)]
     {
-        use tendr::attach_proto::{self, Frame};
+        use super::Point;
+        use tendr::attach_proto::{self, Frame, WatchPoint};
         use tendr::pty_exit::PtyExitCode;
 
         let first = attach_proto::read_frame(&mut std::io::stdin().lock());
+        let resume = resume.map(|point| {
+            if read_only {
+                Point::Watch(WatchPoint {
+                    run_id: point.run_id,
+                    offset: point.offset,
+                })
+            } else {
+                Point::Control(point)
+            }
+        });
         let (stream, answer, epoch) = match resume {
             None => {
-                let mode = super::mode(takeover, false);
+                let mode = super::mode(takeover, read_only);
                 match first {
                     Ok(Frame::Hello { mode: hello, .. }) if hello == mode => {}
                     other => {
@@ -77,7 +101,7 @@ pub fn cmd_attach_bridge(
             }
             Some(point) => {
                 match first {
-                    Ok(Frame::Resume(asked)) if asked == point => {}
+                    Ok(asked) if asked == point.resume_frame() => {}
                     other => {
                         return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
                             "the resume request must be followed by its resume frame, not {other:?}"
@@ -85,7 +109,11 @@ pub fn cmd_attach_bridge(
                     }
                 }
                 let (stream, resumed) = super::connect_resume(session.path(), point)?;
-                (stream, resumed.frame(), Some(resumed.point().epoch))
+                let epoch = match point {
+                    Point::Control(_) => Some(resumed.point().epoch),
+                    Point::Watch(_) => None,
+                };
+                (stream, resumed.frame(), epoch)
             }
         };
         // A resumed client's control is its new epoch: a later takeover of
@@ -95,11 +123,14 @@ pub fn cmd_attach_bridge(
             run_id: meta.run_id(),
             epoch,
         });
-        if unix::run(stream, answer, control) == unix::End::TakenOver {
+        match unix::run(stream, answer, control) {
             // The client has been told, and says so itself.
-            std::process::exit(PtyExitCode::Control.code());
+            unix::End::TakenOver => std::process::exit(PtyExitCode::Control.code()),
+            // The session ends a watcher's connection only at the run's end
+            // or to cut it off; only this end can read which.
+            unix::End::Closed if read_only => super::run_ended(&session, meta.run_id()),
+            unix::End::Closed | unix::End::Left => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -107,7 +138,7 @@ pub fn cmd_attach_bridge(
 mod unix {
     use std::io::{self, BufReader, BufWriter};
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
@@ -150,16 +181,21 @@ mod unix {
             Arc::clone(&outbox),
             Arc::new(AtomicBool::new(false)),
         );
+        // Set once the client has detached: the session then closes the
+        // connection in answer, which is the client leaving, not the session
+        // ending it, whichever direction reports first.
+        let detached = Arc::new(AtomicBool::new(false));
         {
-            let (outbox, ends) = (Arc::clone(&outbox), ends.clone());
+            let (outbox, ends, detached) =
+                (Arc::clone(&outbox), ends.clone(), Arc::clone(&detached));
             std::thread::spawn(move || {
-                if forward_input(&outbox) {
+                if forward_input(&outbox, &detached) {
                     let _ = ends.send(End::Left);
                 }
             });
         }
         std::thread::spawn(move || {
-            let _ = ends.send(forward_output(from_session, control.as_ref()));
+            let _ = ends.send(forward_output(from_session, control.as_ref(), &detached));
         });
 
         let end = wait_end(&ended);
@@ -170,10 +206,11 @@ mod unix {
     }
 
     /// Client → session: input waits behind controls, and the client's
-    /// detach is passed on before the connection closes. `true` if the client
-    /// ended its input; `false` if the outbox closed under it because the
-    /// session closed the connection, which the output direction reports.
-    fn forward_input(outbox: &Outbox) -> bool {
+    /// detach is passed on before the connection closes, noted in
+    /// `detached` first. `true` if the client ended its input; `false` if the
+    /// outbox closed under it because the session closed the connection,
+    /// which the output direction reports.
+    fn forward_input(outbox: &Outbox, detached: &AtomicBool) -> bool {
         let mut input = io::stdin().lock();
         loop {
             match attach_proto::read_frame(&mut input) {
@@ -184,6 +221,7 @@ mod unix {
                 }
                 Ok(frame @ (Frame::Resize(_) | Frame::Repaint)) => outbox.push_control(frame),
                 Ok(Frame::Detach) => {
+                    detached.store(true, Ordering::SeqCst);
                     outbox.push_control(Frame::Detach);
                     outbox.wait_controls_sent(DETACH_GRACE);
                     return true;
@@ -201,8 +239,9 @@ mod unix {
     /// this viewer, exactly as a local client would. A frame the sidecar cut
     /// off is not passed on. When the session ends the connection without
     /// `MSG_RETIRED` because this client was taken over, the event log says
-    /// so, and the client is told as the sidecar would have told it.
-    fn forward_output(socket: UnixStream, control: Option<&Control>) -> End {
+    /// so, and the client is told as the sidecar would have told it. An end
+    /// after the client's own detach (`detached`) is the client leaving.
+    fn forward_output(socket: UnixStream, control: Option<&Control>, detached: &AtomicBool) -> End {
         let mut socket = BufReader::new(socket);
         let mut retired = false;
         loop {
@@ -219,6 +258,9 @@ mod unix {
         }
         if retired {
             return End::TakenOver;
+        }
+        if detached.load(Ordering::SeqCst) {
+            return End::Left;
         }
         match control.and_then(Control::taken_over_by) {
             Some(successor) => {

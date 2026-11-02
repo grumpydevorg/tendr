@@ -191,7 +191,13 @@ const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 ///
 /// A version 2 attach whose connection drops reconnects by itself and
 /// resumes where its terminal stopped ([`resume_host`]), until it resumes,
-/// the remote refuses, or the user leaves.
+/// the remote refuses, or the user leaves; a read-only one too, as a
+/// watcher, which never touches control.
+///
+/// A read-only attach without a terminal streams the session's output to
+/// stdout, as a local one does, and its exit code is the remote's verdict:
+/// 0 when the run ended, 84 when the session cut it off
+/// ([`cmd_attach_bridge`]).
 ///
 /// Returns the exit code. The remote side's own failures (no such session,
 /// a refusal, an unreachable socket) arrive as its exit code, with its
@@ -210,7 +216,15 @@ pub fn cmd_attach_host(
     use tendr::attach_proto::Version;
 
     // Before ssh starts: the request may take over, and ssh shares the
-    // terminal, whose state is taken now.
+    // terminal, whose state is taken now. On Unix a read-only attach needs
+    // none: without one it streams the session's output to stdout.
+    #[cfg(unix)]
+    let terminal = if request.read_only && terminal::absent()? {
+        terminal::none()
+    } else {
+        terminal::open()?
+    };
+    #[cfg(not(unix))]
     let terminal = terminal::open()?;
     let mode = mode(request.takeover, request.read_only);
     attach_proto::write_frame(
@@ -286,7 +300,7 @@ impl HostEnd {
     ///
     /// # Errors
     /// As for [`resume_host`].
-    fn resume(&mut self, point: attach_proto::ResumePoint) -> anyhow::Result<client::Attempt> {
+    fn resume(&mut self, point: Point) -> anyhow::Result<client::Attempt> {
         let dial = tendr::ssh::Dial {
             login: tendr::ssh::Login::Batch,
             stderr: Box::new(client::SshStderr::new(std::sync::Arc::clone(&self.stderr))),
@@ -300,6 +314,57 @@ impl HostEnd {
             }
             Opened::Ended(code) => client::Attempt::Ended(code),
         })
+    }
+}
+
+/// Where a version 2 attach over `--host` stands in its run: the offset of
+/// the next output byte it has not written, from which it resumes after a
+/// lost connection. A controller's point carries the epoch it held, which
+/// the control rule checks on a resume. A watcher's carries none, since it
+/// holds no control, and it resumes with its own frame
+/// ([`Frame::WatchResume`]), so no path can feed its point into the control
+/// rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Point {
+    Control(attach_proto::ResumePoint),
+    Watch(attach_proto::WatchPoint),
+}
+
+impl Point {
+    /// The offset of the next output byte not yet written.
+    pub(super) fn offset(self) -> u64 {
+        match self {
+            Self::Control(point) => point.offset,
+            Self::Watch(point) => point.offset,
+        }
+    }
+
+    /// Move the offset past `written` more bytes.
+    pub(super) fn advance(&mut self, written: u64) {
+        match self {
+            Self::Control(point) => point.offset += written,
+            Self::Watch(point) => point.offset += written,
+        }
+    }
+
+    /// The frame that asks to resume from here, in place of the hello.
+    fn resume_frame(self) -> Frame {
+        match self {
+            Self::Control(point) => Frame::Resume(point),
+            Self::Watch(point) => Frame::WatchResume(point),
+        }
+    }
+
+    /// The point once the session answered a resume from here with
+    /// `answer`: a controller's new epoch and offset; a watcher's offset.
+    pub(super) fn resumed(self, answer: attach_proto::ResumePoint) -> Self {
+        match self {
+            Self::Control(_) => Self::Control(answer),
+            Self::Watch(point) => Self::Watch(attach_proto::WatchPoint {
+                offset: answer.offset,
+                ..point
+            }),
+        }
     }
 }
 
@@ -419,19 +484,19 @@ fn read_answer(
 }
 
 /// Reconnect the `attach --host` of `request` after its connection was lost,
-/// resuming from `point`: the run, the epoch it held and the offset just
-/// past the last output byte written to the terminal (the version 2 resume
-/// point the relay keeps). `dial` says how ssh connects.
+/// resuming from `point`: the run, the offset just past the last output
+/// byte written to the terminal (the version 2 point the relay keeps) and,
+/// for a controller, the epoch it held. `dial` says how ssh connects.
 ///
 /// The request carries `point`, and a resume frame takes the hello's place
 /// on ssh's stdin ([`resume_request`]), so a remote tendr that cannot resume
 /// refuses it rather than attach afresh. On [`Resumption::Resumed`] the relay
-/// goes on from `point.offset`: the session's stamped output follows from
+/// goes on from `point`'s offset: the session's stamped output follows from
 /// there, with no mode replay. On [`Resumption::Gone`] the output in between
 /// is lost: the caller writes the reset of the modes it has tracked
 /// (`TermModes::reset`) before relaying, since the mode replay that follows
-/// only turns modes on, then goes on from the head, and sends the size and
-/// the repaint nudge, as a fresh attach does.
+/// only turns modes on, then goes on from the head, and a controller sends
+/// the size and the repaint nudge, as a fresh attach does.
 ///
 /// # Errors
 /// A refusal (81 when control has changed since, the run has ended, or an
@@ -441,7 +506,7 @@ fn read_answer(
 fn resume_host(
     host: &str,
     request: &crate::remote_op::AttachRequest,
-    point: attach_proto::ResumePoint,
+    point: Point,
     dial: tendr::ssh::Dial,
 ) -> anyhow::Result<Opened<Resumption>> {
     let frame = resume_request(request, point)?;
@@ -450,19 +515,31 @@ fn resume_host(
 
 /// What a resume from `point` writes to ssh's stdin: the remote frame of
 /// `request` carrying `point`, never a takeover, then the resume frame where
-/// the hello would go.
+/// the hello would go. A watcher's request is still read-only, and the
+/// epoch it carries is zero: the remote reads only its run and offset, into
+/// the watch resume it requires ([`cmd_attach_bridge`]). The field stays
+/// because a remote from before watch resumes requires it, and then refuses
+/// the frame (80) rather than the request (2).
 fn resume_request(
     request: &crate::remote_op::AttachRequest,
-    point: attach_proto::ResumePoint,
+    point: Point,
 ) -> anyhow::Result<Vec<u8>> {
-    use crate::remote_op::{AttachRequest, RemoteOperation};
+    use crate::remote_op::{AttachRequest, RemoteOperation, ResumeRequest};
 
+    let resume = match point {
+        Point::Control(point) => point.into(),
+        Point::Watch(point) => ResumeRequest {
+            run_id: point.run_id,
+            epoch: tendr::model::pty_control::ControllerEpoch::ZERO.get(),
+            offset: point.offset,
+        },
+    };
     let mut frame = crate::remote_frame::encode(&RemoteOperation::Attach(AttachRequest {
         takeover: false,
-        resume: Some(point.into()),
+        resume: Some(resume),
         ..request.clone()
     }))?;
-    attach_proto::write_frame(&mut frame, &Frame::Resume(point))?;
+    attach_proto::write_frame(&mut frame, &point.resume_frame())?;
     Ok(frame)
 }
 
@@ -544,13 +621,15 @@ impl Accept {
         }
     }
 
-    /// Where a version 2 controller's output starts; `None` for version 1,
-    /// whose output carries no offsets, and for a watcher, which does not
-    /// resume.
-    fn resume_point(self) -> Option<attach_proto::ResumePoint> {
+    /// Where an `attach --host` attach's stamped output starts: a version 2
+    /// controller's point, or a watcher's (the bridge always speaks version
+    /// 2 for a watcher); `None` for version 1, whose output carries no
+    /// offsets. A local attach does not reconnect and has no use for it.
+    fn resume_point(self) -> Option<Point> {
         match self {
-            Self::V1(_) | Self::Watch(_) => None,
-            Self::V2(point) => Some(point),
+            Self::V1(_) => None,
+            Self::V2(point) => Some(Point::Control(point)),
+            Self::Watch(point) => Some(Point::Watch(point)),
         }
     }
 
@@ -624,8 +703,9 @@ pub(super) fn connect(
     Ok((stream, accept))
 }
 
-/// What the sidecar answered a resume: control regained at a new epoch, and
-/// where the output goes on from.
+/// What the sidecar answered a resume: a controller's control regained at a
+/// new epoch (a watcher's answer is at epoch zero, which names no control),
+/// and where the output goes on from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Resumption {
     /// The output follows from `point.offset`, the offset asked for, with
@@ -641,7 +721,7 @@ pub(super) enum Resumption {
 }
 
 impl Resumption {
-    /// The new epoch, and the offset the stamped output starts at.
+    /// The epoch, and the offset the stamped output starts at.
     pub(super) fn point(self) -> attach_proto::ResumePoint {
         match self {
             Self::Resumed(point) | Self::Gone { point, .. } => point,
@@ -658,23 +738,28 @@ impl Resumption {
     }
 }
 
-/// [`connect`] for a resume from `point`: the resume frame takes the hello's
-/// place. A sidecar started by a tendr that cannot resume refuses it with
-/// the protocol class; that is "cannot resume" (80), never a fresh attach.
+/// [`connect`] for a resume from `point`: the resume frame, a controller's
+/// or a watcher's, takes the hello's place. A sidecar started by a tendr
+/// that cannot resume it refuses it with the protocol class; that is
+/// "cannot resume" (80), never a fresh attach.
 #[cfg(unix)]
 fn connect_resume(
     session_dir: &std::path::Path,
-    point: attach_proto::ResumePoint,
+    point: Point,
 ) -> anyhow::Result<(std::os::unix::net::UnixStream, Resumption)> {
     let mut stream = open_socket(session_dir)?;
-    let reply = exchange(&mut stream, &Frame::Resume(point), "resume")?;
+    let reply = exchange(&mut stream, &point.resume_frame(), "resume")?;
     if let Ok(Frame::Rejected {
         class: attach_proto::RejectClass::Protocol,
         reason,
     }) = &reply
     {
+        let what = match point {
+            Point::Control(_) => "an attach",
+            Point::Watch(_) => "a read-only attach",
+        };
         return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
-            "cannot resume: the session was started by a tendr that cannot resume an attach ({reason}); attach again"
+            "cannot resume: the session was started by a tendr that cannot resume {what} ({reason}); attach again"
         )));
     }
     let resumed = resume_reply(reply, point)?;
@@ -789,22 +874,21 @@ fn hello_reply(
 }
 
 /// What the sidecar's reply to a resume from `asked` means for the client.
-/// An answer must be for the same run, at a later epoch; a resumed one at
-/// the offset asked for, a gone one naming a span that starts after it (an
-/// offset past the head means this client's count is broken). Otherwise as
-/// [`hello_reply`].
-fn resume_reply(
-    reply: Result<Frame, FrameError>,
-    asked: attach_proto::ResumePoint,
-) -> anyhow::Result<Resumption> {
-    let ours = |point: attach_proto::ResumePoint| {
-        point.run_id == asked.run_id && point.epoch > asked.epoch
+/// An answer must be for the same run, and a controller's at a later epoch;
+/// a watcher's names no control, so only its run and offsets count. A
+/// resumed one must be at the offset asked for, a gone one name a span that
+/// starts after it (an offset past the head means this client's count is
+/// broken). Otherwise as [`hello_reply`].
+fn resume_reply(reply: Result<Frame, FrameError>, asked: Point) -> anyhow::Result<Resumption> {
+    let ours = |point: attach_proto::ResumePoint| match asked {
+        Point::Control(asked) => point.run_id == asked.run_id && point.epoch > asked.epoch,
+        Point::Watch(asked) => point.run_id == asked.run_id,
     };
     match reply {
-        Ok(Frame::Resumed(point)) if ours(point) && point.offset == asked.offset => {
+        Ok(Frame::Resumed(point)) if ours(point) && point.offset == asked.offset() => {
             Ok(Resumption::Resumed(point))
         }
-        Ok(Frame::Gone { point, oldest }) if ours(point) && asked.offset < oldest => {
+        Ok(Frame::Gone { point, oldest }) if ours(point) && asked.offset() < oldest => {
             Ok(Resumption::Gone { point, oldest })
         }
         Ok(answer @ (Frame::Resumed(_) | Frame::Gone { .. })) => {
@@ -872,7 +956,7 @@ impl client::Link {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{Accept, Resumption, exchange, hello_reply, resume_reply, resume_request};
+    use super::{Accept, Point, Resumption, exchange, hello_reply, resume_reply, resume_request};
     use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
     use tendr::attach_proto::{
@@ -909,7 +993,7 @@ mod tests {
             epoch: ControllerEpoch::new(4),
             offset: 99,
         };
-        let sent = resume_request(&request, point).unwrap();
+        let sent = resume_request(&request, Point::Control(point)).unwrap();
         let len = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
         let json: serde_json::Value = serde_json::from_slice(&sent[4..4 + len]).unwrap();
         assert_eq!(
@@ -925,6 +1009,46 @@ mod tests {
         assert_eq!(
             tendr::attach_proto::read_frame(&mut rest).unwrap(),
             Frame::Resume(point)
+        );
+        assert!(rest.is_empty());
+    }
+
+    /// A watcher's resume stays read-only, carries its run and offset in the
+    /// request with epoch zero (the field a remote from before watch resumes
+    /// requires), and sends the watch resume, with no epoch, in place of the
+    /// hello.
+    #[test]
+    fn a_watchers_resume_sends_a_watch_resume_with_no_epoch() {
+        let request = crate::remote_op::AttachRequest {
+            session: "s".to_owned(),
+            namespace: None,
+            takeover: false,
+            read_only: true,
+            escape: tendr::attach_escape::EscapeMode::CtrlBackslash,
+            protocol: 2,
+            resume: None,
+        };
+        let point = WatchPoint {
+            run_id: RunId::new(),
+            offset: 99,
+        };
+        let sent = resume_request(&request, Point::Watch(point)).unwrap();
+        let len = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
+        let json: serde_json::Value = serde_json::from_slice(&sent[4..4 + len]).unwrap();
+        assert_eq!(json["params"]["read_only"], true);
+        assert_eq!(json["params"]["takeover"], false);
+        assert_eq!(
+            json["params"]["resume"],
+            serde_json::json!({
+                "run_id": point.run_id.as_uuid().to_string(),
+                "epoch": 0,
+                "offset": 99
+            })
+        );
+        let mut rest = &sent[4 + len..];
+        assert_eq!(
+            tendr::attach_proto::read_frame(&mut rest).unwrap(),
+            Frame::WatchResume(point)
         );
         assert!(rest.is_empty());
     }
@@ -1015,13 +1139,17 @@ mod tests {
             epoch: ControllerEpoch::new(3),
             offset: 100,
         };
-        let code = |reply| resume_reply(Ok(reply), asked).err().map(|e| exit_code(&e));
+        let code = |reply| {
+            resume_reply(Ok(reply), Point::Control(asked))
+                .err()
+                .map(|e| exit_code(&e))
+        };
         let resumed = ResumePoint {
             epoch: ControllerEpoch::new(5),
             ..asked
         };
         assert_eq!(
-            resume_reply(Ok(Frame::Resumed(resumed)), asked).unwrap(),
+            resume_reply(Ok(Frame::Resumed(resumed)), Point::Control(asked)).unwrap(),
             Resumption::Resumed(resumed)
         );
         let head = ResumePoint {
@@ -1033,7 +1161,7 @@ mod tests {
             oldest: 101,
         };
         assert_eq!(
-            resume_reply(Ok(gone), asked).unwrap(),
+            resume_reply(Ok(gone), Point::Control(asked)).unwrap(),
             Resumption::Gone {
                 point: head,
                 oldest: 101
@@ -1071,6 +1199,65 @@ mod tests {
             reason: "taken".to_owned(),
         };
         assert_eq!(code(refusal), Some(81));
+    }
+
+    /// A watcher's resume answer names no control: its run and offsets are
+    /// checked as a controller's are, its epoch is not. Anything else, a
+    /// grant of control included, is a protocol failure. The point it then
+    /// goes on from is still a watcher's.
+    #[test]
+    fn a_watchers_resume_answer_counts_only_its_run_and_offsets() {
+        let asked = WatchPoint {
+            run_id: RunId::new(),
+            offset: 100,
+        };
+        let reply = |frame| resume_reply(Ok(frame), Point::Watch(asked));
+        let resumed = ResumePoint {
+            run_id: asked.run_id,
+            epoch: ControllerEpoch::ZERO,
+            offset: 100,
+        };
+        assert_eq!(
+            reply(Frame::Resumed(resumed)).unwrap(),
+            Resumption::Resumed(resumed)
+        );
+        let head = ResumePoint {
+            offset: 500,
+            ..resumed
+        };
+        let gone = reply(Frame::Gone {
+            point: head,
+            oldest: 101,
+        })
+        .unwrap();
+        assert_eq!(
+            Point::Watch(asked).resumed(gone.point()),
+            Point::Watch(WatchPoint {
+                offset: 500,
+                ..asked
+            })
+        );
+
+        for wrong in [
+            Frame::Resumed(ResumePoint {
+                run_id: RunId::new(),
+                ..resumed
+            }),
+            Frame::Resumed(ResumePoint {
+                offset: 99,
+                ..resumed
+            }),
+            Frame::Gone {
+                point: head,
+                oldest: 100,
+            },
+            Frame::Watching(asked),
+            Frame::Accepted(ControllerEpoch::new(4)),
+            Frame::AcceptedV2(head),
+        ] {
+            let code = reply(wrong.clone()).err().map(|e| exit_code(&e));
+            assert_eq!(code, Some(80), "{wrong:?}");
+        }
     }
 
     /// Anything but a v1 reply, or no reply before the deadline, is a

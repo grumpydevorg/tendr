@@ -301,6 +301,36 @@ the user cannot see what they would land on until the screen is back.
 Source: step 1 of
 [remote frame transport](plans/active/01_remote-frame-transport.md) at `d282062`.
 
+### Watchers never touch control
+
+*2026-11-03.* A read-only viewer (a watcher) never reaches the input writer:
+it is not granted an epoch, records no `pty.control_changed`, is kept in
+its own set that a takeover cannot reach, and its keystrokes, resizes and
+repaints are dropped by the sidecar. So nothing a watcher does or loses can
+move control: not its attach, its link dropping, its resume, nor its
+detach. A human holding the session therefore does not keep a watcher out,
+locally or over `--host`, and a takeover never retires one. Taking control
+means attaching again with `--takeover` (Rick's decision), never upgrading
+a watcher in place, which would put a second path into the control rule.
+Source: step 1 of
+[remote frame transport](plans/active/01_remote-frame-transport.md) at `6612733`.
+
+### A watch resume carries no epoch
+
+*2026-11-03.* A watcher that lost its link resumes with its own frame,
+`MSG_WATCH_RESUME` (run id and offset), not with `MSG_RESUME` and a dummy
+epoch. With no epoch in the frame, no path can feed a watcher's point into
+`InputArbiter::resume`, and a sidecar or remote tendr from before it refuses
+it as an unknown frame instead of reading it as a controller's resume, so a
+skewed peer can never grant control to a watcher. The bridge requires
+exactly this frame after a read-only request and refuses a plain resume
+there. The answers are the controller's `MSG_RESUMED` and `MSG_GONE` at
+epoch 0, which names no control, since the watcher reads only their run and
+offsets; the remote request still carries an `epoch` field, set to 0, only
+because a remote from before watch resumes requires the field to refuse
+the frame with 80 rather than reject the request with 2. Source: step 1 of
+[remote frame transport](plans/active/01_remote-frame-transport.md) at `6612733`.
+
 ### Windows uses Job Objects and a hidden console
 
 *2026-03 to 2026-04.* Windows has no SIGTERM. The sidecar runs the child in a
