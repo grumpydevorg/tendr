@@ -531,3 +531,48 @@ fn a_scripted_end_of_output_ends_the_watch_at_its_offset() {
         assert!(!stderr.contains("reconnecting"), "{end}: {stderr}");
     }
 }
+
+/// A remote tendr from before 0.7.0 ignores `read_only` and refuses a
+/// watcher before any answer, in its own frozen words (those of 0.5.0 and
+/// 0.6.0): 80 for the watch hello it does not know, or 81 from its
+/// human-control check, whose `--takeover` hint would take the terminal
+/// from whoever holds it. The client keeps the remote's code and message,
+/// and adds a line after it saying what the refusal means. A 0.7.0 remote's
+/// own refusal, and a plain attach's 81, get no such line.
+#[test]
+fn a_watcher_refused_by_an_old_remote_says_it_needs_0_7_0() {
+    const OLD_HELLO: &str = "the attach request must be followed by its Attach hello, \
+                             not Err(Malformed(UnsupportedHello))";
+    const OLD_CONTROL: &str =
+        "session is already under human control (use --takeover to take it over)";
+    const NEW_SESSION: &str = "cannot attach read-only: the session was started by a tendr \
+                               that cannot serve read-only viewers (unsupported attach \
+                               protocol version or mode)";
+    const NEEDS: &str = "tendr: watching (attach --read-only) needs tendr 0.7.0 or newer on \
+                         box, and a session started by it\n";
+    const OLDER: &str = "tendr: the tendr on box is older than 0.7.0 and cannot serve \
+                         watchers; --takeover would take the terminal from whoever holds it\n";
+    let terminals: &[bool] = if cfg!(unix) { &[true, false] } else { &[true] };
+    for &terminal in terminals {
+        for (code, said, note) in [
+            (80, OLD_HELLO, Some(NEEDS)),
+            (81, OLD_CONTROL, Some(OLDER)),
+            (80, NEW_SESSION, None),
+        ] {
+            let root = TempDir::new().unwrap();
+            let remote = Remote::new(&format!("watch say {said}\nwatch exit {code}"));
+            let mut client = remote.watch(&root, terminal);
+            let case = format!("{code} {said:?}, terminal {terminal}");
+            assert_eq!(client.wait_exit(), code, "{case}: {}", client.stderr());
+            assert_eq!(client.screen(), "", "{case}");
+            let stderr = client.stderr();
+            let expected = format!("{said}\n{}", note.unwrap_or_default());
+            assert_eq!(stderr, expected, "{case}");
+        }
+    }
+    let root = TempDir::new().unwrap();
+    let remote = Remote::new(&format!("hello say {OLD_CONTROL}\nhello exit 81"));
+    let mut client = remote.attach(&root);
+    assert_eq!(client.wait_exit(), 81, "{}", client.stderr());
+    assert_eq!(client.stderr(), format!("{OLD_CONTROL}\n"));
+}

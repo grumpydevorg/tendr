@@ -87,6 +87,24 @@
   before this says nothing of the end: a watcher then goes by whether the
   run ended, as before.
 
+- **`--host` states the oldest remote it works with.** The `--host` help
+  and the guide said the remote `tendr` must be this version or newer, and
+  a remote too old for the remote frame was told to upgrade to this
+  version. Every `--host` command works with a remote from 0.5.0 on;
+  reconnecting needs 0.6.0 on the remote and for the session, and watching
+  needs 0.7.0 on both hosts and for the session. The guide's remote section
+  now says so in one place, and the upgrade message names 0.5.0.
+
+- **A watcher refused by an older remote says why.** A remote `tendr` from
+  before 0.7.0 refuses `attach --read-only --host` in its own words: an
+  internal error about the attach hello (80), or, when a human is attached,
+  `session is already under human control (use --takeover to take it
+  over)` (81), whose hint would take the terminal from that human. tendr
+  now adds a line after either: that watching needs 0.7.0 or newer on the
+  host and a session started by it, or that the remote is older than 0.7.0
+  and cannot serve watchers, and `--takeover` would take the terminal from
+  whoever holds it. The exit codes are unchanged.
+
 ## v0.6.0 — `attach --host` survives dropped connections
 
 Works with 0.5.0 in both directions over `--host`: an attach between a 0.6.0

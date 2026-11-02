@@ -303,6 +303,8 @@ fn forward(argv: &[String]) -> ! {
 ///                since this step began hold these bytes (two hex digits
 ///                each), or its input ends
 /// drain          read the client's frames until its input ends
+/// say <text>     write <text> and a newline to stderr, as the remote
+///                tendr's own message
 /// drop [<code>]  say what ssh says when its keepalives go unanswered, then
 ///                exit <code> (default 255; a u32, so an NTSTATUS such as
 ///                3221225786 fits) without an exit trailer: the link is lost
@@ -472,6 +474,7 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                 };
                 std::process::exit(code as i32)
             }
+            "say" => eprintln!("{value}"),
             "exit" => exit(value.parse().unwrap()),
             other => panic!("fake ssh: unknown script step {other:?}"),
         }
