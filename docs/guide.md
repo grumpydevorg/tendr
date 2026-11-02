@@ -298,10 +298,11 @@ concurrent `push` is refused, not interleaved.
   output beside whoever holds the terminal, even while a human does, and up
   to eight can watch at once (a ninth is refused with 84). Your keystrokes
   are dropped, with a note on the bottom line at the first one; `Ctrl-\ d`
-  still detaches (0). It sends no window size, so a full-screen program
-  shows nothing new until it next redraws, and then at the controlling
-  terminal's size. A takeover leaves watchers attached. To take control,
-  attach again with `--takeover` (it cannot be combined with
+  still detaches (0), so `--escape none` is refused with it. It sends no
+  window size, so a full-screen program shows nothing new until it next
+  redraws, and then at the controlling terminal's size. A takeover leaves
+  watchers attached. To take control, attach again with `--takeover` (it
+  cannot be combined with
   `--read-only`). A session started by a `tendr` without read-only viewers
   refuses it with 80. `--read-only` does not yet work with `--host` from a
   Unix client (2); from Windows it is passed to the remote `tendr attach`.

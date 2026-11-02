@@ -1425,15 +1425,18 @@ fn meta_control(root: &TempDir, session: &str) -> String {
     meta["pty"]["control"].as_str().unwrap().to_owned()
 }
 
-/// A read-only attach cannot also take over: a usage error (2), before
-/// anything else.
+/// A read-only attach cannot also take over, nor drop its escape, which is
+/// then its only way out: usage errors (2), before anything else.
 #[test]
-fn read_only_and_takeover_together_are_a_usage_error() {
+fn read_only_with_takeover_or_without_the_escape_is_a_usage_error() {
     let root = TempDir::new().unwrap();
-    tendr(&root)
-        .args(["attach", "pty-none", "--read-only", "--takeover"])
-        .assert()
-        .code(2);
+    for conflict in [&["--takeover"][..], &["--escape", "none"]] {
+        tendr(&root)
+            .args(["attach", "pty-none", "--read-only"])
+            .args(conflict)
+            .assert()
+            .code(2);
+    }
 }
 
 /// A sidecar from before read-only viewers, emulated at the frame level as

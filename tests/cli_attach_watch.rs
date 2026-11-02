@@ -308,7 +308,7 @@ fn a_watchers_input_resize_and_repaint_never_reach_the_child() {
     assert_eq!(
         shown.matches("size:").count(),
         1,
-        "only the controller's size request was read: {shown:?}"
+        "the controller's size request was answered once: {shown:?}"
     );
     let logged = poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
         let logged = std::fs::read_to_string(&input).unwrap_or_default();
@@ -336,7 +336,9 @@ fn read_until_line_end(stream: &mut UnixStream, mut shown: String) -> String {
 /// keeps control and its output.
 #[test]
 fn a_watcher_a_ring_behind_is_cut_off_and_nothing_else_is() {
-    const RING: u64 = 64 * 1024;
+    // Far smaller than the flood, so the stalled watcher falls behind it,
+    // and roomy enough that a reader briefly descheduled does not.
+    const RING: u64 = 1024 * 1024;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "watch-evict");

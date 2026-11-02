@@ -459,9 +459,10 @@ enum Commands {
         #[arg(long)]
         takeover: bool,
         /// Watch without control: show the session's output and drop
-        /// keystrokes (the detach escape still works). Sends no size, so a
-        /// full-screen program shows nothing new until it next redraws, at
-        /// the controller's size. Up to eight per session
+        /// keystrokes (the detach escape still works, so not with `--escape
+        /// none`). Sends no size, so a full-screen program shows nothing new
+        /// until it next redraws, at the controller's size. Up to eight per
+        /// session
         #[arg(long, conflicts_with = "takeover")]
         read_only: bool,
         /// Detach escape: `ctrl-backslash` (Ctrl-\ then d detaches; Ctrl-\ twice
@@ -798,6 +799,21 @@ fn without_exit_trailer(
 fn main() {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // A read-only attach drops every key but the escape: without it, nothing
+    // the user types could end the attach.
+    if let Commands::Attach {
+        read_only: true,
+        escape: AttachEscape::None,
+        ..
+    } = &cli.command
+    {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--read-only needs the detach escape; with --escape none nothing typed could end it",
+            )
+            .exit();
+    }
     if cli.exit_trailer {
         run_with_exit_trailer(&matches);
     }
