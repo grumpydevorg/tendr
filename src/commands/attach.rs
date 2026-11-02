@@ -289,7 +289,8 @@ pub(super) enum Opened<A> {
 /// read the session's answer, and let `answer` classify it. A remote side
 /// that ends without answering is [`Opened::Ended`] with its exit code (84
 /// if it claims success); an answer `answer` refuses stops ssh. Setting the
-/// dial's `cancel` stops ssh at any point before the answer.
+/// dial's `cancel` stops ssh at any point before the answer begins to
+/// arrive.
 ///
 /// # Errors
 /// `answer`'s error, and the ssh failures of [`tendr::ssh::AttachSsh`].
@@ -337,8 +338,9 @@ fn open_host<A>(
     }
 }
 
-/// Wait until `stdout` has something to read, or has closed: `true`; or
-/// until `cancel` is set: `false`.
+/// Wait until `stdout` has something to read, has closed, or cannot be
+/// polled: `true`, and the read that follows says which; or until `cancel`
+/// is set: `false`.
 #[cfg(unix)]
 fn readable_unless(
     stdout: &impl std::os::fd::AsFd,
@@ -354,8 +356,9 @@ fn readable_unless(
             return false;
         }
         let mut fds = [PollFd::new(stdout, PollFlags::IN)];
-        if matches!(poll(&mut fds, Some(&tick)), Ok(n) if n > 0) {
-            return true;
+        match poll(&mut fds, Some(&tick)) {
+            Ok(0) | Err(rustix::io::Errno::INTR) => {}
+            Ok(_) | Err(_) => return true,
         }
     }
 }
