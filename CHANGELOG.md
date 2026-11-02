@@ -53,6 +53,12 @@
 
 ### Fixed
 
+- **An `attach --host` answer is read even when the remote ends at once.**
+  A remote that said hello, answered and exited before tendr looked (a
+  session whose run ended just then, a resume answered gone with the last
+  output) could be taken as a remote that ended without answering: exit 84,
+  or its own code without the output it sent. tendr now reads the answer
+  whenever the remote said hello.
 - **A signal that also ends ssh leaves `attach --host` as a signal does.**
   SIGINT, SIGTERM or SIGHUP sent to the whole process group ends ssh too;
   the attach could report ssh's end, or the end of a reconnect that end

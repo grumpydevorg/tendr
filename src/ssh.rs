@@ -309,8 +309,9 @@ pub struct AttachSsh {
 
 /// How [`AttachSsh::start`] went.
 pub enum AttachStart {
-    /// The remote tendr is running (it said hello, or the connect deadline is
-    /// off). Its answer to the attach comes next on `stdout`.
+    /// The remote tendr started (it said hello, or the connect deadline is
+    /// off), and may have ended since. Its answer to the attach, if it gave
+    /// one, comes next on `stdout`.
     Running {
         ssh: AttachSsh,
         stdin: std::process::ChildStdin,
@@ -487,7 +488,7 @@ enum Until {
 
 /// Where [`Watch::wait`] stopped.
 enum Progress {
-    /// The remote tendr is running.
+    /// The remote tendr started (it said hello), and may have ended since.
     Connected,
     /// ssh exited: its status, and the remote's exit trailer if it wrote one.
     Exited(std::process::ExitStatus, Option<i32>),
@@ -612,7 +613,13 @@ impl Watch {
                     } else {
                         RUNNING_POLL
                     })) {
-                    Ok(Relay::Hello) => self.hello = true,
+                    // The remote tendr is running, and what it answered is
+                    // on stdout even if ssh has exited since: report the
+                    // connection before looking at the exit.
+                    Ok(Relay::Hello) => {
+                        self.hello = true;
+                        continue;
+                    }
                     Ok(Relay::Done(done)) => self.ended = Some(done),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -632,10 +639,18 @@ impl Watch {
                     Some(ended) => Some(ended),
                     None if self.hello => wait_relay(
                         &self.events,
+                        &mut self.hello,
                         limit.map(|limit| limit.saturating_duration_since(Instant::now())),
                     ),
-                    None => wait_relay(&self.events, Some(Duration::from_secs(1))),
+                    None => wait_relay(&self.events, &mut self.hello, Some(Duration::from_secs(1))),
                 };
+                // A hello relayed only after ssh's exit still proves the
+                // remote tendr ran, and its answer, if it wrote one, is on
+                // stdout to read.
+                if matches!(until, Until::Connected) && self.hello {
+                    self.ended = Some(ended.unwrap_or_default());
+                    return Ok(Progress::Connected);
+                }
                 return Ok(self.exited(host, status, ended.unwrap_or_default()));
             }
             if let Some(deadline) = self
@@ -792,9 +807,14 @@ struct Ended {
     trailer: Option<i32>,
 }
 
-/// Wait for the relay to finish, at most `limit` (forever with `None`).
-/// Returns how stderr ended, or `None` if it did not finish.
-fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option<Ended> {
+/// Wait for the relay to finish, at most `limit` (forever with `None`),
+/// noting a `hello` relayed meanwhile. Returns how stderr ended, or `None`
+/// if it did not finish.
+fn wait_relay(
+    events: &mpsc::Receiver<Relay>,
+    hello: &mut bool,
+    limit: Option<Duration>,
+) -> Option<Ended> {
     let until = limit.map(|limit| Instant::now() + limit);
     loop {
         let event = match until {
@@ -803,8 +823,9 @@ fn wait_relay(events: &mpsc::Receiver<Relay>, limit: Option<Duration>) -> Option
                 .recv_timeout(until.saturating_duration_since(Instant::now()))
                 .ok()?,
         };
-        if let Relay::Done(ended) = event {
-            return Some(ended);
+        match event {
+            Relay::Hello => *hello = true,
+            Relay::Done(ended) => return Some(ended),
         }
     }
 }
