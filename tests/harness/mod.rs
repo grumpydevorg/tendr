@@ -258,6 +258,24 @@ pub fn recorded_output(root: &TempDir, session: &str) -> Vec<u8> {
         .collect()
 }
 
+/// The PTY output of a session as `tendr log --raw` prints it, with every line
+/// break removed. Capture logs each read of the PTY as lines of its own, so text
+/// that straddles two reads is split there: a shell that echoes a typed line one
+/// keystroke at a time, as macOS's `/bin/sh` (bash 3.2) does, is often read
+/// mid-line. Joining the lines recovers such text, at the cost of the output's
+/// own line breaks.
+#[allow(dead_code)]
+pub fn logged_output(root: &TempDir, session: &str) -> String {
+    let output = tendr(root)
+        .args(["log", session, "--raw"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .chars()
+        .filter(|&c| c != '\n')
+        .collect()
+}
+
 // Polling. A wait on the filesystem or a process (meta.json, event logs, a
 // path, PID liveness, `try_wait`, `try_acquire`, `tendr log` or `status`
 // output) goes through `poll_until` or a wrapper below. The rules:

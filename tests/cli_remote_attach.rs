@@ -1290,12 +1290,8 @@ fn host_reconnect_fails_fast_backs_off_and_discards_typing() {
     wrapped
         .cli
         .type_until_logged(&root, "host-backoff", "after-the-gap\n");
-    let log = tendr(&root)
-        .args(["log", "host-backoff", "--raw"])
-        .output()
-        .unwrap();
     assert!(
-        !String::from_utf8_lossy(&log.stdout).contains("typed-in-the-gap"),
+        !harness::logged_output(&root, "host-backoff").contains("typed-in-the-gap"),
         "input typed while reconnecting reached the session"
     );
     wrapped.cli.type_bytes(b"\x1cd");
