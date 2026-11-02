@@ -5,12 +5,12 @@
 
 mod harness;
 
-use harness::{Observation, SessionGuard, poll_until, tendr};
+use harness::{BURST, Observation, SessionGuard, assert_prefix_of_the_burst, poll_until, tendr};
 use std::io::{Read, Seek, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 use tendr::attach_proto::{Frame, Mode, Version, read_frame, write_frame};
@@ -403,4 +403,145 @@ fn every_viewer_behind_at_the_runs_end_gets_its_last_bytes() {
             "{who} did not get the recording's end"
         );
     }
+}
+
+/// A child that writes a burst and exits at once: a piped watcher reading
+/// all along gets the whole burst, through the marker that ends it, and
+/// exits 0, told by the session where the run's output ended.
+#[test]
+fn a_burst_as_the_run_ends_reaches_a_piped_watcher_through_its_marker() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "ro-burst");
+    let go = root.path().join("go");
+    start(&root, "ro-burst", &ticking_then(&go, BURST), &[]);
+
+    let mut child = attach(&root, "ro-burst", Stdio::null(), &[]);
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    touch(&go);
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+
+    assert_eq!(code, Some(0), "the run ended; stderr: {stderr}");
+    assert!(
+        out.ends_with(b"burst-0199999\r\nBURST-END"),
+        "stdout ends short of the marker: {:?}",
+        String::from_utf8_lossy(&out[out.len().saturating_sub(80)..])
+    );
+    let recording = harness::recorded_output(&root, "ro-burst");
+    assert!(
+        recording.ends_with(&out),
+        "stdout is not the recording's end"
+    );
+}
+
+/// A watcher whose consumer reads nothing from the burst at the run's end
+/// until well past the session's wait for its viewers is cut off then: it
+/// exits 84, saying how much of the output it had, and stdout is the
+/// recording up to where it stopped. Without the session's end of output it
+/// read the run's end in `meta.json` and exited 0, short.
+#[test]
+fn a_watcher_stalled_past_the_run_end_flush_exits_84() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "ro-stall");
+    let go = root.path().join("go");
+    start(&root, "ro-stall", &ticking_then(&go, BURST), &[]);
+
+    let mut child = attach(&root, "ro-stall", Stdio::null(), &[]);
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    touch(&go);
+    // The run's end is recorded only once the session has waited for its
+    // viewers and shut their connections.
+    harness::wait_terminal(&root, "ro-stall");
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+
+    assert_eq!(code, Some(84), "cut off at the run's end; stderr: {stderr}");
+    assert!(stderr.contains("cut this read-only attach off"), "{stderr}");
+    assert!(stderr.contains("bytes of the run's output"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("tendr:"),
+        "a notice reached stdout"
+    );
+    assert_prefix_of_the_burst(&harness::recorded_output(&root, "ro-stall"), &out);
+}
+
+/// A sidecar started by a tendr from before the end of output, emulated at
+/// the frame level in front of `session`'s real one: a hello of version 3
+/// is refused with the protocol class, as that decoder refuses it, and any
+/// other first frame is passed through to the real sidecar, which serves
+/// it as the old one would. Returns the hellos it was sent.
+fn sidecar_before_output_end(root: &TempDir, session: &str) -> Arc<Mutex<Vec<Vec<u8>>>> {
+    use tendr::attach_proto::{MSG_HELLO, RejectClass, read_msg, write_msg};
+    let real = socket(root, session);
+    let sock = root.path().join("old.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let hellos = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for mut client in listener.incoming().map_while(Result::ok) {
+            let Ok((msg_type, payload)) = read_msg(&mut client) else {
+                continue;
+            };
+            hellos.lock().unwrap().push(payload.clone());
+            if msg_type == MSG_HELLO && payload.first() == Some(&3) {
+                let refusal = Frame::Rejected {
+                    class: RejectClass::Protocol,
+                    reason: "unsupported attach protocol version or mode".to_owned(),
+                };
+                let _ = write_frame(&mut client, &refusal);
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
+            let mut sidecar = UnixStream::connect(&real).unwrap();
+            write_msg(&mut sidecar, msg_type, &payload).unwrap();
+            let (mut from_client, mut to_sidecar) =
+                (client.try_clone().unwrap(), sidecar.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut from_client, &mut to_sidecar);
+                let _ = to_sidecar.shutdown(std::net::Shutdown::Both);
+            });
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut sidecar, &mut client);
+                let _ = client.flush();
+                let _ = client.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    let dir = session_dir(root, session);
+    let tmp = dir.join("a.sock.path.test");
+    std::fs::write(&tmp, sock.to_str().unwrap()).unwrap();
+    std::fs::rename(&tmp, dir.join("a.sock.path")).unwrap();
+    seen
+}
+
+/// A session whose sidecar cannot report the end of its output refuses the
+/// version 3 watch hello; the attach says it again in version 2, and at the
+/// run's end goes by `meta.json` as before: all the output, and exit 0.
+#[test]
+fn a_sidecar_from_before_the_end_of_output_keeps_the_run_end_verdict() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "ro-old");
+    let go = root.path().join("go");
+    start(&root, "ro-old", &ticking_then(&go, "echo ALL-DONE"), &[]);
+    let hellos = sidecar_before_output_end(&root, "ro-old");
+
+    let mut child = attach(&root, "ro-old", Stdio::null(), &[]);
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    touch(&go);
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+
+    assert_eq!(code, Some(0), "the run ended; stderr: {stderr}");
+    assert!(
+        out.ends_with(b"ALL-DONE\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(*hellos.lock().unwrap(), [vec![3, 4], vec![2, 4]]);
 }

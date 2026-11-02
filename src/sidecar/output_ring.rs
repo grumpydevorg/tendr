@@ -83,9 +83,9 @@ pub(super) enum Next {
     Evicted,
     /// The cursor was closed.
     Closed,
-    /// The cursor is at the head of a finished ring: it has had all the
-    /// run's output.
-    Ended,
+    /// The cursor is at the head of a finished ring, this final offset: it
+    /// has had all the run's output.
+    Ended(u64),
 }
 
 impl Default for OutputRing {
@@ -210,7 +210,7 @@ impl OutputRing {
                 };
             }
             if state.finished {
-                return Next::Ended;
+                return Next::Ended(at);
             }
             state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
         }
@@ -356,8 +356,9 @@ mod tests {
     }
 
     /// A finished ring still gives a cursor behind the head the rest of
-    /// the output, then ends it; a sender waiting at the head is woken to
-    /// end. Waiting for the cursors to close sees each close.
+    /// the output, then ends it at the final offset; a sender waiting at
+    /// the head is woken to end. Waiting for the cursors to close sees each
+    /// close.
     #[test]
     fn a_finished_ring_ends_each_cursor_once_it_has_everything() {
         let ring = Arc::new(OutputRing::with_capacity(16));
@@ -370,9 +371,9 @@ mod tests {
         };
         std::thread::sleep(Duration::from_millis(50));
         ring.finish();
-        assert_eq!(reader.join().unwrap(), Next::Ended);
+        assert_eq!(reader.join().unwrap(), Next::Ended(4));
         assert_eq!(drain(&ring, &behind, 2), b"last");
-        assert_eq!(ring.next(&behind, 64), Next::Ended);
+        assert_eq!(ring.next(&behind, 64), Next::Ended(4));
 
         let soon = std::time::Instant::now() + Duration::from_millis(50);
         assert!(

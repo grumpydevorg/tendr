@@ -582,12 +582,12 @@ fn host_attach_falls_back_to_v1_for_an_old_sidecar() {
     wait_control(&root, "host-old-sidecar", "AgentControl");
     assert_eq!(
         *hellos.lock().unwrap(),
-        [vec![2, 1], vec![1, 1]],
-        "version 2 first, then version 1 once"
+        [vec![3, 1], vec![2, 1], vec![1, 1]],
+        "version 3 first, then each older version once"
     );
 }
 
-/// The bridge speaks version 2 to the sidecar and passes its acceptance and
+/// The bridge speaks version 3 to the sidecar and passes its acceptance and
 /// stamped output to the client, which writes output that follows on with no
 /// gap and refuses output that skips: a protocol failure (80), after which
 /// the terminal is restored.
@@ -629,7 +629,7 @@ fn host_attach_tracks_offsets_and_refuses_output_that_skips() {
     assert!(!output.contains("after-the-gap"), "{output}");
     // The offset it expected: 100, then 6 and 7 bytes written.
     assert!(output.contains("113") && output.contains("200"), "{output}");
-    assert_eq!(*hellos.lock().unwrap(), [vec![2, 1]]);
+    assert_eq!(*hellos.lock().unwrap(), [vec![3, 1]]);
 }
 
 /// `tendr _remote` run by a client that speaks the attach protocol itself,
@@ -871,7 +871,7 @@ fn attach_v2(root: &TempDir, session: &str) -> (FrameClient, tendr::attach_proto
 /// connection, whose remote side reports it taken over.
 #[test]
 fn remote_resume_is_not_refused_by_the_human_control_check() {
-    use tendr::attach_proto::{Frame, ResumePoint};
+    use tendr::attach_proto::{Frame, ResumePoint, Version};
     use tendr::model::pty_control::ControllerEpoch;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
@@ -884,7 +884,10 @@ fn remote_resume_is_not_refused_by_the_human_control_check() {
     let mut resumed = FrameClient::start_with(
         &root,
         &attach_json("host-resume", Some(accepted)),
-        &Frame::Resume(accepted),
+        &Frame::Resume {
+            point: accepted,
+            version: Version::V2,
+        },
     );
     assert_eq!(
         resumed.frame(),
@@ -905,7 +908,7 @@ fn remote_resume_is_not_refused_by_the_human_control_check() {
 /// falls back to version 1.
 #[test]
 fn remote_resume_with_a_sidecar_that_cannot_resume_is_refused() {
-    use tendr::attach_proto::{Frame, RejectClass, ResumePoint, write_frame};
+    use tendr::attach_proto::{Frame, RejectClass, ResumePoint, Version, write_frame};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "host-old-resume");
@@ -924,7 +927,11 @@ fn remote_resume_with_a_sidecar_that_cannot_resume_is_refused() {
         offset: 7,
     };
     let mut stdin = remote_request(&attach_json("host-old-resume", Some(point)));
-    write_frame(&mut stdin, &Frame::Resume(point)).unwrap();
+    let resume_frame = Frame::Resume {
+        point,
+        version: Version::V2,
+    };
+    write_frame(&mut stdin, &resume_frame).unwrap();
 
     let output = tendr(&root)
         .arg("_remote")
@@ -935,7 +942,7 @@ fn remote_resume_with_a_sidecar_that_cannot_resume_is_refused() {
     assert_eq!(output.status.code(), Some(80), "{output:?}");
     assert!(output.stdout.is_empty(), "no frame is sent");
     let mut resume = Vec::new();
-    write_frame(&mut resume, &Frame::Resume(point)).unwrap();
+    write_frame(&mut resume, &resume_frame).unwrap();
     assert_eq!(
         *seen.lock().unwrap(),
         [resume[5..].to_vec()],
@@ -1709,7 +1716,11 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
         offset: 3,
         ..admitted
     };
-    let mut resumed = watch_resume(&root, "host-ro-resume", asked, &Frame::WatchResume(asked));
+    let watch_resume_frame = Frame::WatchResume {
+        point: asked,
+        version: Version::V2,
+    };
+    let mut resumed = watch_resume(&root, "host-ro-resume", asked, &watch_resume_frame);
     assert_eq!(
         resumed.frame(),
         Frame::Resumed(ResumePoint {
@@ -1722,7 +1733,7 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
 
     touch(&root, "GO2");
     harness::wait_log_tail(&root, "host-ro-resume", "FLOOD-END");
-    let mut gone = watch_resume(&root, "host-ro-resume", asked, &Frame::WatchResume(asked));
+    let mut gone = watch_resume(&root, "host-ro-resume", asked, &watch_resume_frame);
     match gone.frame() {
         Frame::Gone { point, oldest } => {
             assert_eq!(
@@ -1742,11 +1753,14 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
         run_id: tendr::model::ids::RunId::new(),
         ..asked
     };
-    let plain = Frame::Resume(ResumePoint {
-        run_id: asked.run_id,
-        epoch: ControllerEpoch::new(1),
-        offset: 3,
-    });
+    let plain = Frame::Resume {
+        point: ResumePoint {
+            run_id: asked.run_id,
+            epoch: ControllerEpoch::new(1),
+            offset: 3,
+        },
+        version: Version::V2,
+    };
     for (what, mut refused, code) in [
         (
             "another run",
@@ -1754,7 +1768,10 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
                 &root,
                 "host-ro-resume",
                 elsewhere,
-                &Frame::WatchResume(elsewhere),
+                &Frame::WatchResume {
+                    point: elsewhere,
+                    version: Version::V2,
+                },
             ),
             81,
         ),
@@ -1777,6 +1794,82 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
     );
     assert_eq!(controller.detach(), Some(0));
     wait_control(&root, "host-ro-resume", "AgentControl");
+}
+
+/// Watchers resumed through `_remote` in version 3 (the request's
+/// `protocol`) and in version 2, side by side: at the run's end the version
+/// 3 one is sent the rest of the output, then the end of output at the
+/// final offset, and its remote exits 0; the version 2 one gets the output
+/// and nothing it does not know, and its remote goes by `meta.json` (0).
+#[test]
+fn remote_watch_resume_in_version_3_is_told_where_the_output_ends() {
+    use tendr::attach_proto::{Frame, Mode, Version, WatchPoint};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-end");
+    start_script(
+        &root,
+        "host-ro-end",
+        "while [ ! -f \"$GO\" ]; do sleep 0.05; done; printf xyz",
+        &["GO"],
+        &[],
+    );
+    let json = |protocol: u8, resume: Option<WatchPoint>| {
+        watch_json("host-ro-end", resume)
+            .replace("\"protocol\":2", &format!("\"protocol\":{protocol}"))
+    };
+    let mut watcher = FrameClient::start_with(
+        &root,
+        &json(3, None),
+        &Frame::Hello {
+            version: Version::V1,
+            mode: Mode::Watch,
+        },
+    );
+    let Frame::Watching(admitted) = watcher.frame() else {
+        panic!("the watcher was not admitted");
+    };
+    assert_eq!(watcher.detach(), Some(0));
+
+    // The client's frame is version 2's either way; the request says which
+    // the remote may speak.
+    let first = Frame::WatchResume {
+        point: admitted,
+        version: Version::V2,
+    };
+    let mut resumed: Vec<FrameClient> = [3, 2]
+        .into_iter()
+        .map(|protocol| FrameClient::start_with(&root, &json(protocol, Some(admitted)), &first))
+        .collect();
+    for client in &mut resumed {
+        assert!(matches!(client.frame(), Frame::Resumed(point) if point.offset == admitted.offset));
+    }
+    touch(&root, "GO");
+    let ends: Vec<(Vec<Frame>, Option<i32>)> = resumed
+        .into_iter()
+        .map(|mut client| {
+            let mut frames = Vec::new();
+            while let Ok((msg_type, payload)) = tendr::attach_proto::read_msg(&mut client.stdout) {
+                frames.push(Frame::decode(msg_type, payload).unwrap());
+            }
+            drop(client.stdin.take());
+            (frames, client.child.wait().unwrap().code())
+        })
+        .collect();
+
+    let output = Frame::Output {
+        offset: admitted.offset,
+        bytes: b"xyz".to_vec(),
+    };
+    assert_eq!(
+        ends[0],
+        (
+            vec![output.clone(), Frame::OutputEnd(admitted.offset + 3)],
+            Some(0)
+        ),
+        "version 3"
+    );
+    assert_eq!(ends[1], (vec![output], Some(0)), "version 2");
 }
 
 /// `tendr --host box attach --read-only <session>` through the fake ssh in
@@ -1972,6 +2065,128 @@ fn host_read_only_gets_the_runs_last_bytes_at_its_end() {
     );
 }
 
+/// A child that writes a burst and exits at once: a watcher over `--host`,
+/// through ssh's pipes, reading all along, gets the whole burst through the
+/// marker that ends it, and exits 0.
+#[test]
+fn host_read_only_gets_a_burst_as_the_run_ends_through_its_marker() {
+    use std::io::Read;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-burst");
+    start_script(
+        &root,
+        "host-ro-burst",
+        &ticking_then(harness::BURST),
+        &["GO"],
+        &[],
+    );
+    let ssh = fake_ssh("pump");
+
+    let mut child = watch_without_terminal(&ssh, &root, "host-ro-burst");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    touch(&root, "GO");
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+
+    assert_eq!(code, Some(0), "the run ended; stderr: {stderr}");
+    assert!(
+        out.ends_with(b"burst-0199999\r\nBURST-END"),
+        "stdout ends short of the marker: {:?}",
+        String::from_utf8_lossy(&out[out.len().saturating_sub(80)..])
+    );
+    let recording = harness::recorded_output(&root, "host-ro-burst");
+    assert!(
+        recording.ends_with(&out),
+        "stdout is not the recording's end"
+    );
+}
+
+/// A watcher over `--host` whose consumer reads nothing from the burst at
+/// the run's end until well past the session's wait for its viewers is cut
+/// off then: 84, never the remote's reading of `meta.json` that the run
+/// ended, and stdout is the recording up to where it stopped.
+#[test]
+fn host_read_only_stalled_past_the_run_end_flush_exits_84() {
+    use std::io::Read;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-stall");
+    start_script(
+        &root,
+        "host-ro-stall",
+        &ticking_then(harness::BURST),
+        &["GO"],
+        &[],
+    );
+    let ssh = fake_ssh("pump");
+
+    let mut child = watch_without_terminal(&ssh, &root, "host-ro-stall");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    touch(&root, "GO");
+    // The run's end is recorded only once the session has waited for its
+    // viewers and shut their connections.
+    harness::wait_terminal(&root, "host-ro-stall");
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+
+    assert_eq!(code, Some(84), "cut off at the run's end; stderr: {stderr}");
+    assert!(stderr.contains("cut this read-only attach off"), "{stderr}");
+    assert!(stderr.contains("bytes of the run's output"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("tendr:"),
+        "a notice reached stdout"
+    );
+    harness::assert_prefix_of_the_burst(&harness::recorded_output(&root, "host-ro-stall"), &out);
+}
+
+/// A session over `--host` whose sidecar cannot report the end of its
+/// output refuses the bridge's version 3 watch hello; the bridge says it
+/// again in version 2, and at the run's end its verdict goes by `meta.json`
+/// as before: all the output, and exit 0.
+#[test]
+fn host_read_only_with_a_sidecar_from_before_the_end_of_output_exits_0() {
+    use std::io::Read;
+    use tendr::attach_proto::MSG_HELLO;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-old-end");
+    start_script(
+        &root,
+        "host-ro-old-end",
+        &ticking_then("echo ALL-DONE"),
+        &["GO"],
+        &[],
+    );
+    let seen = old_sidecar(
+        &root,
+        "host-ro-old-end",
+        "pre-end",
+        decoded_before_output_end,
+    );
+    let ssh = fake_ssh("pump");
+
+    let mut child = watch_without_terminal(&ssh, &root, "host-ro-old-end");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    touch(&root, "GO");
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+
+    assert_eq!(code, Some(0), "the run ended; stderr: {stderr}");
+    assert!(
+        out.ends_with(b"ALL-DONE\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(MSG_HELLO, vec![3, 4]), (MSG_HELLO, vec![2, 4])]
+    );
+}
+
 /// The first frames, type and payload, an emulated old sidecar was sent.
 type FirstFrames = std::sync::Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
 
@@ -2058,8 +2273,71 @@ fn decoded_before_watch_resumes(msg_type: u8, payload: &[u8]) -> bool {
         || (msg_type == tendr::attach_proto::MSG_HELLO && matches!(payload, [1 | 2, 4]))
 }
 
+/// The first frames a sidecar from before the end of output decodes: those
+/// of [`decoded_before_watch_resumes`], and a watch resume without a
+/// version.
+fn decoded_before_output_end(msg_type: u8, payload: &[u8]) -> bool {
+    decoded_before_watch_resumes(msg_type, payload)
+        || (msg_type == tendr::attach_proto::MSG_WATCH_RESUME && payload.len() == 24)
+}
+
+/// A watcher over `--host` of a session whose sidecar knows watch resumes
+/// but not the end of output loses its link: the bridge's version 3 watch
+/// resume is refused, it says it again in version 2, which the sidecar
+/// resumes, and at the run's end the remote's verdict goes by `meta.json`
+/// as before (0).
+#[test]
+fn host_watch_resume_to_a_sidecar_from_before_the_end_of_output_says_it_in_version_2() {
+    use tendr::attach_proto::{MSG_HELLO, MSG_WATCH_RESUME};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-ro-old-end-resume");
+    start_script(
+        &root,
+        "host-ro-old-end-resume",
+        &ticking_then("echo ALL-DONE"),
+        &["GO"],
+        &[],
+    );
+    let seen = old_sidecar(
+        &root,
+        "host-ro-old-end-resume",
+        "pre-end-resume",
+        decoded_before_output_end,
+    );
+    let link = Flaky::new();
+
+    let watcher = link.attach(
+        &root,
+        "old-end-resume",
+        &["host-ro-old-end-resume", "--read-only"],
+    );
+    watcher.wait_output_contains("tick");
+    link.cut();
+    poll_until(Duration::from_secs(30), Duration::from_millis(50), || {
+        let seen = seen.lock().unwrap().clone();
+        if seen.len() >= 4 {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("{seen:?}"))
+        }
+    })
+    .unwrap();
+    touch(&root, "GO");
+    watcher.wait_output_contains("ALL-DONE");
+    assert_eq!(watcher.wait_exit(Duration::from_secs(30)), 0);
+    watcher.assert_terminal_restored();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    assert_eq!(seen[0], (MSG_HELLO, vec![3, 4]));
+    assert_eq!(seen[1], (MSG_HELLO, vec![2, 4]));
+    assert_eq!((seen[2].0, seen[2].1.len()), (MSG_WATCH_RESUME, 25));
+    assert_eq!((seen[3].0, seen[3].1.len()), (MSG_WATCH_RESUME, 24));
+}
+
 /// A watch hello to a sidecar started before read-only viewers is refused
-/// (80), once: it is not said again in version 1, and nothing attaches. The
+/// (80), said in version 3 and then once in version 2, which every sidecar
+/// with watchers speaks: never in version 1, and nothing attaches. The
 /// controller holding the session is untouched.
 #[test]
 fn host_watch_hello_to_a_sidecar_from_before_watchers_exits_80() {
@@ -2077,7 +2355,10 @@ fn host_watch_hello_to_a_sidecar_from_before_watchers_exits_80() {
         host_attach_exit(&root, &remote, "old-watch", &["host-ro-old", "--read-only"]);
     assert_eq!(code, 80, "{out}");
     assert!(out.contains("cannot serve read-only viewers"), "{out}");
-    assert_eq!(*seen.lock().unwrap(), [(MSG_HELLO, vec![2, 4])]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(MSG_HELLO, vec![3, 4]), (MSG_HELLO, vec![2, 4])]
+    );
     assert_eq!(
         control_changes(&root, "host-ro-old"),
         [("attach".to_owned(), 1)]
@@ -2089,8 +2370,9 @@ fn host_watch_hello_to_a_sidecar_from_before_watchers_exits_80() {
 }
 
 /// A watcher admitted by a sidecar started before watch resumes loses its
-/// link: its watch resume is refused (80), once, and it neither attaches
-/// afresh nor sends a controller's resume. The controller is untouched.
+/// link: its watch resume is refused (80), in version 3 and then once in
+/// version 2, and it neither attaches afresh nor sends a controller's
+/// resume. The controller is untouched.
 #[test]
 fn host_watch_resume_to_a_sidecar_from_before_it_exits_80() {
     use tendr::attach_proto::{MSG_HELLO, MSG_WATCH_RESUME};
@@ -2120,9 +2402,11 @@ fn host_watch_resume_to_a_sidecar_from_before_it_exits_80() {
     watcher.assert_terminal_restored();
     watcher.wait_output_contains("cannot resume a read-only attach");
     let seen = seen.lock().unwrap().clone();
-    assert_eq!(seen.len(), 2, "{seen:?}");
-    assert_eq!(seen[0], (MSG_HELLO, vec![2, 4]));
-    assert_eq!(seen[1].0, MSG_WATCH_RESUME);
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    assert_eq!(seen[0], (MSG_HELLO, vec![3, 4]));
+    assert_eq!(seen[1], (MSG_HELLO, vec![2, 4]));
+    assert_eq!((seen[2].0, seen[2].1.len()), (MSG_WATCH_RESUME, 25));
+    assert_eq!((seen[3].0, seen[3].1.len()), (MSG_WATCH_RESUME, 24));
     assert_eq!(
         control_changes(&root, "host-ro-old-resume"),
         [("attach".to_owned(), 1)]

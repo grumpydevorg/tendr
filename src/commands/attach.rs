@@ -38,8 +38,15 @@ pub fn cmd_attach(
             terminal::open()?
         };
         let mode = mode(takeover, read_only);
-        // A local attach does not reconnect, so it has no use for offsets.
-        let (stream, accept) = connect(session.path(), attach_proto::Version::V1, mode)?;
+        // A local controller does not reconnect, so it has no use for
+        // offsets. A watcher speaks the newest version, to be told where the
+        // run's output ends, and so whether it was cut off.
+        let version = if read_only {
+            attach_proto::Version::LATEST
+        } else {
+            attach_proto::Version::V1
+        };
+        let (stream, accept, version) = connect(session.path(), version, mode)?;
         // A watcher holds no control, so nothing can take it over.
         let control = accept.epoch().map(|epoch| Control {
             session_dir: session.path().to_path_buf(),
@@ -51,20 +58,28 @@ pub fn cmd_attach(
                 .as_ref()
                 .is_some_and(|control| control.taken_over_by().is_some())
         };
+        let end = if version.reports_end() {
+            client::EndNotice::Promised
+        } else {
+            client::EndNotice::Unknown
+        };
         // A local relay's code is always 0: its failures are errors.
         client::relay(
             client::Link::socket(stream)?,
-            None,
+            accept.resume_point(),
             escape,
             accept.access(),
             client::Peer::Local {
                 recorded_takeover: &recorded_takeover,
             },
             terminal,
+            end,
         )?;
         // Without a terminal nothing typed ends the attach: the session
-        // ended it, at the end of the run or by cutting this watcher off.
-        if no_terminal {
+        // ended it, at the end of the run or by cutting this watcher off. A
+        // session that reports the end of its output has said which; one
+        // started by a tendr from before that leaves `meta.json` to tell.
+        if no_terminal && end == client::EndNotice::Unknown {
             run_ended(&session, meta.run_id())?;
         }
         Ok(())
@@ -85,10 +100,14 @@ const RUN_END_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(unix)]
 const RUN_END_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// After the session closed a no-terminal read-only attach: `Ok` if the run
-/// `run_id` ended, waiting for it to say so ([`RUN_END_GRACE`],
-/// [`RUN_END_RECORD_GRACE`]); otherwise the attach was cut off (84), having
-/// fallen too far behind or been shut by the sidecar.
+/// After the session closed a no-terminal read-only attach whose sidecar
+/// does not report the end of its output (one started by a tendr from
+/// before version 3): `Ok` if the run `run_id` ended, waiting for it to say
+/// so ([`RUN_END_GRACE`], [`RUN_END_RECORD_GRACE`]); otherwise the attach
+/// was cut off (84), having fallen too far behind or been shut by the
+/// sidecar. It cannot tell a watcher cut off at the run's end, when the
+/// sidecar stops waiting for a slow one, from one that had everything: both
+/// read as the run ended.
 #[cfg(unix)]
 fn run_ended(session: &SessionDir, run_id: tendr::model::ids::RunId) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
@@ -197,7 +216,9 @@ const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// A read-only attach without a terminal streams the session's output to
 /// stdout, as a local one does, and its exit code is the remote's verdict:
 /// 0 when the run ended, 84 when the session cut it off
-/// ([`cmd_attach_bridge`]).
+/// ([`cmd_attach_bridge`]). Only the remote knows the version its sidecar
+/// speaks, so it judges: from version 3 by the session's end of output,
+/// which it passes on, and which, when it comes, ends the output here too.
 ///
 /// Returns the exit code. The remote side's own failures (no such session,
 /// a refusal, an unreachable socket) arrive as its exit code, with its
@@ -264,6 +285,8 @@ pub fn cmd_attach_host(
         accept.access(),
         client::Peer::Host(Box::new(end)),
         terminal,
+        // The remote judges, and passes the end of output on when it comes.
+        client::EndNotice::Unknown,
     )
 }
 
@@ -347,11 +370,12 @@ impl Point {
         }
     }
 
-    /// The frame that asks to resume from here, in place of the hello.
-    fn resume_frame(self) -> Frame {
+    /// The frame that asks to resume from here in `version` (2 or later),
+    /// in place of the hello.
+    fn resume_frame(self, version: attach_proto::Version) -> Frame {
         match self {
-            Self::Control(point) => Frame::Resume(point),
-            Self::Watch(point) => Frame::WatchResume(point),
+            Self::Control(point) => Frame::Resume { point, version },
+            Self::Watch(point) => Frame::WatchResume { point, version },
         }
     }
 
@@ -519,7 +543,9 @@ fn resume_host(
 /// epoch it carries is zero: the remote reads only its run and offset, into
 /// the watch resume it requires ([`cmd_attach_bridge`]). The field stays
 /// because a remote from before watch resumes requires it, and then refuses
-/// the frame (80) rather than the request (2).
+/// the frame (80) rather than the request (2). The frame is always version
+/// 2's, the only one such a remote takes; the request's `protocol` says
+/// which the remote may speak to the session.
 fn resume_request(
     request: &crate::remote_op::AttachRequest,
     point: Point,
@@ -539,7 +565,7 @@ fn resume_request(
         resume: Some(resume),
         ..request.clone()
     }))?;
-    attach_proto::write_frame(&mut frame, &point.resume_frame())?;
+    attach_proto::write_frame(&mut frame, &point.resume_frame(attach_proto::Version::V2))?;
     Ok(frame)
 }
 
@@ -621,10 +647,11 @@ impl Accept {
         }
     }
 
-    /// Where an `attach --host` attach's stamped output starts: a version 2
-    /// controller's point, or a watcher's (the bridge always speaks version
-    /// 2 for a watcher); `None` for version 1, whose output carries no
-    /// offsets. A local attach does not reconnect and has no use for it.
+    /// Where an attach's stamped output starts: a version 2 controller's
+    /// point, or a watcher's (a watcher speaks version 2 or later); `None`
+    /// for version 1, whose output carries no offsets. Over `--host` it is
+    /// where a lost connection resumes from; locally, where the session's
+    /// end of output must find a watcher's output.
     fn resume_point(self) -> Option<Point> {
         match self {
             Self::V1(_) => None,
@@ -654,14 +681,16 @@ impl Accept {
 
 /// Connect to the session's attach socket, check that its listener is this
 /// user's, and complete the hello in `mode`, speaking `version`; `attach`,
-/// PTY `push` and the attach bridge all start here. Returns the connection
-/// and the sidecar's acceptance.
+/// PTY `push` and the attach bridge all start here. Returns the connection,
+/// the sidecar's acceptance, and the version it accepted.
 ///
 /// A sidecar started by an older tendr may not speak `version`: it refuses
-/// the hello with the protocol class. Then this connects once more and
-/// speaks version 1, which every sidecar with a hello speaks. A watch hello
-/// is never retried: the protocol class there means the sidecar predates
-/// read-only viewers in every version, and the failure says so (80).
+/// the hello with the protocol class. Then this connects once more and says
+/// it in the version before, until one is accepted or version 1, which
+/// every sidecar with a hello speaks, is refused too. A watch hello stops
+/// at version 2: every sidecar that serves read-only viewers speaks it, so
+/// the protocol class there means the sidecar predates them, and the
+/// failure says so (80).
 ///
 /// Every failure carries its PTY exit code ([`tendr::pty_exit`]): a socket
 /// that is missing or cannot be reached is a runtime failure (84), a listener
@@ -672,27 +701,32 @@ pub(super) fn connect(
     session_dir: &std::path::Path,
     version: attach_proto::Version,
     mode: Mode,
-) -> anyhow::Result<(std::os::unix::net::UnixStream, Accept)> {
+) -> anyhow::Result<(
+    std::os::unix::net::UnixStream,
+    Accept,
+    attach_proto::Version,
+)> {
     use attach_proto::{RejectClass, Version};
     let mut stream = open_socket(session_dir)?;
     let hello = |version| Frame::Hello { version, mode };
     let mut reply = exchange(&mut stream, &hello(version), verb(mode))?;
     let mut version = version;
-    if let Ok(Frame::Rejected {
+    while let Ok(Frame::Rejected {
         class: RejectClass::Protocol,
         reason,
     }) = &reply
     {
-        if mode == Mode::Watch {
-            return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
-                "cannot attach read-only: the session was started by a tendr that cannot serve read-only viewers ({reason})"
-            )));
+        match version.older() {
+            Some(older) if mode != Mode::Watch || older >= Version::V2 => version = older,
+            _ if mode == Mode::Watch => {
+                return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+                    "cannot attach read-only: the session was started by a tendr that cannot serve read-only viewers ({reason})"
+                )));
+            }
+            _ => break,
         }
-        if version > Version::V1 {
-            version = Version::V1;
-            stream = open_socket(session_dir)?;
-            reply = exchange(&mut stream, &hello(version), verb(mode))?;
-        }
+        stream = open_socket(session_dir)?;
+        reply = exchange(&mut stream, &hello(version), verb(mode))?;
     }
     let accept = hello_reply(reply, mode, version)?;
     // From here an attach waits for output, and a push as long as the terminal
@@ -700,7 +734,7 @@ pub(super) fn connect(
     stream.set_read_timeout(None).map_err(|e| {
         PtyExitCode::Runtime.error(anyhow::anyhow!("{} handshake failed: {e}", verb(mode)))
     })?;
-    Ok((stream, accept))
+    Ok((stream, accept, version))
 }
 
 /// What the sidecar answered a resume: a controller's control regained at a
@@ -738,35 +772,51 @@ impl Resumption {
     }
 }
 
-/// [`connect`] for a resume from `point`: the resume frame, a controller's
-/// or a watcher's, takes the hello's place. A sidecar started by a tendr
-/// that cannot resume it refuses it with the protocol class; that is
-/// "cannot resume" (80), never a fresh attach.
+/// [`connect`] for a resume from `point`, speaking `version` (2 or later):
+/// the resume frame, a controller's or a watcher's, takes the hello's place.
+/// A sidecar started by a tendr from before `version` refuses it with the
+/// protocol class, and this says it again in the version before, down to
+/// version 2. One that cannot resume it at all refuses that too; that is
+/// "cannot resume" (80), never a fresh attach. Returns the connection, the
+/// answer, and the version it was given in.
 #[cfg(unix)]
 fn connect_resume(
     session_dir: &std::path::Path,
     point: Point,
-) -> anyhow::Result<(std::os::unix::net::UnixStream, Resumption)> {
+    version: attach_proto::Version,
+) -> anyhow::Result<(
+    std::os::unix::net::UnixStream,
+    Resumption,
+    attach_proto::Version,
+)> {
     let mut stream = open_socket(session_dir)?;
-    let reply = exchange(&mut stream, &point.resume_frame(), "resume")?;
-    if let Ok(Frame::Rejected {
+    let mut reply = exchange(&mut stream, &point.resume_frame(version), "resume")?;
+    let mut version = version;
+    while let Ok(Frame::Rejected {
         class: attach_proto::RejectClass::Protocol,
         reason,
     }) = &reply
     {
-        let what = match point {
-            Point::Control(_) => "an attach",
-            Point::Watch(_) => "a read-only attach",
-        };
-        return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
-            "cannot resume: the session was started by a tendr that cannot resume {what} ({reason}); attach again"
-        )));
+        match version.older() {
+            Some(older) if older >= attach_proto::Version::V2 => version = older,
+            _ => {
+                let what = match point {
+                    Point::Control(_) => "an attach",
+                    Point::Watch(_) => "a read-only attach",
+                };
+                return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+                    "cannot resume: the session was started by a tendr that cannot resume {what} ({reason}); attach again"
+                )));
+            }
+        }
+        stream = open_socket(session_dir)?;
+        reply = exchange(&mut stream, &point.resume_frame(version), "resume")?;
     }
     let resumed = resume_reply(reply, point)?;
     stream
         .set_read_timeout(None)
         .map_err(|e| PtyExitCode::Runtime.error(anyhow::anyhow!("resume handshake failed: {e}")))?;
-    Ok((stream, resumed))
+    Ok((stream, resumed, version))
 }
 
 /// Connect to the session's attach socket and check that its listener is
@@ -985,7 +1035,7 @@ mod tests {
             takeover: true,
             read_only: false,
             escape: tendr::attach_escape::EscapeMode::CtrlBackslash,
-            protocol: 2,
+            protocol: 3,
             resume: None,
         };
         let point = ResumePoint {
@@ -1005,10 +1055,15 @@ mod tests {
             })
         );
         assert_eq!(json["params"]["takeover"], false);
+        // Version 2's frame, whatever the request agrees: the remote speaks
+        // its version to the session.
         let mut rest = &sent[4 + len..];
         assert_eq!(
             tendr::attach_proto::read_frame(&mut rest).unwrap(),
-            Frame::Resume(point)
+            Frame::Resume {
+                point,
+                version: Version::V2
+            }
         );
         assert!(rest.is_empty());
     }
@@ -1025,7 +1080,7 @@ mod tests {
             takeover: false,
             read_only: true,
             escape: tendr::attach_escape::EscapeMode::CtrlBackslash,
-            protocol: 2,
+            protocol: 3,
             resume: None,
         };
         let point = WatchPoint {
@@ -1048,7 +1103,10 @@ mod tests {
         let mut rest = &sent[4 + len..];
         assert_eq!(
             tendr::attach_proto::read_frame(&mut rest).unwrap(),
-            Frame::WatchResume(point)
+            Frame::WatchResume {
+                point,
+                version: Version::V2
+            }
         );
         assert!(rest.is_empty());
     }

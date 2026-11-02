@@ -77,6 +77,16 @@
   the last bytes. It now sends every client everything first, waiting up to
   2 s for one that is slow to read.
 
+- **`attach --read-only` cut off at the run's end exits 84, not 0.** A
+  watcher still not reading the run's last output when the session stopped
+  waiting for it (2 s) was cut off short, yet exited 0 because the run had
+  ended. The session now tells each viewer where the run's output ends
+  (attach protocol version 3), and a watcher exits 0 only once it has all
+  of it; otherwise 84, saying on stderr how many bytes it had, locally with
+  or without a terminal and over `--host`. A session or remote `tendr` from
+  before this says nothing of the end: a watcher then goes by whether the
+  run ended, as before.
+
 ## v0.6.0 — `attach --host` survives dropped connections
 
 Works with 0.5.0 in both directions over `--host`: an attach between a 0.6.0

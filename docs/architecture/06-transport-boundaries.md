@@ -151,9 +151,9 @@ command line as the other operations, and keeps the terminal on the client
   ([04-pty-lane.md](04-pty-lane.md)).
 - The attach protocol version is agreed in the request, not in that hello.
   The request's `protocol` field names the newest version the client speaks
-  (2), and the hello on ssh stdin is always a version 1 hello. A remote
+  (3), and the hello on ssh stdin is always a version 1 hello. A remote
   tendr from 0.5.0 takes only that hello and ignores the field, so it
-  answers as before, in version 1. A new remote tendr speaks the newest
+  answers as before, in version 1. A newer remote tendr speaks the newest
   version both know (`attach_proto::Version::negotiate`; a request without
   the field, from a 0.5.0 client, means version 1) to the sidecar.
 - The remote tendr (`_remote`) makes the checks of a local attach (a PTY
@@ -161,25 +161,29 @@ command line as the other operations, and keeps the terminal on the client
   hello, which must name the request's mode (otherwise exit 80), and makes
   the same connection a local attach makes: peer check, a hello in the
   agreed version with the client's mode, the sidecar's answer within 10 s.
-  A sidecar started by an older tendr refuses a version 2 hello with the
-  protocol class; the remote tendr then connects once more and says hello
-  in version 1. It passes the sidecar's acceptance to the client as it
-  came: `MSG_ACCEPTED_V2` for version 2, `MSG_ACCEPTED` for version 1, so
-  the client learns the version from its type. A failure before that is its
-  exit code and stderr, as for a local attach (1, 80, 81, 84, 85), and the
-  client exits with it; a remote that ends without answering and exits 0 is
-  84 on the client.
+  A sidecar started by an older tendr refuses a hello in a version it does
+  not speak with the protocol class; the remote tendr then connects once
+  more and says hello one version lower, down to version 1 (version 2 for a
+  watch hello). It passes the sidecar's acceptance to the client as it
+  came: `MSG_ACCEPTED_V2` for version 2 or 3, `MSG_ACCEPTED` for version 1,
+  so the client learns from its type whether its output is stamped. A
+  failure before that is its exit code and stderr, as for a local attach
+  (1, 80, 81, 84, 85), and the client exits with it; a remote that ends
+  without answering and exits 0 is 84 on the client.
 - A client resuming after a lost link puts its resume point (`resume`: run
   id, epoch, offset) in the request, and sends `MSG_RESUME` with the same
   point where the hello would go ([resuming a
   viewer](04-pty-lane.md#resuming-a-viewer)). The remote tendr then skips the
   human-control check: after a lost link sshd keeps the old remote tendr and
   its connection open, so `meta.json` still names the client's own control,
-  and the sidecar decides. It passes the resume on, then the sidecar's answer
-  (`MSG_RESUMED` or `MSG_GONE`) as it came, and keeps the new epoch as this
-  client's, so a later takeover is read as one. A sidecar that cannot resume
-  refuses with the protocol class; the remote tendr exits 80, saying it
-  cannot resume, and neither attaches afresh nor falls back to version 1. A
+  and the sidecar decides. It passes the resume on in the agreed version
+  (from version 3 the frame names it; a sidecar from before that refuses it
+  with the protocol class, and the remote tendr says it again in version
+  2), then the sidecar's answer (`MSG_RESUMED` or `MSG_GONE`) as it came,
+  and keeps the new epoch as this client's, so a later takeover is read as
+  one. A sidecar that cannot resume refuses with the protocol class; the
+  remote tendr exits 80, saying it cannot resume, and neither attaches
+  afresh nor falls back to version 1. A
   0.5.0 remote tendr ignores `resume` and refuses `MSG_RESUME` as not its
   hello (80), unless its own human-control check refuses first (81); it
   never attaches afresh either.
@@ -189,13 +193,27 @@ command line as the other operations, and keeps the terminal on the client
   output to stdout. The remote tendr skips the human-control check, since a
   watcher never holds or changes control, requires a watch hello (`MSG_HELLO`
   mode `watch`), passes it on in the agreed version, and passes the
-  sidecar's `MSG_WATCHING` back; a watch hello is never said again in
-  version 1. No takeover check runs for a watcher: it has no epoch to be
-  taken over. When the session ends a watcher's connection, the remote
-  tendr reads its own `meta.json` and exits 0 if the run ended, or 84 if the
-  session cut the watcher off while the run went on, waiting for the end to
-  be recorded as a local read-only attach does; the client exits with that
-  verdict, which it cannot read itself.
+  sidecar's `MSG_WATCHING` back; a watch hello is never said in version 1.
+  No takeover check runs for a watcher: it has no epoch to be taken over.
+- How the remote tendr ends a watcher's attach, which the client exits
+  with:
+  - In version 3 it passes the sidecar's end of output (`MSG_OUTPUT_END`)
+    on and exits 0: the client has all of the run's output. The client
+    stops reading there, without reconnecting, and refuses an end at any
+    other offset than its own (80). When the session ends the connection
+    without one, it cut the watcher off, at the run's end too, when it
+    stopped waiting for one slow to read: the remote tendr exits 84,
+    whatever `meta.json` says, and the client adds how many bytes of the
+    run's output it had.
+  - With a sidecar from before version 3, which sends no end, the remote
+    tendr reads its own `meta.json` and exits 0 if the run ended, or 84 if
+    the session cut the watcher off while the run went on, waiting for the
+    end to be recorded as a local read-only attach does. A watcher cut off
+    at the run's end then exits 0, short. So does one whose remote tendr is
+    from before version 3, which never passes the end on.
+  - The client cannot tell which version the remote tendr spoke to the
+    sidecar, so the remote decides; the end of output, when it comes, only
+    ends the client's reading.
 - A watcher resuming after a lost link sends a read-only request whose
   `resume` carries its run and offset with epoch 0, and the watch resume
   (`MSG_WATCH_RESUME`: run id and offset, no epoch) where the hello would go.

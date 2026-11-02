@@ -99,7 +99,14 @@ fn attach_v2(root: &TempDir, session: &str) -> (UnixStream, ResumePoint) {
 }
 
 fn resume(root: &TempDir, session: &str, point: ResumePoint) -> (UnixStream, Frame) {
-    open(root, session, &Frame::Resume(point))
+    open(
+        root,
+        session,
+        &Frame::Resume {
+            point,
+            version: Version::V2,
+        },
+    )
 }
 
 fn epoch(n: u64) -> ControllerEpoch {

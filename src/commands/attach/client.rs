@@ -29,7 +29,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -102,6 +102,23 @@ pub(in crate::commands::attach) enum Access {
     /// the session nor sizes it, so a program it attaches to shows
     /// nothing new until it next draws, at the controller's size.
     ReadOnly,
+}
+
+/// Whether the session has promised to tell this attach where the run's
+/// output ends ([`Frame::OutputEnd`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::commands::attach) enum EndNotice {
+    /// It speaks version 3, so it ends a viewer's output with the notice
+    /// once it has sent all of it: a watcher whose connection ends without
+    /// one was cut off short (84), whatever the run did. A local attach's
+    /// only: Windows has no attach socket.
+    #[cfg_attr(windows, allow(dead_code))]
+    Promised,
+    /// It may not: a sidecar from before version 3, or, over `--host`, a
+    /// remote whose own verdict decides, since only the remote knows the
+    /// version its sidecar speaks. A notice that comes all the same still
+    /// ends the output and must match it.
+    Unknown,
 }
 
 /// One connection's paths to the session: the sender, writing its
@@ -177,6 +194,12 @@ impl Connection {
 /// attach's stamped output starts, a controller's or a watcher's; `None`
 /// for version 1.
 ///
+/// The session's end of output ([`Frame::OutputEnd`]) ends the relay as the
+/// session closing the connection does, never as a lost link, and must be
+/// at the offset the output has reached (else exit 80). A watcher whose
+/// session promised it (`end`) but that never got it was cut off: exit 84,
+/// saying how many bytes of the run's output it had.
+///
 /// A read-only attach ([`Access::ReadOnly`]) sends no size, resize or
 /// repaint, and drops keystrokes, saying so once in the status line; the
 /// escape and the signals still leave.
@@ -194,6 +217,7 @@ pub(super) fn relay(
     access: Access,
     peer: Peer<'_>,
     terminal: Box<dyn Terminal>,
+    end: EndNotice,
 ) -> anyhow::Result<i32> {
     let (recorded_takeover, mut host) = match peer {
         Peer::Local { recorded_takeover } => (Some(recorded_takeover), None),
@@ -216,6 +240,8 @@ pub(super) fn relay(
         bracketed_paste: AtomicBool::new(false),
         broken: OnceLock::new(),
         terminal_gone: AtomicBool::new(false),
+        ended: AtomicBool::new(false),
+        written: AtomicU64::new(0),
         output: terminal.output(),
     });
     // From here on, what ssh says stays off the session's screen. With no
@@ -250,8 +276,11 @@ pub(super) fn relay(
             if screen.terminal_gone.load(Ordering::SeqCst) {
                 break Ending::OutputGone;
             }
-            let lost =
-                resumable && !retired.load(Ordering::SeqCst) && screen.broken.get().is_none();
+            // The end of the output is the session's end, not a lost link.
+            let lost = resumable
+                && !retired.load(Ordering::SeqCst)
+                && screen.broken.get().is_none()
+                && !screen.ended.load(Ordering::SeqCst);
             match (host.take(), connection.take()) {
                 (Some(end), Some(old)) if lost => {
                     reconnecting = Some(reconnect::Job::start(
@@ -439,7 +468,23 @@ pub(super) fn relay(
     }
     // The far side ended the connection: the remote's code, or ssh's
     // failure (a lost version 1 connection) when there is no code.
-    verdict.or(finished).unwrap_or(Ok(0))
+    let code = verdict.or(finished).unwrap_or(Ok(0));
+    if access == Access::ReadOnly && !screen.ended.load(Ordering::SeqCst) {
+        let written = screen.written.load(Ordering::SeqCst);
+        match end {
+            EndNotice::Promised => {
+                return Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
+                    "tendr: the session cut this read-only attach off after {written} bytes of the run's output, before its end"
+                )));
+            }
+            EndNotice::Unknown if matches!(code, Ok(code) if code == PtyExitCode::Runtime.code()) =>
+            {
+                eprintln!("tendr: this read-only attach had {written} bytes of the run's output");
+            }
+            EndNotice::Unknown => {}
+        }
+    }
+    code
 }
 
 /// Send keystrokes to the session, counting them in `dropped` if the
@@ -529,6 +574,13 @@ pub(super) struct Screen {
     /// terminal's sake, not the connection's, so there is nothing to
     /// reconnect for. Set before it marks the connection closed.
     terminal_gone: AtomicBool,
+    /// The session said the run's output ended where this attach's had
+    /// reached ([`Frame::OutputEnd`]): it has had all of it. Set before the
+    /// reader marks the connection closed.
+    ended: AtomicBool,
+    /// Bytes of the run's own output (stamped) written to the terminal,
+    /// over every connection, for the report when a watcher is cut off.
+    written: AtomicU64,
     /// The terminal's screen, which every write to it goes through.
     output: Arc<dyn Output>,
 }
@@ -747,6 +799,7 @@ fn spawn_reader(
             let shown = match attach_proto::read_frame(&mut stream) {
                 Ok(Frame::Data(payload)) => show(&screen, None, &payload),
                 Ok(Frame::Output { offset, bytes }) => show(&screen, Some(offset), &bytes),
+                Ok(Frame::OutputEnd(offset)) => end_output(&screen, offset),
                 Ok(Frame::Retired(_)) => {
                     retired.store(true, Ordering::SeqCst);
                     Ok(true)
@@ -802,8 +855,30 @@ fn show(screen: &Screen, offset: Option<u64>, bytes: &[u8]) -> Result<bool, Stri
     }
     if let (Some(_), Some(point)) = (offset, shown.resume.as_mut()) {
         point.advance(bytes.len() as u64);
+        screen
+            .written
+            .fetch_add(bytes.len() as u64, Ordering::SeqCst);
     }
     Ok(true)
+}
+
+/// The session's end of output, at `offset`: nothing more comes, so the
+/// reader stops (`Ok(false)`), the output complete. It must be where the
+/// stamped output has reached, or it is refused, with why: output the
+/// session never sent, or an end it claims before output it did send.
+fn end_output(screen: &Screen, offset: u64) -> Result<bool, String> {
+    let shown = screen.lock();
+    match &shown.resume {
+        None => Err("the session sent an end of output to a version 1 attach".to_owned()),
+        Some(point) if point.offset() != offset => Err(format!(
+            "the session's output ended at offset {offset}, but this attach has it up to {}",
+            point.offset()
+        )),
+        Some(_) => {
+            screen.ended.store(true, Ordering::SeqCst);
+            Ok(false)
+        }
+    }
 }
 
 /// How often the terminal size is checked. Debug builds accept

@@ -1440,9 +1440,11 @@ fn read_only_with_takeover_or_without_the_escape_is_a_usage_error() {
 }
 
 /// A sidecar from before read-only viewers, emulated at the frame level as
-/// its decoder behaves: a hello whose mode it does not know is refused with
-/// the protocol class. A read-only attach to it exits 80 after that one
-/// hello, never retried in another version, and never holds control.
+/// its decoder behaves: a hello whose version or mode it does not know is
+/// refused with the protocol class. A read-only attach to it says its watch
+/// hello in version 3, then in version 2, which every sidecar with watchers
+/// speaks, and exits 80 after that, never trying version 1, and never holds
+/// control.
 #[test]
 fn a_read_only_attach_to_a_sidecar_from_before_it_exits_80() {
     use tendr::attach_proto::{Frame, RejectClass, write_frame};
@@ -1477,7 +1479,7 @@ fn a_read_only_attach_to_a_sidecar_from_before_it_exits_80() {
     let wrapped = WrappedAttach::spawn(&root, "ro-old", &["pty-ro-old", "--read-only"]);
     assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 80);
     wrapped.assert_terminal_restored();
-    assert_eq!(*hellos.lock().unwrap(), [vec![1, 4]]);
+    assert_eq!(*hellos.lock().unwrap(), [vec![3, 4], vec![2, 4]]);
     assert_eq!(meta_control(&root, "pty-ro-old"), "AgentControl");
     assert!(control_triggers(&root, "pty-ro-old").is_empty());
 }

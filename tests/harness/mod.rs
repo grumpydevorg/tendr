@@ -260,6 +260,35 @@ pub fn recorded_output(root: &TempDir, session: &str) -> Vec<u8> {
         .collect()
 }
 
+/// A burst for a child to write as it ends: 200 000 numbered lines (2.8 MB),
+/// then the marker `BURST-END`, which ends the run's output. Well past every
+/// buffer between a session and a stalled reader, and well inside the
+/// session's output ring.
+#[allow(dead_code)]
+pub const BURST: &str =
+    "awk 'BEGIN { for (i = 0; i < 200000; i++) printf \"burst-%07d\\n\", i }'; printf BURST-END";
+
+/// `out`, what a viewer of a run that wrote [`BURST`] got before it was cut
+/// off, is the recording's output up to some point of the burst: from the
+/// burst's first line on it is the recording's, and the marker never came.
+#[allow(dead_code)]
+pub fn assert_prefix_of_the_burst(recording: &[u8], out: &[u8]) {
+    let first = |bytes: &[u8]| {
+        bytes
+            .windows(13)
+            .position(|w| w == b"burst-0000000")
+            .expect("the burst's first line")
+    };
+    let (rec, got) = (&recording[first(recording)..], &out[first(out)..]);
+    assert!(
+        got.len() < rec.len() && rec.starts_with(got),
+        "the output is not a prefix of the recording's burst ({} of {} bytes)",
+        got.len(),
+        rec.len()
+    );
+    assert!(!out.ends_with(b"BURST-END"), "the marker came after all");
+}
+
 /// The PTY output of a session as `tendr log --raw` prints it, with every line
 /// break removed. Capture logs each read of the PTY as lines of its own, so text
 /// that straddles two reads is split there: a shell that echoes a typed line one

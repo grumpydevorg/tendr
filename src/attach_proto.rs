@@ -51,8 +51,10 @@ pub const MSG_OUTPUT: u8 = 0x0b;
 /// connection was lost asks to regain the control and output it had.
 /// Payload: a [`ResumePoint`], encoded as for [`MSG_ACCEPTED_V2`]: the run,
 /// the epoch it held, and the offset of the next output byte it did not
-/// get. A sidecar that predates it refuses it with the protocol class, as it
-/// refuses anything but a hello.
+/// get; from version 3, the version byte follows it, as a hello names its
+/// version (without it the resume is version 2). A sidecar that predates
+/// it, or that version, refuses it with the protocol class, as it refuses
+/// anything but a hello.
 pub const MSG_RESUME: u8 = 0x0c;
 /// Sidecar → resuming viewer: control regained at a new epoch, and its
 /// output follows from the offset it asked for, stamped, with no mode
@@ -74,13 +76,21 @@ pub const MSG_WATCHING: u8 = 0x0f;
 /// Client → sidecar, in place of the hello: a watcher whose connection was
 /// lost asks for the output it had not yet received. Payload: a
 /// [`WatchPoint`], encoded as for [`MSG_WATCHING`]: the run and the offset
-/// of the next output byte it did not get. It carries no epoch, so no path
+/// of the next output byte it did not get; from version 3, the version byte
+/// follows it, as for [`MSG_RESUME`]. It carries no epoch, so no path
 /// can feed a watcher's point into the control rule. The sidecar answers
 /// [`MSG_RESUMED`] or [`MSG_GONE`] at epoch zero, which names no control,
 /// and the watcher reads only their run and offsets. A sidecar that
-/// predates it refuses it with the protocol class, as it refuses anything
-/// but a hello.
+/// predates it, or that version, refuses it with the protocol class, as it
+/// refuses anything but a hello.
 pub const MSG_WATCH_RESUME: u8 = 0x10;
+/// Sidecar → version 3 viewer, a controller or a watcher: the run's output
+/// has ended, and this viewer has been sent all of it. Payload: the final
+/// offset (u64 BE), the count of output bytes the run wrote. Nothing
+/// follows it; the sidecar then closes the connection. A viewer that gets
+/// to the end of its connection without it was cut off, short of the
+/// run's output. Only a version 3 hello or resume asks for it.
+pub const MSG_OUTPUT_END: u8 = 0x11;
 
 /// The attach protocol version carried in [`MSG_HELLO`]. The discriminant is
 /// the wire byte.
@@ -89,27 +99,53 @@ pub const MSG_WATCH_RESUME: u8 = 0x10;
 /// [`MSG_ACCEPTED_V2`] instead of [`MSG_ACCEPTED`], and its output as
 /// [`MSG_OUTPUT`]; and a viewer may resume ([`MSG_RESUME`]). A push is
 /// answered the same in both, and both know the same refusal classes.
+///
+/// Version 3 adds only the end of a viewer's output: [`MSG_OUTPUT_END`]
+/// once it has been sent the run's last byte, so a viewer can tell the
+/// run's end from being cut off. Its answers are version 2's, and a resume
+/// names it with a byte after its point. A sidecar that predates it refuses
+/// a version 3 hello or resume with the protocol class; the client then
+/// says it again in version 2. It knows the same refusal classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Version {
     V1 = 1,
     V2 = 2,
+    V3 = 3,
 }
 
 impl Version {
     /// The newest version this tendr speaks.
-    pub const LATEST: Self = Self::V2;
+    pub const LATEST: Self = Self::V3;
 
     /// The version to speak with a peer whose newest is `theirs`: the newer
     /// of the two that both speak. A peer that names none, or one older than
     /// any, gets version 1.
     #[must_use]
     pub fn negotiate(theirs: u8) -> Self {
-        if theirs >= Self::V2 as u8 {
-            Self::V2
-        } else {
-            Self::V1
+        match theirs {
+            0 | 1 => Self::V1,
+            2 => Self::V2,
+            _ => Self::V3,
         }
+    }
+
+    /// The version before this one, to say again to a sidecar that refused
+    /// this one; `None` for version 1.
+    #[must_use]
+    pub fn older(self) -> Option<Self> {
+        match self {
+            Self::V1 => None,
+            Self::V2 => Some(Self::V1),
+            Self::V3 => Some(Self::V2),
+        }
+    }
+
+    /// Whether a viewer speaking it is told where the run's output ends
+    /// ([`MSG_OUTPUT_END`]).
+    #[must_use]
+    pub fn reports_end(self) -> bool {
+        self >= Self::V3
     }
 }
 
@@ -120,8 +156,39 @@ impl TryFrom<u8> for Version {
         match byte {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
+            3 => Ok(Self::V3),
             _ => Err(ProtocolError::UnsupportedHello),
         }
+    }
+}
+
+/// A resume's payload, `point`'s encoding then, from version 3, the
+/// version byte; version 2 has none, so a sidecar from before version 3
+/// still reads it.
+fn resume_payload(point: &[u8], version: Version) -> Vec<u8> {
+    debug_assert!(version >= Version::V2, "resuming is part of version 2");
+    let mut payload = point.to_vec();
+    if version > Version::V2 {
+        payload.push(version as u8);
+    }
+    payload
+}
+
+/// Split a resume's payload into its point, `len` bytes, and its version:
+/// 2 when nothing follows the point, else the byte after it, which must
+/// name a later one.
+fn split_resume<'a>(
+    payload: &'a [u8],
+    len: usize,
+    what: &'static str,
+) -> Result<(&'a [u8], Version), ProtocolError> {
+    match payload.len() {
+        n if n == len => Ok((payload, Version::V2)),
+        n if n == len + 1 => match Version::try_from(payload[len]) {
+            Ok(version) if version > Version::V2 => Ok((&payload[..len], version)),
+            _ => Err(ProtocolError::Malformed(what)),
+        },
+        _ => Err(ProtocolError::Malformed(what)),
     }
 }
 
@@ -371,8 +438,12 @@ pub enum Frame {
     AcceptedV2(ResumePoint),
     /// Sidecar → version 2 viewer: the run's output from `offset` on.
     Output { offset: u64, bytes: Vec<u8> },
-    /// Client → sidecar, in place of the hello: resume from this point.
-    Resume(ResumePoint),
+    /// Client → sidecar, in place of the hello: resume from this point,
+    /// speaking `version` (2 or later) from here on.
+    Resume {
+        point: ResumePoint,
+        version: Version,
+    },
     /// Sidecar → resuming viewer: control regained at `point.epoch`; its
     /// output follows from `point.offset`, the offset it asked for.
     Resumed(ResumePoint),
@@ -389,8 +460,11 @@ pub enum Frame {
     /// Sidecar → watcher: admitted read-only, at this point of the run.
     Watching(WatchPoint),
     /// Client → sidecar, in place of the hello: a watcher resumes from this
-    /// point.
-    WatchResume(WatchPoint),
+    /// point, speaking `version` (2 or later) from here on.
+    WatchResume { point: WatchPoint, version: Version },
+    /// Sidecar → version 3 viewer: the run's output ended at this offset,
+    /// and the viewer has been sent all of it.
+    OutputEnd(u64),
 }
 
 /// A frame whose payload does not fit its type.
@@ -440,7 +514,13 @@ impl Frame {
             },
             MSG_ACCEPTED => Self::Accepted(epoch("accepted")?),
             MSG_ACCEPTED_V2 => Self::AcceptedV2(ResumePoint::decode(&payload, "accepted v2")?),
-            MSG_RESUME => Self::Resume(ResumePoint::decode(&payload, "resume")?),
+            MSG_RESUME => {
+                let (point, version) = split_resume(&payload, 32, "resume")?;
+                Self::Resume {
+                    point: ResumePoint::decode(point, "resume")?,
+                    version,
+                }
+            }
             MSG_RESUMED => Self::Resumed(ResumePoint::decode(&payload, "resumed")?),
             MSG_GONE => {
                 let malformed = ProtocolError::Malformed("gone");
@@ -471,7 +551,19 @@ impl Frame {
             MSG_RETIRED => Self::Retired(epoch("retired")?),
             MSG_INPUT_DONE => Self::InputDone(PushOutcome::decode(&payload)?),
             MSG_WATCHING => Self::Watching(WatchPoint::decode(&payload, "watching")?),
-            MSG_WATCH_RESUME => Self::WatchResume(WatchPoint::decode(&payload, "watch resume")?),
+            MSG_WATCH_RESUME => {
+                let (point, version) = split_resume(&payload, 24, "watch resume")?;
+                Self::WatchResume {
+                    point: WatchPoint::decode(point, "watch resume")?,
+                    version,
+                }
+            }
+            MSG_OUTPUT_END => Self::OutputEnd(u64::from_be_bytes(
+                payload
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ProtocolError::Malformed("output end"))?,
+            )),
             other => return Err(ProtocolError::UnknownType(other)),
         })
     }
@@ -492,7 +584,9 @@ pub fn write_frame(w: &mut impl Write, frame: &Frame) -> io::Result<()> {
         Frame::Accepted(epoch) => write_msg(w, MSG_ACCEPTED, &epoch.get().to_be_bytes()),
         Frame::AcceptedV2(point) => write_msg(w, MSG_ACCEPTED_V2, &point.encode()),
         Frame::Output { offset, bytes } => write_output(w, *offset, bytes),
-        Frame::Resume(point) => write_msg(w, MSG_RESUME, &point.encode()),
+        Frame::Resume { point, version } => {
+            write_msg(w, MSG_RESUME, &resume_payload(&point.encode(), *version))
+        }
         Frame::Resumed(point) => write_msg(w, MSG_RESUMED, &point.encode()),
         Frame::Gone { point, oldest } => {
             let mut payload = [0u8; 40];
@@ -509,7 +603,12 @@ pub fn write_frame(w: &mut impl Write, frame: &Frame) -> io::Result<()> {
         Frame::Retired(epoch) => write_msg(w, MSG_RETIRED, &epoch.get().to_be_bytes()),
         Frame::InputDone(outcome) => write_msg(w, MSG_INPUT_DONE, &outcome.encode()),
         Frame::Watching(point) => write_msg(w, MSG_WATCHING, &point.encode()),
-        Frame::WatchResume(point) => write_msg(w, MSG_WATCH_RESUME, &point.encode()),
+        Frame::WatchResume { point, version } => write_msg(
+            w,
+            MSG_WATCH_RESUME,
+            &resume_payload(&point.encode(), *version),
+        ),
+        Frame::OutputEnd(offset) => write_msg(w, MSG_OUTPUT_END, &offset.to_be_bytes()),
     }
 }
 
@@ -696,7 +795,14 @@ mod tests {
             Frame::InputDone(PushOutcome::Written { bytes: 9 }),
             Frame::InputDone(PushOutcome::Revoked(progress)),
             Frame::InputDone(PushOutcome::Closed(progress)),
-            Frame::Resume(point),
+            Frame::Resume {
+                point,
+                version: Version::V2,
+            },
+            Frame::Resume {
+                point,
+                version: Version::V3,
+            },
             Frame::Resumed(point),
             Frame::Gone {
                 point,
@@ -714,10 +820,26 @@ mod tests {
                 run_id: point.run_id,
                 offset: 1 << 41,
             }),
-            Frame::WatchResume(WatchPoint {
-                run_id: point.run_id,
-                offset: 1 << 42,
-            }),
+            Frame::WatchResume {
+                point: WatchPoint {
+                    run_id: point.run_id,
+                    offset: 1 << 42,
+                },
+                version: Version::V2,
+            },
+            Frame::WatchResume {
+                point: WatchPoint {
+                    run_id: point.run_id,
+                    offset: 1 << 42,
+                },
+                version: Version::V3,
+            },
+            Frame::Hello {
+                version: Version::V3,
+                mode: Mode::Watch,
+            },
+            Frame::OutputEnd(1 << 43),
+            Frame::OutputEnd(0),
         ] {
             assert_eq!(round_trip(&frame), frame);
         }
@@ -737,7 +859,14 @@ mod tests {
         payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 3, 4]);
         for (sent, msg_type, what) in [
             (Frame::Watching(point), 0x0f, "watching"),
-            (Frame::WatchResume(point), 0x10, "watch resume"),
+            (
+                Frame::WatchResume {
+                    point,
+                    version: Version::V2,
+                },
+                0x10,
+                "watch resume",
+            ),
         ] {
             let mut bytes = Vec::new();
             write_frame(&mut bytes, &sent).unwrap();
@@ -803,7 +932,11 @@ mod tests {
         let mut payload = vec![0, 0, 0, 0, 0, 0, 1, 2];
         payload.extend_from_slice(run_id.as_uuid().as_bytes());
         payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 3, 4]);
-        for (sent, msg_type) in [(Frame::Resume(point), 0x0c), (Frame::Resumed(point), 0x0d)] {
+        let resume = Frame::Resume {
+            point,
+            version: Version::V2,
+        };
+        for (sent, msg_type) in [(resume, 0x0c), (Frame::Resumed(point), 0x0d)] {
             let mut bytes = Vec::new();
             write_frame(&mut bytes, &sent).unwrap();
             assert_eq!(bytes, frame(msg_type, 32, &payload));
@@ -867,12 +1000,85 @@ mod tests {
         );
     }
 
+    /// Version 3's frames: a resume is version 2's point, then the version
+    /// byte, which must name a version after 2; the end of output is the
+    /// final offset, big-endian.
+    #[test]
+    fn v3_frames_keep_their_wire_format() {
+        let run_id = RunId::new();
+        let point = ResumePoint {
+            run_id,
+            epoch: ControllerEpoch::new(0x0102),
+            offset: 0x0304,
+        };
+        let watch = WatchPoint {
+            run_id,
+            offset: 0x0304,
+        };
+        for (sent, msg_type, encoded) in [
+            (
+                Frame::Resume {
+                    point,
+                    version: Version::V3,
+                },
+                MSG_RESUME,
+                point.encode().to_vec(),
+            ),
+            (
+                Frame::WatchResume {
+                    point: watch,
+                    version: Version::V3,
+                },
+                MSG_WATCH_RESUME,
+                watch.encode().to_vec(),
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &sent).unwrap();
+            let payload = [encoded.as_slice(), &[3]].concat();
+            assert_eq!(bytes, frame(msg_type, payload.len() as u32, &payload));
+            for version in [0, 1, 2, 4] {
+                let bad = [encoded.as_slice(), &[version]].concat();
+                assert!(
+                    matches!(
+                        Frame::decode(msg_type, bad),
+                        Err(ProtocolError::Malformed(_))
+                    ),
+                    "version byte {version}"
+                );
+            }
+        }
+
+        let mut end = Vec::new();
+        write_frame(&mut end, &Frame::OutputEnd(0x0506)).unwrap();
+        assert_eq!(end, frame(0x11, 8, &[0, 0, 0, 0, 0, 0, 5, 6]));
+        for bad in [vec![0; 7], vec![0; 9], Vec::new()] {
+            assert_eq!(
+                Frame::decode(MSG_OUTPUT_END, bad),
+                Err(ProtocolError::Malformed("output end"))
+            );
+        }
+    }
+
     #[test]
     fn the_negotiated_version_is_the_newest_both_speak() {
         assert_eq!(Version::negotiate(0), Version::V1);
         assert_eq!(Version::negotiate(1), Version::V1);
         assert_eq!(Version::negotiate(2), Version::V2);
-        assert_eq!(Version::negotiate(9), Version::V2);
+        assert_eq!(Version::negotiate(3), Version::V3);
+        assert_eq!(Version::negotiate(9), Version::V3);
+    }
+
+    /// A refused version steps down one at a time, and only version 3 is
+    /// told where the output ends.
+    #[test]
+    fn each_version_steps_down_to_the_one_before() {
+        assert_eq!(Version::V3.older(), Some(Version::V2));
+        assert_eq!(Version::V2.older(), Some(Version::V1));
+        assert_eq!(Version::V1.older(), None);
+        assert!(Version::V3.reports_end());
+        assert!(!Version::V2.reports_end());
+        assert!(!Version::V1.reports_end());
     }
 
     /// The typed outcomes keep the v1 wire format: `[status][accepted][received]`.
@@ -1037,11 +1243,20 @@ mod tests {
                 mode: Mode::Watch
             })
         );
+        // Version 3 is the byte a sidecar from before the end of output
+        // refuses.
+        assert_eq!(
+            Frame::decode(MSG_HELLO, vec![3, 4]),
+            Ok(Frame::Hello {
+                version: Version::V3,
+                mode: Mode::Watch
+            })
+        );
         for payload in [
             vec![1, 0],
             vec![2, 5],
             vec![0, 1],
-            vec![3, 1],
+            vec![4, 1],
             vec![1],
             vec![1, 1, 0],
         ] {
