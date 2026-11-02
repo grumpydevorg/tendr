@@ -549,12 +549,9 @@ fn host_connect_deadline_that_cannot_be_represented_falls_back() {
     );
 }
 
-/// What a call to a remote tendr too old for it is told to do.
-const UPGRADE: &str = concat!(
-    "tendr on box is too old for this client: upgrade it to ",
-    env!("CARGO_PKG_VERSION"),
-    " or later"
-);
+/// What a call to a remote tendr too old for it is told to do: upgrade it
+/// to the first version with the remote frame, not to this one.
+const UPGRADE: &str = "tendr on box is too old for this client: upgrade it to 0.5.0 or later";
 
 /// A remote tendr too old to know `--hello` or `--exit-trailer` fails fast
 /// with clap's parse error; the caller is told to upgrade it, for exec too.
@@ -678,14 +675,7 @@ fn host_call_to_a_tendr_without_the_frame_entry_says_to_upgrade_it() {
             stderr.contains("unrecognized subcommand '_remote'"),
             "{deadline}: {stderr}"
         );
-        assert!(
-            stderr.contains(concat!(
-                "tendr on box is too old for this client: upgrade it to ",
-                env!("CARGO_PKG_VERSION"),
-                " or later"
-            )),
-            "{deadline}: {stderr}"
-        );
+        assert!(stderr.contains(UPGRADE), "{deadline}: {stderr}");
     }
 }
 

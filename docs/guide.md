@@ -305,7 +305,8 @@ concurrent `push` is refused, not interleaved.
   cannot be combined with
   `--read-only`). A session started by a `tendr` without read-only viewers
   refuses it with 80. It works with `--host` too, and reconnects like any
-  `attach --host` (below).
+  `attach --host` (below), when both hosts and the session are new enough
+  ([versions](#reach-remote-hosts-with---host)).
 - With no terminal (stdin or stdout redirected), `attach --read-only`
   streams the session's output to stdout, for an agent or script watching a
   PTY session live: `tendr attach --read-only build | grep -m1 'error'`. It
@@ -344,9 +345,10 @@ concurrent `push` is refused, not interleaved.
   setting) and mintty (Git Bash's terminal) are refused before ssh starts.
 
 **When an `attach --host` connection drops**, tendr reconnects by itself
-and carries on where your terminal stopped, with the screen as it was. The
-remote host must run this version or newer, and so must the session's
-sidecar; otherwise the attach ends as before, with ssh's exit.
+and carries on where your terminal stopped, with the screen as it was. That
+needs a remote host and a session new enough to resume
+([versions](#reach-remote-hosts-with---host)); otherwise the attach ends as
+before, with ssh's exit.
 
 - ssh checks the link every 5 s and gives up after three unanswered checks,
   so a dead network is noticed within about 15 to 20 s. Killing `ssh`, or a
@@ -571,9 +573,21 @@ Start work under `--host`, disconnect, and come back later to `log`, `status`,
 |`run`, `wrap`, `prune`, `query`, `guide`, `skill`|Refused with exit 2 and a ready-to-paste fallback for a POSIX shell, such as `try (POSIX shell):  ssh data-box 'tendr run deploy.sh'`.|
 |`events`, `emit`|Refused with exit 1.|
 
-**The remote `tendr` must be this version or newer**, `exec` included. An
-older one rejects the request, and tendr says to upgrade it. An older client
-still works against a newer remote.
+**Versions.** The remote `tendr` must be 0.5.0 or newer for every command,
+`exec` included. An older one fails at once, and tendr says to upgrade it.
+Two features need more:
+
+- Reconnecting a dropped `attach --host` needs 0.6.0 or newer on the remote
+  host, and a session started by 0.6.0 or newer. Otherwise the attach ends
+  with ssh's exit.
+- Watching (`attach --read-only`) needs 0.7.0 or newer on both hosts, and a
+  session started by 0.7.0 or newer. An older remote refuses it with 80, or
+  with 81 when a human is attached, and tendr adds a line saying the remote
+  is too old. The 81's own hint, `--takeover`, would take the terminal from
+  that human: do not follow it to watch. A session started by an older
+  `tendr` refuses it with 80.
+
+An older client still works against a newer remote.
 
 **Invalid requests.** The remote `tendr` checks a request before it does
 anything. One it refuses, such as a bad session name or a malformed `--env`,
@@ -795,8 +809,8 @@ or an I/O error.
 |`wrap`|the child's|The wrapped command's code; 6 for an `--event` with a reserved prefix|
 |`query`|DuckDB's|DuckDB's exit code|
 |`guide`, `skill install`|2|Unknown topic; refusing to overwrite a modified skill file|
-|`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not within 10 s (an older or newer `tendr`), an `attach --host` got output that does not follow on from the last, or its reconnect reached a session that cannot resume, or an `attach --read-only` reached a session started by a `tendr` without read-only viewers|
-|`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach (also when the attach had stopped reading its output and learns of it only later), or the session's run has ended. An `attach --host` whose reconnect is refused exits 81 too: someone took the terminal while it was disconnected (an attach, a takeover, or an agent's `push` still running), or the run ended meanwhile (`not running`)|
+|`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not within 10 s (an older or newer `tendr`), an `attach --host` got output that does not follow on from the last, or its reconnect reached a session that cannot resume, or an `attach --read-only` reached a session started by a `tendr` without read-only viewers, or, over `--host`, a remote `tendr` older than 0.7.0 (tendr adds a line saying so)|
+|`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach (also when the attach had stopped reading its output and learns of it only later), or the session's run has ended. An `attach --host` whose reconnect is refused exits 81 too: someone took the terminal while it was disconnected (an attach, a takeover, or an agent's `push` still running), or the run ended meanwhile (`not running`). So does an `attach --read-only --host` whose remote `tendr`, older than 0.7.0, finds a human attached; tendr adds a line saying the remote is too old, and that the `--takeover` it suggests would take the terminal from that human|
 |`attach`, `push` to a PTY session|82, 83|Reserved, not used yet|
 |`attach`, `push` to a PTY session|84|Runtime or transport: the attach socket is missing or unreachable, the connection fails, the session already serves as many connections of that kind as it admits (eight read-only viewers, or eight attaches, takeovers, resumes and pushes), an `attach --read-only` was cut off short of the run's output (at the run's end too, when it was not reading its last bytes within 2 s; with a session started by an older `tendr`, only without a terminal or over `--host`, and only while the run went on), or a push ended revoked or stopped with bytes unwritten (stderr gives the byte counts)|
 |`attach`, `push` to a PTY session|85|Identity: the socket's listener, or the connecting client, is another user|

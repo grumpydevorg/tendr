@@ -227,7 +227,11 @@ command line as the other operations, and keeps the terminal on the client
   `read_only` and refuses the watch hello or the watch resume as not the
   frame it requires (80), unless its own human-control check refuses first
   (81), which it makes for a watch hello, and 0.5.0's for a watch resume
-  too, since it knows no `resume`; neither ever attaches.
+  too, since it knows no `resume`; neither ever attaches. When a first
+  attach is refused so, in those releases' frozen words, the client adds a
+  line after the remote's message (`commands::attach::old_remote_watch_note`):
+  watching needs 0.7.0 on the host, or, after an 81, that the remote cannot
+  serve watchers and its `--takeover` hint would take the terminal.
 - Raw mode, the size check and SIGWINCH (`WINDOW_BUFFER_SIZE_EVENT` on
   Windows), the detach escape, and restoring the terminal and its modes all
   happen on the client, as for a local attach.

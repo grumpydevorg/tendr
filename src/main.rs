@@ -65,8 +65,9 @@ struct Cli {
     ///
     /// Supported remotely: start, status, list, log, push, kill, wait,
     /// watch, attach and exec. The request travels to the remote tendr as
-    /// data, never through a shell; the remote tendr must be this version
-    /// or newer. Every other command is local-only.
+    /// data, never through a shell; the remote tendr must be 0.5.0 or newer,
+    /// and some features need newer (`tendr guide remote`). Every other
+    /// command is local-only.
     // allow_hyphen_values so an option-shaped destination (`-oProxyCommand=…`)
     // is captured as the value and rejected by our own validate_destination
     // (clear error, exit 2) rather than mis-parsed by clap as a flag.

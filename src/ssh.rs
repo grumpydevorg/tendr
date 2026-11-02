@@ -672,16 +672,22 @@ impl Watch {
     /// ssh exited with `status` after stderr `ended`.
     fn exited(&self, host: &str, status: std::process::ExitStatus, ended: Ended) -> Progress {
         // An old tendr writes no trailer; its parse error fails the call
-        // (exit 2, or 1 under a PowerShell login shell).
+        // (exit 2, or 1 under a PowerShell login shell). Every remote from
+        // REMOTE_FLOOR on takes the frame and both flags.
         if ended.old_tendr && ended.trailer.is_none() && status.code() != Some(0) {
             eprintln!(
-                "tendr on {host} is too old for this client: upgrade it to {} or later",
-                env!("CARGO_PKG_VERSION")
+                "tendr on {host} is too old for this client: upgrade it to {REMOTE_FLOOR} or later"
             );
         }
         Progress::Exited(status, ended.trailer)
     }
 }
+
+/// The oldest remote tendr a `--host` call works with: the first with the
+/// remote frame (`_remote`), `--hello` and `--exit-trailer`. Reconnecting
+/// and watching need newer ones (`docs/guide.md`, "Reach remote hosts with
+/// `--host`").
+const REMOTE_FLOOR: &str = "0.5.0";
 
 /// How often a framed call looks at ssh while the connect deadline is pending.
 const PENDING_POLL: Duration = Duration::from_millis(20);

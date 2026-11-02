@@ -223,7 +223,8 @@ const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Returns the exit code. The remote side's own failures (no such session,
 /// a refusal, an unreachable socket) arrive as its exit code, with its
 /// message passed through on stderr, so the codes are those of a local
-/// attach.
+/// attach. A watcher refused by a remote too old to serve it gets a line
+/// after that message saying so ([`old_remote_watch_note`]).
 ///
 /// # Errors
 /// A takeover of this attach (81), an answer or output outside the protocol
@@ -257,9 +258,26 @@ pub fn cmd_attach_host(
     )?;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stderr = std::sync::Arc::new(client::StderrRoute::default());
+    let ssh_stderr: Box<dyn std::io::Write + Send> =
+        Box::new(client::SshStderr::new(std::sync::Arc::clone(&stderr)));
+    // A watcher keeps the end of what the remote says, to explain a
+    // refusal by a remote too old to serve it.
+    let (ssh_stderr, heard) = if request.read_only {
+        let heard = std::sync::Arc::default();
+        let tail = Overheard {
+            out: ssh_stderr,
+            tail: std::sync::Arc::clone(&heard),
+        };
+        (
+            Box::new(tail) as Box<dyn std::io::Write + Send>,
+            Some(heard),
+        )
+    } else {
+        (ssh_stderr, None)
+    };
     let dial = tendr::ssh::Dial {
         login: tendr::ssh::Login::Interactive,
-        stderr: Box::new(client::SshStderr::new(std::sync::Arc::clone(&stderr))),
+        stderr: ssh_stderr,
         cancel: std::sync::Arc::clone(&cancel),
     };
     // The remote side's answer is the sidecar's acceptance.
@@ -268,7 +286,20 @@ pub fn cmd_attach_host(
     })?;
     let (link, accept) = match opened {
         Opened::Answered(link, accept) => (link, accept),
-        Opened::Ended(code) => return Ok(code),
+        Opened::Ended(code) => {
+            // Every byte the remote said has been passed on by now: ssh's
+            // stderr ends before its exit code is known.
+            let note = heard.and_then(|heard| {
+                let heard = heard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                old_remote_watch_note(host, code, &heard)
+            });
+            if let Some(note) = note {
+                eprintln!("{note}");
+            }
+            return Ok(code);
+        }
     };
     let (link, ssh) = link.split();
     let end = HostEnd {
@@ -288,6 +319,70 @@ pub fn cmd_attach_host(
         // The remote judges, and passes the end of output on when it comes.
         client::EndNotice::Unknown,
     )
+}
+
+/// The most of the remote's stderr a watcher keeps, from its end: the
+/// refusal it looks for is the remote's last line.
+const OVERHEARD_BYTES: usize = 4096;
+
+/// An `attach --host` connection's ssh stderr, passed on to `out` as it
+/// comes, whose last [`OVERHEARD_BYTES`] are kept in `tail`.
+struct Overheard {
+    out: Box<dyn std::io::Write + Send>,
+    tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for Overheard {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.out.write(buf)?;
+        let mut tail = self
+            .tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tail.extend_from_slice(&buf[..written]);
+        let excess = tail.len().saturating_sub(OVERHEARD_BYTES);
+        tail.drain(..excess);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// The oldest `tendr` that serves watchers over `--host`.
+const WATCH_FLOOR: &str = "0.7.0";
+
+/// What a remote tendr from before [`WATCH_FLOOR`] says when it refuses a
+/// watcher. It ignores the request's `read_only`, so it wants an attach
+/// hello and refuses the watch hello (80), unless its human-control check,
+/// which a newer remote skips for a watcher, refuses first (81). This is
+/// the frozen text of the released 0.5.0 and 0.6.0, matched as it is; no
+/// remote from 0.7.0 on says either to a watcher: it wants a `Watch` hello,
+/// and never suggests `--takeover` to one.
+const OLD_REMOTE_HELLO_REFUSAL: &str = "the attach request must be followed by its Attach hello";
+const OLD_REMOTE_HUMAN_CONTROL: &str =
+    "session is already under human control (use --takeover to take it over)";
+
+/// The line an `attach --read-only --host` adds after the remote's own
+/// message when a remote too old to serve watchers refused it before any
+/// answer, with exit `code` and the stderr whose end is `heard`; `None` for
+/// any other refusal.
+fn old_remote_watch_note(host: &str, code: i32, heard: &[u8]) -> Option<String> {
+    let heard = String::from_utf8_lossy(heard);
+    if code == PtyExitCode::Protocol.code() && heard.contains(OLD_REMOTE_HELLO_REFUSAL) {
+        Some(format!(
+            "tendr: watching (attach --read-only) needs tendr {WATCH_FLOOR} or newer on {host}, \
+             and a session started by it"
+        ))
+    } else if code == PtyExitCode::Control.code() && heard.contains(OLD_REMOTE_HUMAN_CONTROL) {
+        Some(format!(
+            "tendr: the tendr on {host} is older than {WATCH_FLOOR} and cannot serve watchers; \
+             --takeover would take the terminal from whoever holds it"
+        ))
+    } else {
+        None
+    }
 }
 
 /// The ssh end of an `attach --host`: the current connection's ssh, and what
