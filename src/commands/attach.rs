@@ -2,10 +2,15 @@ use tendr::attach_escape::EscapeMode;
 #[cfg(unix)]
 use tendr::attach_proto::{self, Frame, FrameError, Mode};
 use tendr::model::ids::{Namespace, SessionName};
+use tendr::model::meta::Meta;
 use tendr::model::pty::PtyControl;
 use tendr::model::state::RunStatus;
 use tendr::pty_exit::PtyExitCode;
-use tendr::session::{self, SessionRoot};
+use tendr::session::{self, SessionDir, SessionRoot};
+
+mod bridge;
+
+pub use bridge::cmd_attach_bridge;
 
 pub fn cmd_attach(
     name: &str,
@@ -13,6 +18,41 @@ pub fn cmd_attach(
     takeover: bool,
     escape: EscapeMode,
 ) -> anyhow::Result<()> {
+    let (session, meta) = attachable(name, namespace, takeover)?;
+
+    #[cfg(not(unix))]
+    {
+        let _ = (session, meta, escape);
+        anyhow::bail!("attach is only supported on Unix");
+    }
+
+    #[cfg(unix)]
+    {
+        // Fail before any side effect — a takeover included — if there is no
+        // terminal to drive.
+        require_terminal()?;
+        let mode = mode(takeover);
+        let (stream, epoch) = connect(session.path(), mode)?;
+        let control = Control {
+            session_dir: session.path().to_path_buf(),
+            run_id: meta.run_id(),
+            epoch,
+        };
+        unix_relay::relay(unix_relay::Link::socket(stream)?, escape, &|| {
+            control.taken_over_by().is_some()
+        })
+        .map(drop)
+    }
+}
+
+/// The session `name` in `namespace`, if it can be attached: a PTY session
+/// whose run is running, and not under human control unless `takeover`.
+/// Shared by a local attach and the remote end of `attach --host`.
+fn attachable(
+    name: &str,
+    namespace: &Namespace,
+    takeover: bool,
+) -> anyhow::Result<(SessionDir, Meta)> {
     let session_name = SessionName::new(name)?;
     let root = SessionRoot::default_path()?;
 
@@ -39,33 +79,131 @@ pub fn cmd_attach(
             "session is already under human control (use --takeover to take it over)"
         )));
     }
+    Ok((session, meta))
+}
 
-    #[cfg(not(unix))]
-    {
-        let _ = (takeover, escape);
-        anyhow::bail!("attach is only supported on Unix");
+#[cfg(unix)]
+fn mode(takeover: bool) -> Mode {
+    if takeover {
+        Mode::Takeover
+    } else {
+        Mode::Attach
+    }
+}
+
+/// An attach drives the terminal on stdin.
+#[cfg(unix)]
+fn require_terminal() -> anyhow::Result<()> {
+    if rustix::termios::isatty(std::io::stdin()) {
+        Ok(())
+    } else {
+        anyhow::bail!("attach requires an interactive terminal on stdin")
+    }
+}
+
+/// How long `attach --host` waits for ssh to end once the attach has ended
+/// on this side (a detach, or the keyboard closing) before stopping it. The
+/// remote side ends as soon as it reads the end of its input; the session
+/// treats a lost connection as a detach either way.
+#[cfg(unix)]
+const SSH_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long `attach --host` waits for ssh to end, for its exit code, once
+/// the remote end has closed the connection.
+#[cfg(unix)]
+const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `attach --host` from a Unix client. `request` is the encoded remote frame
+/// of the attach request; the hello follows it on ssh's stdin, and then the
+/// typed attach frames, which the remote tendr bridges to the session's
+/// attach socket ([`cmd_attach_bridge`]). This end keeps the terminal: raw
+/// mode, resizes (SIGWINCH included) and the detach escape, exactly as a
+/// local attach. The remote sidecar keeps the controller epochs and the
+/// recording.
+///
+/// Returns the exit code. The remote side's own failures (no such session,
+/// a refusal, an unreachable socket) arrive as its exit code, with its
+/// message passed through on stderr, so the codes are those of a local
+/// attach.
+///
+/// # Errors
+/// A takeover of this attach (81), an answer outside the protocol (80), a
+/// remote that ended without answering (84), and the ssh failures of
+/// [`tendr::ssh::AttachSsh`].
+#[cfg(unix)]
+pub fn cmd_attach_host(
+    host: &str,
+    mut request: Vec<u8>,
+    takeover: bool,
+    escape: EscapeMode,
+) -> anyhow::Result<i32> {
+    use tendr::ssh::{AttachSsh, AttachStart};
+
+    // Before ssh starts: the request may take over.
+    require_terminal()?;
+    attach_proto::write_frame(&mut request, &Frame::Hello(mode(takeover)))?;
+    let (ssh, stdin, stdout) = match AttachSsh::start(host, &request)? {
+        AttachStart::Running { ssh, stdin, stdout } => (ssh, stdin, stdout),
+        AttachStart::Ended(code) => return unanswered(code),
+    };
+    // The remote side's answer is the sidecar's acceptance; a refusal or a
+    // failure of its own ends the connection, and its exit code says which.
+    let mut reader = std::io::BufReader::new(stdout);
+    match attach_proto::read_frame(&mut reader) {
+        Ok(Frame::Accepted(_)) => {}
+        Err(FrameError::Io(_)) => {
+            drop(stdin);
+            return match ssh.finish(None) {
+                Some(code) => unanswered(code?),
+                None => unreachable!("no grace"),
+            };
+        }
+        reply => {
+            drop(stdin);
+            let _ = ssh.finish(Some(SSH_LEAVE_GRACE));
+            hello_reply(reply, "attach")?;
+            unreachable!("only an acceptance is accepted");
+        }
     }
 
-    #[cfg(unix)]
-    {
-        // Fail before any side effect — a takeover included — if there is no
-        // terminal to drive.
-        if !rustix::termios::isatty(std::io::stdin()) {
-            anyhow::bail!("attach requires an interactive terminal on stdin");
-        }
+    let link = unix_relay::Link {
+        reader: Box::new(reader),
+        writer: Box::new(std::io::BufWriter::new(stdin)),
+        // The sender closes ssh's stdin when the relay closes its outbox,
+        // and `finish` stops ssh if it does not end by itself.
+        close: Box::new(|| {}),
+    };
+    // The remote side reports a takeover in band, even one that cut the
+    // connection before the sidecar could say so.
+    let ending = unix_relay::relay(link, escape, &|| false);
+    let closed = matches!(ending, Ok(unix_relay::Ending::SessionClosed));
+    let finished = ssh.finish(Some(if closed {
+        SSH_CLOSE_GRACE
+    } else {
+        SSH_LEAVE_GRACE
+    }));
+    ending?;
+    if !closed {
+        return Ok(0);
+    }
+    // The connection ended from the far side: the session's run ended, or
+    // the connection was lost (ssh's 255).
+    match finished {
+        Some(code) => Ok(code?),
+        None => Ok(0),
+    }
+}
 
-        let mode = if takeover {
-            Mode::Takeover
-        } else {
-            Mode::Attach
-        };
-        let (stream, epoch) = connect(session.path(), mode)?;
-        let control = Control {
-            session_dir: session.path().to_path_buf(),
-            run_id: meta.run_id(),
-            epoch,
-        };
-        unix_relay::relay(stream, escape, &control)
+/// The exit code of an `attach --host` whose remote side ended without
+/// accepting: its own code, or 84 if it claims success.
+#[cfg(unix)]
+fn unanswered(code: i32) -> anyhow::Result<i32> {
+    if code == 0 {
+        Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
+            "the remote tendr ended without answering the attach"
+        )))
+    } else {
+        Ok(code)
     }
 }
 
@@ -79,24 +217,20 @@ struct Control {
 
 #[cfg(unix)]
 impl Control {
-    /// Whether another client took this control over: in this run, the event
-    /// log records a takeover granting the epoch after this one, and no
-    /// detach releasing this one. A client that had already let go (dropped
-    /// for falling behind, say) is not taken over by a later `--takeover`,
-    /// which also grants the next epoch.
+    /// The epoch of the client that took this control over, if one did: in
+    /// this run, the event log records a takeover granting the epoch after
+    /// this one, and no detach releasing this one. A client that had already
+    /// let go (dropped for falling behind, say) is not taken over by a later
+    /// `--takeover`, which also grants the next epoch.
     ///
     /// A client that stopped reading its output cannot read the `MSG_RETIRED`
     /// queued behind it, so the sidecar records the takeover before it ends the
     /// connection, and the client looks here when it sees the end. An
     /// unreadable log, or a sidecar that records no epochs, reads as no
     /// takeover.
-    fn taken_over(&self) -> bool {
-        let Some(successor) = self.epoch.next().ok() else {
-            return false;
-        };
-        let Ok(log) = tendr::events::read_session_events(&self.session_dir) else {
-            return false;
-        };
+    fn taken_over_by(&self) -> Option<tendr::model::pty_control::ControllerEpoch> {
+        let successor = self.epoch.next().ok()?;
+        let log = tendr::events::read_session_events(&self.session_dir).ok()?;
         let changes = || {
             log.events.iter().filter_map(|event| {
                 (event.run_id == self.run_id && event.kind.as_str() == "pty.control_changed")
@@ -106,9 +240,9 @@ impl Control {
         };
         let released =
             changes().any(|data| data["trigger"] == "detach" && data["epoch"] == self.epoch.get());
-        !released
-            && changes()
-                .any(|data| data["trigger"] == "takeover" && data["epoch"] == successor.get())
+        let took_over =
+            changes().any(|data| data["trigger"] == "takeover" && data["epoch"] == successor.get());
+        (!released && took_over).then_some(successor)
     }
 }
 
@@ -247,7 +381,8 @@ fn hello_reply(
     }
 }
 
-/// The interactive relay between the user's terminal and the session.
+/// The interactive relay between the user's terminal and the session, over
+/// the attach socket or, for `attach --host`, over ssh to the remote bridge.
 ///
 /// Three independent paths, so no blocked one can delay a detach:
 ///
@@ -259,9 +394,9 @@ fn hello_reply(
 /// - a **reader thread** writes session output to the terminal; if the terminal
 ///   stops reading, only this thread waits.
 ///
-/// Leaving never joins a blocked thread: the socket is shut down, the terminal
-/// is restored (without waiting for pending output to drain), and the process
-/// exits.
+/// Leaving never joins a blocked thread: the connection is closed, the
+/// terminal is restored (without waiting for pending output to drain), and
+/// the process exits.
 ///
 /// SIGHUP, SIGTERM and SIGINT end the relay like a detach, and SIGWINCH brings
 /// the next size check forward. Their handlers only wake the main thread's
@@ -281,9 +416,11 @@ mod unix_relay {
     use tendr::pty_exit::PtyExitCode;
     use tendr::term_modes::TermModes;
 
-    /// Keystrokes that may wait for a session that is not accepting input.
-    /// Beyond this, further keystrokes are dropped (and reported) rather than
-    /// buffered without bound; the escape is still recognized.
+    /// Input that may wait for a session that is not accepting it. Beyond
+    /// this, the attach client drops further keystrokes (and reports them)
+    /// rather than buffering without bound, and the escape is still
+    /// recognized; the remote bridge stops reading its input until there is
+    /// room.
     const OUTBOX_DATA_LIMIT: usize = 1 << 20;
     /// How long the main thread waits on the keyboard before it checks again
     /// whether the session has closed.
@@ -291,7 +428,7 @@ mod unix_relay {
     /// How often the terminal size is checked.
     const SIZE_POLL: Duration = Duration::from_millis(100);
     /// How long a detach waits for the detach message to be sent.
-    const DETACH_GRACE: Duration = Duration::from_millis(200);
+    pub(super) const DETACH_GRACE: Duration = Duration::from_millis(200);
     /// How long leaving on a signal waits for its report to be written to a
     /// terminal that may be gone or not reading.
     const REPORT_GRACE: Duration = Duration::from_millis(200);
@@ -300,14 +437,39 @@ mod unix_relay {
     /// [`REPORT_GRACE`] applies: SIGHUP means the terminal is gone.
     const MODES_GRACE: Duration = Duration::from_secs(1);
 
+    /// One attach connection as the relay sees it: frames in, frames out.
+    pub(super) struct Link {
+        pub(super) reader: Box<dyn Read + Send>,
+        pub(super) writer: Box<dyn Write + Send>,
+        /// Ends the connection when the relay leaves, unblocking the reader
+        /// and the sender; the session treats a closed connection as a
+        /// detach.
+        pub(super) close: Box<dyn FnOnce()>,
+    }
+
+    impl Link {
+        /// A connection to the session's attach socket.
+        pub(super) fn socket(stream: UnixStream) -> anyhow::Result<Self> {
+            let socket = |e| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket: {e}"));
+            let shutdown = stream.try_clone().map_err(socket)?;
+            Ok(Self {
+                reader: Box::new(stream.try_clone().map_err(socket)?),
+                writer: Box::new(stream),
+                close: Box::new(move || {
+                    let _ = shutdown.shutdown(std::net::Shutdown::Both);
+                }),
+            })
+        }
+    }
+
+    /// Relay until the attach ends; how it ended, unless another client took
+    /// it over (an error, exit 81). `recorded_takeover` is asked when the
+    /// session closes the connection without saying so.
     pub(super) fn relay(
-        stream: UnixStream,
+        link: Link,
         escape: EscapeMode,
-        control: &super::Control,
-    ) -> anyhow::Result<()> {
-        let socket = |e| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket: {e}"));
-        let shutdown = stream.try_clone().map_err(socket)?;
-        let reader_stream = stream.try_clone().map_err(socket)?;
+        recorded_takeover: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Ending> {
         let closed = Arc::new(AtomicBool::new(false));
         let retired = Arc::new(AtomicBool::new(false));
         let outbox = Arc::new(Outbox::default());
@@ -322,9 +484,9 @@ mod unix_relay {
         // included.
         let terminal = RawTerminal::enter()?;
 
-        spawn_sender(stream, Arc::clone(&outbox), Arc::clone(&closed));
+        spawn_sender(link.writer, Arc::clone(&outbox), Arc::clone(&closed));
         spawn_reader(
-            reader_stream,
+            link.reader,
             Arc::clone(&closed),
             Arc::clone(&retired),
             Arc::clone(&screen),
@@ -401,9 +563,9 @@ mod unix_relay {
             outbox.push_control(Frame::Detach);
             outbox.wait_controls_sent(DETACH_GRACE);
         }
-        // Unblocks the sender and reader on the socket; the session treats a
-        // closed connection as a detach.
-        let _ = shutdown.shutdown(std::net::Shutdown::Both);
+        // Unblocks the sender and reader; the session treats a closed
+        // connection as a detach.
+        (link.close)();
         outbox.close();
         turn_off_modes(
             &screen,
@@ -422,7 +584,7 @@ mod unix_relay {
         // so at the end of its connection the event log decides.
         let taken_over = ending != Ending::Detached
             && (retired.load(Ordering::SeqCst)
-                || (ending == Ending::SessionClosed && control.taken_over()));
+                || (ending == Ending::SessionClosed && recorded_takeover()));
         let mut notes = Vec::new();
         if let Ending::Signalled(cancel) = ending {
             notes.push(format!("tendr: attach ended by {}", cancel.name()));
@@ -451,7 +613,7 @@ mod unix_relay {
                 "tendr: another client took over this session"
             )));
         }
-        Ok(())
+        Ok(ending)
     }
 
     /// Queue keystrokes for the session, counting them in `dropped` if the
@@ -465,8 +627,9 @@ mod unix_relay {
         }
     }
 
+    /// How a relay ended.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Ending {
+    pub(super) enum Ending {
         Detached,
         SessionClosed,
         KeyboardClosed,
@@ -569,9 +732,12 @@ mod unix_relay {
         }
     }
 
-    /// Messages waiting for the sender thread; controls go first.
+    /// Messages waiting for the sender thread. Controls go first, on a
+    /// bounded path: at most one size waits (a newer one replaces it), and
+    /// the others are sent once each. Input waits behind them, bounded by
+    /// [`OUTBOX_DATA_LIMIT`].
     #[derive(Default)]
-    struct Outbox {
+    pub(super) struct Outbox {
         state: Mutex<OutboxState>,
         changed: Condvar,
     }
@@ -590,8 +756,21 @@ mod unix_relay {
             self.state.lock().unwrap_or_else(|e| e.into_inner())
         }
 
-        fn push_control(&self, frame: Frame) {
-            self.lock().controls.push_back(frame);
+        pub(super) fn push_control(&self, frame: Frame) {
+            let mut state = self.lock();
+            let queued_size = matches!(frame, Frame::Resize(_))
+                .then(|| {
+                    state
+                        .controls
+                        .iter_mut()
+                        .find(|queued| matches!(queued, Frame::Resize(_)))
+                })
+                .flatten();
+            match queued_size {
+                Some(queued) => *queued = frame,
+                None => state.controls.push_back(frame),
+            }
+            drop(state);
             self.changed.notify_all();
         }
 
@@ -599,6 +778,26 @@ mod unix_relay {
         fn push_data(&self, bytes: Vec<u8>) -> bool {
             let mut state = self.lock();
             if state.data_bytes + bytes.len() > OUTBOX_DATA_LIMIT {
+                return false;
+            }
+            state.data_bytes += bytes.len();
+            state.data.push_back(bytes);
+            drop(state);
+            self.changed.notify_all();
+            true
+        }
+
+        /// Queue input, waiting while the backlog is full; `false` once
+        /// closed.
+        pub(super) fn push_data_waiting(&self, bytes: Vec<u8>) -> bool {
+            let mut state = self.lock();
+            while !state.closed
+                && state.data_bytes > 0
+                && state.data_bytes + bytes.len() > OUTBOX_DATA_LIMIT
+            {
+                state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            if state.closed {
                 return false;
             }
             state.data_bytes += bytes.len();
@@ -621,6 +820,8 @@ mod unix_relay {
                 }
                 if let Some(data) = state.data.pop_front() {
                     state.data_bytes -= data.len();
+                    // Room for input that waits for it.
+                    self.changed.notify_all();
                     return Some(Frame::Data(data));
                 }
                 state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
@@ -633,7 +834,7 @@ mod unix_relay {
         }
 
         /// Wait up to `grace` for queued controls to be written.
-        fn wait_controls_sent(&self, grace: Duration) {
+        pub(super) fn wait_controls_sent(&self, grace: Duration) {
             let deadline = Instant::now() + grace;
             let mut state = self.lock();
             while !state.closed && (!state.controls.is_empty() || state.sending_control) {
@@ -648,13 +849,20 @@ mod unix_relay {
             }
         }
 
-        fn close(&self) {
+        pub(super) fn close(&self) {
             self.lock().closed = true;
             self.changed.notify_all();
         }
     }
 
-    fn spawn_sender(mut stream: UnixStream, outbox: Arc<Outbox>, closed: Arc<AtomicBool>) {
+    /// Write the outbox's messages to `stream` until it closes. A failed
+    /// write sets `closed` and closes the outbox. Dropping `stream` at the end
+    /// closes it, which ends ssh's input for `attach --host`.
+    pub(super) fn spawn_sender(
+        mut stream: impl Write + Send + 'static,
+        outbox: Arc<Outbox>,
+        closed: Arc<AtomicBool>,
+    ) {
         std::thread::spawn(move || {
             while let Some(frame) = outbox.next() {
                 let written = attach_proto::write_frame(&mut stream, &frame);
@@ -669,7 +877,7 @@ mod unix_relay {
     }
 
     fn spawn_reader(
-        mut stream: UnixStream,
+        mut stream: impl Read + Send + 'static,
         closed: Arc<AtomicBool>,
         retired: Arc<AtomicBool>,
         screen: Arc<Screen>,

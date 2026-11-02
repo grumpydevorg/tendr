@@ -4,8 +4,10 @@
 //! The parsed command line becomes a [`RemoteOperation`] (`TryFrom<&Commands>`),
 //! and [`dispatch`] runs it. Locally that is the whole path. With `--host`
 //! the request travels as data in the remote frame ([`crate::remote_frame`])
-//! and the remote tendr dispatches it; `attach` alone still runs under
-//! `ssh -t`, with a command line of plain names ([`AttachRequest::ssh_argv`]).
+//! and the remote tendr dispatches it; for `attach` it bridges the attach
+//! protocol that follows the request instead. A Windows client still runs
+//! `attach` under `ssh -t`, with a command line of plain names
+//! (`AttachRequest::ssh_argv`).
 //!
 //! A request holds only what the user typed. Defaults (the namespace) and
 //! bindings (`--after` run ids) resolve in [`dispatch`], on the host that runs
@@ -153,6 +155,8 @@ pub struct WatchRequest {
     pub ready_file: Option<PathBuf>,
 }
 
+/// `attach`: `escape` is applied by the client's terminal, so over `--host`
+/// the remote tendr ignores it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachRequest {
     pub session: String,
@@ -161,11 +165,13 @@ pub struct AttachRequest {
     pub escape: EscapeMode,
 }
 
+#[cfg(windows)]
 impl AttachRequest {
-    /// The remote tendr argv for `attach --host`, which still runs under
-    /// `ssh -t` as a command line until the attach bridge lands. Only plain
-    /// names ([`tendr::ssh::is_plain_name`]) and fixed flag values go in it,
-    /// so no remote shell acts on any of it.
+    /// The remote tendr argv for `attach --host` from a Windows client, which
+    /// has no local console frontend for the attach protocol yet and so runs
+    /// `attach` under `ssh -t` as a command line. Only plain names
+    /// ([`tendr::ssh::is_plain_name`]) and fixed flag values go in it, so no
+    /// remote shell acts on any of it.
     ///
     /// # Errors
     /// [`NotPlainName`] for a session or namespace that is not a plain name.
@@ -194,10 +200,12 @@ impl AttachRequest {
     }
 }
 
-/// A session or namespace that `attach --host` cannot put on its command line.
+/// A session or namespace that `attach --host` from a Windows client cannot
+/// put on its command line.
+#[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "attach over --host takes plain names until the attach bridge lands: \
+    "attach over --host from Windows takes plain names: \
      {what} {value:?} must match [A-Za-z][A-Za-z0-9_-]{{0,254}}"
 )]
 pub struct NotPlainName {
@@ -769,8 +777,9 @@ mod tests {
         assert!(!(i.stdin || i.pty || i.replace || i.any_exit));
     }
 
-    /// attach's `ssh -t` command line: the plain names and fixed flags, in
-    /// the order the remote parse expects.
+    /// A Windows client's `ssh -t` command line for attach: the plain names
+    /// and fixed flags, in the order the remote parse expects.
+    #[cfg(windows)]
     #[test]
     fn attach_ssh_argv_is_plain() {
         let cases: &[(&[&str], &[&str])] = &[
@@ -808,6 +817,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn attach_ssh_argv_refuses_names_a_shell_acts_on() {
         for args in [
@@ -823,7 +833,7 @@ mod tests {
             let err = request.ssh_argv().expect_err("not plain");
             assert!(
                 err.to_string()
-                    .starts_with("attach over --host takes plain names"),
+                    .starts_with("attach over --host from Windows takes plain names"),
                 "{err}"
             );
         }

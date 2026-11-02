@@ -35,7 +35,9 @@ mod wait;
 mod watch;
 mod wrap;
 
-pub use attach::cmd_attach;
+#[cfg(unix)]
+pub use attach::cmd_attach_host;
+pub use attach::{cmd_attach, cmd_attach_bridge};
 pub use emit::{EmitOptions, cmd_emit};
 pub use events::{EventsOptions, cmd_events};
 pub use exec::{cmd_exec, cmd_exec_frame_from_stdin};

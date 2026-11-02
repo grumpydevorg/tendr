@@ -253,6 +253,32 @@ A `push` to a pipe session that is not running exits 1.
   reading. A connection whose input is backed up is still released promptly
   when its client hangs up.
 
+### Attaching over `--host`
+
+From a Unix client, `attach --host` runs this same client on the laptop:
+raw mode, the size check and SIGWINCH, the escape, mode tracking and
+restoring the terminal. Only its connection differs. Instead of the attach
+socket it speaks the same frames over ssh's stdin and stdout, to a remote
+tendr that bridges them to the session's socket
+([transport boundaries](06-transport-boundaries.md#the-attach-bridge)).
+
+- The handshake is the one above. The remote tendr sends the hello, applies
+  the 10 s reply deadline and classifies the reply, so refusals keep their
+  exit codes; on success it sends the client `MSG_ACCEPTED` with the epoch.
+- The sidecar keeps the controller epochs and the recording. The bridge only
+  passes frames on; it decides nothing about control.
+- A client that stops reading backs up its output through ssh and the
+  bridge to the sidecar, which then treats it as above: the viewer queue
+  fills, and a takeover retires it through the event log. The bridge's
+  input and output directions are separate, so the stalled client's resize
+  and detach still reach the sidecar, and its controls go ahead of its input
+  on a bounded path.
+- When the sidecar ends the connection of a client taken over without
+  `MSG_RETIRED`, the bridge checks the event log as the local client does
+  and sends `MSG_RETIRED` itself, so the client exits 81 when it reads again.
+- A Windows client still runs the remote `tendr attach` under `ssh -t`; the
+  remote end then is the client described above, driving a remote terminal.
+
 ## Output and viewers
 
 - PTY output is merged and recorded as `O` lines in `output.log`.
@@ -300,9 +326,8 @@ A `push` to a pipe session that is not running exits 1.
   drains it. A viewer that stops reading is disconnected and loses control. It
   never stalls capture or the child.
 - A viewer gets no recording sequence numbers, so a viewer that disconnects
-  cannot resume from where it stopped. The typed attach bridge in
-  [remote frame transport](../plans/active/01_remote-frame-transport.md)
-  step 5 adds this.
+  cannot resume from where it stopped. Resumable viewers are step 1 of
+  [remote frame transport](../plans/active/01_remote-frame-transport.md).
 - Capture also tracks the terminal modes the child's output turns on
   (`term_modes::TermModes`, which lists them): among them the alternate
   screen, mouse tracking, bracketed paste, kitty keyboard flags (one stack

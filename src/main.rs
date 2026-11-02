@@ -865,9 +865,32 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        // A Unix client keeps the terminal and speaks the attach protocol
+        // over the same constant command line; the remote tendr bridges it to
+        // the session's attach socket.
+        #[cfg(unix)]
+        if let remote_op::RemoteOperation::Attach(request) = &operation {
+            let frame = remote_frame::encode(&operation).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            });
+            match commands::cmd_attach_host(host, frame, request.takeover, request.escape) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    std::process::exit(e.downcast_ref::<tendr::ssh::SshError>().map_or_else(
+                        || tendr::pty_exit::exit_code(&e),
+                        tendr::ssh::SshError::exit_code,
+                    ));
+                }
+            }
+        }
         let sent = match operation {
-            // attach still needs `ssh -t`, so it cannot take its request on
-            // stdin: it sends a command line of plain names instead.
+            // A Windows client has no local console frontend for the attach
+            // protocol yet, so attach runs under `ssh -t` with the remote
+            // tendr driving a remote terminal, and its command line takes
+            // plain names only.
+            #[cfg(windows)]
             remote_op::RemoteOperation::Attach(request) => match request.ssh_argv() {
                 Ok(args) => tendr::ssh::exec_ssh_attach(host, &args),
                 Err(e) => {

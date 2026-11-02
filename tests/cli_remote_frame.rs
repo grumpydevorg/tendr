@@ -745,11 +745,6 @@ fn remote_entry_refuses_bad_requests_without_side_effects() {
             "unknown remote operation 'explode'",
         ),
         (
-            "attach",
-            frame(br#"{"v":1,"op":"attach","params":{"session":"victim","namespace":null,"takeover":true,"escape":"none"}}"#),
-            "attach",
-        ),
-        (
             "missing field",
             frame(br#"{"v":1,"op":"kill","params":{"namespace":null,"force":true}}"#),
             "missing field `session`",
