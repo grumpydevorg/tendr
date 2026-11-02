@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 — framed `--host`, NDJSON exec, attach bridge
+
+Breaking over `--host`: a 0.5.0 client needs 0.5.0 or newer on the remote
+host for every `--host` command, and for `attach` from macOS or Linux. An
+older remote is named in the error, with the version to upgrade it to. A
+timed-out `exec` now returns at its deadline (see Fixed).
 
 ### Security
 
