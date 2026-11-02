@@ -2053,9 +2053,81 @@ impl RunEffects {
     }
 }
 
-/// Maximum simultaneous attach connections, including ones awaiting a hello.
+/// Connections awaiting their first frame (a hello or a resume). Only the run
+/// owner can connect, so stalling them all locks only the owner out, and only
+/// for [`crate::attach_proto::HELLO_TIMEOUT`].
 #[cfg(unix)]
-const MAX_ATTACH_CONNECTIONS: usize = 8;
+const PENDING_CONNECTIONS: usize = 5;
+
+/// Attaches, takeovers, resumes and pushes. A retiring controller keeps its
+/// connection about 2.4 s (its retirement write plus
+/// [`TAKEOVER_RECORD_GRACE`]), so repeated takeovers need a cap.
+#[cfg(unix)]
+const CONTROLLER_CONNECTIONS: usize = 8;
+
+/// A capped count of connections of one kind.
+#[cfg(unix)]
+struct Pool {
+    in_use: std::sync::atomic::AtomicUsize,
+    cap: usize,
+}
+
+#[cfg(unix)]
+impl Pool {
+    fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            in_use: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+        })
+    }
+
+    /// A slot, held until the returned guard drops; `None` if all are taken.
+    fn take(self: &Arc<Self>) -> Option<Slot> {
+        self.in_use
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < self.cap).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Slot(Arc::clone(self)))
+    }
+}
+
+/// One taken slot of a [`Pool`], returned when dropped.
+#[cfg(unix)]
+struct Slot(Arc<Pool>);
+
+#[cfg(unix)]
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.in_use.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The admission pools of one run's attach socket. Every connection holds a
+/// pending slot until its first frame is read, then gives it back before
+/// taking the slot of the mode it asked for.
+#[cfg(unix)]
+#[derive(Clone)]
+struct AttachPools {
+    pending: Arc<Pool>,
+    controllers: Arc<Pool>,
+}
+
+#[cfg(unix)]
+impl Default for AttachPools {
+    fn default() -> Self {
+        Self {
+            pending: Pool::new(PENDING_CONNECTIONS),
+            controllers: Pool::new(CONTROLLER_CONNECTIONS),
+        }
+    }
+}
+
+/// Refuse a connection for which its pool has no free slot.
+#[cfg(unix)]
+fn reject_full(stream: &mut std::os::unix::net::UnixStream) {
+    reject_connection(stream, RejectClass::Runtime, "too many attach connections");
+}
 
 /// Ownership side effects, decided on the input writer thread. Only the
 /// connection registry is touched there; the event log and `meta.json` are
@@ -2451,10 +2523,8 @@ fn run_attach_listener(
     writer: &crate::pty_input::InputWriter,
     registry: &ConnectionRegistry,
     attach_sink: &AttachSink,
+    pools: &AttachPools,
 ) {
-    use std::sync::atomic::AtomicUsize;
-
-    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else {
             continue;
@@ -2465,24 +2535,18 @@ fn run_attach_listener(
             reject_connection(&mut stream, RejectClass::Identity, "peer identity rejected");
             continue;
         }
-        if active.fetch_add(1, Ordering::SeqCst) >= MAX_ATTACH_CONNECTIONS {
-            active.fetch_sub(1, Ordering::SeqCst);
-            reject_connection(
-                &mut stream,
-                RejectClass::Runtime,
-                "too many attach connections",
-            );
+        let Some(pending) = pools.pending.take() else {
+            reject_full(&mut stream);
             continue;
-        }
-        let (writer, registry, sink, active) = (
+        };
+        let (writer, registry, sink, pools) = (
             writer.clone(),
             registry.clone(),
             Arc::clone(attach_sink),
-            Arc::clone(&active),
+            pools.clone(),
         );
         std::thread::spawn(move || {
-            handle_attach_connection(stream, run_id, &writer, &registry, &sink);
-            active.fetch_sub(1, Ordering::SeqCst);
+            handle_attach_connection(stream, run_id, &writer, &registry, &sink, pending, &pools);
         });
     }
 }
@@ -2570,6 +2634,10 @@ enum Ask {
 /// the answer is either resumed, with the output from the offset asked for
 /// and no mode replay, or gone, naming what the ring holds, with the mode
 /// replay and the output from the head.
+///
+/// `pending` is this connection's pending slot, given back once the first
+/// frame is read; the connection then holds a slot of the pool its mode
+/// belongs to in `pools` until it ends.
 #[cfg(unix)]
 fn handle_attach_connection(
     mut stream: std::os::unix::net::UnixStream,
@@ -2577,6 +2645,8 @@ fn handle_attach_connection(
     writer: &crate::pty_input::InputWriter,
     registry: &ConnectionRegistry,
     attach_sink: &AttachSink,
+    pending: Slot,
+    pools: &AttachPools,
 ) {
     use crate::attach_proto::{
         self, Frame, FrameError, Mode, ProtocolError, ResumePoint, Version, read_frame, write_frame,
@@ -2589,10 +2659,16 @@ fn handle_attach_connection(
         stream: &stream,
         deadline: std::time::Instant::now() + attach_proto::HELLO_TIMEOUT,
     });
+    // The first frame is read: the pending slot is free for the next arrival
+    // before this connection takes any slot of its own.
+    drop(pending);
     let (version, ask) = match hello {
         Ok(Frame::Hello {
             mode: Mode::Push, ..
         }) => {
+            let Some(_slot) = pools.controllers.take() else {
+                return reject_full(&mut stream);
+            };
             let _ = stream.set_read_timeout(None);
             return handle_push_connection(stream, writer, registry);
         }
@@ -2616,6 +2692,9 @@ fn handle_attach_connection(
                 "attach requires a protocol hello",
             );
         }
+    };
+    let Some(_slot) = pools.controllers.take() else {
+        return reject_full(&mut stream);
     };
     let _ = stream.set_read_timeout(None);
     if let Ask::Resume(point) = ask {
@@ -3639,6 +3718,191 @@ mod tests {
             _accepted: usize,
             _total: usize,
         ) {
+        }
+    }
+
+    #[test]
+    fn a_pool_admits_up_to_its_cap_and_takes_back_dropped_slots() {
+        let pool = Pool::new(2);
+        let first = pool.take().expect("a first slot");
+        let second = pool.take().expect("a second slot");
+        assert!(pool.take().is_none(), "a full pool admitted a third");
+        drop(first);
+        let third = pool.take().expect("a dropped slot is free again");
+        assert!(pool.take().is_none());
+        drop((second, third));
+        assert_eq!(pool.in_use.load(Ordering::SeqCst), 0);
+    }
+
+    /// An attach socket served by a real listener with a recording PTY.
+    struct Served {
+        path: std::path::PathBuf,
+        pools: AttachPools,
+        _dir: tempfile::TempDir,
+    }
+
+    fn serve_attach() -> Served {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let pools = AttachPools::default();
+        let writer =
+            crate::pty_input::InputWriter::spawn(RunId::new(), RecordingPty::default(), InertHooks);
+        let served = pools.clone();
+        // Lives until the test process ends; nothing closes the listener.
+        std::thread::spawn(move || {
+            run_attach_listener(
+                &listener,
+                RunId::new(),
+                &writer,
+                &ConnectionRegistry::default(),
+                &AttachSink::default(),
+                &served,
+            );
+        });
+        Served {
+            path,
+            pools,
+            _dir: dir,
+        }
+    }
+
+    /// Connect, send `first` and read the answer.
+    fn ask(
+        path: &Path,
+        first: &crate::attach_proto::Frame,
+    ) -> (std::os::unix::net::UnixStream, crate::attach_proto::Frame) {
+        use crate::attach_proto::{read_frame, write_frame};
+        let mut conn = std::os::unix::net::UnixStream::connect(path).unwrap();
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        write_frame(&mut conn, first).unwrap();
+        let answer = read_frame(&mut conn).expect("the sidecar answers");
+        (conn, answer)
+    }
+
+    fn push_hello() -> crate::attach_proto::Frame {
+        crate::attach_proto::Frame::Hello {
+            version: crate::attach_proto::Version::V1,
+            mode: crate::attach_proto::Mode::Push,
+        }
+    }
+
+    fn is_full_refusal(frame: &crate::attach_proto::Frame) -> bool {
+        matches!(
+            frame,
+            crate::attach_proto::Frame::Rejected {
+                class: RejectClass::Runtime,
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn a_full_controller_pool_refuses_a_push_but_leaves_pending_slots_usable() {
+        use crate::attach_proto::{Frame, read_frame};
+        let served = serve_attach();
+        let held: Vec<Slot> = (0..CONTROLLER_CONNECTIONS)
+            .map(|_| served.pools.controllers.take().expect("a free slot"))
+            .collect();
+
+        let (_conn, answer) = ask(&served.path, &push_hello());
+        assert!(is_full_refusal(&answer), "{answer:?}");
+
+        // A connection still waiting for its hello is admitted, not refused.
+        let mut waiting = std::os::unix::net::UnixStream::connect(&served.path).unwrap();
+        waiting
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        assert!(
+            matches!(
+                read_frame(&mut waiting),
+                Err(crate::attach_proto::FrameError::Io(e))
+                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+            ),
+            "a pending connection was answered before its hello"
+        );
+
+        drop(held);
+        let (_conn, answer) = ask(&served.path, &push_hello());
+        assert!(matches!(answer, Frame::Accepted(_)), "{answer:?}");
+    }
+
+    #[test]
+    fn every_way_a_connection_ends_returns_its_slots() {
+        use crate::attach_proto::{Frame, PushOutcome, read_frame, write_frame};
+        let served = serve_attach();
+        let rounds = 3 * CONTROLLER_CONNECTIONS.max(PENDING_CONNECTIONS);
+        for round in 0..rounds {
+            // A malformed first frame.
+            let (_conn, answer) = ask(&served.path, &Frame::Detach);
+            assert!(
+                matches!(
+                    answer,
+                    Frame::Rejected {
+                        class: RejectClass::Protocol,
+                        ..
+                    }
+                ),
+                "round {round}: {answer:?}"
+            );
+            // A push that ends normally.
+            let (mut conn, answer) = ask(&served.path, &push_hello());
+            assert!(
+                matches!(answer, Frame::Accepted(_)),
+                "round {round}: {answer:?}"
+            );
+            write_frame(&mut conn, &Frame::Detach).unwrap();
+            assert_eq!(
+                read_frame(&mut conn).unwrap(),
+                Frame::InputDone(PushOutcome::Written { bytes: 0 })
+            );
+            drop(conn);
+            // A refusal: control is held by a push, so an attach is turned away.
+            let (holder, answer) = ask(&served.path, &push_hello());
+            assert!(
+                matches!(answer, Frame::Accepted(_)),
+                "round {round}: {answer:?}"
+            );
+            let (_conn, answer) = ask(
+                &served.path,
+                &Frame::Hello {
+                    version: crate::attach_proto::Version::V1,
+                    mode: crate::attach_proto::Mode::Attach,
+                },
+            );
+            assert!(
+                matches!(
+                    answer,
+                    Frame::Rejected {
+                        class: RejectClass::Control,
+                        ..
+                    }
+                ),
+                "round {round}: {answer:?}"
+            );
+            // Ended, not dropped, so the next round's push finds control free.
+            let mut holder = holder;
+            write_frame(&mut holder, &Frame::Detach).unwrap();
+            assert!(matches!(
+                read_frame(&mut holder).unwrap(),
+                Frame::InputDone(_)
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let in_use = || {
+            (
+                served.pools.pending.in_use.load(Ordering::SeqCst),
+                served.pools.controllers.in_use.load(Ordering::SeqCst),
+            )
+        };
+        while in_use() != (0, 0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slots still taken: {:?}",
+                in_use()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

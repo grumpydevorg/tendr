@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- **Connections stalled before their hello no longer starve attaches.** A
+  sidecar now admits at most five connections waiting for their hello,
+  apart from the eight attaches, takeovers, resumes and pushes it serves: four
+  stalled connections no longer stop an attach, and five refuse new ones for
+  at most the 5 s hello deadline.
+
 ### Fixed
 
 - **On Windows, `tendr query` no longer lends DuckDB your pipes.** DuckDB,
