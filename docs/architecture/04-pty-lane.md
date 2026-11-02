@@ -32,7 +32,7 @@ flowchart LR
     Push["tendr push"] --> Attach
     Exec["tendr exec (python-repl)"] --> FIFO["stdin.pipe"]
     FIFO --> Forwarder["FIFO forwarder (agent claim)"]
-    Human["human terminal"] --> Attach["attach socket connections (hello: attach, takeover, push)"]
+    Human["human terminal"] --> Attach["attach socket connections (hello: attach, takeover, push, watch)"]
     Forwarder --> Writer["input writer (arbiter, epochs)"]
     Attach --> Writer
     Writer --> PTY["PTY master"]
@@ -116,10 +116,23 @@ flowchart LR
     last ended. The mode replay is not the run's output and still goes as
     plain `MSG_DATA`, unstamped.
   - A version 1 client never receives either new type.
+- A watch hello (`Mode::Watch`, mode byte 4, either version) asks for a
+  read-only viewer, a *watcher*
+  ([Read-only viewers](#read-only-viewers)). The sidecar admits it with
+  `MSG_WATCHING`: `[run id 16 bytes][head u64]`, big-endian, with no
+  epoch, since a watcher holds no control. Version 1 then sends it plain
+  `MSG_DATA`, version 2 `MSG_OUTPUT`, as for a controller. One accept
+  serves both versions: only a client that sends a watch hello receives it,
+  and every such client knows it. A sidecar from before watchers decodes
+  `[1, 4]` and `[2, 4]` as an unsupported hello and refuses with the
+  protocol class; the client then exits 80 saying so, never retrying in
+  another version. A client refuses (80) a controller's accept to its watch
+  hello, so it never attaches with control it did not ask for.
 - Instead of a hello, a version 2 viewer whose connection was lost can send
   `MSG_RESUME` to regain its control and output
   ([Resuming a viewer](#resuming-a-viewer)).
-- A plain attach is refused while a human holds control.
+- A plain attach is refused while a human holds control. A watch is not:
+  it contends for nothing.
 - `--takeover` replaces the holder, which is disconnected and exits 81. The
   holder is told in one of two ways:
   - `MSG_RETIRED`, when the sidecar can send it: up to 200 ms of lock
@@ -148,13 +161,42 @@ flowchart LR
   returned when its connection ends however it ends. A connection holds a
   **pending** slot (five, `PENDING_CONNECTIONS`) until its first frame (hello
   or resume) is read, then gives it back before taking the slot of the mode
-  it asked for: attaches, takeovers, resumes and pushes share eight
-  (`CONTROLLER_CONNECTIONS`; a retiring controller keeps its connection for
-  up to about 2.4 s, so repeated takeovers need the cap). A
-  connection that finds its pool full is refused with a runtime refusal.
-  Five connections that never send a hello refuse every new connection for
-  up to 5 s; four leave room. The socket is owner-only and peer-checked, so
-  only the owner can cause this.
+  it asked for:
+  - **watchers**: eight (`WATCH_CONNECTIONS`);
+  - **controllers and pushes**: attaches, takeovers, resumes and pushes
+    share eight (`CONTROLLER_CONNECTIONS`; a retiring controller keeps its
+    connection for up to about 2.4 s, so repeated takeovers need the cap).
+
+  So a full set of watchers never keeps a controller out, nor the reverse.
+  A connection that finds its pool full is refused with a runtime refusal
+  (84). A hello refused before any mode slot (a protocol refusal) used only
+  its pending slot. Five connections that never send a hello refuse every
+  new connection for up to 5 s; four leave room. The socket is owner-only
+  and peer-checked, so only the owner can cause this.
+
+### Read-only viewers
+
+- A watcher is sent the run's output beside the controller, from the head
+  at its admission, after the mode replay. It never holds or changes
+  control: it never reaches the input writer, so it gets no epoch, records
+  no `pty.control_changed`, and a human holding control does not keep it
+  out.
+- The sidecar reads a watcher's frames only for its end: its `MSG_DATA`,
+  `MSG_RESIZE` and `MSG_REPAINT` are dropped, so its keystrokes never reach
+  the child and its terminal never sizes the PTY.
+- Watchers live in their own set beside the controller's viewer, keyed by
+  an identity the input writer never grants control to. A takeover retires
+  only the holder the arbiter names, so it never touches a watcher. Watchers
+  are in the connection registry (`Retirement::Watcher`) only so the run's
+  end shuts them down with every other connection.
+- A watcher sends no size and no repaint. Attached to a full-screen
+  program, it shows nothing new until the program next redraws, and then at
+  the controller's size, not its own.
+- `attach --read-only` is the watcher client: it drops keystrokes, says so
+  once on the status line at the first one, and still detaches with the
+  escape. With `--host` it is refused (exit 2) until the attach bridge
+  passes watchers through; a Windows client passes `--read-only` to the
+  remote `tendr attach` it runs under `ssh -t`.
 
 ### Resuming a viewer
 
@@ -445,9 +487,12 @@ tendr that bridges them to the session's socket
   attach sink's lock, so offsets are assigned in one place. The ring keeps
   the last 32 MiB, from the first viewer on. A viewer is a cursor into it,
   the offset of the next byte it gets; its own sender thread sends from
-  there. A viewer whose cursor the ring evicts (it fell 32 MiB behind) is
-  disconnected and loses control. Capture never waits for a viewer, so a
-  viewer never stalls capture or the child.
+  there. A sender blocked writing to a client that stopped reading cannot
+  see its cursor evicted, so after each append capture checks every cursor
+  (at most nine: the controller's and eight watchers') and shuts down the
+  connection of each one the ring evicted (it fell 32 MiB behind); a
+  controller cut off this way loses control. Capture never waits for a
+  viewer, so a viewer never stalls capture, the child, or other viewers.
 - A version 2 viewer gets each byte's offset ([the attach
   handshake](#the-attach-handshake)); why offsets and not recording sequence
   numbers: [design](../design.md#viewers-count-output-in-bytes-and-agree-the-version-in-the-request).

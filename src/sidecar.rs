@@ -44,13 +44,16 @@ use crate::session::{self, LockGuard, SessionDir, SessionRoot};
 /// Type alias for the platform's ReadyWriter to avoid verbose turbofish.
 type ReadyWriter = <Current as Platform>::ReadyWriter;
 
-/// The human viewer PTY output is teed to, tagged with its controller identity
-/// so a stale connection can never clear or replace its successor's viewer.
+/// A viewer PTY output is teed to: the controller's, tagged with its
+/// controller identity so a stale connection can never clear or replace its
+/// successor's viewer, or a watcher's, tagged with the identity it is
+/// registered under.
 ///
-/// Output capture never writes to the viewer's socket. It appends each chunk
-/// to the run's [`OutputRing`], and the viewer's own sender thread sends from
-/// its cursor there; a viewer that falls a whole ring behind is disconnected
-/// instead of stalling capture (and, through capture, the child).
+/// Output capture never writes to a viewer's socket. It appends each chunk
+/// to the run's [`OutputRing`], and each viewer's own sender thread sends
+/// from its cursor there; a viewer that falls a whole ring behind is
+/// disconnected instead of stalling capture (and, through capture, the
+/// child).
 struct AttachViewer {
     #[cfg(unix)]
     holder: crate::model::pty_control::HolderId,
@@ -58,6 +61,10 @@ struct AttachViewer {
     /// Shut the viewer's socket down (used when its cursor is lost).
     disconnect: Box<dyn Fn() + Send>,
 }
+
+/// The most read-only viewers a run serves at once, beside its controller.
+#[cfg(unix)]
+const WATCH_CONNECTIONS: usize = 8;
 
 /// The most output one frame to a viewer carries: what capture reads at once.
 const PTY_READ_BYTES: usize = 4096;
@@ -101,16 +108,40 @@ fn run_viewer_sender(
     }
 }
 
-/// Tees PTY output to the attached client, and tracks the terminal modes that
-/// output has turned on, so that a client accepted later gets them first.
+/// Tees PTY output to the attached clients, and tracks the terminal modes
+/// that output has turned on, so that a client accepted later gets them
+/// first.
 #[derive(Default)]
 struct AttachTee {
+    /// The controller's viewer.
     viewer: Option<AttachViewer>,
+    /// The read-only viewers, at most [`WATCH_CONNECTIONS`]. Kept apart from
+    /// the controller's, so nothing that retires a controller can reach them.
+    watchers: Vec<AttachViewer>,
     /// The run's latest output, which viewers send from.
     ring: Arc<OutputRing>,
     modes: crate::term_modes::TermModes,
     /// When the child last wrote output; a repaint waits for it to go quiet.
     last_output: Option<std::time::Instant>,
+}
+
+#[cfg(unix)]
+impl AttachTee {
+    /// Remove `holder`'s viewer, the controller's or a watcher's, and close
+    /// its cursor, which ends its sender.
+    fn forget(&mut self, holder: crate::model::pty_control::HolderId) {
+        let viewer = match self.viewer.take_if(|v| v.holder == holder) {
+            Some(viewer) => Some(viewer),
+            None => self
+                .watchers
+                .iter()
+                .position(|w| w.holder == holder)
+                .map(|i| self.watchers.swap_remove(i)),
+        };
+        if let Some(viewer) = viewer {
+            self.ring.close(&viewer.cursor);
+        }
+    }
 }
 
 /// A repaint restores the PTY's size once the child's output has been quiet
@@ -1693,8 +1724,11 @@ fn capture_stream_with_tee(
             }
         }
 
-        // Append raw bytes to the ring the viewer sends from; never block. The
-        // chunk's offset is assigned here, under the tee's lock.
+        // Append raw bytes to the ring the viewers send from; never block.
+        // The chunk's offset is assigned here, under the tee's lock. A sender
+        // stuck writing to a client that stopped reading cannot see its
+        // cursor evicted, so every cursor (at most nine) is checked here, and
+        // a lost one's socket is shut down, which unblocks that write.
         let mut tee = lock(attach_sink);
         tee.modes.feed(&buf[..n]);
         tee.last_output = Some(std::time::Instant::now());
@@ -1702,6 +1736,13 @@ fn capture_stream_with_tee(
         if let Some(viewer) = tee.viewer.take_if(|v| v.cursor.is_lost(span)) {
             (viewer.disconnect)(); // its sender failed, or it fell a whole ring behind
         }
+        tee.watchers.retain(|watcher| {
+            let lost = watcher.cursor.is_lost(span);
+            if lost {
+                (watcher.disconnect)();
+            }
+            !lost
+        });
     }
 }
 
@@ -1774,10 +1815,14 @@ enum Retirement {
     /// A push: flagged revoked and its read side shut down, which wakes a handler
     /// waiting for the next frame; the handler then reports the outcome itself.
     Push { revoked: Arc<AtomicBool> },
+    /// A read-only viewer: never superseded, since it holds no control. It is
+    /// registered only so the run's end shuts it down.
+    Watcher,
 }
 
 /// Live attach connections by controller identity, so a takeover can retire
-/// exactly the superseded connection.
+/// exactly the superseded connection, and so the run's end can shut every
+/// connection down, watchers included.
 #[cfg(unix)]
 #[derive(Clone, Default)]
 struct ConnectionRegistry(Arc<Mutex<RegistryState>>);
@@ -1806,6 +1851,16 @@ impl ConnectionRegistry {
 
     fn remove(&self, holder: crate::model::pty_control::HolderId) -> Option<Registered> {
         lock(&self.0).live.remove(&holder)
+    }
+
+    /// Remove `holder` for retirement, unless it is a watcher: a watcher is
+    /// never retired, whatever identity a takeover names.
+    fn remove_retirable(&self, holder: crate::model::pty_control::HolderId) -> Option<Registered> {
+        let mut state = lock(&self.0);
+        if matches!(state.live.get(&holder)?.retirement, Retirement::Watcher) {
+            return None;
+        }
+        state.live.remove(&holder)
     }
 
     fn contains(&self, holder: crate::model::pty_control::HolderId) -> bool {
@@ -2111,6 +2166,7 @@ impl Drop for Slot {
 struct AttachPools {
     pending: Arc<Pool>,
     controllers: Arc<Pool>,
+    watchers: Arc<Pool>,
 }
 
 #[cfg(unix)]
@@ -2119,6 +2175,7 @@ impl Default for AttachPools {
         Self {
             pending: Pool::new(PENDING_CONNECTIONS),
             controllers: Pool::new(CONTROLLER_CONNECTIONS),
+            watchers: Pool::new(WATCH_CONNECTIONS),
         }
     }
 }
@@ -2177,10 +2234,12 @@ impl crate::pty_input::ControlHooks for SidecarControlHooks {
         // unregistered holder (a FIFO exec forwarder) learns of revocation from
         // its write outcomes.
         let _ = kind;
-        let Some(entry) = self.registry.remove(holder) else {
+        let Some(entry) = self.registry.remove_retirable(holder) else {
             return;
         };
         match entry.retirement {
+            // Never removed for retirement: a watcher holds no control.
+            Retirement::Watcher => {}
             Retirement::Push { revoked } => {
                 // Nonblocking: interrupt a handler idling on its next frame. A
                 // handler waiting on a PTY write gets a NotAuthorized outcome.
@@ -2274,10 +2333,7 @@ fn retire_connection(
         let _ = recorded.recv_timeout(TAKEOVER_RECORD_GRACE);
     }
     let _ = control.shutdown(std::net::Shutdown::Both);
-    let mut tee = lock(sink);
-    if let Some(viewer) = tee.viewer.take_if(|v| v.holder == holder) {
-        tee.ring.close(&viewer.cursor);
-    }
+    lock(sink).forget(holder);
 }
 
 /// One acknowledged agent push: claim control if nobody holds it, write each
@@ -2449,10 +2505,21 @@ struct Placement {
     gone: Option<output_ring::Span>,
 }
 
-/// Install `holder`'s viewer unless its connection has been retired, with a
-/// cursor at `resume` if the ring holds that offset, and otherwise (or with
-/// no `resume`) at the ring's head. Returns where its output starts, which
-/// the reply tells it, and what its sender sends.
+/// Which of the tee's viewers a connection installs.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seat {
+    /// The controller's, replacing its predecessor's.
+    Controller,
+    /// One of the read-only viewers, beside the others.
+    Watcher,
+}
+
+/// Install `holder`'s viewer in `seat` unless its connection has been
+/// retired, or the run has ended, with a cursor at `resume` if the ring
+/// holds that offset, and otherwise (or with no `resume`) at the ring's head.
+/// Returns where its output starts, which the reply tells it, and what its
+/// sender sends.
 ///
 /// The mode replay is sent first unless the viewer resumes where it left
 /// off: its terminal already has those modes.
@@ -2467,6 +2534,7 @@ fn install_viewer(
     registry: &ConnectionRegistry,
     sink: &AttachSink,
     holder: crate::model::pty_control::HolderId,
+    seat: Seat,
     resume: Option<u64>,
     disconnect: Box<dyn Fn() + Send>,
 ) -> (Placement, Option<ViewerStart>) {
@@ -2502,11 +2570,15 @@ fn install_viewer(
         .ring
         .cursor_at(placement.from)
         .expect("the placement is in the span, read under the same lock");
-    tee.viewer = Some(AttachViewer {
+    let viewer = AttachViewer {
         holder,
         cursor: Arc::clone(&cursor),
         disconnect,
-    });
+    };
+    match seat {
+        Seat::Controller => tee.viewer = Some(viewer),
+        Seat::Watcher => tee.watchers.push(viewer),
+    }
     let start = ViewerStart {
         ring: Arc::clone(&tee.ring),
         cursor,
@@ -2627,7 +2699,8 @@ enum Ask {
 /// takeover or resume through the input writer; then relay input and
 /// resizes until detach, disconnect, or retirement. A version 2 viewer of
 /// the run `run_id` is told where its output starts and gets it stamped
-/// with offsets.
+/// with offsets. A watch hello goes to [`handle_watch_connection`] instead,
+/// and a push to [`handle_push_connection`].
 ///
 /// A resume decides control and output on this one connection: once the
 /// control rule grants it ([`crate::model::pty_control::InputArbiter::resume`]),
@@ -2637,7 +2710,8 @@ enum Ask {
 ///
 /// `pending` is this connection's pending slot, given back once the first
 /// frame is read; the connection then holds a slot of the pool its mode
-/// belongs to in `pools` until it ends.
+/// belongs to in `pools` until it ends: a watcher's, or else a
+/// controller's.
 #[cfg(unix)]
 fn handle_attach_connection(
     mut stream: std::os::unix::net::UnixStream,
@@ -2671,6 +2745,17 @@ fn handle_attach_connection(
             };
             let _ = stream.set_read_timeout(None);
             return handle_push_connection(stream, writer, registry);
+        }
+        Ok(Frame::Hello {
+            version,
+            mode: Mode::Watch,
+        }) => {
+            let Some(_slot) = pools.watchers.take() else {
+                return reject_full(&mut stream);
+            };
+            let _ = stream.set_read_timeout(None);
+            let holder = writer.next_holder();
+            return handle_watch_connection(stream, run_id, version, holder, registry, attach_sink);
         }
         Ok(Frame::Hello {
             version,
@@ -2757,7 +2842,14 @@ fn handle_attach_connection(
         Ask::Resume(point) => Some(point.offset),
         Ask::Attach | Ask::Takeover => None,
     };
-    let (placement, viewer) = install_viewer(registry, attach_sink, holder, resume, disconnect);
+    let (placement, viewer) = install_viewer(
+        registry,
+        attach_sink,
+        holder,
+        Seat::Controller,
+        resume,
+        disconnect,
+    );
     let point = ResumePoint {
         run_id,
         epoch: handle.epoch(),
@@ -2811,11 +2903,83 @@ fn handle_attach_connection(
     let _ = stream.shutdown(std::net::Shutdown::Both);
     writer.disconnect(handle);
     registry.remove(holder);
-    let mut tee = lock(attach_sink);
-    if tee.viewer.as_ref().is_some_and(|v| v.holder == holder) {
-        tee.viewer = None;
+    lock(attach_sink).forget(holder);
+    if let Some((ring, cursor)) = installed {
+        ring.close(&cursor);
     }
-    drop(tee);
+}
+
+/// One read-only viewer of the run `run_id`, registered as `holder`: told
+/// where its output starts ([`crate::attach_proto::Frame::Watching`]), sent
+/// that output (stamped for version 2) until it detaches, disconnects, falls
+/// a ring behind, or the run ends.
+///
+/// It never reaches the input writer: it asks for no control, so no
+/// control event records it and no takeover retires it, and its input,
+/// resizes and repaints are read and dropped.
+#[cfg(unix)]
+fn handle_watch_connection(
+    mut stream: std::os::unix::net::UnixStream,
+    run_id: RunId,
+    version: crate::attach_proto::Version,
+    holder: crate::model::pty_control::HolderId,
+    registry: &ConnectionRegistry,
+    attach_sink: &AttachSink,
+) {
+    use crate::attach_proto::{Frame, FrameError, WatchPoint, read_frame, write_frame};
+
+    let (Ok(conn_stream), Ok(control), Ok(shutdown)) =
+        (stream.try_clone(), stream.try_clone(), stream.try_clone())
+    else {
+        return;
+    };
+    let registered = registry.insert(
+        holder,
+        Registered {
+            control,
+            retirement: Retirement::Watcher,
+        },
+    );
+    if !registered {
+        return reject_connection(&mut stream, RejectClass::Control, "session ended");
+    }
+    let conn: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(conn_stream)));
+    let disconnect = Box::new(move || {
+        let _ = shutdown.shutdown(std::net::Shutdown::Both);
+    });
+    let (placement, viewer) = install_viewer(
+        registry,
+        attach_sink,
+        holder,
+        Seat::Watcher,
+        None,
+        disconnect,
+    );
+    let reply = Frame::Watching(WatchPoint {
+        run_id,
+        offset: placement.from,
+    });
+    // Its sender starts only after the reply, so no output comes ahead of it.
+    let accepted = write_frame(&mut *lock(&conn), &reply);
+    let installed = viewer.map(|viewer| {
+        let installed = (Arc::clone(&viewer.ring), Arc::clone(&viewer.cursor));
+        if accepted.is_ok() {
+            // Detached: exits when its cursor or its connection closes.
+            std::thread::spawn(move || run_viewer_sender(viewer, version, &conn));
+        }
+        installed
+    });
+    if accepted.is_ok() {
+        // Only the end matters; every other frame is dropped unread.
+        while !matches!(
+            read_frame(&mut stream),
+            Ok(Frame::Detach) | Err(FrameError::Io(_))
+        ) {}
+    }
+
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    registry.remove(holder);
+    lock(attach_sink).forget(holder);
     if let Some((ring, cursor)) = installed {
         ring.close(&cursor);
     }
@@ -3137,7 +3301,14 @@ mod tests {
 
         // No waiting: the old connection may try to install at any instant after
         // the takeover is decided, including before any notification thread runs.
-        let (_, installed) = install_viewer(&registry, &sink, old, None, Box::new(|| {}));
+        let (_, installed) = install_viewer(
+            &registry,
+            &sink,
+            old,
+            Seat::Controller,
+            None,
+            Box::new(|| {}),
+        );
         assert!(
             installed.is_none(),
             "a retired connection installed its viewer"
@@ -3208,7 +3379,7 @@ mod tests {
                 // makes the ring keep output.
                 capture(&sink, b"\x1b[?2004h");
                 register(HolderId::new(1));
-                install_viewer(&registry, &sink, HolderId::new(1), None, Box::new(|| {}));
+                install_viewer(&registry, &sink, HolderId::new(1), Seat::Controller, None, Box::new(|| {}));
                 for chunk in &chunks {
                     capture(&sink, chunk);
                 }
@@ -3219,7 +3390,7 @@ mod tests {
 
                 register(HolderId::new(2));
                 let (placement, start) =
-                    install_viewer(&registry, &sink, HolderId::new(2), Some(at), Box::new(|| {}));
+                    install_viewer(&registry, &sink, HolderId::new(2), Seat::Controller, Some(at), Box::new(|| {}));
                 let start = start.expect("a registered viewer is installed");
                 // Live output joins on, as much as the ring keeps behind the
                 // new cursor.
@@ -3832,7 +4003,9 @@ mod tests {
     fn every_way_a_connection_ends_returns_its_slots() {
         use crate::attach_proto::{Frame, PushOutcome, read_frame, write_frame};
         let served = serve_attach();
-        let rounds = 3 * CONTROLLER_CONNECTIONS.max(PENDING_CONNECTIONS);
+        let rounds = 3 * CONTROLLER_CONNECTIONS
+            .max(PENDING_CONNECTIONS)
+            .max(WATCH_CONNECTIONS);
         for round in 0..rounds {
             // A malformed first frame.
             let (_conn, answer) = ask(&served.path, &Frame::Detach);
@@ -3888,15 +4061,28 @@ mod tests {
                 read_frame(&mut holder).unwrap(),
                 Frame::InputDone(_)
             ));
+            // A watcher that detaches, and one that just goes.
+            let (mut watcher, answer) = ask(&served.path, &watch_hello());
+            assert!(
+                matches!(answer, Frame::Watching(_)),
+                "round {round}: {answer:?}"
+            );
+            write_frame(&mut watcher, &Frame::Detach).unwrap();
+            let (_gone, answer) = ask(&served.path, &watch_hello());
+            assert!(
+                matches!(answer, Frame::Watching(_)),
+                "round {round}: {answer:?}"
+            );
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let in_use = || {
             (
                 served.pools.pending.in_use.load(Ordering::SeqCst),
                 served.pools.controllers.in_use.load(Ordering::SeqCst),
+                served.pools.watchers.in_use.load(Ordering::SeqCst),
             )
         };
-        while in_use() != (0, 0) {
+        while in_use() != (0, 0, 0) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "slots still taken: {:?}",
@@ -3904,6 +4090,39 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    fn watch_hello() -> crate::attach_proto::Frame {
+        crate::attach_proto::Frame::Hello {
+            version: crate::attach_proto::Version::V1,
+            mode: crate::attach_proto::Mode::Watch,
+        }
+    }
+
+    /// Watchers and controllers are admitted from pools of their own: eight
+    /// controller-pool connections leave a watcher admitted, and eight
+    /// watchers refuse a ninth while a push is still admitted.
+    #[test]
+    fn watchers_and_controllers_fill_separate_pools() {
+        use crate::attach_proto::Frame;
+        let served = serve_attach();
+        let held: Vec<Slot> = (0..CONTROLLER_CONNECTIONS)
+            .map(|_| served.pools.controllers.take().expect("a free slot"))
+            .collect();
+        let (_conn, answer) = ask(&served.path, &push_hello());
+        assert!(is_full_refusal(&answer), "{answer:?}");
+        let mut watchers = Vec::new();
+        for _ in 0..WATCH_CONNECTIONS {
+            let (conn, answer) = ask(&served.path, &watch_hello());
+            assert!(matches!(answer, Frame::Watching(_)), "{answer:?}");
+            watchers.push(conn);
+        }
+        drop(held);
+
+        let (_conn, answer) = ask(&served.path, &watch_hello());
+        assert!(is_full_refusal(&answer), "a ninth watcher: {answer:?}");
+        let (_conn, answer) = ask(&served.path, &push_hello());
+        assert!(matches!(answer, Frame::Accepted(_)), "{answer:?}");
     }
 
     /// A takeover that lands after a push's last frame was written, but before

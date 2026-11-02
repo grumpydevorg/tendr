@@ -165,11 +165,16 @@ pub struct WatchRequest {
 /// `resume` is set when a client whose connection was lost asks to regain
 /// its control and output; it is sent only after a version 2 acceptance,
 /// and travels again as the frame that replaces the hello.
+///
+/// `read_only` asks for a read-only viewer, which holds no control. Left out
+/// when false, so a request without it reads as it always has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachRequest {
     pub session: String,
     pub namespace: Option<String>,
     pub takeover: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
     pub escape: EscapeMode,
     #[serde(default)]
     pub protocol: u8,
@@ -234,6 +239,9 @@ impl AttachRequest {
         }
         if self.takeover {
             args.push("--takeover".to_owned());
+        }
+        if self.read_only {
+            args.push("--read-only".to_owned());
         }
         if self.escape == EscapeMode::Disabled {
             args.extend(["--escape".to_owned(), "none".to_owned()]);
@@ -386,11 +394,13 @@ impl TryFrom<&Commands> for RemoteOperation {
                 name,
                 namespace,
                 takeover,
+                read_only,
                 escape,
             } => Self::Attach(AttachRequest {
                 session: name.clone(),
                 namespace: namespace.clone(),
                 takeover: *takeover,
+                read_only: *read_only,
                 escape: match escape {
                     AttachEscape::CtrlBackslash => EscapeMode::CtrlBackslash,
                     AttachEscape::None => EscapeMode::Disabled,
@@ -531,7 +541,7 @@ pub fn dispatch(operation: RemoteOperation) -> anyhow::Result<()> {
         }
         RemoteOperation::Attach(r) => {
             let ns = resolve_namespace(r.namespace)?;
-            commands::cmd_attach(&r.session, &ns, r.takeover, r.escape)
+            commands::cmd_attach(&r.session, &ns, r.takeover, r.read_only, r.escape)
         }
     }
 }
@@ -783,6 +793,7 @@ mod tests {
                 "none",
                 "s",
             ],
+            &["attach", "--read-only", "s"],
         ];
         for args in cases {
             let original = op(args);
@@ -851,6 +862,10 @@ mod tests {
                     "--escape",
                     "none",
                 ],
+            ),
+            (
+                &["attach", "s", "--read-only"],
+                &["attach", "s", "--read-only"],
             ),
         ];
         for (args, expected) in cases {

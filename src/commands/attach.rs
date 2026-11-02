@@ -16,9 +16,10 @@ pub fn cmd_attach(
     name: &str,
     namespace: &Namespace,
     takeover: bool,
+    read_only: bool,
     escape: EscapeMode,
 ) -> anyhow::Result<()> {
-    let (session, meta) = attachable(name, namespace, takeover)?;
+    let (session, meta) = attachable(name, namespace, takeover || read_only)?;
 
     #[cfg(not(unix))]
     {
@@ -31,19 +32,25 @@ pub fn cmd_attach(
         // Fail before any side effect — a takeover included — if there is no
         // terminal to drive.
         require_terminal()?;
-        let mode = mode(takeover);
+        let mode = mode(takeover, read_only);
         // A local attach does not reconnect, so it has no use for offsets.
         let (stream, accept) = connect(session.path(), attach_proto::Version::V1, mode)?;
-        let control = Control {
+        // A watcher holds no control, so nothing can take it over.
+        let control = accept.epoch().map(|epoch| Control {
             session_dir: session.path().to_path_buf(),
             run_id: meta.run_id(),
-            epoch: accept.epoch(),
+            epoch,
+        });
+        let recorded_takeover = || {
+            control
+                .as_ref()
+                .is_some_and(|control| control.taken_over_by().is_some())
         };
-        let recorded_takeover = || control.taken_over_by().is_some();
         unix_relay::relay(
             unix_relay::Link::socket(stream)?,
             None,
             escape,
+            accept.access(),
             unix_relay::Peer::Local {
                 recorded_takeover: &recorded_takeover,
             },
@@ -53,15 +60,16 @@ pub fn cmd_attach(
 }
 
 /// The session `name` in `namespace`, if it can be attached: a PTY session
-/// whose run is running, and not under human control unless the attach may
-/// supersede its holder: a takeover, or a resume, where the sidecar decides
-/// (after a lost connection `meta.json` still names the resuming client's
-/// own control). Shared by a local attach and the remote end of
-/// `attach --host`.
+/// whose run is running, and not under human control unless the attach does
+/// not contend for it: a takeover or a resume, which may supersede its
+/// holder and where the sidecar decides (after a lost connection
+/// `meta.json` still names the resuming client's own control), or a
+/// read-only attach, which never holds control. Shared by a local attach
+/// and the remote end of `attach --host`.
 fn attachable(
     name: &str,
     namespace: &Namespace,
-    may_supersede: bool,
+    human_control_ok: bool,
 ) -> anyhow::Result<(SessionDir, Meta)> {
     let session_name = SessionName::new(name)?;
     let root = SessionRoot::default_path()?;
@@ -84,7 +92,7 @@ fn attachable(
     }
 
     // Informational pre-check for a clear message; the sidecar is the authority.
-    if !may_supersede && pty.control == PtyControl::HumanControl {
+    if !human_control_ok && pty.control == PtyControl::HumanControl {
         return Err(PtyExitCode::Control.error(anyhow::anyhow!(
             "session is already under human control (use --takeover to take it over)"
         )));
@@ -92,12 +100,14 @@ fn attachable(
     Ok((session, meta))
 }
 
+/// The hello's mode: `read_only` and `takeover` never come together (the
+/// command line refuses it).
 #[cfg(unix)]
-fn mode(takeover: bool) -> Mode {
-    if takeover {
-        Mode::Takeover
-    } else {
-        Mode::Attach
+fn mode(takeover: bool, read_only: bool) -> Mode {
+    match (read_only, takeover) {
+        (true, _) => Mode::Watch,
+        (false, true) => Mode::Takeover,
+        (false, false) => Mode::Attach,
     }
 }
 
@@ -161,11 +171,12 @@ pub fn cmd_attach_host(
 
     // Before ssh starts: the request may take over.
     require_terminal()?;
+    let mode = mode(request.takeover, request.read_only);
     attach_proto::write_frame(
         &mut frame,
         &Frame::Hello {
             version: Version::V1,
-            mode: mode(request.takeover),
+            mode,
         },
     )?;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -177,7 +188,7 @@ pub fn cmd_attach_host(
     };
     // The remote side's answer is the sidecar's acceptance.
     let opened = open_host(host, &frame, dial, |reply| {
-        hello_reply(reply, "attach", Version::LATEST)
+        hello_reply(reply, mode, Version::LATEST)
     })?;
     let (link, accept) = match opened {
         Opened::Answered(link, accept) => (link, accept),
@@ -195,6 +206,7 @@ pub fn cmd_attach_host(
         link,
         accept.resume_point(),
         request.escape,
+        accept.access(),
         unix_relay::Peer::Host(Box::new(end)),
     )
 }
@@ -474,30 +486,44 @@ impl Control {
 const HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The sidecar's acceptance: version 1's controller epoch, or version 2's
-/// point in the run, from which a viewer's stamped output starts.
+/// point in the run, from which a viewer's stamped output starts; or, for a
+/// read-only viewer, its point in the run with no epoch, since it holds no
+/// control.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Accept {
     V1(tendr::model::pty_control::ControllerEpoch),
     V2(attach_proto::ResumePoint),
+    Watch(attach_proto::WatchPoint),
 }
 
 #[cfg(unix)]
 impl Accept {
-    /// The controller epoch granted.
-    fn epoch(self) -> tendr::model::pty_control::ControllerEpoch {
+    /// The controller epoch granted; `None` for a watcher, which holds
+    /// none, so no takeover check applies to it.
+    fn epoch(self) -> Option<tendr::model::pty_control::ControllerEpoch> {
         match self {
-            Self::V1(epoch) => epoch,
-            Self::V2(point) => point.epoch,
+            Self::V1(epoch) => Some(epoch),
+            Self::V2(point) => Some(point.epoch),
+            Self::Watch(_) => None,
         }
     }
 
-    /// Where a version 2 viewer's output starts; `None` for version 1, whose
-    /// output carries no offsets.
+    /// Where a version 2 controller's output starts; `None` for version 1,
+    /// whose output carries no offsets, and for a watcher, which does not
+    /// resume.
     fn resume_point(self) -> Option<attach_proto::ResumePoint> {
         match self {
-            Self::V1(_) => None,
+            Self::V1(_) | Self::Watch(_) => None,
             Self::V2(point) => Some(point),
+        }
+    }
+
+    /// What the relay may send for this attach.
+    fn access(self) -> unix_relay::Access {
+        match self {
+            Self::V1(_) | Self::V2(_) => unix_relay::Access::Control,
+            Self::Watch(_) => unix_relay::Access::ReadOnly,
         }
     }
 
@@ -506,6 +532,7 @@ impl Accept {
         match self {
             Self::V1(epoch) => Frame::Accepted(epoch),
             Self::V2(point) => Frame::AcceptedV2(point),
+            Self::Watch(point) => Frame::Watching(point),
         }
     }
 }
@@ -517,7 +544,9 @@ impl Accept {
 ///
 /// A sidecar started by an older tendr may not speak `version`: it refuses
 /// the hello with the protocol class. Then this connects once more and
-/// speaks version 1, which every sidecar with a hello speaks.
+/// speaks version 1, which every sidecar with a hello speaks. A watch hello
+/// is never retried: the protocol class there means the sidecar predates
+/// read-only viewers in every version, and the failure says so (80).
 ///
 /// Every failure carries its PTY exit code ([`tendr::pty_exit`]): a socket
 /// that is missing or cannot be reached is a runtime failure (84), a listener
@@ -534,20 +563,23 @@ pub(super) fn connect(
     let hello = |version| Frame::Hello { version, mode };
     let mut reply = exchange(&mut stream, &hello(version), verb(mode))?;
     let mut version = version;
-    if version > Version::V1
-        && matches!(
-            reply,
-            Ok(Frame::Rejected {
-                class: RejectClass::Protocol,
-                ..
-            })
-        )
+    if let Ok(Frame::Rejected {
+        class: RejectClass::Protocol,
+        reason,
+    }) = &reply
     {
-        version = Version::V1;
-        stream = open_socket(session_dir)?;
-        reply = exchange(&mut stream, &hello(version), verb(mode))?;
+        if mode == Mode::Watch {
+            return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+                "cannot attach read-only: the session was started by a tendr that cannot serve read-only viewers ({reason})"
+            )));
+        }
+        if version > Version::V1 {
+            version = Version::V1;
+            stream = open_socket(session_dir)?;
+            reply = exchange(&mut stream, &hello(version), verb(mode))?;
+        }
     }
-    let accept = hello_reply(reply, verb(mode), version)?;
+    let accept = hello_reply(reply, mode, version)?;
     // From here an attach waits for output, and a push as long as the terminal
     // applies backpressure.
     stream.set_read_timeout(None).map_err(|e| {
@@ -687,24 +719,33 @@ fn verb(mode: Mode) -> &'static str {
     match mode {
         Mode::Attach | Mode::Takeover => "attach",
         Mode::Push => "push",
+        Mode::Watch => "read-only attach",
     }
 }
 
-/// What the sidecar's reply to a hello means for the client, which speaks
-/// versions up to `upto`.
+/// What the sidecar's reply to a hello in `mode` means for the client, which
+/// speaks versions up to `upto`.
 ///
 /// A refusal exits with its class's code. An acceptance of a newer version
-/// than `upto`, any other reply, or none before the deadline (a sidecar from
-/// before the hello waits silently), is a protocol failure (80); a connection
-/// that ends first is a transport failure (84).
+/// than `upto`, an acceptance that does not fit the mode (control granted to
+/// a watch hello, or a watcher's admission to any other), any other reply,
+/// or none before the deadline (a sidecar from before the hello waits
+/// silently), is a protocol failure (80); a connection that ends first is a
+/// transport failure (84).
 #[cfg(unix)]
 fn hello_reply(
     reply: Result<Frame, FrameError>,
-    what: &str,
+    mode: Mode,
     upto: attach_proto::Version,
 ) -> anyhow::Result<Accept> {
+    let what = verb(mode);
     let protocol = |message: String| Err(PtyExitCode::Protocol.error(anyhow::anyhow!(message)));
+    let watch = mode == Mode::Watch;
     match reply {
+        Ok(Frame::Watching(point)) if watch => Ok(Accept::Watch(point)),
+        Ok(answer @ (Frame::Accepted(_) | Frame::AcceptedV2(_))) if watch => protocol(format!(
+            "the session answered the {what} with {answer:?}, granting control it was not asked for"
+        )),
         Ok(Frame::Accepted(epoch)) => Ok(Accept::V1(epoch)),
         Ok(Frame::AcceptedV2(point)) if upto >= attach_proto::Version::V2 => Ok(Accept::V2(point)),
         Ok(Frame::AcceptedV2(_)) => protocol(format!(
@@ -885,10 +926,22 @@ mod unix_relay {
         Host(Box<super::HostEnd>),
     }
 
+    /// What an attach may send the session.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in crate::commands::attach) enum Access {
+        /// Keystrokes, resizes and the repaint nudge: it holds control.
+        Control,
+        /// Nothing but the detach: a watcher's terminal neither types into
+        /// the session nor sizes it, so a program it attaches to shows
+        /// nothing new until it next draws, at the controller's size.
+        ReadOnly,
+    }
+
     /// One connection's paths to the session: the sender, writing its
     /// outbox, and the reader.
     struct Connection {
         outbox: Arc<Outbox>,
+        access: Access,
         /// Set once the connection has ended: by the reader at the end of
         /// the session's output, or by the sender on a failed write.
         closed: Arc<AtomicBool>,
@@ -897,7 +950,12 @@ mod unix_relay {
     }
 
     impl Connection {
-        fn open(link: Link, retired: &Arc<AtomicBool>, screen: &Arc<Screen>) -> Self {
+        fn open(
+            link: Link,
+            access: Access,
+            retired: &Arc<AtomicBool>,
+            screen: &Arc<Screen>,
+        ) -> Self {
             let closed = Arc::new(AtomicBool::new(false));
             let outbox = Arc::new(Outbox::default());
             spawn_sender(link.writer, Arc::clone(&outbox), Arc::clone(&closed));
@@ -909,6 +967,7 @@ mod unix_relay {
             );
             Self {
                 outbox,
+                access,
                 closed,
                 reader,
                 close: link.close,
@@ -921,11 +980,21 @@ mod unix_relay {
 
         /// Send the terminal's size, then the repaint nudge: an attach at
         /// the session's size makes the child draw nothing, so the sidecar
-        /// nudges it into redrawing, which only a resize lets apply.
+        /// nudges it into redrawing, which only a resize lets apply. A
+        /// read-only attach sends neither.
         fn greet(&self, size: Option<tendr::recording::Geometry>) {
             if let Some(size) = size {
+                if self.access == Access::Control {
+                    self.outbox.push_control(Frame::Resize(size));
+                    self.outbox.push_control(Frame::Repaint);
+                }
+            }
+        }
+
+        /// Send the terminal's new size, unless the attach is read-only.
+        fn resize(&self, size: tendr::recording::Geometry) {
+            if self.access == Access::Control {
                 self.outbox.push_control(Frame::Resize(size));
-                self.outbox.push_control(Frame::Repaint);
             }
         }
 
@@ -945,6 +1014,10 @@ mod unix_relay {
     /// that breaks the protocol (exit 80). `resume` is where a version 2
     /// attach's stamped output starts; `None` for version 1.
     ///
+    /// A read-only attach ([`Access::ReadOnly`]) sends no size, resize or
+    /// repaint, and drops keystrokes, saying so once in the status line; the
+    /// escape and the signals still leave.
+    ///
     /// A version 2 `attach --host` whose connection the far side ends, without
     /// a takeover or a broken protocol, hands ssh's end to a
     /// [`reconnect::Job`]: the remote's exit code ends the attach with it, and
@@ -955,6 +1028,7 @@ mod unix_relay {
         link: Link,
         resume: Option<attach_proto::ResumePoint>,
         escape: EscapeMode,
+        access: Access,
         peer: Peer<'_>,
     ) -> anyhow::Result<i32> {
         let (recorded_takeover, mut host) = match peer {
@@ -990,7 +1064,7 @@ mod unix_relay {
         }
 
         let mut size = terminal_size();
-        let mut connection = Some(Connection::open(link, &retired, &screen));
+        let mut connection = Some(Connection::open(link, access, &retired, &screen));
         let mut reconnecting: Option<reconnect::Job> = None;
         if let Some(connection) = &connection {
             connection.greet(size);
@@ -1031,7 +1105,7 @@ mod unix_relay {
                 host = end;
                 match outcome {
                     reconnect::Outcome::Resumed(link) => {
-                        let resumed = Connection::open(link, &retired, &screen);
+                        let resumed = Connection::open(link, access, &retired, &screen);
                         resumed.greet(size);
                         connection = Some(resumed);
                     }
@@ -1065,7 +1139,7 @@ mod unix_relay {
                     // While reconnecting, the size goes with the next
                     // connection's greeting.
                     if let (Some(connection), Some(size)) = (&connection, now) {
-                        connection.outbox.push_control(Frame::Resize(size));
+                        connection.resize(size);
                     }
                 }
             }
@@ -1074,7 +1148,14 @@ mod unix_relay {
                 // Esc key, say) is forwarded once it has waited long enough.
                 let mut forward = Vec::new();
                 parser.flush_expired(Instant::now(), &mut forward);
-                send_keystrokes(connection.as_ref(), &status, &screen, forward, &mut dropped);
+                send_keystrokes(
+                    connection.as_ref(),
+                    access,
+                    &status,
+                    &screen,
+                    forward,
+                    &mut dropped,
+                );
                 continue;
             }
             let n = match stdin.read(&mut buf) {
@@ -1086,7 +1167,14 @@ mod unix_relay {
             let mut forward = Vec::new();
             parser.set_bracketed_paste(screen.bracketed_paste.load(Ordering::SeqCst));
             let decision = parser.feed(&buf[..n], &mut forward);
-            send_keystrokes(connection.as_ref(), &status, &screen, forward, &mut dropped);
+            send_keystrokes(
+                connection.as_ref(),
+                access,
+                &status,
+                &screen,
+                forward,
+                &mut dropped,
+            );
             if decision == Escape::Detach {
                 break Ending::Detached;
             }
@@ -1178,15 +1266,21 @@ mod unix_relay {
 
     /// Send keystrokes to the session, counting them in `dropped` if the
     /// outbox is full. With no connection, while reconnecting, they are
-    /// discarded: never sent late to a program that has moved on.
+    /// discarded: never sent late to a program that has moved on. A
+    /// read-only attach drops them all, and says so once.
     fn send_keystrokes(
         connection: Option<&Connection>,
+        access: Access,
         status: &Arc<reconnect::Status>,
         screen: &Arc<Screen>,
         forward: Vec<u8>,
         dropped: &mut usize,
     ) {
         if forward.is_empty() {
+            return;
+        }
+        if access == Access::ReadOnly {
+            status.read_only(screen);
             return;
         }
         let Some(connection) = connection else {
@@ -1891,14 +1985,16 @@ mod tests {
     use super::{Accept, Resumption, exchange, hello_reply, resume_reply, resume_request};
     use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
-    use tendr::attach_proto::{Frame, FrameError, ProtocolError, RejectClass, ResumePoint};
+    use tendr::attach_proto::{
+        Frame, FrameError, ProtocolError, RejectClass, ResumePoint, WatchPoint,
+    };
     use tendr::attach_proto::{Mode, Version, write_frame};
     use tendr::model::ids::RunId;
     use tendr::model::pty_control::ControllerEpoch;
     use tendr::pty_exit::exit_code;
 
     fn code(reply: Result<Frame, FrameError>) -> Option<i32> {
-        hello_reply(reply, "attach", Version::V1)
+        hello_reply(reply, Mode::Attach, Version::V1)
             .err()
             .map(|e| exit_code(&e))
     }
@@ -1913,6 +2009,7 @@ mod tests {
             session: "s".to_owned(),
             namespace: None,
             takeover: true,
+            read_only: false,
             escape: tendr::attach_escape::EscapeMode::CtrlBackslash,
             protocol: 2,
             resume: None,
@@ -1946,7 +2043,7 @@ mod tests {
     fn hello(stream: &mut UnixStream, version: Version, mode: Mode) -> anyhow::Result<Accept> {
         hello_reply(
             exchange(stream, &Frame::Hello { version, mode }, "attach")?,
-            "attach",
+            mode,
             version,
         )
     }
@@ -1980,14 +2077,41 @@ mod tests {
         };
         assert_eq!(code(Ok(Frame::AcceptedV2(point))), Some(80));
         assert_eq!(
-            hello_reply(Ok(Frame::AcceptedV2(point)), "attach", Version::V2).unwrap(),
+            hello_reply(Ok(Frame::AcceptedV2(point)), Mode::Attach, Version::V2).unwrap(),
             Accept::V2(point)
         );
         let epoch = ControllerEpoch::new(4);
         assert_eq!(
-            hello_reply(Ok(Frame::Accepted(epoch)), "attach", Version::V2).unwrap(),
+            hello_reply(Ok(Frame::Accepted(epoch)), Mode::Attach, Version::V2).unwrap(),
             Accept::V1(epoch)
         );
+    }
+
+    /// A watch hello is answered only by a watcher's admission, which holds
+    /// no epoch: control granted to it is a protocol failure, never an
+    /// attach with control, and a watcher's admission answers no other hello.
+    #[test]
+    fn only_a_watch_hello_is_admitted_as_a_watcher_and_never_with_control() {
+        let point = WatchPoint {
+            run_id: RunId::new(),
+            offset: 7,
+        };
+        let watch = |reply, version| {
+            hello_reply(Ok(reply), Mode::Watch, version).map_err(|e| exit_code(&e))
+        };
+        for version in [Version::V1, Version::V2] {
+            let accept = watch(Frame::Watching(point), version).unwrap();
+            assert_eq!(accept, Accept::Watch(point));
+            assert_eq!(accept.epoch(), None);
+        }
+        let granted = ResumePoint {
+            run_id: point.run_id,
+            epoch: ControllerEpoch::new(1),
+            offset: 7,
+        };
+        assert_eq!(watch(Frame::Accepted(granted.epoch), Version::V1), Err(80));
+        assert_eq!(watch(Frame::AcceptedV2(granted), Version::V2), Err(80));
+        assert_eq!(code(Ok(Frame::Watching(point))), Some(80));
     }
 
     /// A resume's answer counts only if it is for the run and offset asked,

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- **`attach --read-only` watches a PTY session without control.** Up to
+  eight read-only viewers can watch a session beside whoever holds its
+  terminal, a human included. Keystrokes are dropped, with one note at the
+  first; `Ctrl-\ d` detaches. A watcher sends no window size, so a
+  full-screen program shows nothing new until it redraws, at the
+  controlling terminal's size. A takeover leaves watchers attached, and
+  watching never changes who holds the terminal. A session started by an
+  older `tendr` refuses it (80). Not yet over `--host` from a Unix client.
+
 ### Changed
 
 - **Connections stalled before their hello no longer starve attaches.** A

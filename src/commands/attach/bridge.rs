@@ -63,7 +63,7 @@ pub fn cmd_attach_bridge(
         let first = attach_proto::read_frame(&mut std::io::stdin().lock());
         let (stream, answer, epoch) = match resume {
             None => {
-                let mode = super::mode(takeover);
+                let mode = super::mode(takeover, false);
                 match first {
                     Ok(Frame::Hello { mode: hello, .. }) if hello == mode => {}
                     other => {
@@ -85,16 +85,16 @@ pub fn cmd_attach_bridge(
                     }
                 }
                 let (stream, resumed) = super::connect_resume(session.path(), point)?;
-                (stream, resumed.frame(), resumed.point().epoch)
+                (stream, resumed.frame(), Some(resumed.point().epoch))
             }
         };
         // A resumed client's control is its new epoch: a later takeover of
-        // it grants the one after.
-        let control = super::Control {
+        // it grants the one after. A watcher has none to be taken over.
+        let control = epoch.map(|epoch| super::Control {
             session_dir: session.path().to_path_buf(),
             run_id: meta.run_id(),
             epoch,
-        };
+        });
         if unix::run(stream, answer, control) == unix::End::TakenOver {
             // The client has been told, and says so itself.
             std::process::exit(PtyExitCode::Control.code());
@@ -132,8 +132,9 @@ mod unix {
     }
 
     /// Pass the sidecar's acceptance on to the client, then bridge until
-    /// either side ends.
-    pub(super) fn run(stream: UnixStream, accepted: Frame, control: Control) -> End {
+    /// either side ends. `control` is `None` for a watcher, which holds no
+    /// control, so no takeover check runs for it.
+    pub(super) fn run(stream: UnixStream, accepted: Frame, control: Option<Control>) -> End {
         if attach_proto::write_frame(&mut io::stdout().lock(), &accepted).is_err() {
             return End::Left;
         }
@@ -158,7 +159,7 @@ mod unix {
             });
         }
         std::thread::spawn(move || {
-            let _ = ends.send(forward_output(from_session, &control));
+            let _ = ends.send(forward_output(from_session, control.as_ref()));
         });
 
         let end = wait_end(&ended);
@@ -201,7 +202,7 @@ mod unix {
     /// off is not passed on. When the session ends the connection without
     /// `MSG_RETIRED` because this client was taken over, the event log says
     /// so, and the client is told as the sidecar would have told it.
-    fn forward_output(socket: UnixStream, control: &Control) -> End {
+    fn forward_output(socket: UnixStream, control: Option<&Control>) -> End {
         let mut socket = BufReader::new(socket);
         let mut retired = false;
         loop {
@@ -219,7 +220,7 @@ mod unix {
         if retired {
             return End::TakenOver;
         }
-        match control.taken_over_by() {
+        match control.and_then(Control::taken_over_by) {
             Some(successor) => {
                 if attach_proto::write_frame(&mut io::stdout().lock(), &Frame::Retired(successor))
                     .is_err()

@@ -458,6 +458,12 @@ enum Commands {
         /// and dropping its queued input
         #[arg(long)]
         takeover: bool,
+        /// Watch without control: show the session's output and drop
+        /// keystrokes (the detach escape still works). Sends no size, so a
+        /// full-screen program shows nothing new until it next redraws, at
+        /// the controller's size. Up to eight per session
+        #[arg(long, conflicts_with = "takeover")]
+        read_only: bool,
         /// Detach escape: `ctrl-backslash` (Ctrl-\ then d detaches; Ctrl-\ twice
         /// sends one Ctrl-\) or `none` (every key goes to the session)
         #[arg(long, value_enum, default_value_t = AttachEscape::CtrlBackslash)]
@@ -870,6 +876,12 @@ fn main() {
         // the session's attach socket.
         #[cfg(unix)]
         if let remote_op::RemoteOperation::Attach(request) = &operation {
+            // The remote end does not bridge a read-only attach yet: refuse it
+            // here, before ssh, rather than have the remote refuse its hello.
+            if request.read_only {
+                eprintln!("error: attach --read-only does not support --host yet");
+                std::process::exit(2);
+            }
             let frame = remote_frame::encode(&operation).unwrap_or_else(|e| {
                 eprintln!("error: {e}");
                 std::process::exit(2);
