@@ -72,10 +72,16 @@ struct ViewerStart {
 }
 
 /// Send a viewer its mode replay, then its output from the ring, until its
-/// cursor or its connection closes or the ring evicts its cursor.
+/// cursor or its connection closes or the ring evicts its cursor. A version 2
+/// viewer gets that output stamped with its offsets; the replay, which is
+/// not the run's output, is never stamped.
 #[cfg(unix)]
-fn run_viewer_sender(viewer: ViewerStart, conn: &Mutex<Box<dyn Write + Send>>) {
-    use crate::attach_proto::{Frame, write_frame};
+fn run_viewer_sender(
+    viewer: ViewerStart,
+    version: crate::attach_proto::Version,
+    conn: &Mutex<Box<dyn Write + Send>>,
+) {
+    use crate::attach_proto::{Frame, Version, write_frame};
     let ViewerStart {
         ring,
         cursor,
@@ -84,8 +90,12 @@ fn run_viewer_sender(viewer: ViewerStart, conn: &Mutex<Box<dyn Write + Send>>) {
     if !replay.is_empty() && write_frame(&mut *lock(conn), &Frame::Data(replay)).is_err() {
         return ring.close(&cursor);
     }
-    while let output_ring::Next::Bytes(chunk) = ring.next(&cursor, PTY_READ_BYTES) {
-        if write_frame(&mut *lock(conn), &Frame::Data(chunk)).is_err() {
+    while let output_ring::Next::Bytes { offset, bytes } = ring.next(&cursor, PTY_READ_BYTES) {
+        let frame = match version {
+            Version::V1 => Frame::Data(bytes),
+            Version::V2 => Frame::Output { offset, bytes },
+        };
+        if write_frame(&mut *lock(conn), &frame).is_err() {
             return ring.close(&cursor);
         }
     }
@@ -2353,28 +2363,30 @@ fn await_push_write(
 }
 
 /// Install `holder`'s viewer, with a cursor at the ring's head, unless its
-/// connection has been retired. Returns what its sender sends.
+/// connection has been retired. Returns the head, which is where a version 2
+/// accept says the viewer's output starts, and what its sender sends.
 ///
-/// The registry check and the install happen under the sink lock. Combined
-/// with retirement removing the holder from the registry synchronously (on the
-/// writer thread, before the successor is even granted control), a retired
-/// connection can never install its viewer over its successor's.
+/// The registry check, the head and the install are all taken under the sink
+/// lock. Combined with retirement removing the holder from the registry
+/// synchronously (on the writer thread, before the successor is even granted
+/// control), a retired connection can never install its viewer over its
+/// successor's.
 #[cfg(unix)]
 fn install_viewer(
     registry: &ConnectionRegistry,
     sink: &AttachSink,
     holder: crate::model::pty_control::HolderId,
     disconnect: Box<dyn Fn() + Send>,
-) -> Option<ViewerStart> {
+) -> (u64, Option<ViewerStart>) {
     let mut tee = lock(sink);
+    let head = tee.ring.span().head;
     if !registry.contains(holder) {
-        return None;
+        return (head, None);
     }
     // Under the tee's lock, which capture holds while it appends, so the
     // modes replayed are exactly those of the output before the cursor: no
     // output lands between the replay and the output that follows it.
     let replay = tee.modes.replay();
-    let head = tee.ring.span().head;
     let cursor = tee
         .ring
         .cursor_at(head)
@@ -2384,16 +2396,19 @@ fn install_viewer(
         cursor: Arc::clone(&cursor),
         disconnect,
     });
-    Some(ViewerStart {
+    let start = ViewerStart {
         ring: Arc::clone(&tee.ring),
         cursor,
         replay,
-    })
+    };
+    (head, Some(start))
 }
 
+/// Accept attach connections for the run `run_id` until the listener closes.
 #[cfg(unix)]
 fn run_attach_listener(
     listener: &std::os::unix::net::UnixListener,
+    run_id: RunId,
     writer: &crate::pty_input::InputWriter,
     registry: &ConnectionRegistry,
     attach_sink: &AttachSink,
@@ -2427,7 +2442,7 @@ fn run_attach_listener(
             Arc::clone(&active),
         );
         std::thread::spawn(move || {
-            handle_attach_connection(stream, &writer, &registry, &sink);
+            handle_attach_connection(stream, run_id, &writer, &registry, &sink);
             active.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -2470,17 +2485,20 @@ fn request_reject_class(error: &crate::pty_input::RequestError) -> RejectClass {
     }
 }
 
-/// One attach connection: v1 hello, claim or takeover through the input writer,
-/// then relay input and resizes until detach, disconnect, or retirement.
+/// One attach connection: a version 1 or 2 hello, claim or takeover through
+/// the input writer, then relay input and resizes until detach, disconnect,
+/// or retirement. A version 2 viewer of the run `run_id` is told where its
+/// output starts and gets it stamped with offsets.
 #[cfg(unix)]
 fn handle_attach_connection(
     mut stream: std::os::unix::net::UnixStream,
+    run_id: RunId,
     writer: &crate::pty_input::InputWriter,
     registry: &ConnectionRegistry,
     attach_sink: &AttachSink,
 ) {
     use crate::attach_proto::{
-        self, Frame, FrameError, Mode, ProtocolError, read_frame, write_frame,
+        self, Frame, FrameError, Mode, ProtocolError, ResumePoint, Version, read_frame, write_frame,
     };
     use crate::model::pty_control::ControllerKind;
 
@@ -2490,8 +2508,8 @@ fn handle_attach_connection(
         stream: &stream,
         deadline: std::time::Instant::now() + attach_proto::HELLO_TIMEOUT,
     });
-    let mode = match hello {
-        Ok(Frame::Hello(mode)) => mode,
+    let (version, mode) = match hello {
+        Ok(Frame::Hello { version, mode }) => (version, mode),
         Err(FrameError::Malformed(e @ ProtocolError::UnsupportedHello)) => {
             return reject_connection(&mut stream, RejectClass::Protocol, &e.to_string());
         }
@@ -2508,7 +2526,9 @@ fn handle_attach_connection(
         return handle_push_connection(stream, writer, registry);
     }
 
-    let (Ok(conn_stream), Ok(control)) = (stream.try_clone(), stream.try_clone()) else {
+    let (Ok(conn_stream), Ok(control), Ok(shutdown)) =
+        (stream.try_clone(), stream.try_clone(), stream.try_clone())
+    else {
         return;
     };
     let conn: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(conn_stream)));
@@ -2540,23 +2560,35 @@ fn handle_attach_connection(
         }
     };
 
-    // Reply before installing the viewer, so tee output never precedes it.
-    let accepted = write_frame(&mut *lock(&conn), &Frame::Accepted(handle.epoch()));
-    let mut installed = None;
-    if accepted.is_ok() {
-        if let Ok(shutdown) = stream.try_clone() {
-            let disconnect = Box::new(move || {
-                let _ = shutdown.shutdown(std::net::Shutdown::Both);
-            });
-            // Refused if this connection was retired in the meantime.
-            if let Some(viewer) = install_viewer(registry, attach_sink, holder, disconnect) {
-                installed = Some((Arc::clone(&viewer.ring), Arc::clone(&viewer.cursor)));
-                let conn = Arc::clone(&conn);
-                // Detached: exits when its cursor or its connection closes.
-                std::thread::spawn(move || run_viewer_sender(viewer, &conn));
-            }
+    // The reply and the install happen under the connection's lock, so a
+    // takeover's `MSG_RETIRED` cannot come ahead of the reply; the sender
+    // starts only after both, so no output does either.
+    let disconnect = Box::new(move || {
+        let _ = shutdown.shutdown(std::net::Shutdown::Both);
+    });
+    let mut reply_to = lock(&conn);
+    // Refused if this connection was retired in the meantime.
+    let (head, viewer) = install_viewer(registry, attach_sink, holder, disconnect);
+    let reply = match version {
+        Version::V1 => Frame::Accepted(handle.epoch()),
+        Version::V2 => Frame::AcceptedV2(ResumePoint {
+            run_id,
+            epoch: handle.epoch(),
+            offset: head,
+        }),
+    };
+    let accepted = write_frame(&mut *reply_to, &reply);
+    drop(reply_to);
+    let installed = viewer.map(|viewer| {
+        let installed = (Arc::clone(&viewer.ring), Arc::clone(&viewer.cursor));
+        if accepted.is_ok() {
+            let conn = Arc::clone(&conn);
+            // Detached: exits when its cursor or its connection closes.
+            std::thread::spawn(move || run_viewer_sender(viewer, version, &conn));
         }
-
+        installed
+    });
+    if accepted.is_ok() {
         loop {
             match read_frame(&mut stream) {
                 Ok(Frame::Data(payload)) => {
@@ -2910,7 +2942,7 @@ mod tests {
 
         // No waiting: the old connection may try to install at any instant after
         // the takeover is decided, including before any notification thread runs.
-        let installed = install_viewer(&registry, &sink, old, Box::new(|| {}));
+        let (_, installed) = install_viewer(&registry, &sink, old, Box::new(|| {}));
         assert!(
             installed.is_none(),
             "a retired connection installed its viewer"

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tendr::attach_proto::{
-    MSG_ACCEPTED, MSG_DATA, MSG_DETACH, MSG_HELLO, MSG_INPUT_DONE, MSG_REJECTED, MSG_RESIZE,
-    MSG_RETIRED, Mode, PROTOCOL_VERSION, read_msg, resize_payload,
+    MSG_ACCEPTED, MSG_ACCEPTED_V2, MSG_DATA, MSG_DETACH, MSG_HELLO, MSG_INPUT_DONE, MSG_OUTPUT,
+    MSG_REJECTED, MSG_RESIZE, MSG_RETIRED, Mode, Version, read_msg, resize_payload,
 };
 use tendr::recording::Geometry;
 
@@ -934,8 +934,17 @@ fn wait_for_attach_socket(root: &TempDir, session: &str) -> std::path::PathBuf {
 /// Connect, send a v1 hello in `mode`, and return the stream with the sidecar's
 /// reply (`(message type, payload)`), read under a deadline.
 fn hello(sock_path: &std::path::Path, mode: Mode) -> (UnixStream, (u8, Vec<u8>)) {
+    hello_in(sock_path, Version::V1, mode)
+}
+
+/// [`hello`], speaking `version`.
+fn hello_in(
+    sock_path: &std::path::Path,
+    version: Version,
+    mode: Mode,
+) -> (UnixStream, (u8, Vec<u8>)) {
     let mut stream = UnixStream::connect(sock_path).expect("failed to connect to attach socket");
-    write_msg(&mut stream, MSG_HELLO, &[PROTOCOL_VERSION, mode as u8]);
+    write_msg(&mut stream, MSG_HELLO, &[version as u8, mode as u8]);
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -2397,6 +2406,157 @@ fn a_stalled_viewer_is_disconnected_only_once_a_ring_behind() {
     wait_for_pty_control(&root, "pty-stalled", "AgentControl");
 }
 
+/// What one viewer of [`view_a_flood`] saw.
+struct Viewed {
+    /// The hello's reply: `(message type, payload)`.
+    reply: (u8, Vec<u8>),
+    /// Every frame after it, up to the end of the flood.
+    frames: Vec<(u8, Vec<u8>)>,
+    /// The run's whole output, as recorded.
+    recorded: Vec<u8>,
+    run_id: String,
+}
+
+/// The output a [`view_a_flood`] run writes before its viewer attaches:
+/// bracketed paste on, which the viewer gets replayed, then `before`.
+const BEFORE_VIEW: &[u8] = b"\x1b[?2004hbefore";
+
+/// Attach to a PTY run in `version` once it has written [`BEFORE_VIEW`];
+/// then the run floods about 3 MB, well past the socket buffers and over
+/// many frames, and `VIEW-DONE`. The viewer reads every frame up to that,
+/// detaches, and the run ends.
+fn view_a_flood(root: &TempDir, session: &str, version: Version) -> Viewed {
+    let (go, end) = (root.path().join("go"), root.path().join("end"));
+    let line = "0123456789abcdef".repeat(62);
+    let script = format!(
+        "printf '\\033[?2004hbefore'; \
+         while [ ! -f \"$GO\" ]; do sleep 0.05; done; \
+         yes {line} | head -n 3000; echo VIEW-DONE; \
+         while [ ! -f \"$END\" ]; do sleep 0.05; done"
+    );
+    tendr(root)
+        .args(["start", session, "--pty"])
+        .arg("--env")
+        .arg(format!("GO={}", go.display()))
+        .arg("--env")
+        .arg(format!("END={}", end.display()))
+        .args(["--", "sh", "-c", &script])
+        .output()
+        .unwrap();
+    harness::wait_running(root, session);
+    let sock_path = wait_for_attach_socket(root, session);
+    wait_output_contains(root, session, "before");
+
+    let (mut stream, reply) = hello_in(&sock_path, version, Mode::Attach);
+    std::fs::write(&go, b"").unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut frames = Vec::new();
+    let mut shown = Vec::new();
+    while !shown.ends_with(b"VIEW-DONE\r\n") {
+        let (msg_type, payload) = read_msg(&mut stream).expect("the viewer gets the whole flood");
+        let bytes = if msg_type == MSG_OUTPUT {
+            &payload[8..]
+        } else {
+            &payload[..]
+        };
+        shown.extend_from_slice(bytes);
+        frames.push((msg_type, payload));
+    }
+    write_msg(&mut stream, MSG_DETACH, &[]);
+    std::fs::write(&end, b"").unwrap();
+    harness::wait_terminal(root, session);
+    Viewed {
+        reply,
+        frames,
+        recorded: recorded_output(&decode_session_recording(root, session).records),
+        run_id: session_meta(root, session)["run_id"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    }
+}
+
+/// A version 2 viewer is accepted at the run's head offset, gets the mode
+/// replay unstamped, then every output byte from there stamped with offsets
+/// that follow each other with no gap: exactly the recorded output.
+#[test]
+fn a_v2_viewer_gets_every_output_byte_stamped_from_its_accept() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-v2-view");
+    let viewed = view_a_flood(&root, "pty-v2-view", Version::V2);
+
+    let (msg_type, accept) = &viewed.reply;
+    assert_eq!(*msg_type, MSG_ACCEPTED_V2, "{accept:?}");
+    assert_eq!(accept.len(), 32);
+    assert_eq!(epoch_of(&accept[0..8]), 1, "the first human claim");
+    let run_id = uuid::Uuid::from_slice(&accept[8..24]).unwrap();
+    assert_eq!(run_id.to_string(), viewed.run_id);
+    let head = u64::from_be_bytes(accept[24..32].try_into().unwrap());
+    assert_eq!(
+        head,
+        BEFORE_VIEW.len() as u64,
+        "the output before the accept"
+    );
+
+    let (replay, stamped) = viewed.frames.split_first().unwrap();
+    assert_eq!(
+        replay,
+        &(MSG_DATA, b"\x1b[?2004h".to_vec()),
+        "the mode replay comes first, unstamped"
+    );
+    let mut next = head;
+    let mut output = Vec::new();
+    for (msg_type, payload) in stamped {
+        assert_eq!(*msg_type, MSG_OUTPUT, "only the run's output follows");
+        let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
+        assert_eq!(offset, next, "each frame starts where the last ended");
+        next += (payload.len() - 8) as u64;
+        output.extend_from_slice(&payload[8..]);
+    }
+    assert!(viewed.recorded.starts_with(BEFORE_VIEW));
+    assert!(
+        output == viewed.recorded[BEFORE_VIEW.len()..],
+        "the viewer got {} bytes, not the {} recorded after its accept",
+        output.len(),
+        viewed.recorded.len() - BEFORE_VIEW.len()
+    );
+    assert_eq!(
+        next,
+        viewed.recorded.len() as u64,
+        "offsets count every byte"
+    );
+}
+
+/// A version 1 viewer sees what it always did: the plain acceptance, the
+/// mode replay, then the output as plain data, byte for byte.
+#[test]
+fn a_v1_viewer_gets_plain_output_as_before() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-v1-view");
+    let viewed = view_a_flood(&root, "pty-v1-view", Version::V1);
+
+    let (msg_type, accept) = &viewed.reply;
+    assert_eq!(*msg_type, MSG_ACCEPTED, "{accept:?}");
+    assert_eq!(epoch_of(accept), 1);
+    assert!(
+        viewed.frames.iter().all(|(t, _)| *t == MSG_DATA),
+        "only plain data"
+    );
+    let shown: Vec<u8> = viewed.frames.into_iter().flat_map(|(_, p)| p).collect();
+    let mut expected = b"\x1b[?2004h".to_vec();
+    expected.extend_from_slice(&viewed.recorded[BEFORE_VIEW.len()..]);
+    assert!(
+        shown == expected,
+        "the viewer got {} bytes, not the replay and the {} recorded after its accept",
+        shown.len(),
+        viewed.recorded.len() - BEFORE_VIEW.len()
+    );
+}
+
 #[test]
 fn a_second_push_is_refused_while_one_holds_the_terminal() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -2513,7 +2673,7 @@ fn a_trickled_hello_is_cut_off_at_the_overall_deadline() {
     // A well-formed hello sent one byte per second: every individual read is
     // quick, but the whole handshake takes 7 s, past the 5 s deadline.
     let mut slow = UnixStream::connect(&sock_path).unwrap();
-    let hello = [MSG_HELLO, 0, 0, 0, 2, PROTOCOL_VERSION, Mode::Attach as u8];
+    let hello = [MSG_HELLO, 0, 0, 0, 2, Version::V1 as u8, Mode::Attach as u8];
     let started = Instant::now();
     for byte in hello {
         if slow.write_all(&[byte]).is_err() {

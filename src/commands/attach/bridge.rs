@@ -12,11 +12,19 @@
 //! output holds up only the output; its resizes and its detach still reach
 //! the session, and a takeover by another client never waits for it.
 
+use tendr::attach_proto::Version;
 use tendr::model::ids::Namespace;
 
 /// `tendr _remote` for an attach request: check the session as a local
 /// attach does, read the client's hello from stdin, connect to the session's
-/// attach socket with it, then bridge frames until either side ends.
+/// attach socket with its mode, speaking `version`, then pass the sidecar's
+/// answer to the client and bridge frames until either side ends.
+///
+/// `version` is the one the request agreed. The client's hello is always a
+/// version 1 hello, so that a remote tendr older than the agreement takes it
+/// too; this end speaks the agreed version to the sidecar, or version 1 to a
+/// sidecar started by a tendr that predates it ([`super::connect`]). The
+/// answer's type tells the client which.
 ///
 /// Its exit code is that of a local attach: the checks' and the sidecar's
 /// refusals keep their codes, and a client taken over exits 81 (after the
@@ -24,12 +32,17 @@ use tendr::model::ids::Namespace;
 ///
 /// # Errors
 /// The local attach's errors, and a request not followed by its hello (80).
-pub fn cmd_attach_bridge(name: &str, namespace: &Namespace, takeover: bool) -> anyhow::Result<()> {
+pub fn cmd_attach_bridge(
+    name: &str,
+    namespace: &Namespace,
+    takeover: bool,
+    version: Version,
+) -> anyhow::Result<()> {
     let (session, meta) = super::attachable(name, namespace, takeover)?;
 
     #[cfg(not(unix))]
     {
-        let _ = (session, meta);
+        let _ = (session, meta, version);
         anyhow::bail!("attach is only supported on Unix");
     }
 
@@ -40,20 +53,20 @@ pub fn cmd_attach_bridge(name: &str, namespace: &Namespace, takeover: bool) -> a
 
         let mode = super::mode(takeover);
         match attach_proto::read_frame(&mut std::io::stdin().lock()) {
-            Ok(Frame::Hello(hello)) if hello == mode => {}
+            Ok(Frame::Hello { mode: hello, .. }) if hello == mode => {}
             other => {
                 return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
                     "the attach request must be followed by its {mode:?} hello, not {other:?}"
                 )));
             }
         }
-        let (stream, epoch) = super::connect(session.path(), mode)?;
+        let (stream, accept) = super::connect(session.path(), version, mode)?;
         let control = super::Control {
             session_dir: session.path().to_path_buf(),
             run_id: meta.run_id(),
-            epoch,
+            epoch: accept.epoch(),
         };
-        if unix::run(stream, control) == unix::End::TakenOver {
+        if unix::run(stream, accept.frame(), control) == unix::End::TakenOver {
             // The client has been told, and says so itself.
             std::process::exit(PtyExitCode::Control.code());
         }
@@ -89,11 +102,10 @@ mod unix {
         TakenOver,
     }
 
-    /// Tell the client it has control, then bridge until either side ends.
-    pub(super) fn run(stream: UnixStream, control: Control) -> End {
-        if attach_proto::write_frame(&mut io::stdout().lock(), &Frame::Accepted(control.epoch))
-            .is_err()
-        {
+    /// Pass the sidecar's acceptance on to the client, then bridge until
+    /// either side ends.
+    pub(super) fn run(stream: UnixStream, accepted: Frame, control: Control) -> End {
+        if attach_proto::write_frame(&mut io::stdout().lock(), &accepted).is_err() {
             return End::Left;
         }
         let (Ok(to_session), Ok(from_session)) = (stream.try_clone(), stream.try_clone()) else {

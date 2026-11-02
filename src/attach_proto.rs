@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::model::ids::RunId;
 use crate::model::pty_control::ControllerEpoch;
 use crate::pty_exit::PtyExitCode;
 use crate::recording::Geometry;
@@ -16,7 +17,8 @@ pub const MSG_DETACH: u8 = 0x03;
 /// A connection that does not open with a valid hello is closed without
 /// gaining control.
 pub const MSG_HELLO: u8 = 0x04;
-/// Sidecar → client: control granted. Payload: the controller epoch (u64 BE).
+/// Sidecar → client: control granted, in reply to a version 1 hello or a
+/// push. Payload: the controller epoch (u64 BE).
 pub const MSG_ACCEPTED: u8 = 0x05;
 /// Sidecar → client: control refused. Payload: `[class u8][reason UTF-8]`,
 /// where the class is a [`RejectClass`] and the reason is for people. The
@@ -34,9 +36,95 @@ pub const MSG_INPUT_DONE: u8 = 0x08;
 /// attach did not change the PTY's size. No payload. A sidecar that predates it
 /// ignores it as an unknown type, so it needs no version bump.
 pub const MSG_REPAINT: u8 = 0x09;
+/// Sidecar → viewer: control granted, in reply to a version 2 attach or
+/// takeover hello. Payload: `[epoch u64 BE][run id 16 bytes][head u64 BE]`,
+/// where the head is the offset of the first output byte the viewer gets
+/// stamped (see [`ResumePoint`]). A version 1 client never receives it.
+pub const MSG_ACCEPTED_V2: u8 = 0x0a;
+/// Sidecar → version 2 viewer: PTY output stamped with its offset. Payload:
+/// `[offset u64 BE][bytes]`, where the offset is the count of output bytes
+/// the run wrote before these. Each follows the last with no gap. Output that
+/// is not the run's own (the mode replay) still goes as unstamped
+/// [`MSG_DATA`]. A version 1 client never receives it.
+pub const MSG_OUTPUT: u8 = 0x0b;
 
-/// The attach protocol version carried in [`MSG_HELLO`].
-pub const PROTOCOL_VERSION: u8 = 1;
+/// The attach protocol version carried in [`MSG_HELLO`]. The discriminant is
+/// the wire byte.
+///
+/// Version 2 changes only what a viewer (an attach or takeover) receives:
+/// [`MSG_ACCEPTED_V2`] instead of [`MSG_ACCEPTED`], and its output as
+/// [`MSG_OUTPUT`]. A push is answered the same in both, and both know the
+/// same refusal classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Version {
+    V1 = 1,
+    V2 = 2,
+}
+
+impl Version {
+    /// The newest version this tendr speaks.
+    pub const LATEST: Self = Self::V2;
+
+    /// The version to speak with a peer whose newest is `theirs`: the newer
+    /// of the two that both speak. A peer that names none, or one older than
+    /// any, gets version 1.
+    #[must_use]
+    pub fn negotiate(theirs: u8) -> Self {
+        if theirs >= Self::V2 as u8 {
+            Self::V2
+        } else {
+            Self::V1
+        }
+    }
+}
+
+impl TryFrom<u8> for Version {
+    type Error = ProtocolError;
+
+    fn try_from(byte: u8) -> Result<Self, ProtocolError> {
+        match byte {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            _ => Err(ProtocolError::UnsupportedHello),
+        }
+    }
+}
+
+/// Where a version 2 viewer stands in its run: the run, the controller epoch
+/// it was granted, and the offset of the next output byte it has not yet
+/// received. [`MSG_ACCEPTED_V2`] carries the first, at the head of the
+/// output when the viewer was installed; each [`MSG_OUTPUT`] then moves the
+/// offset past its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumePoint {
+    pub run_id: RunId,
+    pub epoch: ControllerEpoch,
+    pub offset: u64,
+}
+
+impl ResumePoint {
+    fn encode(self) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&self.epoch.get().to_be_bytes());
+        buf[8..24].copy_from_slice(self.run_id.as_uuid().as_bytes());
+        buf[24..32].copy_from_slice(&self.offset.to_be_bytes());
+        buf
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        let malformed = ProtocolError::Malformed("accepted v2");
+        let bytes: &[u8; 32] = payload.try_into().map_err(|_| malformed)?;
+        let (epoch, rest) = bytes.split_at(8);
+        let (run_id, offset) = rest.split_at(16);
+        let run_id = uuid::Uuid::from_slice(run_id).map_err(|_| malformed)?;
+        Ok(Self {
+            run_id: RunId::from_v7(run_id).ok_or(malformed)?,
+            epoch: ControllerEpoch::new(u64::from_be_bytes(epoch.try_into().expect("8 bytes"))),
+            offset: u64::from_be_bytes(offset.try_into().expect("8 bytes")),
+        })
+    }
+}
 
 /// What a connection asks for in its [`MSG_HELLO`]. The discriminant is the
 /// wire byte.
@@ -72,9 +160,9 @@ impl TryFrom<u8> for Mode {
 ///
 /// Decoding is strict, so the set is part of the protocol version: a sidecar
 /// sends only the classes of the version the client's hello names, and adding
-/// a class means bumping [`PROTOCOL_VERSION`]. A refusal sent before the hello
-/// is read (a peer of another user, no free connection slot) may use only
-/// classes every supported version knows.
+/// a class means a new [`Version`]. Versions 1 and 2 know the same four. A
+/// refusal sent before the hello is read (a peer of another user, no free
+/// connection slot) may use only classes every supported version knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RejectClass {
@@ -196,9 +284,9 @@ impl PushOutcome {
 /// One attach protocol frame, decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    /// Client → sidecar, first frame of every connection. Only
-    /// [`PROTOCOL_VERSION`] decodes.
-    Hello(Mode),
+    /// Client → sidecar, first frame of every connection: the protocol
+    /// version the client speaks on it, and what it asks for.
+    Hello { version: Version, mode: Mode },
     /// Terminal bytes: input from a client, output to a viewer.
     Data(Vec<u8>),
     /// Client → sidecar: the client's terminal size.
@@ -207,8 +295,12 @@ pub enum Frame {
     Detach,
     /// Client → sidecar: make the child redraw after an attach at its size.
     Repaint,
-    /// Sidecar → client: control granted at this epoch.
+    /// Sidecar → client: control granted at this epoch (version 1, or a push).
     Accepted(ControllerEpoch),
+    /// Sidecar → version 2 viewer: control granted, at this point of the run.
+    AcceptedV2(ResumePoint),
+    /// Sidecar → version 2 viewer: the run's output from `offset` on.
+    Output { offset: u64, bytes: Vec<u8> },
     /// Sidecar → client: control refused, with why.
     Rejected { class: RejectClass, reason: String },
     /// Sidecar → client: another client took over at this epoch.
@@ -256,10 +348,22 @@ impl Frame {
             MSG_REPAINT if payload.is_empty() => Self::Repaint,
             MSG_REPAINT => return Err(ProtocolError::Malformed("repaint")),
             MSG_HELLO => match payload.as_slice() {
-                [PROTOCOL_VERSION, mode] => Self::Hello(Mode::try_from(*mode)?),
+                [version, mode] => Self::Hello {
+                    version: Version::try_from(*version)?,
+                    mode: Mode::try_from(*mode)?,
+                },
                 _ => return Err(ProtocolError::UnsupportedHello),
             },
             MSG_ACCEPTED => Self::Accepted(epoch("accepted")?),
+            MSG_ACCEPTED_V2 => Self::AcceptedV2(ResumePoint::decode(&payload)?),
+            MSG_OUTPUT if payload.len() >= 8 => {
+                let (offset, bytes) = payload.split_at(8);
+                Self::Output {
+                    offset: u64::from_be_bytes(offset.try_into().expect("8 bytes")),
+                    bytes: bytes.to_vec(),
+                }
+            }
+            MSG_OUTPUT => return Err(ProtocolError::Malformed("output")),
             MSG_REJECTED => match payload.split_first() {
                 Some((class, reason)) => Self::Rejected {
                     class: RejectClass::try_from(*class)?,
@@ -281,12 +385,16 @@ impl Frame {
 /// The writer's error.
 pub fn write_frame(w: &mut impl Write, frame: &Frame) -> io::Result<()> {
     match frame {
-        Frame::Hello(mode) => write_msg(w, MSG_HELLO, &[PROTOCOL_VERSION, *mode as u8]),
+        Frame::Hello { version, mode } => write_msg(w, MSG_HELLO, &[*version as u8, *mode as u8]),
         Frame::Data(bytes) => write_msg(w, MSG_DATA, bytes),
         Frame::Resize(size) => write_msg(w, MSG_RESIZE, &resize_payload(*size)),
         Frame::Detach => write_msg(w, MSG_DETACH, &[]),
         Frame::Repaint => write_msg(w, MSG_REPAINT, &[]),
         Frame::Accepted(epoch) => write_msg(w, MSG_ACCEPTED, &epoch.get().to_be_bytes()),
+        Frame::AcceptedV2(point) => write_msg(w, MSG_ACCEPTED_V2, &point.encode()),
+        Frame::Output { offset, bytes } => {
+            write_msg_parts(w, MSG_OUTPUT, &[&offset.to_be_bytes(), bytes])
+        }
         Frame::Rejected { class, reason } => {
             let mut payload = Vec::with_capacity(1 + reason.len());
             payload.push(*class as u8);
@@ -336,10 +444,17 @@ pub const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 
 pub fn write_msg(w: &mut impl Write, msg_type: u8, payload: &[u8]) -> io::Result<()> {
-    let len = payload.len() as u32;
+    write_msg_parts(w, msg_type, &[payload])
+}
+
+/// [`write_msg`] for a payload in parts, written without joining them.
+fn write_msg_parts(w: &mut impl Write, msg_type: u8, parts: &[&[u8]]) -> io::Result<()> {
+    let len: usize = parts.iter().map(|part| part.len()).sum();
     w.write_all(&[msg_type])?;
-    w.write_all(&len.to_be_bytes())?;
-    w.write_all(payload)?;
+    w.write_all(&(len as u32).to_be_bytes())?;
+    for part in parts {
+        w.write_all(part)?;
+    }
     w.flush()
 }
 
@@ -429,15 +544,38 @@ mod tests {
             accepted: 3,
             unwritten: 5,
         };
+        let point = ResumePoint {
+            run_id: RunId::new(),
+            epoch: ControllerEpoch::new(6),
+            offset: 1 << 40,
+        };
         for frame in [
-            Frame::Hello(Mode::Attach),
-            Frame::Hello(Mode::Takeover),
-            Frame::Hello(Mode::Push),
+            Frame::Hello {
+                version: Version::V1,
+                mode: Mode::Attach,
+            },
+            Frame::Hello {
+                version: Version::V2,
+                mode: Mode::Takeover,
+            },
+            Frame::Hello {
+                version: Version::V2,
+                mode: Mode::Push,
+            },
             Frame::Data(b"abc".to_vec()),
             Frame::Resize(Geometry::new(24, 80).unwrap()),
             Frame::Detach,
             Frame::Repaint,
             Frame::Accepted(ControllerEpoch::new(7)),
+            Frame::AcceptedV2(point),
+            Frame::Output {
+                offset: 3,
+                bytes: b"xyz".to_vec(),
+            },
+            Frame::Output {
+                offset: u64::MAX,
+                bytes: Vec::new(),
+            },
             Frame::Rejected {
                 class: RejectClass::Control,
                 reason: "busy".to_owned(),
@@ -449,6 +587,66 @@ mod tests {
         ] {
             assert_eq!(round_trip(&frame), frame);
         }
+    }
+
+    /// The v2 frames' wire formats: the accept is `[epoch][run id][head]`,
+    /// stamped output `[offset][bytes]`, all integers big-endian.
+    #[test]
+    fn v2_frames_keep_their_wire_format() {
+        let run_id = RunId::new();
+        let mut accept = Vec::new();
+        write_frame(
+            &mut accept,
+            &Frame::AcceptedV2(ResumePoint {
+                run_id,
+                epoch: ControllerEpoch::new(0x0102),
+                offset: 0x0304,
+            }),
+        )
+        .unwrap();
+        let mut payload = vec![0, 0, 0, 0, 0, 0, 1, 2];
+        payload.extend_from_slice(run_id.as_uuid().as_bytes());
+        payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 3, 4]);
+        assert_eq!(accept, frame(0x0a, 32, &payload));
+
+        let mut output = Vec::new();
+        write_frame(
+            &mut output,
+            &Frame::Output {
+                offset: 5,
+                bytes: b"hi".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(output, frame(0x0b, 10, b"\0\0\0\0\0\0\0\x05hi"));
+    }
+
+    #[test]
+    fn a_malformed_v2_frame_does_not_decode() {
+        let mut payload = vec![0; 8];
+        payload.extend_from_slice(RunId::new().as_uuid().as_bytes());
+        payload.extend_from_slice(&[0; 8]);
+        assert!(Frame::decode(MSG_ACCEPTED_V2, payload.clone()).is_ok());
+        let mut not_v7 = payload.clone();
+        not_v7[8..24].copy_from_slice(uuid::Uuid::from_u128(1).as_bytes());
+        for bad in [payload[..31].to_vec(), [payload, vec![0]].concat(), not_v7] {
+            assert_eq!(
+                Frame::decode(MSG_ACCEPTED_V2, bad),
+                Err(ProtocolError::Malformed("accepted v2"))
+            );
+        }
+        assert_eq!(
+            Frame::decode(MSG_OUTPUT, vec![0; 7]),
+            Err(ProtocolError::Malformed("output"))
+        );
+    }
+
+    #[test]
+    fn the_negotiated_version_is_the_newest_both_speak() {
+        assert_eq!(Version::negotiate(0), Version::V1);
+        assert_eq!(Version::negotiate(1), Version::V1);
+        assert_eq!(Version::negotiate(2), Version::V2);
+        assert_eq!(Version::negotiate(9), Version::V2);
     }
 
     /// The typed outcomes keep the v1 wire format: `[status][accepted][received]`.
@@ -590,17 +788,28 @@ mod tests {
     }
 
     #[test]
-    fn a_hello_decodes_only_for_this_version_and_a_known_mode() {
+    fn a_hello_decodes_only_for_a_known_version_and_mode() {
         assert_eq!(
-            Frame::decode(MSG_HELLO, vec![PROTOCOL_VERSION, 3]),
-            Ok(Frame::Hello(Mode::Push))
+            Frame::decode(MSG_HELLO, vec![1, 3]),
+            Ok(Frame::Hello {
+                version: Version::V1,
+                mode: Mode::Push
+            })
+        );
+        assert_eq!(
+            Frame::decode(MSG_HELLO, vec![2, 1]),
+            Ok(Frame::Hello {
+                version: Version::V2,
+                mode: Mode::Attach
+            })
         );
         for payload in [
-            vec![PROTOCOL_VERSION, 0],
-            vec![PROTOCOL_VERSION, 4],
-            vec![PROTOCOL_VERSION + 1, 1],
-            vec![PROTOCOL_VERSION],
-            vec![PROTOCOL_VERSION, 1, 0],
+            vec![1, 0],
+            vec![2, 4],
+            vec![0, 1],
+            vec![3, 1],
+            vec![1],
+            vec![1, 1, 0],
         ] {
             assert_eq!(
                 Frame::decode(MSG_HELLO, payload.clone()),
