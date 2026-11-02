@@ -274,18 +274,18 @@ pub(super) fn relay(
         if let Some(due) = parser.partial_deadline() {
             timeout = timeout.min(due.saturating_duration_since(Instant::now()));
         }
-        let typed = match terminal.input(&mut buf, timeout) {
-            Input::Bytes(n) => Some(n),
-            Input::SizeDue => {
-                // Size notices coalesce, so this only brings the check
-                // forward; the poll stays the source of truth.
-                size_due = Instant::now();
-                None
-            }
-            Input::Wake => None,
+        let (typed, resized) = match terminal.input(&mut buf, timeout) {
+            Input::Bytes(n) => (Some(n), false),
+            Input::SizeDue => (None, true),
+            Input::Wake => (None, false),
             Input::Leave(leave) => break Ending::Left(leave),
             Input::Closed => break Ending::KeyboardClosed,
         };
+        if resized {
+            // Size notices coalesce, so this only brings the check forward;
+            // the poll stays the source of truth.
+            size_due = Instant::now();
+        }
         if Instant::now() >= size_due {
             size_due = Instant::now() + size_poll;
             let now = screen.size();
@@ -299,6 +299,12 @@ pub(super) fn relay(
             }
         }
         let Some(n) = typed else {
+            if resized {
+                // Typing may be waiting behind the notice: the next wait
+                // reads it, so an unfinished escape sequence meets it before
+                // it is flushed, or flushes at once if nothing is waiting.
+                continue;
+            }
             // An escape sequence left unfinished by the last read (a lone
             // Esc key, say) is forwarded once it has waited long enough.
             let mut forward = Vec::new();
