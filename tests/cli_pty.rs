@@ -2314,16 +2314,16 @@ fn a_stalled_viewer_is_disconnected_only_once_a_ring_behind() {
     let _kill = harness::SessionGuard::new(&root, "pty-stalled");
     let (go1, go2) = (root.path().join("go1"), root.path().join("go2"));
 
-    // 508,400 lines of 34 bytes once the terminal adds CRs: about 16 MiB,
-    // half the ring. Then 1,300,000 more: about 42 MiB, well past the ring
-    // and the socket buffers.
-    const LINE: &str = "0123456789abcdef0123456789abcdef";
-    const FIRST_LINES: usize = 508_400;
+    // Long lines keep output.log's per-line cost down. 16,900 lines of 994
+    // bytes once the terminal adds CRs: about 16 MiB, half the ring. Then
+    // 44,000 more: about 42 MiB, well past the ring and the socket buffers.
+    let line = "0123456789abcdef".repeat(62);
+    const FIRST_LINES: usize = 16_900;
     let script = format!(
         "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; \
-         yes {LINE} | head -n {FIRST_LINES}; echo FIRST-DONE; \
+         yes {line} | head -n {FIRST_LINES}; echo FIRST-DONE; \
          while [ ! -f \"$GO2\" ]; do sleep 0.05; done; \
-         yes {LINE} | head -n 1300000; echo ALL-OUTPUT-DONE; sleep 60"
+         yes {line} | head -n 44000; echo ALL-OUTPUT-DONE; sleep 60"
     );
     tendr(&root)
         .args(["start", "pty-stalled", "--pty"])
@@ -2338,6 +2338,8 @@ fn a_stalled_viewer_is_disconnected_only_once_a_ring_behind() {
     let sock_path = wait_for_attach_socket(&root, "pty-stalled");
     // Capture must keep up regardless of the stalled viewer. Read the end of
     // output.log directly: `tendr log` would re-parse tens of MiB every poll.
+    // Each read of the PTY is logged as its own lines, so a marker split
+    // between two reads is found only by joining the lines' text.
     let log_path = root
         .path()
         .join(".tendr/sessions/default/pty-stalled/output.log");
@@ -2346,13 +2348,18 @@ fn a_stalled_viewer_is_disconnected_only_once_a_ring_behind() {
             use std::io::{Read, Seek, SeekFrom};
             let mut tail = Vec::new();
             if let Ok(mut log) = std::fs::File::open(&log_path) {
-                let _ = log.seek(SeekFrom::End(-4096));
+                let _ = log.seek(SeekFrom::End(-16384));
                 let _ = log.read_to_end(&mut tail);
             }
-            if tail.windows(marker.len()).any(|w| w == marker.as_bytes()) {
+            let text: String = tail
+                .split(|&b| b == b'\n')
+                .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+                .filter_map(|l| l["content"].as_str().map(str::to_owned))
+                .collect();
+            if text.contains(marker) {
                 Observation::Ready(())
             } else {
-                Observation::Pending(String::from_utf8_lossy(&tail).into_owned())
+                Observation::Pending(text)
             }
         })
         .unwrap_or_else(|e| panic!("capture stalled behind a viewer that never reads: {e}"))
@@ -2373,7 +2380,7 @@ fn a_stalled_viewer_is_disconnected_only_once_a_ring_behind() {
         assert_eq!(msg_type, MSG_DATA);
         received.extend(payload);
     }
-    let expected = format!("{LINE}\r\n").repeat(FIRST_LINES) + "FIRST-DONE\r\n";
+    let expected = format!("{line}\r\n").repeat(FIRST_LINES) + "FIRST-DONE\r\n";
     assert!(
         received == expected.as_bytes(),
         "the viewer got {} bytes, not the {} written",
@@ -3840,10 +3847,11 @@ fn cli_attach_dropped_for_lag_then_taken_over_exits_0() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = harness::SessionGuard::new(&root, "pty-x0-lagged");
-    // Unpaced: far past the 32 MiB output ring within a few seconds.
+    // Unpaced: far past the 32 MiB output ring within a few seconds. Long
+    // lines keep output.log's per-line cost down.
     tendr(&root)
         .args(["start", "pty-x0-lagged", "--pty", "--stdin", "--"])
-        .args(["sh", "-c", "stty raw -echo; yes 0000000000"])
+        .args(["sh", "-c", "stty raw -echo; yes \"$(printf '%01000d' 0)\""])
         .output()
         .unwrap();
     harness::wait_running(&root, "pty-x0-lagged");

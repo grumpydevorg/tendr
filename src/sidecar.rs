@@ -2374,8 +2374,11 @@ fn install_viewer(
     // modes replayed are exactly those of the output before the cursor: no
     // output lands between the replay and the output that follows it.
     let replay = tee.modes.replay();
-    // The head is always in the ring, so this cannot be refused.
-    let cursor = tee.ring.cursor_at(tee.ring.span().head).ok()?;
+    let head = tee.ring.span().head;
+    let cursor = tee
+        .ring
+        .cursor_at(head)
+        .expect("a ring always holds its own head");
     tee.viewer = Some(AttachViewer {
         holder,
         cursor: Arc::clone(&cursor),

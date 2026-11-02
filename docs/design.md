@@ -202,15 +202,15 @@ a pipe session redirects the child's output to its own file.
 
 ### Viewers are cursors into one output ring
 
-*2026-11-02.* A PTY run keeps its latest 32 MiB of output in one ring, and
-each viewer is a cursor into it, instead of a queue of copies per viewer.
-One shared ring is what lets a viewer resume from an offset later: a
-reconnecting viewer gets a cursor at the offset it reached, so the bytes it
-missed and the live output join by construction, with no gap and no
-duplicate. It also bounds memory to one ring per run however many viewers
-there are, and keeps capture from ever waiting on one. The ring holds bytes,
-not capture's chunks, so a cursor can stand at any offset and tiny chunks
-cost no per-chunk overhead. Source: step 1 of
+*2026-11-02.* A PTY run keeps its latest 32 MiB of output in one ring, from
+its first viewer on, and a viewer is a cursor into it, instead of a queue of
+copies per viewer. One shared ring is what lets a viewer resume from an
+offset later: a reconnecting viewer gets a cursor at the offset it reached,
+so the bytes it missed and the live output join by construction, with no gap
+and no duplicate. It also keeps capture from ever waiting on a viewer, and
+bounds memory to one ring per run however many viewers it gets. The ring
+holds bytes, not capture's chunks, so a cursor can stand at any offset and
+tiny chunks cost no per-chunk overhead. Source: step 1 of
 [remote frame transport](plans/active/01_remote-frame-transport.md).
 
 ### Windows uses Job Objects and a hidden console
