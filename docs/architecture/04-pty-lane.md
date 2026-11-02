@@ -169,9 +169,11 @@ bytes ([design](../design.md#a-resume-decides-control-and-output-on-one-connecti
 
   Otherwise it is refused with the control class (81).
 - After a lost link, the old connection is often still open (sshd keeps the
-  old bridge alive) and still holds its epoch. The resume retires it exactly
-  as a takeover retires a holder (`MSG_RETIRED`, or the event log). Its late
-  disconnect then releases nothing, because its epoch is no longer current.
+  old bridge alive) and still holds its epoch. The resume retires it as a
+  takeover retires a holder: `MSG_RETIRED` if it can be sent, otherwise just
+  the end of its connection, and the event log then shows a resume, not a
+  takeover of it. Its late disconnect releases nothing, because its epoch is
+  no longer current.
 - The change is recorded as `pty.control_changed` with trigger `resume`, never
   `takeover`. So a client cut off without `MSG_RETIRED` never reads a resume
   as a takeover, and a later takeover of the resumed client, which grants the
@@ -185,7 +187,8 @@ bytes ([design](../design.md#a-resume-decides-control-and-output-on-one-connecti
     follows, unstamped, then the output from the head, stamped. A client
     first turns off the modes it tracked, since the replay only turns modes
     on, and after the replay sends its size and a repaint, as a fresh attach
-    does.
+    does. An offset past the head is answered gone as well; the client
+    treats that as a protocol failure (80), since its own count is broken.
 - A sidecar that predates resuming refuses `MSG_RESUME` with the protocol
   class, as it refuses anything that is not a hello.
 

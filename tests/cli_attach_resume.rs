@@ -346,11 +346,29 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
     // Evicted and disconnected, it lost control.
     wait_control(&root, "resume-gone", "AgentControl");
 
-    let (mut gone, reply) = resume(&root, "resume-gone", accepted);
-    let Frame::Gone { point, oldest } = reply else {
-        panic!("expected gone, got {reply:?}");
-    };
-    assert_eq!((point.run_id, point.epoch), (accepted.run_id, epoch(2)));
+    // Capture logs a chunk just before it appends it to the ring, so the
+    // ring can lag the log for a moment: resume, each time from the last
+    // answer, until the head is the whole output.
+    let total = (b"\x1b[?2004h".len() + 2000 * (line().len() + 2) + b"ALL-DONE\r\n".len()) as u64;
+    let mut asked = accepted;
+    let (mut gone, point, oldest) = (0..100)
+        .find_map(|_| {
+            let (stream, reply) = resume(&root, "resume-gone", asked);
+            let Frame::Gone { point, oldest } = reply else {
+                panic!("expected gone, got {reply:?}");
+            };
+            assert_eq!(
+                (point.run_id, point.epoch),
+                (asked.run_id, asked.epoch.next().unwrap())
+            );
+            if point.offset == total {
+                return Some((stream, point, oldest));
+            }
+            asked = ResumePoint { offset: 0, ..point };
+            std::thread::sleep(Duration::from_millis(20));
+            None
+        })
+        .expect("the ring never held the whole output");
     let head = point.offset;
     assert_eq!(head - oldest, RING, "a full ring");
     assert_eq!(
@@ -370,7 +388,7 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
     assert_eq!(
         reply,
         Frame::Resumed(ResumePoint {
-            epoch: epoch(3),
+            epoch: point.epoch.next().unwrap(),
             offset: oldest,
             ..point
         })
@@ -381,7 +399,7 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
         &root,
         "resume-gone",
         ResumePoint {
-            epoch: epoch(3),
+            epoch: point.epoch.next().unwrap(),
             offset: oldest - 1,
             ..point
         },
@@ -390,7 +408,7 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
         reply,
         Frame::Gone {
             point: ResumePoint {
-                epoch: epoch(4),
+                epoch: point.epoch.next().unwrap().next().unwrap(),
                 ..point
             },
             oldest

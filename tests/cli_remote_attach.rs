@@ -1076,9 +1076,12 @@ fn host_resume_past_the_ring_goes_on_from_the_head() {
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "host-gone");
     let (go1, go2) = (root.path().join("go1"), root.path().join("go2"));
-    // About 2 MB of `x` lines, far past a 64 KiB ring, then markers.
+    // About 2 MB of `x` lines, far past a 64 KiB ring, then markers. The
+    // pause keeps the flood out of the end marker's chunk: capture logs a
+    // chunk just before it adds it to the ring, so only that chunk can lag.
     let script = format!(
-        "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; yes {} | head -n 20000; echo FLOOD-END; \
+        "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; yes {} | head -n 20000; \
+         sleep 0.5; echo FLOOD-END; \
          while [ ! -f \"$GO2\" ]; do sleep 0.05; done; printf after-the-gap; sleep 60",
         "x".repeat(100)
     );

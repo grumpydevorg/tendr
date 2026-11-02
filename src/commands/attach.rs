@@ -634,8 +634,9 @@ fn hello_reply(
 
 /// What the sidecar's reply to a resume from `asked` means for the client.
 /// An answer must be for the same run, at a later epoch; a resumed one at
-/// the offset asked for, a gone one naming a span without it. Otherwise
-/// as [`hello_reply`].
+/// the offset asked for, a gone one naming a span that starts after it (an
+/// offset past the head means this client's count is broken). Otherwise as
+/// [`hello_reply`].
 #[cfg(unix)]
 fn resume_reply(
     reply: Result<Frame, FrameError>,
@@ -648,9 +649,7 @@ fn resume_reply(
         Ok(Frame::Resumed(point)) if ours(point) && point.offset == asked.offset => {
             Ok(Resumption::Resumed(point))
         }
-        Ok(Frame::Gone { point, oldest })
-            if ours(point) && !(oldest..=point.offset).contains(&asked.offset) =>
-        {
+        Ok(Frame::Gone { point, oldest }) if ours(point) && asked.offset < oldest => {
             Ok(Resumption::Gone { point, oldest })
         }
         Ok(answer @ (Frame::Resumed(_) | Frame::Gone { .. })) => {
@@ -1698,9 +1697,9 @@ mod tests {
     }
 
     /// A resume's answer counts only if it is for the run and offset asked,
-    /// at a later epoch; a gone answer must name a span without that
-    /// offset. Anything else, a fresh acceptance included, is a protocol
-    /// failure, and a refusal exits with its class's code.
+    /// at a later epoch; a gone answer must name a span that starts after
+    /// that offset. Anything else, a fresh acceptance included, is a
+    /// protocol failure, and a refusal exits with its class's code.
     #[test]
     fn a_resume_answer_must_fit_the_resume() {
         let asked = ResumePoint {
@@ -1746,6 +1745,13 @@ mod tests {
             Frame::Gone {
                 point: head,
                 oldest: 100,
+            },
+            Frame::Gone {
+                point: ResumePoint {
+                    offset: 50,
+                    ..resumed
+                },
+                oldest: 10,
             },
             Frame::Accepted(ControllerEpoch::new(4)),
             Frame::AcceptedV2(head),
