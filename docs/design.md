@@ -211,7 +211,7 @@ and no duplicate. It also keeps capture from ever waiting on a viewer, and
 bounds memory to one ring per run however many viewers it gets. The ring
 holds bytes, not capture's chunks, so a cursor can stand at any offset and
 tiny chunks cost no per-chunk overhead. Source: step 1 of
-[remote frame transport](plans/active/01_remote-frame-transport.md).
+[remote frame transport](plans/active/01_remote-frame-transport.md) at `d282062`.
 
 ### Viewers count output in bytes, and agree the version in the request
 
@@ -231,7 +231,7 @@ ignores an unknown request field. So a new client keeps working against an
 old remote, and a new remote against a sidecar started by an old one; the
 steps are in [the attach bridge](architecture/06-transport-boundaries.md#the-attach-bridge).
 Source: step 1 of
-[remote frame transport](plans/active/01_remote-frame-transport.md).
+[remote frame transport](plans/active/01_remote-frame-transport.md) at `d282062`.
 
 ### A resume decides control and output on one connection
 
@@ -254,7 +254,7 @@ disconnect then releases nothing, and its queued input cannot be written.
 The change is recorded with its own trigger, `resume`, so a client checking
 the event log for a takeover of its epoch never mistakes a resume for one,
 while a takeover of the resumed client still reads as a takeover. Source:
-step 1 of [remote frame transport](plans/active/01_remote-frame-transport.md).
+step 1 of [remote frame transport](plans/active/01_remote-frame-transport.md) at `d282062`.
 
 ### A dropped `attach --host` reconnects by itself, judged by ssh's exit
 
@@ -291,14 +291,14 @@ master's settings decide when a dead link is noticed. With Rick's config
 an attach over an open master noticed an iptables drop on the VM after
 240 s; on its own connection, after 20 s. The extra handshake (about 0.4 s
 to the VM) is paid once per connection. Short framed calls keep sharing:
-the master saves them about 0.3 s each, and over a dead master they still
+the master saves them about 0.4 s each, and over a dead master they still
 end, at the 30 s connect deadline.
 
 Input typed while reconnecting is discarded with one notice, never queued:
 keystrokes sent seconds late to a program that has moved on can do harm, and
 the user cannot see what they would land on until the screen is back.
 Source: step 1 of
-[remote frame transport](plans/active/01_remote-frame-transport.md).
+[remote frame transport](plans/active/01_remote-frame-transport.md) at `d282062`.
 
 ### Windows uses Job Objects and a hidden console
 

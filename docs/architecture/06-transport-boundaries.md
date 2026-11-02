@@ -280,9 +280,11 @@ before the remote tendr starts.
 - A Unix client's `attach` adds `-o ControlMaster=no -o ControlPath=none`:
   it always makes its own connection, so its keepalives apply. On the VM, an
   attach riding a master with `ServerAliveInterval 60` noticed a dead link
-  after 240 s instead of 20. Other calls keep sharing, which saves each
-  about 0.3 s; over a master whose link is dead they end at the 30 s
-  connect deadline (82) rather than at `ConnectTimeout`.
+  after 240 s instead of 20
+  ([results](../../scripts/pty-vm/README.md#resuming-attach---host)). Other
+  calls keep sharing, which saves each about 0.4 s; over a master whose link
+  is dead they end at the 30 s connect deadline (82) rather than at
+  `ConnectTimeout`.
 - An `attach` reconnect also adds `-o BatchMode=yes`, its own constant argv:
   the first connection may need a prompt, which reads the terminal before
   raw mode; a reconnect happens in raw mode, where a prompt would eat

@@ -231,7 +231,7 @@ const FRAME_OPTIONS: [&str; 6] = [
 /// VM instead of 20. A connection over a master whose link is dead waits
 /// out the connect deadline rather than failing at `ConnectTimeout`. Other
 /// framed calls keep sharing: they are short, and a shared connection
-/// saves about 0.3 s each.
+/// saves about 0.4 s each.
 #[cfg(unix)]
 const ATTACH_OPTIONS: [&str; 4] = ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
 

@@ -9,7 +9,7 @@ drive the same PTY, with Claude the same process throughout and its output
 recorded exactly. What shipped for it is described in the
 [PTY lane](../../docs/architecture/04-pty-lane.md) and the
 [PTY recording format](../../docs/architecture/08-pty-recording-format.md).
-The last results are [below](#results-2026-11-01); a re-run starts there.
+The last results are [below](#results-2026-11-02); a re-run starts there.
 
 They were written on an exe.dev VM on 2026-09-26 and first used on
 2026-11-01, with tendr 0.4.1, Claude Code 2.1.316 and Ghostty 1.4.0.
@@ -53,12 +53,15 @@ Run `sync-vm.sh` again after changing a script.
 | `reattach.sh` | VM | Detaches, waits, reattaches at the same size, and measures what the child redraws |
 | `resize.sh` | VM | Compares a same-size resize, `kill -WINCH`, and rows−1 then restore |
 | `smoke.sh` | VM | Start, push, attach, detach, refused second attach, takeover, kill, prune |
-| `halfopen.sh`, `heal.sh` | VM | Drop one SSH client's packets with `iptables` for N seconds and time when the server notices; the rule is removed four separate ways |
+| `halfopen.sh`, `heal.sh` | VM | Drop one SSH client's packets with `iptables` for N seconds and time when the server notices; the rule is removed four separate ways. Without `--client-port` it drops every client's packets to the port, new connections included; `--both` also drops sshd's replies |
 | `halfopen-exe.sh` | Mac | Freeze the local `ssh` of an attached client with SIGSTOP (exe.dev's own SSH path) |
 | `halfopen-loopback.sh` | Mac | Attach as `acc` over the VM's OpenSSH and run `halfopen.sh` against that connection |
 | `nested-ssh.sh` | Mac | Resize over `ssh -t <vm> tendr attach` from a PTY with `TERM=xterm-ghostty`. [`tests/cli_attach_ssh.rs`](../../tests/cli_attach_ssh.rs) covers the rest: detach, `Ctrl-]`, paste, terminal restore, takeover |
 | `ptydrive.py` | both | Runs a command in a fresh PTY from a step file (`expect`, `quiet`, `send`, `resize`) with bounded waits |
 | `rep_exit.py <session>` | VM | Repro for a client taken over while stalled: attach a client that never reads, take over, detach the new client, then drain the old one and report its exit code (81 expected) |
+| `resume.py drop\|takeover\|gone` | Mac | Attaches with `tendr --host <alias> attach` from a fresh PTY, drops the link with `halfopen.sh` and checks the resume: the terminal's bytes, status rows taken out, against the recording; the reconnect's exit 81 after a takeover; the gone notice, mode reset and redraw after more than 32 MiB. Options: `--child claude\|sh`, `--drop N`, `--both yes`, `--master open\|none`, `--prompt TEXT`. Needs `VM_HOST`, `TENDR_BIN` and an `ssh` on `PATH` that resolves the alias (below) |
+| `recout.py <session> output\|len\|resizes` | VM | Reads a session's recording: its output bytes, their count, or its resize records with their output offsets |
+| `inject.py <session> <tag> <bytes> [<bytes_per_s>]` | VM | Writes numbered fields to the session's terminal (its PTY's slave side), which the sidecar captures as the child's output: known bytes in flight beside Claude Code |
 | `treekill/treekill.py NAME MODE SETTLE [--timeout N] [--push DELAY:TEXT]… -- CMD…` | VM | Starts `CMD` in a PTY session tagged `S9K_TAG=NAME`, snapshots its process tree, stops it (`kill`, `force` or `timeout`) and reports, from 0 to 30 s after, which processes of the run (tagged, same session or group, or descendants) are still alive; writes `NAME.survivors` |
 | `treekill/run-shell.sh`, `treekill/run-agent.sh`, `treekill/devwrap.sh` | VM | The process-tree children of the [survivor table](#what-survives-a-stop): an interactive bash with `&`, `setsid`, `nohup`, `(cmd &)` and `disown` jobs; Claude Code or omp told to start a background and a `setsid` task; a dev server with forked workers |
 | `treekill/reap.py NAME…` | VM | Kills the survivors `treekill.py` recorded, if their pid and start time still match |
@@ -78,6 +81,67 @@ The Mac-side scripts need `VM_HOST` and GNU `timeout` as `gtimeout`. All but
 `vmx` and `sync-vm.sh` also need `SSH_BIN`, an absolute path to `ssh`; those two
 use it when set and `ssh` from `PATH` otherwise. `halfopen-loopback.sh` also
 needs `ACC_KEY`, the private half of the key given to `provision-root.sh`.
+
+`resume.py` reaches `acc` through tendr's own `ssh <host>`, so the alias has to
+resolve in `ssh` on `PATH` without touching `~/.ssh/config`. The 2026-11-02
+run used a throwaway key added to `acc`'s `authorized_keys`, and a wrapper
+`/tmp/tvm/bin/ssh` (`exec /usr/bin/ssh -F /tmp/tvm/config "$@"`) first on
+`PATH`, with this config, so Rick's own settings (ControlMaster, keepalives)
+applied:
+
+```text
+Include /Users/rick/.ssh/config
+Host tvm
+    HostName 127.0.0.1
+    Port 2222
+    User acc
+    IdentityFile /tmp/tvm/key
+    HostKeyAlias slice1-acc
+    UserKnownHostsFile /tmp/tvm/known_hosts.acc
+    StrictHostKeyChecking yes
+    ProxyJump <vm>.exe.xyz
+```
+
+## Results (2026-11-02)
+
+### Resuming `attach --host`
+
+The acceptance of resumable viewers (step 1 of the
+[remote frame transport plan](../../docs/plans/active/01_remote-frame-transport.md)
+at `d282062`, closed by this run),
+on `tendr-pty.exe.xyz`: Ubuntu 24.04.5, kernel 6.12.113, x86_64, 2 vCPU,
+OpenSSH 9.6p1 (`sshd` on `127.0.0.1:2222`), Claude Code 2.1.316 through
+exe.dev's LLM gateway. The client: macOS 27.0.1 (arm64), OpenSSH 10.3p1,
+`ssh` resolving `tvm` as [above](#scripts), so Rick's `Host *` settings
+applied: `ControlMaster auto`, `ControlPath ~/.ssh/sockets/%r@%h-%p`,
+`ControlPersist 600`, `ServerAliveInterval 60`, `ServerAliveCountMax 3`.
+tendr: main `4c4df4a` on both ends before the fix, the branch of #168 for the
+runs after it, and its merge `d282062` on both ends for the final runs.
+
+Every run: `PATH=/tmp/tvm/bin:$PATH VM_HOST=tendr-pty.exe.xyz
+TENDR_BIN=<checkout>/target/release/tendr resume.py <scenario> …`, Claude Code
+in the session at 40×120, `TERM=xterm-256color` (it uses the alternate
+screen there). The drop is `iptables` on the VM, so detection is ssh's
+keepalives: 5 s × 3 when they apply. Times are from the Mac.
+
+| Item | Result |
+|------|--------|
+| No gap, no duplicate, redraw (`drop --drop 30 --prompt 'Count from 1 to 30, one number per line.'`, `inject.py` writing 40 KB/s throughout) | Pass. Before the fix, no master: noticed 20.2 s after the drop, resumed 0.9 s after the heal; the terminal got the recording from the attach on, 3,005,682 bytes, exactly and once, plus only the 54-byte mode replay before it and the 54-byte reset after it. After the resume a repaint pair was recorded and Claude cleared and redrew its screen on both halves (1.3 KB and 1.5 KB, Claude's answer and prompt). After the fix, master open: noticed 19.9 s after the drop, resumed 0.6 s after the heal, 3,005,807 bytes exact. On `d282062`, master open: 3,005,902 bytes exact; the Mac slept for 238 s in the middle of that reconnect (a maintenance sleep, from `pmset -g log`), and it resumed exactly after the wake |
+| A takeover while stalled exits 81 (`takeover --drop 45 --both yes`: a `tendr attach --takeover` on the VM, then detach, 5 s into the drop) | Pass. The reconnect noticed the drop after 18.3 s (17.5 s on `d282062`), failed while the drop held, and the first attempt after the heal was refused: `resume refused: cannot resume: control changed while disconnected; attach again`, exit 81, 5.3 s (5.1 s) after the heal, with the reason printed again once the terminal was restored. With only the client's packets dropped (`takeover --drop 40`), sshd's still arrived, the client never saw the link as lost, and it exited 81 with `tendr: another client took over this session` 5.1 s after the heal |
+| The gone path (`gone --drop 120 --both yes`: 40 MiB written by `inject.py` during the outage, in 1.1 s on the VM; not `TENDR_TEST_OUTPUT_RING_BYTES`, which the release build ignores) | Pass, twice (the second on `d282062` with a master open). The notice: 41,943,052 bytes missed, 8,388,620 no longer held. The terminal got the recording exactly up to its offset, then the mode reset (`?1049l ?1003l ?1004l ?1006l ?2004l ?2031l ?25h`), the notice, the mode replay, and the recording from the head exactly; none of the 3,813,004 injected fields. A repaint pair followed, and the final screen, rendered with `pyte`, was Claude's clean prompt. The notice was printed again after the exit. It came 19.4 s after the heal, at the next attempt in the 30 s backoff |
+| Keepalives with ControlMaster (`drop --child sh --master open\|none`) | Fail on `4c4df4a`, fixed in #168. With a master open (`ssh tvm true` first), tendr's ssh was a mux client: it sends no keepalives, and the master's 60 s × 3 decided. The drop was noticed after **239.8 s**. With no master, tendr's own ssh became a ControlPersist master, forked with its `-o` options, and noticed it after 20.2 s and 19.7 s. Reconnect attempts did not ride the dead master: nothing noticed the drop until the master exited, removing its socket, and attempt 1 made a new connection. A new connection started over a master whose link is dead does ride it: `tendr --host tvm list` ended with 82 after 30.06 s (the connect deadline), against 10.04 s (`ConnectTimeout`) with no sharing. Sharing saves 0.40 s a call (0.10 against 0.50 s through the jump host; 0.08 against 0.40 s direct to the VM), so #168 opts only `attach` out (`-o ControlMaster=no -o ControlPath=none`, both argvs) and documents the master's keepalives for other calls. After it, with a master open: 19.35 s (bash) and 19.9 s (Claude) |
+| Tailscale approval URL in the status line | Not run: it needs a tailnet host whose check-mode approval has lapsed, which the VM is not, and only Rick can trigger it. The fake-ssh test `host_reconnect_fails_fast_backs_off_and_discards_typing` covers the mechanism. Pending as a manual check (below); it does not block closing the step, whose acceptance is items 1–3 |
+
+Found on the way and fixed in #168: with its own connection, ssh's
+`Timeout, server 127.0.0.1 not responding.` went into the session's screen,
+133,412 bytes into a bash run's output. Once the attach owns the terminal,
+ssh's stderr now goes to the status line (the timeout shows under
+`tendr: connection lost`), or is printed after the attach ends.
+
+The status line during a drop: `tendr: connection lost, reconnecting
+(attempt N)` or `…, attempt N failed, next in S s`, and below it ssh's
+latest line: `Timeout, server 127.0.0.1 not responding.`, then the jump
+host's `Connection timed out during banner exchange` while the drop held.
 
 ## Results (2026-11-01)
 
@@ -182,6 +246,11 @@ off with any value, empty included, so `--env` cannot undo it; `--unset-env`
 exists for that.
 
 ## Not yet measured
+
+Pending, for Rick: on a tailnet host whose Tailscale SSH check-mode approval
+has lapsed, drop an `attach --host` link and check that the approval URL
+shows on the status line's second row, and that the attach resumes once the
+URL is approved. Do not trigger it from an agent.
 
 A half-open loss without ACKs (dropping the Mac's packets with a `pf` rule,
 which needs root) is unmeasured. On exe.dev, the SSH relay creates no logind
