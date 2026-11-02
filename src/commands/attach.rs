@@ -73,18 +73,26 @@ pub fn cmd_attach(
 }
 
 /// How long a no-terminal read-only attach whose connection the session
-/// closed waits for the run to record that it ended, before counting the
-/// close as a cut-off.
+/// closed waits for the run to record that it ended, while the session
+/// still publishes its attach socket, before counting the close as a
+/// cut-off.
 #[cfg(unix)]
 const RUN_END_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long it waits once the socket is gone: the sidecar removes it as the
+/// run ends, before the durable writes that record the end, which a busy
+/// disk can hold past [`RUN_END_GRACE`]. Beyond this the sidecar is taken to
+/// have died before recording it.
+#[cfg(unix)]
+const RUN_END_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// After the session closed a no-terminal read-only attach: `Ok` if the run
-/// `run_id` ended, waiting up to [`RUN_END_GRACE`] for it to say so;
-/// otherwise the attach was cut off (84), having fallen too far behind or
-/// been shut by the sidecar.
+/// `run_id` ended, waiting for it to say so ([`RUN_END_GRACE`],
+/// [`RUN_END_RECORD_GRACE`]); otherwise the attach was cut off (84), having
+/// fallen too far behind or been shut by the sidecar.
 #[cfg(unix)]
 fn run_ended(session: &SessionDir, run_id: tendr::model::ids::RunId) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + RUN_END_GRACE;
+    let start = std::time::Instant::now();
     loop {
         let ended = session::read_meta(session).is_ok_and(|meta| {
             meta.run_id() != run_id || !matches!(meta.status(), RunStatus::Running { .. })
@@ -92,7 +100,12 @@ fn run_ended(session: &SessionDir, run_id: tendr::model::ids::RunId) -> anyhow::
         if ended {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        let grace = if attach_proto::read_sock_path(session.path()).is_some() {
+            RUN_END_GRACE
+        } else {
+            RUN_END_RECORD_GRACE
+        };
+        if start.elapsed() >= grace {
             return Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
                 "tendr: the session cut this read-only attach off while the run was still running"
             )));

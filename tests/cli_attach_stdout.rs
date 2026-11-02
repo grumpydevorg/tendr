@@ -160,6 +160,39 @@ fn stdout_is_exactly_the_runs_output_and_stdin_is_never_read() {
 }
 
 #[test]
+fn stdout_gets_the_mode_replay_but_no_resets_when_leaving() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "ro-modes");
+    let go = root.path().join("go");
+    // Bracketed paste on, then ticks, then the end.
+    let script = format!(
+        "printf '\\033[?2004h'; {}",
+        ticking_then(&go, "echo ALL-DONE")
+    );
+    start(&root, "ro-modes", &script, &[]);
+
+    let mut child = attach(&root, "ro-modes", Stdio::null(), &[]);
+    let mut stdout = child.stdout.take().unwrap();
+    let mut out = read_until(&mut stdout, "tick");
+    touch(&go);
+    stdout.read_to_end(&mut out).unwrap();
+    let (code, stderr) = finish(child);
+
+    assert_eq!(code, Some(0), "the run ended; stderr: {stderr}");
+    assert!(
+        out.starts_with(b"\x1b[?2004h"),
+        "no mode replay first: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        out.ends_with(b"ALL-DONE\r\n"),
+        "stdout does not end with the run's last output: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+#[test]
 fn a_watcher_cut_off_while_its_consumer_stalls_exits_84() {
     // Far smaller than the flood, so the stalled attach falls behind it.
     const RING: &str = "1048576";

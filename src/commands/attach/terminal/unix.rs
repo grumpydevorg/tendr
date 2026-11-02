@@ -176,8 +176,8 @@ impl Raw for AbsentRaw {
     }
 }
 
-/// stdout, which is not a terminal (or not the one being typed at): no
-/// size, and no modes to turn off when leaving.
+/// stdout, which may not be a terminal (or not the one being typed at): no
+/// size, and modes turned off when leaving only if it is one.
 struct AbsentOutput;
 
 impl Output for AbsentOutput {
@@ -189,8 +189,11 @@ impl Output for AbsentOutput {
         None
     }
 
+    /// A stdout that is a terminal (stdin piped) gets its modes turned off
+    /// when leaving; a pipe or file gets nothing but the session's output.
     fn is_terminal(&self) -> bool {
-        false
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal()
     }
 }
 
