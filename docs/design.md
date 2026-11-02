@@ -341,6 +341,22 @@ CTRL_BREAK, which is best-effort, then ends the Job Object after the grace
 period. For CTRL_BREAK to reach the child, the sidecar allocates a console and
 hides its window. Source: `src/platform/windows.rs`.
 
+### Windows clients attach over the bridge, through a console layer
+
+*2026-11-03.* The attach client is one platform-neutral core (frames, the
+control-first outbox, the escape, mode tracking, offsets, the status line,
+drop classification and reconnect) over a small terminal layer (raw mode,
+input, size, output, leave). Windows got its own layer instead of keeping
+`ssh -t`, so a Windows client has the same contract as a Unix one: names
+travel as data, the escape and terminal restore are local, and a dropped
+link resumes. The `ssh -t` path and its plain-name rule were deleted with
+the cutover rather than kept as a fallback. A console without
+virtual-terminal support (before Windows 10 1809) is refused, because a
+fallback would keep a second attach path alive for almost no users. Output
+is written with `WriteFile` under the UTF-8 code page, since Rust's console
+`Stdout` fails on bytes that are not valid UTF-8 and a PTY child can send
+any. Source: `src/commands/attach/terminal/windows.rs`, PRs #177, #179, #181.
+
 ### Remote work runs the same tendr over SSH
 
 *2026-04-01.* `tendr --host <host> <command>` runs the remote host's own

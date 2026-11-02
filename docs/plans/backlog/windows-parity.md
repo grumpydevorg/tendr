@@ -78,6 +78,16 @@ Needed:
   suspended launcher above;
 - a named-pipe carrier for the existing attach frames.
 
+### Attach client loose ends
+
+- A controlling client whose remote answers and exits at once can lose the
+  end of that output: the reconnect ends before it waits for the old reader.
+- No test covers ssh exit 1 on a reconnect's dial; exit 1 at a connection's
+  end is covered.
+- The in-box conhost of Windows 10 1809 may show U+FFFD where a multibyte
+  character is split across two writes. Current conhost and Windows
+  Terminal do not; untested on 1809.
+
 ## Acceptance
 
 Native Windows tests show:
