@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.6.0 — `attach --host` survives dropped connections
+
+Works with 0.5.0 in both directions over `--host`: an attach between a 0.6.0
+host and a 0.5.0 one uses attach protocol version 1 and does not reconnect.
+Reconnecting needs 0.6.0 on both hosts and a session started by 0.6.0.
 
 ### Added
 
