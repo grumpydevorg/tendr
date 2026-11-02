@@ -1,6 +1,6 @@
 [package]
 name = "tendr"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Keep shells, REPLs and long-running jobs alive between tool calls, locally or over SSH"
