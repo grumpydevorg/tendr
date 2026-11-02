@@ -31,7 +31,7 @@ pub fn cmd_attach(
     {
         // Fail before any side effect — a takeover included — if there is no
         // terminal to drive.
-        require_terminal()?;
+        let terminal = terminal::open()?;
         let mode = mode(takeover, read_only);
         // A local attach does not reconnect, so it has no use for offsets.
         let (stream, accept) = connect(session.path(), attach_proto::Version::V1, mode)?;
@@ -46,14 +46,15 @@ pub fn cmd_attach(
                 .as_ref()
                 .is_some_and(|control| control.taken_over_by().is_some())
         };
-        unix_relay::relay(
-            unix_relay::Link::socket(stream)?,
+        client::relay(
+            client::Link::socket(stream)?,
             None,
             escape,
             accept.access(),
-            unix_relay::Peer::Local {
+            client::Peer::Local {
                 recorded_takeover: &recorded_takeover,
             },
+            terminal,
         )
         .map(drop)
     }
@@ -111,16 +112,6 @@ fn mode(takeover: bool, read_only: bool) -> Mode {
     }
 }
 
-/// An attach drives the terminal on stdin.
-#[cfg(unix)]
-fn require_terminal() -> anyhow::Result<()> {
-    if rustix::termios::isatty(std::io::stdin()) {
-        Ok(())
-    } else {
-        anyhow::bail!("attach requires an interactive terminal on stdin")
-    }
-}
-
 /// How long `attach --host` waits for ssh to end once the attach has ended
 /// on this side (a detach, or the keyboard closing) before stopping it. The
 /// remote side ends as soon as it reads the end of its input; the session
@@ -169,8 +160,9 @@ pub fn cmd_attach_host(
 ) -> anyhow::Result<i32> {
     use tendr::attach_proto::Version;
 
-    // Before ssh starts: the request may take over.
-    require_terminal()?;
+    // Before ssh starts: the request may take over, and ssh shares the
+    // terminal, whose state is taken now.
+    let terminal = terminal::open()?;
     let mode = mode(request.takeover, request.read_only);
     attach_proto::write_frame(
         &mut frame,
@@ -180,10 +172,10 @@ pub fn cmd_attach_host(
         },
     )?;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stderr = std::sync::Arc::new(unix_relay::StderrRoute::default());
+    let stderr = std::sync::Arc::new(client::StderrRoute::default());
     let dial = tendr::ssh::Dial {
         login: tendr::ssh::Login::Interactive,
-        stderr: Box::new(unix_relay::SshStderr::new(std::sync::Arc::clone(&stderr))),
+        stderr: Box::new(client::SshStderr::new(std::sync::Arc::clone(&stderr))),
         cancel: std::sync::Arc::clone(&cancel),
     };
     // The remote side's answer is the sidecar's acceptance.
@@ -202,12 +194,13 @@ pub fn cmd_attach_host(
         cancel,
         stderr,
     };
-    unix_relay::relay(
+    client::relay(
         link,
         accept.resume_point(),
         request.escape,
         accept.access(),
-        unix_relay::Peer::Host(Box::new(end)),
+        client::Peer::Host(Box::new(end)),
+        terminal,
     )
 }
 
@@ -224,7 +217,7 @@ pub(super) struct HostEnd {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Where every connection's ssh stderr goes once the relay owns the
     /// terminal.
-    stderr: std::sync::Arc<unix_relay::StderrRoute>,
+    stderr: std::sync::Arc<client::StderrRoute>,
 }
 
 #[cfg(unix)]
@@ -246,21 +239,19 @@ impl HostEnd {
     ///
     /// # Errors
     /// As for [`resume_host`].
-    fn resume(&mut self, point: attach_proto::ResumePoint) -> anyhow::Result<unix_relay::Attempt> {
+    fn resume(&mut self, point: attach_proto::ResumePoint) -> anyhow::Result<client::Attempt> {
         let dial = tendr::ssh::Dial {
             login: tendr::ssh::Login::Batch,
-            stderr: Box::new(unix_relay::SshStderr::new(std::sync::Arc::clone(
-                &self.stderr,
-            ))),
+            stderr: Box::new(client::SshStderr::new(std::sync::Arc::clone(&self.stderr))),
             cancel: std::sync::Arc::clone(&self.cancel),
         };
         Ok(match resume_host(&self.host, &self.request, point, dial)? {
             Opened::Answered(link, resumption) => {
                 let (link, ssh) = link.split();
                 self.ssh = Some(ssh);
-                unix_relay::Attempt::Resumed(link, resumption)
+                client::Attempt::Resumed(link, resumption)
             }
-            Opened::Ended(code) => unix_relay::Attempt::Ended(code),
+            Opened::Ended(code) => client::Attempt::Ended(code),
         })
     }
 }
@@ -280,8 +271,8 @@ impl HostLink {
     /// The relay's link over ssh's stdin and stdout, and ssh. The sender
     /// closes ssh's stdin when the relay closes its outbox, and
     /// [`HostEnd::finish`] stops ssh if it does not end by itself.
-    fn split(self) -> (unix_relay::Link, tendr::ssh::AttachSsh) {
-        let link = unix_relay::Link {
+    fn split(self) -> (client::Link, tendr::ssh::AttachSsh) {
+        let link = client::Link {
             reader: Box::new(self.reader),
             writer: Box::new(std::io::BufWriter::new(self.stdin)),
             close: Box::new(|| {}),
@@ -305,8 +296,7 @@ pub(super) enum Opened<A> {
 /// read the session's answer, and let `answer` classify it. A remote side
 /// that ends without answering is [`Opened::Ended`] with its exit code (84
 /// if it claims success); an answer `answer` refuses stops ssh. Setting the
-/// dial's `cancel` stops ssh at any point before the answer begins to
-/// arrive.
+/// dial's `cancel` stops ssh at any point before the answer has arrived.
 ///
 /// # Errors
 /// `answer`'s error, and the ssh failures of [`tendr::ssh::AttachSsh`].
@@ -328,22 +318,8 @@ fn open_host<A>(
     // and its exit code says which. The answer is waited for where a cancel
     // can stop it: the link may freeze after the hello, and without a
     // connect deadline there is no hello at all.
-    let mut reader = std::io::BufReader::new(stdout);
-    let reply = if readable_unless(reader.get_ref(), &cancel) {
-        attach_proto::read_frame(&mut reader)
-    } else {
-        Err(FrameError::Io(std::io::ErrorKind::Interrupted.into()))
-    };
-    match reply {
-        Err(FrameError::Io(_)) => {
-            drop(stdin);
-            match ssh.finish(None) {
-                Some(code) => unanswered(code?).map(Opened::Ended),
-                // Without a grace, only a cancel stops it.
-                None => Err(SshError::Cancelled.into()),
-            }
-        }
-        reply => match answer(reply) {
+    match read_answer(stdout, &cancel) {
+        Some((reader, reply)) if !matches!(reply, Err(FrameError::Io(_))) => match answer(reply) {
             Ok(answered) => Ok(Opened::Answered(HostLink { ssh, stdin, reader }, answered)),
             Err(e) => {
                 drop(stdin);
@@ -351,30 +327,49 @@ fn open_host<A>(
                 Err(e)
             }
         },
+        _ => {
+            drop(stdin);
+            match ssh.finish(None) {
+                Some(code) => unanswered(code?).map(Opened::Ended),
+                // Without a grace, only a cancel stops it.
+                None => Err(SshError::Cancelled.into()),
+            }
+        }
     }
 }
 
-/// Wait until `stdout` has something to read, has closed, or cannot be
-/// polled: `true`, and the read that follows says which; or until `cancel`
-/// is set: `false`.
+/// How often waiting for the session's answer looks at the cancel flag.
 #[cfg(unix)]
-fn readable_unless(
-    stdout: &impl std::os::fd::AsFd,
+const ANSWER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Read the session's answer from `stdout` on a thread of its own, and wait
+/// for it where `cancel` can stop the wait: the reader and the answer, or
+/// `None` once `cancel` is set (or the thread died). The caller then ends
+/// ssh, which ends the read, and the thread with it.
+#[cfg(unix)]
+fn read_answer(
+    stdout: std::process::ChildStdout,
     cancel: &std::sync::atomic::AtomicBool,
-) -> bool {
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
-    let tick = Timespec {
-        tv_sec: 0,
-        tv_nsec: 20_000_000,
-    };
+) -> Option<(
+    std::io::BufReader<std::process::ChildStdout>,
+    Result<Frame, FrameError>,
+)> {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let (send, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let reply = attach_proto::read_frame(&mut reader);
+        let _ = send.send((reader, reply));
+    });
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-            return false;
+            return None;
         }
-        let mut fds = [PollFd::new(stdout, PollFlags::IN)];
-        match poll(&mut fds, Some(&tick)) {
-            Ok(0) | Err(rustix::io::Errno::INTR) => {}
-            Ok(_) | Err(_) => return true,
+        match answered.recv_timeout(ANSWER_POLL) {
+            Ok(answer) => return Some(answer),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
         }
     }
 }
@@ -520,10 +515,10 @@ impl Accept {
     }
 
     /// What the relay may send for this attach.
-    fn access(self) -> unix_relay::Access {
+    fn access(self) -> client::Access {
         match self {
-            Self::V1(_) | Self::V2(_) => unix_relay::Access::Control,
-            Self::Watch(_) => unix_relay::Access::ReadOnly,
+            Self::V1(_) | Self::V2(_) => client::Access::Control,
+            Self::Watch(_) => client::Access::ReadOnly,
         }
     }
 
@@ -820,1163 +815,24 @@ fn reply_failure<T>(reply: Result<Frame, FrameError>, what: &str) -> anyhow::Res
     }
 }
 
-/// The interactive relay between the user's terminal and the session, over
-/// the attach socket or, for `attach --host`, over ssh to the remote bridge.
-///
-/// Three independent paths, so no blocked one can delay a detach:
-///
-/// - the **main thread** polls the keyboard, recognizes the escape, watches for
-///   terminal size changes, and only ever queues messages;
-/// - a **sender thread** writes queued messages to the session, controls
-///   (resize, detach) before keystrokes; if the session stops accepting input,
-///   only this thread waits;
-/// - a **reader thread** writes session output to the terminal; if the terminal
-///   stops reading, only this thread waits.
-///
-/// When an `attach --host` connection is lost, a fourth path, the
-/// [`reconnect`](unix_relay::reconnect) thread, judges ssh's end and opens a
-/// new connection, while the main thread keeps the keyboard.
-///
-/// Leaving never joins a blocked thread: the connection is closed, the
-/// terminal is restored (without waiting for pending output to drain), and
-/// the process exits.
-///
-/// SIGHUP, SIGTERM and SIGINT end the relay like a detach, and SIGWINCH brings
-/// the next size check forward. Their handlers only wake the main thread's
-/// poll through a self-pipe ([`signals`](unix_relay::signals)); the previous
-/// dispositions are restored when the relay ends.
 #[cfg(unix)]
-mod unix_relay {
-    use std::collections::VecDeque;
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
-    use std::time::{Duration, Instant};
+mod client;
+#[cfg(unix)]
+mod terminal;
 
-    use tendr::attach_escape::{Escape, EscapeMode, EscapeParser};
-    use tendr::attach_proto::{self, Frame, FrameError};
-    use tendr::pty_exit::PtyExitCode;
-    use tendr::term_modes::TermModes;
-
-    mod reconnect;
-
-    pub(super) use reconnect::{Attempt, SshStderr, StderrRoute};
-
-    /// Input that may wait for a session that is not accepting it. Beyond
-    /// this, the attach client drops further keystrokes (and reports them)
-    /// rather than buffering without bound, and the escape is still
-    /// recognized; the remote bridge stops reading its input until there is
-    /// room.
-    const OUTBOX_DATA_LIMIT: usize = 1 << 20;
-    /// How long the main thread waits on the keyboard before it checks again
-    /// whether the session has closed.
-    const POLL: Duration = Duration::from_millis(100);
-    /// How often the terminal size is checked.
-    const SIZE_POLL: Duration = Duration::from_millis(100);
-    /// How long a detach waits for the detach message to be sent.
-    pub(super) const DETACH_GRACE: Duration = Duration::from_millis(200);
-    /// How long leaving on a signal waits for its report to be written to a
-    /// terminal that may be gone or not reading.
-    const REPORT_GRACE: Duration = Duration::from_millis(200);
-    /// How long leaving waits to turn off the session's terminal modes in a
-    /// terminal that is slow, gone or not reading. After a signal the shorter
-    /// [`REPORT_GRACE`] applies: SIGHUP means the terminal is gone.
-    const MODES_GRACE: Duration = Duration::from_secs(1);
-    /// How long leaving during a reconnect waits for it to stop its ssh,
-    /// which gets SIGTERM, then SIGKILL a second later.
-    const RECONNECT_STOP_GRACE: Duration = Duration::from_secs(2);
-
-    /// One attach connection as the relay sees it: frames in, frames out.
-    pub(super) struct Link {
-        pub(super) reader: Box<dyn Read + Send>,
-        pub(super) writer: Box<dyn Write + Send>,
-        /// Ends the connection when the relay leaves, unblocking the reader
-        /// and the sender; the session treats a closed connection as a
-        /// detach.
-        pub(super) close: Box<dyn FnOnce() + Send>,
-    }
-
-    impl Link {
-        /// A connection to the session's attach socket.
-        pub(super) fn socket(stream: UnixStream) -> anyhow::Result<Self> {
-            let socket = |e| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket: {e}"));
-            let shutdown = stream.try_clone().map_err(socket)?;
-            Ok(Self {
-                reader: Box::new(stream.try_clone().map_err(socket)?),
-                writer: Box::new(stream),
-                close: Box::new(move || {
-                    let _ = shutdown.shutdown(std::net::Shutdown::Both);
-                }),
-            })
-        }
-    }
-
-    /// The far end of the relay.
-    pub(super) enum Peer<'a> {
-        /// The session's attach socket on this machine. `recorded_takeover`
-        /// is asked when the session closes the connection without saying
-        /// it was taken over.
-        Local {
-            recorded_takeover: &'a dyn Fn() -> bool,
-        },
-        /// The remote tendr, over ssh (`attach --host`). Its end of a
-        /// connection says whether the remote ended it or the link was lost,
-        /// and a version 2 attach whose link was lost reconnects through it.
-        Host(Box<super::HostEnd>),
-    }
-
-    /// What an attach may send the session.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(in crate::commands::attach) enum Access {
-        /// Keystrokes, resizes and the repaint nudge: it holds control.
-        Control,
-        /// Nothing but the detach: a watcher's terminal neither types into
-        /// the session nor sizes it, so a program it attaches to shows
-        /// nothing new until it next draws, at the controller's size.
-        ReadOnly,
-    }
-
-    /// One connection's paths to the session: the sender, writing its
-    /// outbox, and the reader.
-    struct Connection {
-        outbox: Arc<Outbox>,
-        access: Access,
-        /// Set once the connection has ended: by the reader at the end of
-        /// the session's output, or by the sender on a failed write.
-        closed: Arc<AtomicBool>,
-        reader: std::thread::JoinHandle<()>,
-        close: Box<dyn FnOnce() + Send>,
-    }
-
-    impl Connection {
-        fn open(
-            link: Link,
-            access: Access,
-            retired: &Arc<AtomicBool>,
-            screen: &Arc<Screen>,
-        ) -> Self {
-            let closed = Arc::new(AtomicBool::new(false));
-            let outbox = Arc::new(Outbox::default());
-            spawn_sender(link.writer, Arc::clone(&outbox), Arc::clone(&closed));
-            let reader = spawn_reader(
-                link.reader,
-                Arc::clone(&closed),
-                Arc::clone(retired),
-                Arc::clone(screen),
-            );
-            Self {
-                outbox,
-                access,
-                closed,
-                reader,
-                close: link.close,
-            }
-        }
-
-        fn closed(&self) -> bool {
-            self.closed.load(Ordering::SeqCst)
-        }
-
-        /// Send the terminal's size, then the repaint nudge: an attach at
-        /// the session's size makes the child draw nothing, so the sidecar
-        /// nudges it into redrawing, which only a resize lets apply. A
-        /// read-only attach sends neither.
-        fn greet(&self, size: Option<tendr::recording::Geometry>) {
-            if let Some(size) = size {
-                if self.access == Access::Control {
-                    self.outbox.push_control(Frame::Resize(size));
-                    self.outbox.push_control(Frame::Repaint);
-                }
-            }
-        }
-
-        /// Send the terminal's new size, unless the attach is read-only.
-        fn resize(&self, size: tendr::recording::Geometry) {
-            if self.access == Access::Control {
-                self.outbox.push_control(Frame::Resize(size));
-            }
-        }
-
-        /// End the connection, which unblocks its sender and reader; the
-        /// session treats a closed connection as a detach. Returns the
-        /// reader, which may still be writing to the terminal.
-        fn close(self) -> std::thread::JoinHandle<()> {
-            (self.close)();
-            self.outbox.close();
-            self.reader
-        }
-    }
-
-    /// Relay until the attach ends, and return its exit code: for `attach
-    /// --host`, the remote's when the remote ended it, otherwise 0. Another
-    /// client taking it over is an error (exit 81), and so is session output
-    /// that breaks the protocol (exit 80). `resume` is where a version 2
-    /// attach's stamped output starts; `None` for version 1.
-    ///
-    /// A read-only attach ([`Access::ReadOnly`]) sends no size, resize or
-    /// repaint, and drops keystrokes, saying so once in the status line; the
-    /// escape and the signals still leave.
-    ///
-    /// A version 2 `attach --host` whose connection the far side ends, without
-    /// a takeover or a broken protocol, hands ssh's end to a
-    /// [`reconnect::Job`]: the remote's exit code ends the attach with it, and
-    /// a lost link is resumed. Meanwhile keystrokes are discarded, with one
-    /// notice in the status line; the escape and the signals still leave, and
-    /// stop the reconnect's ssh.
-    pub(super) fn relay(
-        link: Link,
-        resume: Option<attach_proto::ResumePoint>,
-        escape: EscapeMode,
-        access: Access,
-        peer: Peer<'_>,
-    ) -> anyhow::Result<i32> {
-        let (recorded_takeover, mut host) = match peer {
-            Peer::Local { recorded_takeover } => (Some(recorded_takeover), None),
-            Peer::Host(end) => (None, Some(*end)),
-        };
-        // Only a version 2 attach knows where to resume from.
-        let resumable = resume.is_some();
-        let retired = Arc::new(AtomicBool::new(false));
-        let screen = Arc::new(Screen {
-            shown: Mutex::new(Shown {
-                modes: TermModes::default(),
-                resume,
+#[cfg(unix)]
+impl client::Link {
+    /// A connection to the session's attach socket.
+    fn socket(stream: std::os::unix::net::UnixStream) -> anyhow::Result<Self> {
+        let socket = |e| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket: {e}"));
+        let shutdown = stream.try_clone().map_err(socket)?;
+        Ok(Self {
+            reader: Box::new(stream.try_clone().map_err(socket)?),
+            writer: Box::new(stream),
+            close: Box::new(move || {
+                let _ = shutdown.shutdown(std::net::Shutdown::Both);
             }),
-            done: AtomicBool::new(false),
-            bracketed_paste: AtomicBool::new(false),
-            broken: OnceLock::new(),
-            terminal_gone: AtomicBool::new(false),
-        });
-        let status = Arc::new(reconnect::Status::default());
-
-        // Installed before raw mode, so no cancelling signal can arrive between
-        // the two and leave the terminal raw; restored when dropped, after the
-        // terminal.
-        let handlers = signals::Handlers::install()
-            .map_err(|e| anyhow::anyhow!("failed to install attach signal handlers: {e}"))?;
-        // Restores the terminal on every way out of this function, panics
-        // included.
-        let terminal = RawTerminal::enter()?;
-        // From here on, what ssh says stays off the session's screen.
-        if let Some(end) = &host {
-            end.stderr.set(&status, &screen);
-        }
-
-        let mut size = terminal_size();
-        let mut connection = Some(Connection::open(link, access, &retired, &screen));
-        let mut reconnecting: Option<reconnect::Job> = None;
-        if let Some(connection) = &connection {
-            connection.greet(size);
-        }
-        // The remote's exit code, or its failure, when a reconnect ended the
-        // attach.
-        let mut verdict = None;
-
-        let size_poll = size_poll_interval();
-        let mut size_due = Instant::now() + size_poll;
-        let mut parser = EscapeParser::new(escape);
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 4096];
-        let mut dropped = 0usize;
-        let ending = loop {
-            if connection.as_ref().is_some_and(Connection::closed) {
-                let lost = resumable
-                    && !retired.load(Ordering::SeqCst)
-                    && screen.broken.get().is_none()
-                    && !screen.terminal_gone.load(Ordering::SeqCst);
-                match (host.take(), connection.take()) {
-                    (Some(end), Some(old)) if lost => {
-                        reconnecting = Some(reconnect::Job::start(
-                            end,
-                            old.close(),
-                            Arc::clone(&screen),
-                            Arc::clone(&status),
-                        ));
-                    }
-                    (end, old) => {
-                        (host, connection) = (end, old);
-                        break Ending::SessionClosed;
-                    }
-                }
-            }
-            if let Some((end, outcome)) = reconnecting.as_ref().and_then(reconnect::Job::outcome) {
-                reconnecting = None;
-                host = end;
-                match outcome {
-                    reconnect::Outcome::Resumed(link) => {
-                        let resumed = Connection::open(link, access, &retired, &screen);
-                        resumed.greet(size);
-                        connection = Some(resumed);
-                    }
-                    reconnect::Outcome::Ended(result) => {
-                        verdict = Some(result);
-                        break Ending::SessionClosed;
-                    }
-                }
-            }
-            let mut timeout = size_due.saturating_duration_since(Instant::now()).min(POLL);
-            if let Some(due) = parser.partial_deadline() {
-                timeout = timeout.min(due.saturating_duration_since(Instant::now()));
-            }
-            let ready = wait_ready(handlers.wake(), timeout);
-            if ready.signal {
-                let received = handlers.take();
-                if let Some(cancel) = received.cancel {
-                    break Ending::Signalled(cancel);
-                }
-                if received.winch {
-                    // Signals coalesce, so SIGWINCH only brings the check
-                    // forward; the poll stays the source of truth.
-                    size_due = Instant::now();
-                }
-            }
-            if Instant::now() >= size_due {
-                size_due = Instant::now() + size_poll;
-                let now = terminal_size();
-                if now.is_some() && now != size {
-                    size = now;
-                    // While reconnecting, the size goes with the next
-                    // connection's greeting.
-                    if let (Some(connection), Some(size)) = (&connection, now) {
-                        connection.resize(size);
-                    }
-                }
-            }
-            if !ready.keyboard {
-                // An escape sequence left unfinished by the last read (a lone
-                // Esc key, say) is forwarded once it has waited long enough.
-                let mut forward = Vec::new();
-                parser.flush_expired(Instant::now(), &mut forward);
-                send_keystrokes(
-                    connection.as_ref(),
-                    access,
-                    &status,
-                    &screen,
-                    forward,
-                    &mut dropped,
-                );
-                continue;
-            }
-            let n = match stdin.read(&mut buf) {
-                Ok(0) => break Ending::KeyboardClosed,
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break Ending::KeyboardClosed,
-            };
-            let mut forward = Vec::new();
-            parser.set_bracketed_paste(screen.bracketed_paste.load(Ordering::SeqCst));
-            let decision = parser.feed(&buf[..n], &mut forward);
-            send_keystrokes(
-                connection.as_ref(),
-                access,
-                &status,
-                &screen,
-                forward,
-                &mut dropped,
-            );
-            if decision == Escape::Detach {
-                break Ending::Detached;
-            }
-        };
-
-        if let Some(connection) = &connection {
-            if matches!(ending, Ending::Detached | Ending::Signalled(_)) {
-                connection.outbox.push_control(Frame::Detach);
-                connection.outbox.wait_controls_sent(DETACH_GRACE);
-            }
-        }
-        // Unblocks the sender and reader, which are not waited for.
-        drop(connection.map(Connection::close));
-        // Leaving while reconnecting: stop it, and its ssh. A connection it
-        // resumed just now ends as it is dropped, which closes ssh's stdin.
-        if let Some(job) = reconnecting {
-            if let Some((end, _)) = job.stop(RECONNECT_STOP_GRACE) {
-                host = end;
-            }
-        }
-        turn_off_modes(
-            &screen,
-            &status,
-            if matches!(ending, Ending::Signalled(_)) {
-                REPORT_GRACE
-            } else {
-                MODES_GRACE
-            },
-        );
-        drop(terminal);
-        drop(handlers);
-
-        // Only report once the terminal is restored, and never after a user
-        // detach, whose terminal may be the thing that is blocked. A client
-        // that was not reading when it was taken over never got the message,
-        // so at the end of its connection the event log decides.
-        let taken_over = ending != Ending::Detached
-            && (retired.load(Ordering::SeqCst)
-                || (ending == Ending::SessionClosed && recorded_takeover.is_some_and(|f| f())));
-        // What the remote said on the reconnect's last attempt, such as why
-        // it refused to resume, which the status line could only glimpse.
-        let mut notes = status.take_lines();
-        if let Ending::Signalled(cancel) = ending {
-            notes.push(format!("tendr: attach ended by {}", cancel.name()));
-        }
-        if ending != Ending::Detached {
-            // Otherwise the takeover is the error returned below.
-            if taken_over && matches!(ending, Ending::Signalled(_)) {
-                notes.push("tendr: another client took over this session".to_owned());
-            }
-            if dropped > 0 {
-                notes.push(format!(
-                    "tendr: {dropped} typed bytes were dropped while the session was not accepting input"
-                ));
-            }
-        }
-        if matches!(ending, Ending::Signalled(_)) {
-            exit_signalled(notes);
-        }
-        for note in notes {
-            eprintln!("{note}");
-        }
-        let finished = host.as_mut().and_then(|end| {
-            end.finish(if ending == Ending::SessionClosed {
-                super::SSH_CLOSE_GRACE
-            } else {
-                super::SSH_LEAVE_GRACE
-            })
-        });
-        if ending == Ending::SessionClosed {
-            if let Some(why) = screen.broken.get() {
-                return Err(PtyExitCode::Protocol.error(anyhow::anyhow!("tendr: {why}")));
-            }
-        }
-        if taken_over {
-            // This client lost control: a controller conflict, which a script
-            // must be able to tell from a detach.
-            return Err(PtyExitCode::Control.error(anyhow::anyhow!(
-                "tendr: another client took over this session"
-            )));
-        }
-        if ending != Ending::SessionClosed {
-            return Ok(0);
-        }
-        // The far side ended the connection: the remote's code, or ssh's
-        // failure (a lost version 1 connection) when there is no code.
-        verdict.or(finished).unwrap_or(Ok(0))
-    }
-
-    /// Send keystrokes to the session, counting them in `dropped` if the
-    /// outbox is full. With no connection, while reconnecting, they are
-    /// discarded: never sent late to a program that has moved on. A
-    /// read-only attach drops them all, and says so once.
-    fn send_keystrokes(
-        connection: Option<&Connection>,
-        access: Access,
-        status: &Arc<reconnect::Status>,
-        screen: &Arc<Screen>,
-        forward: Vec<u8>,
-        dropped: &mut usize,
-    ) {
-        if forward.is_empty() {
-            return;
-        }
-        if access == Access::ReadOnly {
-            status.read_only(screen);
-            return;
-        }
-        let Some(connection) = connection else {
-            status.discard(screen);
-            return;
-        };
-        let len = forward.len();
-        if !connection.outbox.push_data(forward) {
-            *dropped += len;
-        }
-    }
-
-    /// How a relay ended.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Ending {
-        Detached,
-        SessionClosed,
-        KeyboardClosed,
-        Signalled(signals::Cancel),
-    }
-
-    /// Leave after a cancelling signal with exit code 1. The report is written
-    /// without waiting on the terminal for long, and without panicking if it is
-    /// gone: SIGHUP means it hung up, and a terminal that stopped reading is a
-    /// reason to send SIGTERM.
-    fn exit_signalled(notes: Vec<String>) -> ! {
-        let (done, written) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut stderr = std::io::stderr().lock();
-            for note in notes {
-                let _ = writeln!(stderr, "{note}");
-            }
-            let _ = done.send(());
-        });
-        let _ = written.recv_timeout(REPORT_GRACE);
-        std::process::exit(1);
-    }
-
-    /// What the session's output has done to the user's terminal.
-    pub(super) struct Screen {
-        /// What has been written to the terminal. Held while writing, so a
-        /// reset cannot interleave with output, and so the resume point moves
-        /// only past bytes the terminal took.
-        shown: Mutex<Shown>,
-        /// Set by the main thread when leaving: the reader writes nothing
-        /// more, so at most the chunk it is writing precedes the reset.
-        done: AtomicBool,
-        /// The child has bracketed paste on. Read by the keyboard loop
-        /// without taking `shown`, which a blocked write can hold.
-        bracketed_paste: AtomicBool,
-        /// Why the reader stopped on output outside the protocol, if it did.
-        /// Set before it marks the connection closed.
-        broken: OnceLock<String>,
-        /// The terminal refused a write: the reader stopped for the
-        /// terminal's sake, not the connection's, so there is nothing to
-        /// reconnect for. Set before it marks the connection closed.
-        terminal_gone: AtomicBool,
-    }
-
-    impl Screen {
-        fn lock(&self) -> MutexGuard<'_, Shown> {
-            self.shown.lock().unwrap_or_else(|e| e.into_inner())
-        }
-    }
-
-    /// The terminal as the session's output has left it.
-    struct Shown {
-        /// The modes turned on by everything written so far.
-        modes: TermModes,
-        /// For a version 2 attach, the run and epoch it was accepted at, and
-        /// the offset just past the last output byte written to the terminal:
-        /// where a reconnect would resume. `None` for version 1.
-        resume: Option<attach_proto::ResumePoint>,
-    }
-
-    /// Turn off the terminal modes the session turned on (the alternate
-    /// screen, mouse reports, keyboard protocols), and erase a reconnect's
-    /// status line, so the user's shell gets its terminal back. Waits for a
-    /// write in progress, but not for longer than `grace`: a terminal that is
-    /// not reading cannot hold the exit.
-    fn turn_off_modes(screen: &Arc<Screen>, status: &Arc<reconnect::Status>, grace: Duration) {
-        screen.done.store(true, Ordering::SeqCst);
-        let (done, written) = std::sync::mpsc::channel();
-        let (screen, status) = (Arc::clone(screen), Arc::clone(status));
-        std::thread::spawn(move || {
-            status.leave(&screen);
-            let _ = done.send(());
-        });
-        let _ = written.recv_timeout(grace);
-    }
-
-    /// Write `bytes` to the terminal, if it takes them. The caller holds
-    /// [`Screen::shown`], so nothing else writes in between.
-    fn write_terminal(bytes: &[u8]) {
-        if !bytes.is_empty() {
-            let mut stdout = std::io::stdout().lock();
-            let _ = stdout.write_all(bytes).and_then(|()| stdout.flush());
-        }
-    }
-
-    /// Raw mode for the user's terminal, restored on drop.
-    struct RawTerminal {
-        original: libc::termios,
-    }
-
-    impl RawTerminal {
-        fn enter() -> anyhow::Result<Self> {
-            use std::os::unix::io::AsRawFd;
-            let fd = std::io::stdin().as_raw_fd();
-            // SAFETY: termios is plain old data; tcgetattr fills it completely.
-            let mut original: libc::termios = unsafe { std::mem::zeroed() };
-            // SAFETY: `fd` is this process's stdin; `original` is a valid out-pointer.
-            if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-                anyhow::bail!("failed to get terminal attributes");
-            }
-            let mut raw = original;
-            // SAFETY: `raw` is a valid termios.
-            unsafe { libc::cfmakeraw(&mut raw) };
-            // SAFETY: `fd` is stdin; `raw` is a valid termios.
-            if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
-                anyhow::bail!("failed to set raw mode");
-            }
-            Ok(Self { original })
-        }
-    }
-
-    impl Drop for RawTerminal {
-        fn drop(&mut self) {
-            use std::os::unix::io::AsRawFd;
-            let fd = std::io::stdin().as_raw_fd();
-            // Restore at once, then discard unread typed-ahead input. Not
-            // TCSAFLUSH/TCSADRAIN: those also wait for pending output to drain,
-            // which never happens if the terminal has stopped reading. The input
-            // flush must come after: re-entering canonical mode makes the BSD
-            // tty driver set PENDIN, and flushing input is what clears it.
-            // SAFETY: `fd` is stdin; `original` came from tcgetattr on this fd;
-            // tcflush takes a queue selector.
-            unsafe {
-                libc::tcsetattr(fd, libc::TCSANOW, &self.original);
-                libc::tcflush(fd, libc::TCIFLUSH);
-            }
-        }
-    }
-
-    /// Messages waiting for the sender thread. Controls go first, on a
-    /// bounded path: at most one size waits (a newer one replaces it), and
-    /// the others are sent once each. Input waits behind them, bounded by
-    /// [`OUTBOX_DATA_LIMIT`].
-    #[derive(Default)]
-    pub(super) struct Outbox {
-        state: Mutex<OutboxState>,
-        changed: Condvar,
-    }
-
-    #[derive(Default)]
-    struct OutboxState {
-        controls: VecDeque<Frame>,
-        data: VecDeque<Vec<u8>>,
-        data_bytes: usize,
-        sending_control: bool,
-        closed: bool,
-    }
-
-    impl Outbox {
-        fn lock(&self) -> MutexGuard<'_, OutboxState> {
-            self.state.lock().unwrap_or_else(|e| e.into_inner())
-        }
-
-        pub(super) fn push_control(&self, frame: Frame) {
-            let mut state = self.lock();
-            let queued_size = matches!(frame, Frame::Resize(_))
-                .then(|| {
-                    state
-                        .controls
-                        .iter_mut()
-                        .find(|queued| matches!(queued, Frame::Resize(_)))
-                })
-                .flatten();
-            match queued_size {
-                Some(queued) => *queued = frame,
-                None => state.controls.push_back(frame),
-            }
-            drop(state);
-            self.changed.notify_all();
-        }
-
-        /// Queue keystrokes; `false` if dropped because the backlog is full.
-        fn push_data(&self, bytes: Vec<u8>) -> bool {
-            let mut state = self.lock();
-            if state.data_bytes + bytes.len() > OUTBOX_DATA_LIMIT {
-                return false;
-            }
-            state.data_bytes += bytes.len();
-            state.data.push_back(bytes);
-            drop(state);
-            self.changed.notify_all();
-            true
-        }
-
-        /// Queue input, waiting while the backlog is full; `false` once
-        /// closed.
-        pub(super) fn push_data_waiting(&self, bytes: Vec<u8>) -> bool {
-            let mut state = self.lock();
-            while !state.closed
-                && state.data_bytes > 0
-                && state.data_bytes + bytes.len() > OUTBOX_DATA_LIMIT
-            {
-                state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
-            }
-            if state.closed {
-                return false;
-            }
-            state.data_bytes += bytes.len();
-            state.data.push_back(bytes);
-            drop(state);
-            self.changed.notify_all();
-            true
-        }
-
-        /// The next message to send, controls first; `None` once closed.
-        fn next(&self) -> Option<Frame> {
-            let mut state = self.lock();
-            loop {
-                if state.closed {
-                    return None;
-                }
-                if let Some(control) = state.controls.pop_front() {
-                    state.sending_control = true;
-                    return Some(control);
-                }
-                if let Some(data) = state.data.pop_front() {
-                    state.data_bytes -= data.len();
-                    // Room for input that waits for it.
-                    self.changed.notify_all();
-                    return Some(Frame::Data(data));
-                }
-                state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
-            }
-        }
-
-        fn sent(&self) {
-            self.lock().sending_control = false;
-            self.changed.notify_all();
-        }
-
-        /// Wait up to `grace` for queued controls to be written.
-        pub(super) fn wait_controls_sent(&self, grace: Duration) {
-            let deadline = Instant::now() + grace;
-            let mut state = self.lock();
-            while !state.closed && (!state.controls.is_empty() || state.sending_control) {
-                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                    return;
-                };
-                state = self
-                    .changed
-                    .wait_timeout(state, left)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
-            }
-        }
-
-        pub(super) fn close(&self) {
-            self.lock().closed = true;
-            self.changed.notify_all();
-        }
-    }
-
-    /// Write the outbox's messages to `stream` until it closes. A failed
-    /// write sets `closed` and closes the outbox. Dropping `stream` at the end
-    /// closes it, which ends ssh's input for `attach --host`.
-    pub(super) fn spawn_sender(
-        mut stream: impl Write + Send + 'static,
-        outbox: Arc<Outbox>,
-        closed: Arc<AtomicBool>,
-    ) {
-        std::thread::spawn(move || {
-            while let Some(frame) = outbox.next() {
-                let written = attach_proto::write_frame(&mut stream, &frame);
-                outbox.sent();
-                if written.is_err() {
-                    closed.store(true, Ordering::SeqCst);
-                    outbox.close();
-                    return;
-                }
-            }
-        });
-    }
-
-    fn spawn_reader(
-        mut stream: impl Read + Send + 'static,
-        closed: Arc<AtomicBool>,
-        retired: Arc<AtomicBool>,
-        screen: Arc<Screen>,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            loop {
-                let shown = match attach_proto::read_frame(&mut stream) {
-                    Ok(Frame::Data(payload)) => show(&screen, None, &payload),
-                    Ok(Frame::Output { offset, bytes }) => show(&screen, Some(offset), &bytes),
-                    Ok(Frame::Retired(_)) => {
-                        retired.store(true, Ordering::SeqCst);
-                        Ok(true)
-                    }
-                    Ok(_) | Err(FrameError::Malformed(_) | FrameError::Unknown(_)) => Ok(true),
-                    Err(FrameError::Io(_)) => Ok(false),
-                };
-                match shown {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(why) => {
-                        let _ = screen.broken.set(why);
-                        break;
-                    }
-                }
-            }
-            closed.store(true, Ordering::SeqCst);
         })
-    }
-
-    /// Write the session's output to the terminal: `Ok(true)` to go on,
-    /// `Ok(false)` once leaving or the terminal is gone. Stamped output
-    /// (`offset`) must start exactly where the last ended, or it is refused
-    /// unwritten, with why; it moves the resume point only once the terminal
-    /// has taken all of it. Unstamped output, such as the mode replay, moves
-    /// nothing.
-    fn show(screen: &Screen, offset: Option<u64>, bytes: &[u8]) -> Result<bool, String> {
-        let mut shown = screen.shown.lock().unwrap_or_else(|e| e.into_inner());
-        if screen.done.load(Ordering::SeqCst) {
-            return Ok(false);
-        }
-        if let Some(offset) = offset {
-            match &shown.resume {
-                None => return Err("the session sent offsets to a version 1 attach".to_owned()),
-                Some(point) if point.offset != offset => {
-                    return Err(format!(
-                        "the session's output skipped from offset {} to {offset}",
-                        point.offset
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
-        // Track before writing: modes from a partial write are still turned
-        // off when leaving.
-        shown.modes.feed(bytes);
-        screen
-            .bracketed_paste
-            .store(shown.modes.bracketed_paste(), Ordering::SeqCst);
-        let mut stdout = std::io::stdout().lock();
-        if stdout.write_all(bytes).is_err() || stdout.flush().is_err() {
-            screen.terminal_gone.store(true, Ordering::SeqCst);
-            return Ok(false);
-        }
-        if let (Some(_), Some(point)) = (offset, shown.resume.as_mut()) {
-            point.offset += bytes.len() as u64;
-        }
-        Ok(true)
-    }
-
-    /// What woke the main thread's poll.
-    #[derive(Debug, Default)]
-    struct Ready {
-        /// The keyboard has input, or has closed.
-        keyboard: bool,
-        /// A signal arrived.
-        signal: bool,
-    }
-
-    /// Wait up to `timeout` for the keyboard or for a signal's wake-up byte.
-    fn wait_ready(wake: std::os::fd::BorrowedFd<'_>, timeout: Duration) -> Ready {
-        use rustix::event::{PollFd, PollFlags, poll};
-        let stdin = std::io::stdin();
-        let mut fds = [
-            PollFd::new(&stdin, PollFlags::IN),
-            PollFd::new(&wake, PollFlags::IN),
-        ];
-        let timespec = poll_timespec(timeout);
-        match poll(&mut fds, Some(&timespec)) {
-            Ok(n) if n > 0 => Ready {
-                keyboard: !fds[0].revents().is_empty(),
-                signal: !fds[1].revents().is_empty(),
-            },
-            // A timeout, or EINTR from a signal whose byte the next poll sees.
-            _ => Ready::default(),
-        }
-    }
-
-    /// How often the terminal size is checked. Debug builds accept
-    /// `TENDR_TEST_ATTACH_SIZE_POLL_MS` so tests can tell a size change
-    /// forwarded on SIGWINCH from one found by this poll; release builds ignore
-    /// it.
-    fn size_poll_interval() -> Duration {
-        if cfg!(debug_assertions) {
-            if let Some(ms) = std::env::var("TENDR_TEST_ATTACH_SIZE_POLL_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-            {
-                return Duration::from_millis(ms);
-            }
-        }
-        SIZE_POLL
-    }
-
-    /// The poll timeout for `timeout`, whole seconds included (saturating for a
-    /// duration too long to represent).
-    fn poll_timespec(timeout: Duration) -> rustix::event::Timespec {
-        rustix::event::Timespec::try_from(timeout).unwrap_or(rustix::event::Timespec {
-            tv_sec: i64::MAX,
-            tv_nsec: 999_999_999,
-        })
-    }
-
-    /// The terminal's size; `None` if unknown or if either dimension is zero,
-    /// which the session could not apply.
-    fn terminal_size() -> Option<tendr::recording::Geometry> {
-        use std::os::unix::io::AsRawFd;
-        let fd = std::io::stdout().as_raw_fd();
-        // SAFETY: winsize is plain old data; TIOCGWINSZ fills it on success.
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        // SAFETY: `fd` is stdout; TIOCGWINSZ takes a winsize out-pointer.
-        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 {
-            tendr::recording::Geometry::new(ws.ws_row, ws.ws_col)
-        } else {
-            None
-        }
-    }
-
-    /// The attach client's signal handling: a self-pipe that the handlers
-    /// write to, so the main thread's `poll()` wakes for a signal whichever
-    /// thread the kernel delivered it to.
-    pub(super) mod signals {
-        use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-        use std::sync::OnceLock;
-        use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-
-        /// A signal that ends the attach.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum Cancel {
-            Hangup,
-            Terminate,
-            Interrupt,
-        }
-
-        impl Cancel {
-            const ALL: [Self; 3] = [Self::Hangup, Self::Terminate, Self::Interrupt];
-
-            fn number(self) -> libc::c_int {
-                match self {
-                    Self::Hangup => libc::SIGHUP,
-                    Self::Terminate => libc::SIGTERM,
-                    Self::Interrupt => libc::SIGINT,
-                }
-            }
-
-            pub fn name(self) -> &'static str {
-                match self {
-                    Self::Hangup => "SIGHUP",
-                    Self::Terminate => "SIGTERM",
-                    Self::Interrupt => "SIGINT",
-                }
-            }
-        }
-
-        /// The signals received since the last [`Handlers::take`].
-        #[derive(Debug, Default)]
-        pub struct Received {
-            /// The first cancelling signal, in [`Cancel::ALL`] order.
-            pub cancel: Option<Cancel>,
-            pub winch: bool,
-        }
-
-        /// A bit per signal number; the pipe only wakes the poll, so a full
-        /// pipe cannot lose a signal.
-        static PENDING: AtomicU32 = AtomicU32::new(0);
-        /// The wake pipe's write end, or -1 before the first install.
-        static WAKE_WRITE: AtomicI32 = AtomicI32::new(-1);
-
-        fn bit(signal: libc::c_int) -> u32 {
-            1u32 << (signal as u32 % 32)
-        }
-
-        /// Async-signal-safe only: atomics, `write(2)`, and errno kept intact
-        /// for the code it interrupted.
-        extern "C" fn on_signal(signal: libc::c_int) {
-            PENDING.fetch_or(bit(signal), Ordering::SeqCst);
-            let fd = WAKE_WRITE.load(Ordering::SeqCst);
-            if fd < 0 {
-                return;
-            }
-            let saved = errno::get();
-            let byte = 1u8;
-            // SAFETY: write(2) is async-signal-safe; `fd` is the wake pipe's
-            // write end, which is never closed. A full pipe (EAGAIN) already
-            // holds a wake-up.
-            unsafe { libc::write(fd, std::ptr::addr_of!(byte).cast(), 1) };
-            errno::set(saved);
-        }
-
-        /// The process's wake pipe `(read, write)`, both ends nonblocking and
-        /// close-on-exec. Created once and never closed, so a handler still
-        /// running on another thread after the dispositions are restored
-        /// cannot write to a reused descriptor.
-        fn wake_pipe() -> std::io::Result<&'static (OwnedFd, OwnedFd)> {
-            static PIPE: OnceLock<Result<(OwnedFd, OwnedFd), rustix::io::Errno>> = OnceLock::new();
-            PIPE.get_or_init(|| {
-                // pipe2 is not on every Unix; the attach client spawns no
-                // processes, so setting close-on-exec afterwards cannot leak.
-                let (read, write) = rustix::pipe::pipe()?;
-                for end in [&read, &write] {
-                    rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC)?;
-                    rustix::fs::fcntl_setfl(end, rustix::fs::OFlags::NONBLOCK)?;
-                }
-                Ok((read, write))
-            })
-            .as_ref()
-            .map_err(|&e| e.into())
-        }
-
-        /// Handlers installed for the relay; the previous dispositions come
-        /// back on drop.
-        pub struct Handlers {
-            wake: BorrowedFd<'static>,
-            previous: Vec<(libc::c_int, libc::sigaction)>,
-        }
-
-        impl Handlers {
-            /// Handle SIGHUP, SIGTERM, SIGINT and SIGWINCH. A cancelling
-            /// signal the process inherited as ignored (`nohup`, or SIGINT in
-            /// a shell's background job) stays ignored.
-            pub fn install() -> std::io::Result<Self> {
-                let (read, write) = wake_pipe()?;
-                WAKE_WRITE.store(write.as_raw_fd(), Ordering::SeqCst);
-                let mut handlers = Self {
-                    wake: read.as_fd(),
-                    previous: Vec::new(),
-                };
-                // Nothing from an earlier relay in this process carries over.
-                handlers.take();
-                let wanted = Cancel::ALL
-                    .iter()
-                    .map(|c| (c.number(), true))
-                    .chain([(libc::SIGWINCH, false)]);
-                for (signal, keep_ignored) in wanted {
-                    // SAFETY: sigaction is plain old data; sigaction(2) fills
-                    // `old`, and a null new action only queries.
-                    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-                    if unsafe { libc::sigaction(signal, std::ptr::null(), &mut old) } != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if keep_ignored && old.sa_sigaction == libc::SIG_IGN {
-                        continue;
-                    }
-                    // SAFETY: as above; `new` is fully initialized, and the
-                    // handler is async-signal-safe.
-                    let mut new: libc::sigaction = unsafe { std::mem::zeroed() };
-                    new.sa_sigaction =
-                        on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-                    new.sa_flags = libc::SA_RESTART;
-                    unsafe { libc::sigemptyset(&mut new.sa_mask) };
-                    if unsafe { libc::sigaction(signal, &new, std::ptr::null_mut()) } != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    handlers.previous.push((signal, old));
-                }
-                Ok(handlers)
-            }
-
-            /// The descriptor that becomes readable when a signal arrives.
-            pub fn wake(&self) -> BorrowedFd<'static> {
-                self.wake
-            }
-
-            /// Empty the wake pipe and return what arrived.
-            pub fn take(&self) -> Received {
-                let mut sink = [0u8; 64];
-                while matches!(rustix::io::read(self.wake, &mut sink), Ok(n) if n > 0) {}
-                // After the drain: a signal landing now leaves a byte behind
-                // for the next poll.
-                let pending = PENDING.swap(0, Ordering::SeqCst);
-                Received {
-                    cancel: Cancel::ALL
-                        .into_iter()
-                        .find(|c| pending & bit(c.number()) != 0),
-                    winch: pending & bit(libc::SIGWINCH) != 0,
-                }
-            }
-        }
-
-        impl Drop for Handlers {
-            fn drop(&mut self) {
-                for (signal, old) in self.previous.iter().rev() {
-                    // SAFETY: `old` is the disposition sigaction(2) returned
-                    // for `signal`.
-                    unsafe { libc::sigaction(*signal, old, std::ptr::null_mut()) };
-                }
-            }
-        }
-
-        /// errno, saved and restored around the handler's `write(2)`.
-        mod errno {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            fn location() -> *mut libc::c_int {
-                // SAFETY: returns this thread's errno; always valid.
-                unsafe { libc::__errno_location() }
-            }
-
-            #[cfg(any(
-                target_vendor = "apple",
-                target_os = "freebsd",
-                target_os = "dragonfly"
-            ))]
-            fn location() -> *mut libc::c_int {
-                // SAFETY: returns this thread's errno; always valid.
-                unsafe { libc::__error() }
-            }
-
-            #[cfg(not(any(
-                target_os = "linux",
-                target_os = "android",
-                target_vendor = "apple",
-                target_os = "freebsd",
-                target_os = "dragonfly"
-            )))]
-            fn location() -> *mut libc::c_int {
-                std::ptr::null_mut()
-            }
-
-            pub fn get() -> libc::c_int {
-                let p = location();
-                // SAFETY: a non-null `p` is this thread's errno.
-                if p.is_null() { 0 } else { unsafe { *p } }
-            }
-
-            pub fn set(value: libc::c_int) {
-                let p = location();
-                if !p.is_null() {
-                    // SAFETY: a non-null `p` is this thread's errno.
-                    unsafe { *p = value };
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        fn disposition(signal: libc::c_int) -> libc::sighandler_t {
-            // SAFETY: a null new action only queries the current one.
-            let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
-            assert_eq!(
-                unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) },
-                0
-            );
-            current.sa_sigaction
-        }
-
-        /// One test, because the handlers are process-wide.
-        #[test]
-        fn handlers_wake_on_signals_keep_inherited_ignores_and_restore_dispositions() {
-            // SAFETY: SIGHUP ignored for the length of this test, then reset.
-            let hup_before = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
-            let winch_before = disposition(libc::SIGWINCH);
-
-            let handlers = signals::Handlers::install().unwrap();
-            assert_eq!(
-                disposition(libc::SIGHUP),
-                libc::SIG_IGN,
-                "an inherited ignore is kept"
-            );
-            assert_ne!(disposition(libc::SIGWINCH), winch_before);
-
-            // SAFETY: raise(3) delivers SIGWINCH to this thread, whose handler
-            // is installed.
-            unsafe { libc::raise(libc::SIGWINCH) };
-            let ready = wait_ready(handlers.wake(), Duration::from_secs(5));
-            assert!(ready.signal, "SIGWINCH wakes the poll");
-            let received = handlers.take();
-            assert!(received.winch);
-            assert_eq!(received.cancel, None);
-            let ready = wait_ready(handlers.wake(), Duration::ZERO);
-            assert!(!ready.signal, "the wake pipe was drained");
-
-            drop(handlers);
-            assert_eq!(disposition(libc::SIGWINCH), winch_before);
-            // SAFETY: restores SIGHUP's disposition from before the test.
-            unsafe { libc::signal(libc::SIGHUP, hup_before) };
-        }
-
-        #[test]
-        fn poll_timespec_carries_whole_seconds() {
-            let ts = poll_timespec(Duration::from_millis(1500));
-            assert_eq!((ts.tv_sec, ts.tv_nsec), (1, 500_000_000));
-            let ts = poll_timespec(Duration::from_millis(100));
-            assert_eq!((ts.tv_sec, ts.tv_nsec), (0, 100_000_000));
-        }
     }
 }
 

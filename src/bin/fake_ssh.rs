@@ -47,9 +47,12 @@
 //! forward           act as the remote login shell: see `forward`
 //! pump              act as the remote login shell, as real ssh does (Unix
 //!                   only): see `pump`
+//! script            act as the remote tendr of an `attach --host`, playing
+//!                   the lines after this one: see `play`
 //! ```
 //!
-//! Without an `exit`, `forward` or `pump`, it exits 0 after the last action.
+//! Without an `exit`, `forward`, `pump` or `script`, it exits 0 after the
+//! last action.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -70,7 +73,8 @@ fn main() {
             )
         })
     });
-    for line in script.lines().filter(|l| !l.trim().is_empty()) {
+    let mut lines = script.lines().filter(|l| !l.trim().is_empty());
+    while let Some(line) = lines.next() {
         let (action, value) = line.split_once(' ').unwrap_or((line, ""));
         match action {
             "args" => {
@@ -182,6 +186,7 @@ fn main() {
             "give-up-if" => give_up_if(value.to_owned()),
             "forward" => forward(&argv),
             "pump" => pump(&argv),
+            "script" => play(&argv, lines.collect()),
             other => panic!("fake ssh: unknown action {other:?}"),
         }
     }
@@ -257,6 +262,177 @@ fn remote_tendr(argv: &[String]) -> Command {
 /// exiting with its code.
 fn forward(argv: &[String]) -> ! {
     exec(remote_tendr(argv))
+}
+
+/// Act as the remote tendr of an `attach --host`, statelessly, for the
+/// attach client's conformance tests, with no session behind it: say hello
+/// on stderr if asked, skip the remote frame, read the client's first attach
+/// frame, and play the steps of `lines` for it. Each line is `<first>
+/// <step>`, where `<first>` names the first frame: `hello` (an attach or
+/// takeover hello), `watch` (a watch hello) or `resume`. Frames are built
+/// with `attach_proto`, so they are the protocol's own. The steps:
+///
+/// ```text
+/// answer         accept it: `AcceptedV2` at epoch 1 and offset 0 of a new
+///                run for a hello, `Watching` at offset 0 for a watch, and
+///                `Resumed` at the next epoch and the offset asked for, for
+///                a resume
+/// gone <n>       answer a resume `Gone` at the next epoch: the head is <n>
+///                (at least 1) bytes past the offset asked for, of which the
+///                session still holds the last n - 1
+/// output <text>  the session's output (`\n` is a newline): stamped from the
+///                answer's offset under control, plain for a watcher
+/// retire         `Retired` at the next epoch: another client took over
+/// log <path>     from now on append the frames the client sent to <path>,
+///                `{:?}` one per line, its first frame first
+/// await <type>   read the client's frames until one of <type> (the name
+///                of a `Frame` variant, such as `Repaint`) or the end of
+///                its input: `await Repaint` waits until the client relays
+/// drain          read the client's frames until its input ends
+/// drop           say what ssh says when its keepalives go unanswered, then
+///                exit 255 without an exit trailer: the link is lost
+/// exit <code>    exit with <code>, after the exit trailer
+/// ```
+///
+/// After the last step it exits 0, after the exit trailer.
+fn play(argv: &[String], lines: Vec<&str>) -> ! {
+    use std::io::Read;
+    use tendr::attach_proto::{self, Frame, Mode, ResumePoint, WatchPoint};
+    use tendr::model::ids::RunId;
+    use tendr::model::pty_control::ControllerEpoch;
+
+    let has = |flag: &str| argv.iter().any(|a| a == flag);
+    if has("--hello") {
+        eprintln!("{}", tendr::ssh::HELLO_LINE);
+    }
+    let trailer = has("--exit-trailer");
+    let exit = |code: i32| -> ! {
+        if trailer {
+            eprintln!("{}{code}", tendr::ssh::EXIT_TRAILER);
+        }
+        std::process::exit(code)
+    };
+    let next = |epoch: ControllerEpoch| epoch.next().expect("fake ssh: the next epoch");
+
+    let mut stdin = std::io::stdin().lock();
+    let mut len = [0u8; 4];
+    stdin
+        .read_exact(&mut len)
+        .expect("fake ssh: the remote frame's length");
+    let mut header = vec![0; u32::from_be_bytes(len) as usize];
+    stdin
+        .read_exact(&mut header)
+        .expect("fake ssh: the remote frame");
+    let first = attach_proto::read_frame(&mut stdin).expect("fake ssh: the first attach frame");
+    let fresh = ResumePoint {
+        run_id: RunId::new(),
+        epoch: ControllerEpoch::new(1),
+        offset: 0,
+    };
+    let (section, mut point) = match &first {
+        Frame::Hello {
+            mode: Mode::Attach | Mode::Takeover,
+            ..
+        } => ("hello", fresh),
+        Frame::Hello {
+            mode: Mode::Watch, ..
+        } => ("watch", fresh),
+        Frame::Resume(asked) => ("resume", *asked),
+        other => panic!("fake ssh: no script for a first frame {other:?}"),
+    };
+
+    let mut stdout = std::io::stdout().lock();
+    let mut send = |frame: Frame| {
+        // A client that has gone is the test's to notice.
+        let _ = attach_proto::write_frame(&mut stdout, &frame).and_then(|()| stdout.flush());
+    };
+    let mut log: Option<std::fs::File> = None;
+    for line in lines {
+        let (first_name, step) = line
+            .split_once(' ')
+            .expect("fake ssh: script lines are <first> <step>");
+        if first_name != section {
+            continue;
+        }
+        let (step, value) = step.split_once(' ').unwrap_or((step, ""));
+        match step {
+            "answer" => send(match section {
+                "hello" => Frame::AcceptedV2(point),
+                "watch" => Frame::Watching(WatchPoint {
+                    run_id: point.run_id,
+                    offset: point.offset,
+                }),
+                _ => {
+                    point.epoch = next(point.epoch);
+                    Frame::Resumed(point)
+                }
+            }),
+            "gone" => {
+                let skipped: u64 = value.parse().expect("fake ssh: gone <n>");
+                let asked = point.offset;
+                point.epoch = next(point.epoch);
+                point.offset = asked + skipped;
+                send(Frame::Gone {
+                    point,
+                    oldest: asked + 1,
+                });
+            }
+            "output" => {
+                let bytes = unescape(value).into_bytes();
+                if section == "watch" {
+                    send(Frame::Data(bytes));
+                } else {
+                    let offset = point.offset;
+                    point.offset += bytes.len() as u64;
+                    send(Frame::Output { offset, bytes });
+                }
+            }
+            "retire" => send(Frame::Retired(next(point.epoch))),
+            "log" => {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(value)
+                    .unwrap();
+                writeln!(file, "{first:?}").unwrap();
+                log = Some(file);
+            }
+            "await" => {
+                while let Some(frame) = receive(&mut stdin, log.as_mut()) {
+                    if format!("{frame:?}").split(['(', ' ', '{']).next() == Some(value) {
+                        break;
+                    }
+                }
+            }
+            "drain" => while receive(&mut stdin, log.as_mut()).is_some() {},
+            "drop" => {
+                eprint!("Timeout, server box not responding.\r\n");
+                std::process::exit(255)
+            }
+            "exit" => exit(value.parse().unwrap()),
+            other => panic!("fake ssh: unknown script step {other:?}"),
+        }
+    }
+    exit(0)
+}
+
+/// The client's next frame, appended to `log` if there is one; `None` once
+/// its input ends.
+fn receive(
+    stdin: &mut impl std::io::Read,
+    log: Option<&mut std::fs::File>,
+) -> Option<tendr::attach_proto::Frame> {
+    use tendr::attach_proto::{FrameError, read_frame};
+    match read_frame(stdin) {
+        Ok(frame) => {
+            if let Some(log) = log {
+                writeln!(log, "{frame:?}").unwrap();
+            }
+            Some(frame)
+        }
+        Err(FrameError::Io(_)) => None,
+        Err(e) => panic!("fake ssh: the client sent {e:?}"),
+    }
 }
 
 /// Emulate `ssh` as it carries the remote command's streams: run the remote

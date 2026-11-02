@@ -331,6 +331,14 @@ A `push` to a pipe session that is not running exits 1.
     messages. Resize, repaint and detach go ahead of keystrokes.
   - A sender thread writes the queued messages.
   - A reader thread writes output to the terminal.
+- The client core (`src/commands/attach/client.rs`) touches no descriptor,
+  signal or console API. Raw mode, the keyboard, the size, writes to the
+  screen and the signals belong to the terminal layer
+  (`src/commands/attach/terminal.rs`). It takes the terminal's state before
+  anything that may change it starts, ssh included, restores it on every way
+  out, and discards typed-ahead input. Debug builds accept
+  `TENDR_TEST_ATTACH_TERMINAL=<rows>x<cols>`: a test terminal on piped stdio,
+  which the scripted-remote tests (`tests/cli_attach_scripted.rs`) drive.
 - `Ctrl-\ d` detaches. `Ctrl-\` twice sends one `Ctrl-\`. `--escape none`
   disables the escape. Why this escape:
   [design](../design.md#detach-is-a-fixed-two-key-escape).
@@ -400,7 +408,7 @@ tendr that bridges them to the session's socket
   and sends `MSG_RETIRED` itself, so the client exits 81 when it reads again.
 - A version 2 client whose connection ends from the far side, without
   `MSG_RETIRED` and without output outside the protocol, hands ssh's end to
-  a reconnect thread (`commands::attach::unix_relay::reconnect`;
+  a reconnect thread (`commands::attach::client::reconnect`;
   [design](../design.md#a-dropped-attach---host-reconnects-by-itself-judged-by-sshs-exit)):
   - It waits up to 5 s for ssh's exit. The remote's exit code ends the
     attach with that code. ssh's 255 without an exit trailer, ssh killed by

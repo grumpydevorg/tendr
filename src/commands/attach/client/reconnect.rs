@@ -27,7 +27,7 @@ use tendr::ssh::SshError;
 use tendr::term_modes::TermModes;
 
 use super::super::{HostEnd, Resumption, SSH_CLOSE_GRACE};
-use super::{Link, Screen, write_terminal};
+use super::{Link, Screen};
 
 /// The longest pause between two failed attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -272,9 +272,9 @@ impl Status {
                 if screen.done.load(Ordering::SeqCst) {
                     return;
                 }
-                if let Some(size) = super::terminal_size() {
+                if let Some(size) = screen.size() {
                     let notice = ["tendr: read-only attach; typed input is dropped".to_owned()];
-                    write_terminal(&status_rows(&notice, size.rows(), size.cols()));
+                    screen.write_terminal(&status_rows(&notice, size.rows(), size.cols()));
                 }
             });
         }
@@ -337,8 +337,8 @@ impl Status {
         if screen.done.load(Ordering::SeqCst) {
             return;
         }
-        if let Some(size) = super::terminal_size() {
-            write_terminal(&status_rows(&text, size.rows(), size.cols()));
+        if let Some(size) = screen.size() {
+            screen.write_terminal(&status_rows(&text, size.rows(), size.cols()));
             state.drawn = state
                 .drawn
                 .max(u16::try_from(text.len()).unwrap_or(u16::MAX));
@@ -349,7 +349,7 @@ impl Status {
     fn end(&self, screen: &Screen) {
         let mut state = self.lock();
         let _shown = screen.lock();
-        write_terminal(&self.erase(&mut state));
+        screen.write_terminal(&self.erase(&mut state, screen));
     }
 
     /// The session answered the resume from `asked`: erase the status, and
@@ -360,7 +360,7 @@ impl Status {
     fn resumed(&self, screen: &Screen, asked: ResumePoint, resumption: Resumption) {
         let mut state = self.lock();
         let mut shown = screen.lock();
-        let mut out = self.erase(&mut state);
+        let mut out = self.erase(&mut state, screen);
         // The connection is up: what its attempts said is no longer news.
         self.lines().clear();
         if let Resumption::Gone {
@@ -376,7 +376,7 @@ impl Status {
             self.notices().push(notice.trim().to_owned());
         }
         shown.resume = Some(resumption.point());
-        write_terminal(&out);
+        screen.write_terminal(&out);
     }
 
     /// The attach is leaving: erase the status, and turn off the modes the
@@ -384,14 +384,14 @@ impl Status {
     pub(in crate::commands::attach) fn leave(&self, screen: &Screen) {
         let mut state = self.lock();
         let shown = screen.lock();
-        let mut out = self.erase(&mut state);
+        let mut out = self.erase(&mut state, screen);
         out.extend(shown.modes.reset());
-        write_terminal(&out);
+        screen.write_terminal(&out);
     }
 
     /// End the reconnect's display: the bytes that erase its rows, if
     /// drawn.
-    fn erase(&self, state: &mut State) -> Vec<u8> {
+    fn erase(&self, state: &mut State, screen: &Screen) -> Vec<u8> {
         self.discarded.store(false, Ordering::SeqCst);
         state.active = false;
         state.ssh_line = None;
@@ -400,7 +400,7 @@ impl Status {
             return Vec::new();
         }
         let blank = vec![String::new(); usize::from(drawn)];
-        super::terminal_size().map_or_else(Vec::new, |size| {
+        screen.size().map_or_else(Vec::new, |size| {
             status_rows(&blank, size.rows(), size.cols())
         })
     }
