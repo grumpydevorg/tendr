@@ -114,7 +114,7 @@ mod unix {
     use tendr::attach_proto::{self, Frame, FrameError};
 
     use super::super::Control;
-    use super::super::unix_relay::{DETACH_GRACE, Outbox, spawn_sender};
+    use super::super::client::{DETACH_GRACE, Outbox, spawn_sender};
 
     /// How often the bridge checks whether the client has hung up while
     /// both directions are blocked.
