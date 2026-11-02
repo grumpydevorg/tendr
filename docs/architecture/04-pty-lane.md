@@ -97,7 +97,24 @@ flowchart LR
 
 ## The attach handshake
 
-- `attach` must open with a version 1 hello (`MSG_HELLO`).
+- Every connection opens with a hello (`MSG_HELLO`, `[version, mode]`).
+  The sidecar speaks versions 1 and 2 (`attach_proto::Version`); any other
+  version is refused with the protocol class.
+- Version 2 changes only what a viewer (an attach or takeover) receives. A
+  push is answered the same in both versions.
+  - Version 1 accepts with `MSG_ACCEPTED`, the controller epoch, and sends
+    output as plain `MSG_DATA`.
+  - Version 2 accepts with `MSG_ACCEPTED_V2`: `[epoch u64][run id 16
+    bytes][head u64]`, all big-endian. The head is the offset of the first
+    output byte the viewer gets, read under the lock capture appends under,
+    so a viewer that has received no output yet still knows where it
+    stands.
+  - Version 2 sends the run's output as `MSG_OUTPUT`, `[offset u64][bytes]`:
+    the offset of the first byte, counted from the run's start (below,
+    [Output and viewers](#output-and-viewers)). Each frame starts where the
+    last ended. The mode replay is not the run's output and still goes as
+    plain `MSG_DATA`, unstamped.
+  - A version 1 client never receives either new type.
 - A plain attach is refused while a human holds control.
 - `--takeover` replaces the holder, which is disconnected and exits 81. The
   holder is told in one of two ways:
@@ -146,7 +163,7 @@ for people.
   frame. A client never guesses at a refusal.
 - The set of classes is part of the protocol version. The hello carries the
   client's version, and a sidecar sends only the classes that version knows.
-  A new class requires a new `PROTOCOL_VERSION`.
+  A new class requires a new version; versions 1 and 2 know the same four.
 - A refusal sent before the hello is read (another user's peer, no free
   slot) may use only classes every supported version knows.
 
@@ -262,9 +279,20 @@ socket it speaks the same frames over ssh's stdin and stdout, to a remote
 tendr that bridges them to the session's socket
 ([transport boundaries](06-transport-boundaries.md#the-attach-bridge)).
 
-- The handshake is the one above. The remote tendr sends the hello, applies
-  the 10 s reply deadline and classifies the reply, so refusals keep their
-  exit codes; on success it sends the client `MSG_ACCEPTED` with the epoch.
+- The handshake is the one above, and the request agrees its version
+  ([transport boundaries](06-transport-boundaries.md#the-attach-bridge)):
+  the remote tendr speaks version 2 to the sidecar when both ends know it,
+  applies the 10 s reply deadline and classifies the reply, so refusals keep
+  their exit codes. On success it passes the sidecar's acceptance to the
+  client as it came.
+- On a version 2 attach, the client keeps the run, the epoch and the offset
+  just past the last output byte written to the terminal. It moves the
+  offset under the lock it writes the terminal under, once the write has
+  succeeded, so the offset never counts bytes the terminal did not take.
+  Stamped output that does not start at that offset, or any stamped output
+  on a version 1 attach, is a protocol failure: the client restores the
+  terminal and exits 80. The local `attach` speaks version 1: it does not
+  reconnect, so it has no use for offsets.
 - The sidecar keeps the controller epochs and the recording. The bridge only
   passes frames on; it decides nothing about control.
 - A client that stops reading backs up its output through ssh and the
@@ -330,8 +358,10 @@ tendr that bridges them to the session's socket
   there. A viewer whose cursor the ring evicts (it fell 32 MiB behind) is
   disconnected and loses control. Capture never waits for a viewer, so a
   viewer never stalls capture or the child.
-- A viewer gets no recording sequence numbers, so a viewer that disconnects
-  cannot resume from where it stopped. Resumable viewers are step 1 of
+- A version 2 viewer gets each byte's offset ([the attach
+  handshake](#the-attach-handshake)); why offsets and not recording sequence
+  numbers: [design](../design.md#viewers-count-output-in-bytes-and-agree-the-version-in-the-request).
+  A viewer cannot yet resume from where it stopped; that is step 1 of
   [remote frame transport](../plans/active/01_remote-frame-transport.md).
 - Capture also tracks the terminal modes the child's output turns on
   (`term_modes::TermModes`, which lists them): among them the alternate

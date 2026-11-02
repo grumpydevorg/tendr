@@ -696,7 +696,7 @@ or an I/O error.
 |`wrap`|the child's|The wrapped command's code; 6 for an `--event` with a reserved prefix|
 |`query`|DuckDB's|DuckDB's exit code|
 |`guide`, `skill install`|2|Unknown topic; refusing to overwrite a modified skill file|
-|`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not within 10 s (an older or newer `tendr`)|
+|`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not within 10 s (an older or newer `tendr`), or an `attach --host` got output that does not follow on from the last|
 |`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach (also when the attach had stopped reading its output and learns of it only later), or the session's run has ended|
 |`attach`, `push` to a PTY session|82, 83|Reserved, not used yet|
 |`attach`, `push` to a PTY session|84|Runtime or transport: the attach socket is missing or unreachable, the connection fails, or a push ended revoked or stopped with bytes unwritten (stderr gives the byte counts)|

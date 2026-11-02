@@ -129,7 +129,8 @@ pub fn serve() -> anyhow::Result<()> {
         // escape. Only the session's attach socket is on this host.
         RemoteOperation::Attach(r) => {
             let namespace = crate::resolve_namespace(r.namespace)?;
-            crate::commands::cmd_attach_bridge(&r.session, &namespace, r.takeover)
+            let version = tendr::attach_proto::Version::negotiate(r.protocol);
+            crate::commands::cmd_attach_bridge(&r.session, &namespace, r.takeover, version)
         }
         operation => remote_op::dispatch(operation),
     }
@@ -437,7 +438,7 @@ mod tests {
     #[test]
     fn attach_is_carried_and_checked() {
         let operation = decode(
-            br#"{"v":1,"op":"attach","params":{"session":"0x1F&b'$(id)","namespace":"9n|x","takeover":true,"escape":"none"}}"#,
+            br#"{"v":1,"op":"attach","params":{"session":"0x1F&b'$(id)","namespace":"9n|x","takeover":true,"escape":"none","protocol":2}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -458,6 +459,24 @@ mod tests {
             ),
             Err(FrameError::Invalid(msg)) if msg.contains("session name")
         ));
+    }
+
+    /// This client asks for the newest attach protocol; a 0.5.0 client's
+    /// request, which has no `protocol`, gets version 1.
+    #[test]
+    fn an_attach_request_names_its_protocol_and_an_old_one_gets_version_1() {
+        use tendr::attach_proto::Version;
+        let version = |operation| match operation {
+            RemoteOperation::Attach(r) => Version::negotiate(r.protocol),
+            other => panic!("not an attach: {other:?}"),
+        };
+        let sent = encode(&op(&["attach", "s"])).unwrap();
+        assert_eq!(version(read(&sent).unwrap()), Version::V2);
+        let old = decode(
+            br#"{"v":1,"op":"attach","params":{"session":"s","namespace":null,"takeover":false,"escape":"ctrl-backslash"}}"#,
+        )
+        .unwrap();
+        assert_eq!(version(old), Version::V1);
     }
 
     #[cfg(unix)]
