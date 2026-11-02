@@ -85,8 +85,14 @@ impl Job {
     pub(in crate::commands::attach) fn outcome(&self) -> Option<(Option<HostEnd>, Outcome)> {
         match self.done.try_recv() {
             Ok((end, Some(outcome))) => Some((Some(end), outcome)),
-            // Only leaving cancels, and leaving uses `stop`.
-            Ok((end, None)) => Some((Some(end), Outcome::Ended(Ok(0)))),
+            // Only leaving cancels, and leaving uses `stop`; otherwise there
+            // was no resume point to start from.
+            Ok((end, None)) => Some((
+                Some(end),
+                Outcome::Ended(Err(anyhow::anyhow!(
+                    "tendr: the connection was lost, and there is no point to resume from"
+                ))),
+            )),
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some((
                 None,
@@ -208,9 +214,13 @@ pub(in crate::commands::attach) struct Status {
     /// Held while drawing, so draws and erases do not interleave.
     state: Mutex<State>,
     /// The current attempt's stderr lines, for the report if the remote ends
-    /// the attach. Never held while writing, so the main thread can take
-    /// them when leaving whatever the terminal does.
+    /// the attach: its reason is among them. Like `notices`, never held
+    /// while writing, so the main thread can take them when leaving
+    /// whatever the terminal does.
     lines: Mutex<Vec<String>>,
+    /// The gone notices, said again once the terminal is restored, since a
+    /// program on the alternate screen hides them.
+    notices: Mutex<Vec<String>>,
     /// Typed input was discarded during this reconnect. Set by the main
     /// thread, which never waits on `state`.
     discarded: AtomicBool,
@@ -232,6 +242,10 @@ struct State {
 impl Status {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn notices(&self) -> MutexGuard<'_, Vec<String>> {
+        self.notices.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lines(&self) -> MutexGuard<'_, Vec<String>> {
@@ -324,6 +338,8 @@ impl Status {
         let mut state = self.lock();
         let mut shown = screen.lock();
         let mut out = self.erase(&mut state);
+        // The connection is up: what its attempts said is no longer news.
+        self.lines().clear();
         if let Resumption::Gone {
             point: head,
             oldest,
@@ -332,7 +348,9 @@ impl Status {
             out.extend(shown.modes.reset());
             shown.modes = TermModes::default();
             screen.bracketed_paste.store(false, Ordering::SeqCst);
-            out.extend(gone_notice(asked.offset, oldest, head.offset).as_bytes());
+            let notice = gone_notice(asked.offset, oldest, head.offset);
+            out.extend(notice.as_bytes());
+            self.notices().push(notice.trim().to_owned());
         }
         shown.resume = Some(resumption.point());
         write_terminal(&out);
@@ -353,6 +371,7 @@ impl Status {
     fn erase(&self, state: &mut State) -> Vec<u8> {
         self.discarded.store(false, Ordering::SeqCst);
         state.active = false;
+        state.ssh_line = None;
         let drawn = std::mem::take(&mut state.drawn);
         if drawn == 0 {
             return Vec::new();
@@ -363,9 +382,12 @@ impl Status {
         })
     }
 
-    /// The last attempt's stderr lines, which the remote's refusal is among.
+    /// What to say once the terminal is restored: the gone notices, then the
+    /// stderr of the attempt whose remote ended the attach.
     pub(in crate::commands::attach) fn take_lines(&self) -> Vec<String> {
-        std::mem::take(&mut self.lines())
+        let mut said = std::mem::take(&mut *self.notices());
+        said.append(&mut self.lines());
+        said
     }
 }
 

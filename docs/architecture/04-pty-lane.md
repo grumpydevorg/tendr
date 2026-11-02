@@ -381,9 +381,10 @@ tendr that bridges them to the session's socket
   - On `MSG_RESUMED` the new connection relays from the same offset. On
     `MSG_GONE` the client first writes the reset of the modes it tracked
     and a notice of how many bytes it missed and how many the session no
-    longer held, then relays the replay and the output from the head. Either
-    way it then sends its size and the repaint nudge, the size first so the
-    nudge can apply.
+    longer held, then relays the replay and the output from the head; the
+    notice is printed again once the terminal is restored, since a program
+    on the alternate screen covers it. Either way it then sends its size and
+    the repaint nudge, the size first so the nudge can apply.
 - A Windows client still runs the remote `tendr attach` under `ssh -t`; the
   remote end then is the client described above, driving a remote terminal.
 

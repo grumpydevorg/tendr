@@ -335,6 +335,8 @@ sidecar; otherwise the attach ends as before, with ssh's exit.
   while you were away, tendr says how many bytes you missed and how many the
   session no longer held, turns off the terminal modes the program had set,
   and shows the session from then on, with its current modes and a redraw.
+  A full-screen program covers that notice at once, so tendr repeats it when
+  the attach ends.
 - The reconnect is refused, ending the attach with 81 and the remote's
   reason, if someone took the terminal (an attach, a takeover, or an agent's
   `push` still running), or if the session's run has ended. A session started

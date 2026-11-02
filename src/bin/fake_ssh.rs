@@ -128,7 +128,9 @@ fn main() {
                     .append(true)
                     .open(value)
                     .unwrap();
-                writeln!(file, "{millis} {}", argv.join(" ")).unwrap();
+                // One write, so a reader never sees half a line.
+                let line = format!("{millis} {}\n", argv.join(" "));
+                file.write_all(line.as_bytes()).unwrap();
             }
             "needs-prompt" => {
                 if std::path::Path::new(value).exists() {

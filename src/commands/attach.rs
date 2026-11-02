@@ -288,7 +288,8 @@ pub(super) enum Opened<A> {
 /// Start ssh with `request` (the remote frame and what replaces the hello),
 /// read the session's answer, and let `answer` classify it. A remote side
 /// that ends without answering is [`Opened::Ended`] with its exit code (84
-/// if it claims success); an answer `answer` refuses stops ssh.
+/// if it claims success); an answer `answer` refuses stops ssh. Setting the
+/// dial's `cancel` stops ssh at any point before the answer.
 ///
 /// # Errors
 /// `answer`'s error, and the ssh failures of [`tendr::ssh::AttachSsh`].
@@ -301,14 +302,22 @@ fn open_host<A>(
 ) -> anyhow::Result<Opened<A>> {
     use tendr::ssh::{AttachSsh, AttachStart, SshError};
 
+    let cancel = std::sync::Arc::clone(&dial.cancel);
     let (ssh, stdin, stdout) = match AttachSsh::start(host, request, dial)? {
         AttachStart::Running { ssh, stdin, stdout } => (ssh, stdin, stdout),
         AttachStart::Ended(code) => return unanswered(code).map(Opened::Ended),
     };
     // A refusal or a failure of the remote side's own ends the connection,
-    // and its exit code says which.
+    // and its exit code says which. The answer is waited for where a cancel
+    // can stop it: the link may freeze after the hello, and without a
+    // connect deadline there is no hello at all.
     let mut reader = std::io::BufReader::new(stdout);
-    match attach_proto::read_frame(&mut reader) {
+    let reply = if readable_unless(reader.get_ref(), &cancel) {
+        attach_proto::read_frame(&mut reader)
+    } else {
+        Err(FrameError::Io(std::io::ErrorKind::Interrupted.into()))
+    };
+    match reply {
         Err(FrameError::Io(_)) => {
             drop(stdin);
             match ssh.finish(None) {
@@ -325,6 +334,29 @@ fn open_host<A>(
                 Err(e)
             }
         },
+    }
+}
+
+/// Wait until `stdout` has something to read, or has closed: `true`; or
+/// until `cancel` is set: `false`.
+#[cfg(unix)]
+fn readable_unless(
+    stdout: &impl std::os::fd::AsFd,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> bool {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let tick = Timespec {
+        tv_sec: 0,
+        tv_nsec: 20_000_000,
+    };
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let mut fds = [PollFd::new(stdout, PollFlags::IN)];
+        if matches!(poll(&mut fds, Some(&tick)), Ok(n) if n > 0) {
+            return true;
+        }
     }
 }
 

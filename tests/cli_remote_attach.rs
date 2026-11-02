@@ -973,7 +973,19 @@ impl Flaky {
 
     /// `tendr --host box attach <args>` in a fresh terminal.
     fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
-        attach_through(&self.ssh, "30", root, label, args, &[])
+        self.attach_with_deadline("30", root, label, args)
+    }
+
+    /// [`Flaky::attach`] with a connect deadline of `deadline` seconds; `0`
+    /// turns it off, so no hello marks the remote tendr's start.
+    fn attach_with_deadline(
+        &self,
+        deadline: &str,
+        root: &TempDir,
+        label: &str,
+        args: &[&str],
+    ) -> WrappedAttach {
+        attach_through(&self.ssh, deadline, root, label, args, &[])
     }
 
     /// Turn the `prompt` or `stall` behaviour on or off for later calls.
@@ -1308,7 +1320,9 @@ fn host_reconnect_after_the_run_ended_exits_81() {
 }
 
 /// The escape and a signal still leave while the attach is reconnecting,
-/// and stop the ssh of the attempt under way.
+/// and stop the ssh of the attempt under way: one waiting for the remote's
+/// hello, and one waiting for its answer with no hello to wait for (the
+/// connect deadline off).
 #[test]
 fn host_escape_or_signal_while_reconnecting_leaves_and_stops_ssh() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1318,7 +1332,7 @@ fn host_escape_or_signal_while_reconnecting_leaves_and_stops_ssh() {
     let link = Flaky::new();
 
     // The escape: exit 0.
-    let mut wrapped = link.attach(&root, "gap-escape", &["host-gap-leave"]);
+    let mut wrapped = link.attach_with_deadline("0", &root, "gap-escape", &["host-gap-leave"]);
     wrapped
         .cli
         .type_until_logged(&root, "host-gap-leave", "escape-client\n");
