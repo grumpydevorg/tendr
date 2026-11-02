@@ -38,6 +38,8 @@ struct Client {
     keyboard: Option<ChildStdin>,
     screen: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    /// The threads collecting them, done once both pipes are closed.
+    collectors: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Client {
@@ -65,15 +67,16 @@ impl Client {
                 .stdin(Stdio::null());
         }
         let mut child = command.spawn().unwrap();
-        let collect = |mut from: Box<dyn Read + Send>| {
+        let mut collectors = Vec::new();
+        let mut collect = |mut from: Box<dyn Read + Send>| {
             let into = Arc::new(Mutex::new(Vec::new()));
             let shared = Arc::clone(&into);
-            std::thread::spawn(move || {
+            collectors.push(std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 while let Ok(n @ 1..) = from.read(&mut buf) {
                     shared.lock().unwrap().extend_from_slice(&buf[..n]);
                 }
-            });
+            }));
             into
         };
         let screen = collect(Box::new(child.stdout.take().unwrap()));
@@ -83,6 +86,7 @@ impl Client {
             child,
             screen,
             stderr,
+            collectors,
         }
     }
 
@@ -116,6 +120,8 @@ impl Client {
         .unwrap_or_else(|e| panic!("never showed {needles:?}: {e}"));
     }
 
+    /// Wait for the client to exit, and for what it wrote before exiting
+    /// to be collected: the pipes may still hold it when it has exited.
     fn wait_exit(&mut self) -> i32 {
         let status = poll_until(WAIT, Duration::from_millis(20), || {
             match self.child.try_wait().unwrap() {
@@ -127,6 +133,18 @@ impl Client {
             let _ = self.child.kill();
             panic!("the client never exited: {e}; stderr: {}", self.stderr())
         });
+        poll_until(WAIT, Duration::from_millis(20), || {
+            if self
+                .collectors
+                .iter()
+                .all(std::thread::JoinHandle::is_finished)
+            {
+                Observation::Ready(())
+            } else {
+                Observation::Pending("its output pipes are still open".into())
+            }
+        })
+        .unwrap_or_else(|e| panic!("the client's output never ended: {e}"));
         status.code().expect("the client exited with a code")
     }
 }
