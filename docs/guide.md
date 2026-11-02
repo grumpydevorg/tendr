@@ -359,7 +359,10 @@ sidecar; otherwise the attach ends as before, with ssh's exit.
   after the approval is renewed.
 - Attempts follow each other with pauses of 1, 2, 4, 8 and 16 s, then every
   30 s, for as long as it takes. `Ctrl-\ d`, SIGTERM, SIGHUP and SIGINT still
-  leave (0, or 1 for a signal), and stop the attempt under way. The old
+  leave (0, or 1 for a signal), and so on Windows do Ctrl-Break, closing the
+  console window, and a Ctrl-C event another program raises (1); each stops
+  the attempt under way. A signal or Ctrl-Break that also ends ssh still
+  leaves with 1: the attach does not reconnect for it. The old
   connection may still hold the session until the remote host notices it is
   gone; attach again with `--takeover` then.
 - Output the session wrote meanwhile arrives in full, once, as if the
@@ -384,6 +387,10 @@ sidecar; otherwise the attach ends as before, with ssh's exit.
 - When a run ends, everything it wrote reaches every attached client before
   the session closes the connections, even one that was behind; a client
   that has not taken it all within 2 s is cut off where it is.
+- On Windows, `ssh.exe` ended by Windows (an NTSTATUS exit such as
+  `0xC000013A`, or a crash) or killed (Task Manager's exit 1) is a dropped
+  connection too, and the attach reconnects: the remote `tendr` always
+  reports its own exit code, so an exit without that report is ssh's own.
 
 The escape works with the legacy `Ctrl-\` byte, the kitty keyboard protocol
 (which Claude Code can switch Ghostty, kitty, WezTerm and foot to) and xterm's

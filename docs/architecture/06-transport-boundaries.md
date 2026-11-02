@@ -114,7 +114,8 @@ travels on stderr:
   writes `tendr-exit <code>` as the last stderr line and exits with the
   code. The wrapper covers every exit path, panics included, and never reads
   stdin; the child writes the hello. The flag is accepted only before the
-  subcommand. A child killed by a signal gets no trailer.
+  subcommand. A child killed by a signal gets no trailer, and the wrapper
+  exits 128 + the signal.
 - The client's stderr relay (`src/ssh.rs`) holds back only a line that may be
   the trailer, and only while it is the last thing that arrived. A
   `tendr-exit <int>` line followed by anything else is the command's own
@@ -122,6 +123,18 @@ travels on stderr:
   code becomes the call's exit code.
 - Without a trailer the client falls back to ssh's status. ssh's 255 without
   a trailer is a connection failure; a trailer of 255 is the remote's code.
+- So the Unix remote an attach runs on never ends with 1 and no trailer:
+  the wrapper writes one for every code it gets, a command line it cannot
+  parse exits 2, and a shell that cannot find tendr exits 127. On a Windows
+  client an attach whose connection has been up therefore reads ssh.exe's
+  1 without a trailer, at the connection's end or on a reconnect's dial, as
+  ssh.exe killed (`TerminateProcess`, as Task Manager uses it, gives 1).
+  A Windows client also reads an NTSTATUS exit (such as `0xC000013A` after
+  Ctrl-C or Ctrl-Break), for any call, as ssh.exe ended by Windows, as a
+  signal ends it on Unix (`ssh::classify`). Other calls, and an attach's
+  first dial, keep a 1 without a trailer: a PowerShell login shell gives it
+  for a tendr that fails before its wrapper runs (too old for
+  `--exit-trailer`), with the remote's message. A Unix client keeps it too.
 
 ### The attach bridge
 
@@ -230,8 +243,9 @@ command line as the other operations, and keeps the terminal on the client
 - When the connection ends from the far side, the client takes ssh's exit
   within 5 s. The remote's code, from its exit trailer, is the remote's
   verdict, and the client exits with it. ssh's 255 without a trailer, ssh
-  killed by a signal, or ssh still running after the 5 s is a lost link: a
-  version 2 attach reconnects and resumes
+  killed (a signal; on Windows, an NTSTATUS exit or 1 without a trailer, as
+  [above](#the-exit-trailer)), or ssh still running after the 5 s is a lost
+  link: a version 2 attach reconnects and resumes
   ([04-pty-lane.md](04-pty-lane.md#attaching-over---host)), and a version 1
   attach exits as before (1 for ssh's 255). A reconnect runs the same remote
   command with `-o BatchMode=yes` added ([What ssh is given](#what-ssh-is-given)),

@@ -20,19 +20,15 @@
 
 mod harness;
 
-use harness::{Observation, poll_until};
+use harness::{Observation, poll_until, process_alive};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::STILL_ACTIVE;
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
-};
-use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// Create a named Job Object with the given limit flags. Returns an
@@ -75,23 +71,6 @@ fn create_named_job_with_limits(name: &str, limit_flags: u32) -> OwnedHandle {
     // SAFETY: `job` is a valid kernel HANDLE owned by this scope; transferring
     // ownership to OwnedHandle so Drop calls CloseHandle exactly once.
     unsafe { OwnedHandle::from_raw_handle(job as _) }
-}
-
-/// Returns true iff the process with `pid` is currently alive.
-fn process_alive(pid: u32) -> bool {
-    // SAFETY: OpenProcess/GetExitCodeProcess/CloseHandle are safe to call
-    // with these args; `h` is checked for null before further use; the
-    // handle is closed exactly once on the (single) success path.
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h.is_null() {
-            return false;
-        }
-        let mut code: u32 = 0;
-        let ok = GetExitCodeProcess(h, &mut code);
-        windows_sys::Win32::Foundation::CloseHandle(h);
-        ok != 0 && code == STILL_ACTIVE as u32
-    }
 }
 
 /// Wait up to `timeout` for `pid` to die. Returns `true` if it died within

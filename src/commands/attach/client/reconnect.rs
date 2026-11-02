@@ -3,9 +3,10 @@
 //!
 //! The far side ended the connection. ssh's end says whose doing that was:
 //! the remote's exit code is its verdict, and the attach ends with it. ssh
-//! failing (255 without an exit trailer), killed by a signal, or still
-//! running [`SSH_CLOSE_GRACE`](super::super::SSH_CLOSE_GRACE) after its
-//! output ended is a lost link. Then the old reader is joined, so the resume
+//! failing (255 without an exit trailer), killed (by a signal on Unix; on
+//! Windows, an NTSTATUS exit or 1 without a trailer), or still running
+//! [`SSH_CLOSE_GRACE`](super::super::SSH_CLOSE_GRACE) after its output ended
+//! is a lost link. Then the old reader is joined, so the resume
 //! point is final, and attempts follow, each a new ssh that never prompts,
 //! with a growing pause between failed ones, until one resumes, the remote
 //! refuses (its exit code ends the attach), or the user leaves.
@@ -176,7 +177,8 @@ fn reconnect(
 
 /// Whether `error` is the link failing rather than the remote ending: ssh
 /// failing to connect or stay connected (255 without an exit trailer),
-/// killed by a signal, or not getting through to the remote tendr in time.
+/// killed ([`SshError::Abnormal`]), or not getting through to the remote
+/// tendr in time.
 fn lost_link(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<SshError>(),

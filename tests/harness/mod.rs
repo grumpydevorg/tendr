@@ -529,6 +529,29 @@ pub fn wait_pid_dead(pid: i32) {
         .unwrap_or_else(|e| panic!("waiting for pid {pid} to die: {e}"))
 }
 
+/// Whether the process with `pid` is still running.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: OpenProcess/GetExitCodeProcess/CloseHandle are safe to call
+    // with these args; `h` is checked for null before further use; the
+    // handle is closed exactly once on the (single) success path.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code == STILL_ACTIVE as u32
+    }
+}
+
 /// Proof that a session is terminal and its sidecar has released ownership.
 ///
 /// Construction is private: callers can only obtain this guard through

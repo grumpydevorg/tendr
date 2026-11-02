@@ -295,9 +295,14 @@ fn forward(argv: &[String]) -> ! {
 /// await <type>   read the client's frames until one of <type> (the name
 ///                of a `Frame` variant, such as `Repaint`) or the end of
 ///                its input: `await Repaint` waits until the client relays
+/// await-typed <hex>
+///                read the client's frames until the keystrokes they carried
+///                since this step began hold these bytes (two hex digits
+///                each), or its input ends
 /// drain          read the client's frames until its input ends
-/// drop           say what ssh says when its keepalives go unanswered, then
-///                exit 255 without an exit trailer: the link is lost
+/// drop [<code>]  say what ssh says when its keepalives go unanswered, then
+///                exit <code> (default 255; a u32, so an NTSTATUS such as
+///                3221225786 fits) without an exit trailer: the link is lost
 /// exit <code>    exit with <code>, after the exit trailer
 /// ```
 ///
@@ -405,11 +410,7 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                 let bytes = if step == "output" {
                     unescape(value).into_bytes()
                 } else {
-                    (0..value.len())
-                        .step_by(2)
-                        .map(|i| u8::from_str_radix(&value[i..i + 2], 16))
-                        .collect::<Result<_, _>>()
-                        .expect("fake ssh: output-hex <hex>")
+                    hex(value)
                 };
                 let offset = point.offset;
                 point.offset += bytes.len() as u64;
@@ -438,16 +439,42 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                     }
                 }
             }
+            "await-typed" => {
+                let wanted = hex(value);
+                let mut typed = Vec::new();
+                while let Some(frame) = receive(&mut stdin, log.as_mut()) {
+                    if let Frame::Data(bytes) = frame {
+                        typed.extend(bytes);
+                        if typed.windows(wanted.len()).any(|w| w == wanted) {
+                            break;
+                        }
+                    }
+                }
+            }
             "drain" => while receive(&mut stdin, log.as_mut()).is_some() {},
             "drop" => {
                 eprint!("Timeout, server box not responding.\r\n");
-                std::process::exit(255)
+                let code = if value.is_empty() {
+                    255
+                } else {
+                    value.parse::<u32>().expect("fake ssh: drop <code>")
+                };
+                std::process::exit(code as i32)
             }
             "exit" => exit(value.parse().unwrap()),
             other => panic!("fake ssh: unknown script step {other:?}"),
         }
     }
     exit(0)
+}
+
+/// `text` as bytes, two hex digits each.
+fn hex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16))
+        .collect::<Result<_, _>>()
+        .expect("fake ssh: hex bytes")
 }
 
 /// The client's next frame, appended to `log` if there is one; `None` once
