@@ -836,11 +836,17 @@ fn wait_relay(
 /// is terminated at once, and an attach client restores the console it
 /// shared with ssh itself.
 fn stop(child: &mut std::process::Child) {
+    // An ssh already reaped (a Watch that saw it exit after its hello) has
+    // nothing to stop, and its pid may have been reused.
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
     #[cfg(unix)]
     {
         if let Ok(pid) = i32::try_from(child.id()) {
-            // SAFETY: `pid` is our own unreaped child, so it cannot have been
-            // reused; SIGTERM has no memory-safety implications.
+            // SAFETY: `pid` is our own child, unreaped as just checked, so it
+            // cannot have been reused; SIGTERM has no memory-safety
+            // implications.
             unsafe { libc::kill(pid, libc::SIGTERM) };
             let until = Instant::now() + Duration::from_secs(1);
             while Instant::now() < until {
