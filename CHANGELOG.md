@@ -18,9 +18,9 @@
   the status line, and reconnecting after a dropped connection. It needs
   Windows Terminal or a conhost window on Windows 10 1809 or later; a
   console without virtual terminal support ("Use legacy console") and
-  mintty are refused before ssh starts. Closing the console window, or a
-  Ctrl-C or Ctrl-Break event another program raises, ends it with exit 1;
-  Ctrl-C typed at the keyboard goes to the session. The remote host needs
+  mintty are refused before ssh starts. Closing the console window,
+  Ctrl-Break, or a Ctrl-C event another program raises, ends it with exit
+  1; Ctrl-C typed at the keyboard goes to the session. The remote host needs
   the attach bridge (0.5.0 or newer; 0.6.0 to reconnect).
 
 - **`attach --read-only` streams to a pipe.** With no terminal, it writes

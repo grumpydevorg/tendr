@@ -317,7 +317,7 @@ concurrent `push` is refused, not interleaved.
   `--read-only`, attach still needs a terminal.
 - SIGTERM, SIGHUP or SIGINT (closing the window sends SIGHUP) also detach. It
   exits 1 with `tendr: attach ended by SIGTERM` (or the signal received). On
-  Windows, closing the console window, or a Ctrl-C or Ctrl-Break event that
+  Windows, closing the console window, Ctrl-Break, or a Ctrl-C event that
   another program raises in the console, does the same
   (`tendr: attach ended by CTRL_BREAK_EVENT`); Ctrl-C typed at the keyboard
   goes to the session.

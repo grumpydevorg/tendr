@@ -19,10 +19,11 @@
 //!   session's output need not be.
 //! - A console that cannot take these modes (before Windows 10 1809, or with
 //!   "Use legacy console" set) is refused before anything starts.
-//! - `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` (raised by another program, since
-//!   the keyboard's Ctrl-C is a byte) leave ([`Input::Leave`]); so does
-//!   `CTRL_CLOSE_EVENT`, whose handler waits for the console to be put back
-//!   before Windows ends the process. `WINDOW_BUFFER_SIZE_EVENT` brings the
+//! - `CTRL_C_EVENT` from another program, `CTRL_BREAK_EVENT` (the keyboard's
+//!   Ctrl-Break, or another program's) and `CTRL_CLOSE_EVENT` leave
+//!   ([`Input::Leave`]); the close event's handler waits for the console to
+//!   be put back before Windows ends the process. The keyboard's Ctrl-C is a
+//!   byte for the session. `WINDOW_BUFFER_SIZE_EVENT` brings the
 //!   next size check forward ([`Input::SizeDue`]).
 
 use std::io;
@@ -445,6 +446,11 @@ struct Key {
 /// The Alt key's virtual-key code.
 const VK_MENU: u16 = 0x12;
 
+/// The virtual-key code conhost gives the NUL it makes of Ctrl-Space under
+/// virtual terminal input (`VkKeyScanW(0)` is -1); older consoles give 0.
+/// No key reports either.
+const VK_NONE: u16 = 0xFF;
+
 /// UTF-16 code units from key events → UTF-8. A character outside the
 /// Basic Multilingual Plane comes as two events, or two reads, one code unit
 /// each; a unit without its partner becomes U+FFFD.
@@ -457,10 +463,17 @@ struct Decoder {
 impl Decoder {
     /// Append what `key` types to `out`. A key press types its character
     /// `repeat` times; a release types nothing, except Alt's after an
-    /// Alt-numpad entry, which carries the character entered.
+    /// Alt-numpad entry, which carries the character entered. A press with
+    /// neither a character nor a key is Ctrl-Space: the NUL.
     fn key(&mut self, key: Key, out: &mut Vec<u8>) {
         let types = key.down || key.virtual_key == VK_MENU;
-        if !types || key.unit == 0 {
+        if !types {
+            return;
+        }
+        if key.unit == 0 {
+            if key.down && matches!(key.virtual_key, 0 | VK_NONE) {
+                out.extend(std::iter::repeat_n(0u8, usize::from(key.repeat.max(1))));
+            }
             return;
         }
         for _ in 0..key.repeat.max(1) {
@@ -552,8 +565,8 @@ mod ctrl {
         }
     }
 
-    /// Ctrl-C and Ctrl-Break raised by another program, and the console
-    /// window closing, leave. Logoff and shutdown reach services only.
+    /// Ctrl-Break, Ctrl-C raised by another program, and the console window
+    /// closing, leave. Logoff and shutdown reach services only.
     unsafe extern "system" fn on_event(event: u32) -> i32 {
         if !matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
             return 0;
@@ -723,6 +736,23 @@ mod tests {
             raw_input_mode(ENABLE_PROCESSED_INPUT) & ENABLE_PROCESSED_INPUT,
             0
         );
+    }
+
+    #[test]
+    fn ctrl_space_is_a_nul_for_the_session() {
+        let mut decoder = Decoder::default();
+        let nul = Key {
+            virtual_key: VK_NONE,
+            ..press(0)
+        };
+        let older = Key {
+            virtual_key: 0,
+            repeat: 2,
+            ..press(0)
+        };
+        assert_eq!(typed(&mut decoder, &[nul, older]), [0, 0, 0]);
+        let released = Key { down: false, ..nul };
+        assert!(typed(&mut decoder, &[released]).is_empty());
     }
 
     #[test]

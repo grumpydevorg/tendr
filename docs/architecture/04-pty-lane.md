@@ -475,12 +475,14 @@ tendr that bridges them to the session's socket
     and an event the control handler sets. Key presses give their UTF-16
     character `wRepeatCount` times, joined into UTF-8 across events and
     reads; releases give nothing, except Alt's after an Alt-numpad entry.
-    A batch of records with no typing is not the end of input.
+    A batch of records with no typing is not the end of input. A press
+    with neither a character nor a key is Ctrl-Space, sent as NUL.
   - Output is written with `WriteFile` under the UTF-8 output code page,
     so session output that is not UTF-8 is shown, not refused as Rust's
     console `Stdout` would. The size is the visible window (`srWindow`).
-  - `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` raised by another program in the
-    console, and `CTRL_CLOSE_EVENT`, end the attach as the Unix signals do
+  - `CTRL_BREAK_EVENT` (the keyboard's Ctrl-Break, or another program's),
+    `CTRL_C_EVENT` raised by another program in the console, and
+    `CTRL_CLOSE_EVENT` end the attach as the Unix signals do
     (`tendr: attach ended by CTRL_BREAK_EVENT`). The close event's handler
     waits, under Windows's 5 s limit, until the console has been put back.
   - Restoring discards typed-ahead input (`FlushConsoleInputBuffer`).
