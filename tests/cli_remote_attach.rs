@@ -1561,3 +1561,16 @@ fn host_reconnected_attach_taken_over_while_stalled_exits_81() {
     assert_eq!(second.wait_exit(Duration::from_secs(15)), 0);
     second.assert_terminal_restored();
 }
+
+/// A read-only `attach --host` is not bridged yet: it is refused as a usage
+/// error (2) before ssh runs, rather than sending a watch hello.
+#[test]
+fn a_read_only_host_attach_is_refused_before_ssh() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let remote = Remote::new();
+    let wrapped = remote.attach(&root, "ro-host", &["any", "--read-only"]);
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 2);
+    wrapped.assert_terminal_restored();
+    assert!(!remote.argv.exists(), "ssh ran");
+}

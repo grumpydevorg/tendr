@@ -57,7 +57,7 @@ remote login shell, whether that is bash, `cmd.exe` or PowerShell:
 |---|---|---|
 | `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, and `attach` from a Unix client | `ssh -T … tendr [--hello] --exit-trailer _remote` | The remote frame on ssh stdin |
 | `exec` | `ssh -T … tendr [--hello] --exit-trailer exec --frame-from-stdin` | The exec frame on ssh stdin |
-| `attach` from a Windows client | `ssh -t … tendr attach <name> [--namespace <ns>] [--takeover] [--escape none]` | The command line itself |
+| `attach` from a Windows client | `ssh -t … tendr attach <name> [--namespace <ns>] [--takeover \| --read-only] [--escape none]` | The command line itself |
 
 ### The remote frame
 

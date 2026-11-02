@@ -64,6 +64,13 @@ pub const MSG_RESUMED: u8 = 0x0d;
 /// `oldest` up to `head`. The mode replay follows as unstamped [`MSG_DATA`],
 /// then the output from `head`, stamped.
 pub const MSG_GONE: u8 = 0x0e;
+/// Sidecar → watcher: admitted as a read-only viewer, in reply to a
+/// [`Mode::Watch`] hello of either version. Payload: a [`WatchPoint`],
+/// `[run id 16 bytes][head u64 BE]`. It carries no controller epoch: a
+/// watcher holds no control and is never retired by a takeover. A version 2
+/// watcher then gets its output stamped from the head; a version 1 watcher
+/// gets it plain. Only a client that sends a watch hello receives it.
+pub const MSG_WATCHING: u8 = 0x0f;
 
 /// The attach protocol version carried in [`MSG_HELLO`]. The discriminant is
 /// the wire byte.
@@ -120,6 +127,35 @@ pub struct ResumePoint {
     pub offset: u64,
 }
 
+/// Where a watcher stands in its run: the run, and the offset of the next
+/// output byte it has not yet received. Unlike a [`ResumePoint`] it has no
+/// epoch, so nothing a watcher sends can name a controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchPoint {
+    pub run_id: RunId,
+    pub offset: u64,
+}
+
+impl WatchPoint {
+    fn encode(self) -> [u8; 24] {
+        let mut buf = [0u8; 24];
+        buf[0..16].copy_from_slice(self.run_id.as_uuid().as_bytes());
+        buf[16..24].copy_from_slice(&self.offset.to_be_bytes());
+        buf
+    }
+
+    fn decode(payload: &[u8], what: &'static str) -> Result<Self, ProtocolError> {
+        let malformed = ProtocolError::Malformed(what);
+        let bytes: &[u8; 24] = payload.try_into().map_err(|_| malformed)?;
+        let (run_id, offset) = bytes.split_at(16);
+        let run_id = uuid::Uuid::from_slice(run_id).map_err(|_| malformed)?;
+        Ok(Self {
+            run_id: RunId::from_v7(run_id).ok_or(malformed)?,
+            offset: u64::from_be_bytes(offset.try_into().expect("8 bytes")),
+        })
+    }
+}
+
 impl ResumePoint {
     fn encode(self) -> [u8; 32] {
         let mut buf = [0u8; 32];
@@ -156,6 +192,11 @@ pub enum Mode {
     /// [`Frame::Data`], ends it with [`Frame::Detach`], and receives a
     /// [`Frame::InputDone`] outcome. No output is sent to a push connection.
     Push = 3,
+    /// A read-only viewer: receives the output beside the controller and
+    /// never holds or changes control. Answered with [`Frame::Watching`];
+    /// the sidecar drops its input, resizes and repaints. A sidecar from
+    /// before it refuses the hello with the protocol class.
+    Watch = 4,
 }
 
 impl TryFrom<u8> for Mode {
@@ -166,6 +207,7 @@ impl TryFrom<u8> for Mode {
             1 => Ok(Self::Attach),
             2 => Ok(Self::Takeover),
             3 => Ok(Self::Push),
+            4 => Ok(Self::Watch),
             _ => Err(ProtocolError::UnsupportedHello),
         }
     }
@@ -334,6 +376,8 @@ pub enum Frame {
     Retired(ControllerEpoch),
     /// Sidecar → push client: the push's outcome.
     InputDone(PushOutcome),
+    /// Sidecar → watcher: admitted read-only, at this point of the run.
+    Watching(WatchPoint),
 }
 
 /// A frame whose payload does not fit its type.
@@ -413,6 +457,7 @@ impl Frame {
             },
             MSG_RETIRED => Self::Retired(epoch("retired")?),
             MSG_INPUT_DONE => Self::InputDone(PushOutcome::decode(&payload)?),
+            MSG_WATCHING => Self::Watching(WatchPoint::decode(&payload, "watching")?),
             other => return Err(ProtocolError::UnknownType(other)),
         })
     }
@@ -449,6 +494,7 @@ pub fn write_frame(w: &mut impl Write, frame: &Frame) -> io::Result<()> {
         }
         Frame::Retired(epoch) => write_msg(w, MSG_RETIRED, &epoch.get().to_be_bytes()),
         Frame::InputDone(outcome) => write_msg(w, MSG_INPUT_DONE, &outcome.encode()),
+        Frame::Watching(point) => write_msg(w, MSG_WATCHING, &point.encode()),
     }
 }
 
@@ -645,8 +691,49 @@ mod tests {
                 point,
                 oldest: point.offset,
             },
+            Frame::Hello {
+                version: Version::V1,
+                mode: Mode::Watch,
+            },
+            Frame::Watching(WatchPoint {
+                run_id: point.run_id,
+                offset: 1 << 41,
+            }),
         ] {
             assert_eq!(round_trip(&frame), frame);
+        }
+    }
+
+    /// The watch accept is `[run id][head]`, big-endian, with no epoch; a
+    /// payload of another length, or whose run id is not a v7 UUID, does not
+    /// decode.
+    #[test]
+    fn the_watch_accept_keeps_its_wire_format() {
+        let run_id = RunId::new();
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &Frame::Watching(WatchPoint {
+                run_id,
+                offset: 0x0304,
+            }),
+        )
+        .unwrap();
+        let mut payload = run_id.as_uuid().as_bytes().to_vec();
+        payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 3, 4]);
+        assert_eq!(bytes, frame(0x0f, 24, &payload));
+
+        let mut not_v7 = payload.clone();
+        not_v7[..16].copy_from_slice(uuid::Uuid::from_u128(1).as_bytes());
+        for bad in [
+            payload[..23].to_vec(),
+            [payload, vec![0; 8]].concat(),
+            not_v7,
+        ] {
+            assert_eq!(
+                Frame::decode(MSG_WATCHING, bad),
+                Err(ProtocolError::Malformed("watching"))
+            );
         }
     }
 
@@ -921,9 +1008,17 @@ mod tests {
                 mode: Mode::Attach
             })
         );
+        // The watch hello is the byte a sidecar from before it refuses.
+        assert_eq!(
+            Frame::decode(MSG_HELLO, vec![2, 4]),
+            Ok(Frame::Hello {
+                version: Version::V2,
+                mode: Mode::Watch
+            })
+        );
         for payload in [
             vec![1, 0],
-            vec![2, 4],
+            vec![2, 5],
             vec![0, 1],
             vec![3, 1],
             vec![1],

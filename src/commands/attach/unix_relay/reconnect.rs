@@ -221,6 +221,8 @@ pub(in crate::commands::attach) struct Status {
     /// Typed input was discarded during this reconnect. Set by the main
     /// thread, which never waits on `state`.
     discarded: AtomicBool,
+    /// A read-only attach has said that it drops typed input.
+    read_only_said: AtomicBool,
 }
 
 #[derive(Default)]
@@ -255,6 +257,26 @@ impl Status {
         if !self.discarded.swap(true, Ordering::SeqCst) {
             let (status, screen) = (Arc::clone(self), Arc::clone(screen));
             std::thread::spawn(move || status.draw(&mut status.lock(), &screen));
+        }
+    }
+
+    /// Note, once, that a read-only attach drops typed input: on the last
+    /// row, on a thread of its own, as [`Self::discard`] does. The session's
+    /// output may draw over it; it is a notice, not a status kept on screen.
+    pub(in crate::commands::attach) fn read_only(self: &Arc<Self>, screen: &Arc<Screen>) {
+        if !self.read_only_said.swap(true, Ordering::SeqCst) {
+            let (status, screen) = (Arc::clone(self), Arc::clone(screen));
+            std::thread::spawn(move || {
+                let _state = status.lock();
+                let _shown = screen.lock();
+                if screen.done.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(size) = super::terminal_size() {
+                    let notice = ["tendr: read-only attach; typed input is dropped".to_owned()];
+                    write_terminal(&status_rows(&notice, size.rows(), size.cols()));
+                }
+            });
         }
     }
 

@@ -1359,6 +1359,129 @@ fn cli_escape_detaches_and_restores_the_terminal() {
     wait_log_contains(&root, "pty-escape", "session-still-running");
 }
 
+/// The run's `pty.control_changed` triggers, in order.
+fn control_triggers(root: &TempDir, session: &str) -> Vec<String> {
+    harness::read_events(root, session)
+        .into_iter()
+        .filter(|e| e["kind"] == "pty.control_changed")
+        .map(|e| e["data"]["trigger"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// `attach --read-only` beside a human controller: it is admitted although
+/// a human holds control, shows the controller's echoed input, drops its
+/// own keystrokes with one notice, and detaches with the escape (0),
+/// leaving the controller in control.
+#[test]
+fn read_only_attach_shows_output_and_drops_keystrokes_with_one_notice() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-ro");
+    let sock = start_cat(&root, "pty-ro");
+    let mut controller = attach_as_human(&sock);
+    wait_for_pty_control(&root, "pty-ro", "HumanControl");
+
+    let mut wrapped = WrappedAttach::spawn(&root, "ro", &["pty-ro", "--read-only"]);
+    // Output from before it attached is not replayed: the controller types
+    // until the watcher shows it.
+    poll_until(Duration::from_secs(15), Duration::from_millis(200), || {
+        write_msg(&mut controller, MSG_DATA, b"from-controller\n");
+        if wrapped.cli.output().contains("from-controller") {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(wrapped.cli.output())
+        }
+    })
+    .unwrap();
+
+    let notice = "typed input is dropped";
+    wrapped.cli.type_bytes(b"watcher-keys-1");
+    wrapped.wait_output_contains(notice);
+    wrapped.cli.type_bytes(b"watcher-keys-2");
+    write_msg(&mut controller, MSG_DATA, b"later-output\n");
+    wrapped.wait_output_contains("later-output");
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(10)), 0);
+    wrapped.assert_terminal_restored();
+
+    let output = wrapped.cli.output();
+    assert_eq!(output.matches(notice).count(), 1, "{output}");
+    let logged = harness::logged_output(&root, "pty-ro");
+    assert!(logged.contains("later-output"), "{logged}");
+    assert!(!logged.contains("watcher-keys"), "{logged}");
+    assert_eq!(meta_control(&root, "pty-ro"), "HumanControl");
+    assert_eq!(control_triggers(&root, "pty-ro"), ["attach"]);
+}
+
+fn meta_control(root: &TempDir, session: &str) -> String {
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            root.path()
+                .join(format!(".tendr/sessions/default/{session}/meta.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    meta["pty"]["control"].as_str().unwrap().to_owned()
+}
+
+/// A read-only attach cannot also take over, nor drop its escape, which is
+/// then its only way out: usage errors (2), before anything else.
+#[test]
+fn read_only_with_takeover_or_without_the_escape_is_a_usage_error() {
+    let root = TempDir::new().unwrap();
+    for conflict in [&["--takeover"][..], &["--escape", "none"]] {
+        tendr(&root)
+            .args(["attach", "pty-none", "--read-only"])
+            .args(conflict)
+            .assert()
+            .code(2);
+    }
+}
+
+/// A sidecar from before read-only viewers, emulated at the frame level as
+/// its decoder behaves: a hello whose mode it does not know is refused with
+/// the protocol class. A read-only attach to it exits 80 after that one
+/// hello, never retried in another version, and never holds control.
+#[test]
+fn a_read_only_attach_to_a_sidecar_from_before_it_exits_80() {
+    use tendr::attach_proto::{Frame, RejectClass, write_frame};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-ro-old");
+    start_cat(&root, "pty-ro-old");
+
+    let old = root.path().join("old.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&old).unwrap();
+    let hellos = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&hellos);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().map_while(Result::ok) {
+            let Ok((_, hello)) = read_msg(&mut stream) else {
+                continue;
+            };
+            // Refused as the old decoder refuses a mode it does not know.
+            seen.lock().unwrap().push(hello);
+            let refusal = Frame::Rejected {
+                class: RejectClass::Protocol,
+                reason: "unsupported attach protocol version or mode".to_owned(),
+            };
+            let _ = write_frame(&mut stream, &refusal);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    let dir = root.path().join(".tendr/sessions/default/pty-ro-old");
+    std::fs::write(dir.join("a.sock.path.test"), old.to_str().unwrap()).unwrap();
+    std::fs::rename(dir.join("a.sock.path.test"), dir.join("a.sock.path")).unwrap();
+
+    let wrapped = WrappedAttach::spawn(&root, "ro-old", &["pty-ro-old", "--read-only"]);
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 80);
+    wrapped.assert_terminal_restored();
+    assert_eq!(*hellos.lock().unwrap(), [vec![1, 4]]);
+    assert_eq!(meta_control(&root, "pty-ro-old"), "AgentControl");
+    assert!(control_triggers(&root, "pty-ro-old").is_empty());
+}
+
 /// A PTY child that turns on the alternate screen, mouse reports and kitty
 /// keyboard flags (1 on the main screen, 5 on the alternate one) once it reads
 /// a byte, then prints `modes-on`.
