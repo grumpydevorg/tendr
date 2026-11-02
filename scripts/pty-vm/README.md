@@ -135,6 +135,41 @@ reconnect's new one is not; ssh's keepalives (5 s × 3) notice it.
 | A takeover while the controller and a watcher are stalled (`takeover --drop 30`: both connections dropped, then 4 MiB written so both senders block) | Pass. The takeover over `--host` was admitted 0.57 s after it started and its keystrokes reached the child 1.17 s after it started. The watcher noticed the drop after 18.68 s, resumed 0.49 s later and showed its 4,196,431 bytes exactly and once. The old controller's reconnect was refused (`resume refused: cannot resume: control changed while disconnected; attach again`), exit 81. `pty.control_changed`: attach, takeover, detach |
 | No terminal (`pipe`, two runs) | Pass. `tendr --host tvm attach --read-only rp 2>err \| cat`, against a child that writes 4,000 lines and then `LAST-BYTES-OF-THE-RUN` and exits at once: exit 0 after 5.09–5.19 s, stdout the recording exactly (180,021 bytes, ending with the last bytes), stderr empty. Cut off: `\| (sleep 40; cat)` while 96 MiB were written in 2.7 s: exit 84 after 42.2 s with `tendr: the session cut this read-only attach off while the run was still running` on stderr, the run still running, and stdout exactly the recording's first 2,357,248 and 2,375,671 bytes (sha256) |
 
+### Windows console client over `attach --host`
+
+The first run of the Windows console client (PRs #177, #179, #181) on a real
+Windows desktop, done by hand rather than by these scripts. Client: Windows 11
+10.0.26200.9457, ARM64, a Parallels VM; Windows Terminal 1.24.12741.0 and the
+in-box conhost; OpenSSH_for_Windows 9.5p1. tendr 0.7.0, the released
+`tendr-aarch64-pc-windows-msvc` asset (sha256 checked). Remote: the VM above,
+tendr `v0.7.0` (`1ea81d3`), user `acc` on its `sshd` at `127.0.0.1:2222`,
+reached through `ssh -L 10.211.55.2:2222:127.0.0.1:2222 tendr-pty.exe.xyz` on
+the Mac. Keys came from the VM's virtual keyboard (`prlctl send-key-event -j`);
+each result was read off a screenshot (`prlctl capture`). A drop was killing
+that forward, which closes the TCP connection: a half-open loss on Windows is
+unmeasured.
+
+| Item | Result |
+|------|--------|
+| Keystrokes reach the child | Pass. All 94 printable ASCII characters, typed three times into `cat` under `stty -echo`, reached the remote file exactly. Arrivals were 26–68 ms apart, the keyboard's pace |
+| Output | Pass in both terminals. `✓ café 中文 😀` rendered correctly; `\xff\xfe` showed as replacement characters and the attach went on |
+| Resize | Pass. Maximising Windows Terminal took `stty size` from `30 120` to `46 155`; `top` then filled 46×155 |
+| Ctrl-C | Pass. It ended `sleep 100` in the session; the attach stayed up |
+| Reconnect while idle, and while output flows | Pass. The last rows read `tendr: connection lost, reconnecting (attempt 1)` over ssh's last line (`Connection to 10.211.55.2 closed by remote host.`); once the forward was back it resumed by itself. Cut at `tick-10` of 30 written 0.5 s apart, the screen then showed `tick-11` to `tick-30` and `TICKS-DONE` in order, once each |
+| A watcher beside the controller | Pass. A second window with `--read-only` showed `tendr: read-only attach; typed input is dropped`; a command typed there never ran, and it showed the controller's command and output. `pty.control` stayed `HumanControl`, with no `pty.control_changed` from the watcher |
+| `Ctrl-\ d` | Pass. Watcher and controller each exited 0, the controller after the child had turned on bracketed paste and SGR mouse reporting; cmd's prompt then read and echoed typing normally |
+| Closing the conhost window (`WM_CLOSE`, as its close button sends) | Pass. tendr and ssh were gone 0.62 s later; the run kept running, `pty.control` went to `AgentControl`, and no `_remote` was left on the VM |
+
+What it showed beyond the tests:
+
+- In conhost, Alt+F4 and Alt+Space reach the session (`^[[1;3S`, `^[ `)
+  instead of closing the window or opening its menu. `ssh -t` in conhost does
+  the same: it is the console's virtual terminal input, which tendr needs. The
+  close button still works, and Windows Terminal keeps both keys.
+- The read-only note stays on the window's last row after the watcher leaves.
+- A reconnect erases the rows its status took, and a shell does not redraw
+  them: the line of earlier output there stays blank.
+
 ## Results (2026-11-02)
 
 ### Resuming `attach --host`

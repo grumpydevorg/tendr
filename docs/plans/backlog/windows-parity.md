@@ -22,7 +22,8 @@ Native Windows x64 and ARM64 test lanes already run in required CI. Remote
 through a real OpenSSH server (`tests/cli_remote_windows_ssh.rs`). A Windows
 client attaches to a session on a Unix host over the attach bridge, from
 Windows Terminal or conhost, and reconnects after a dropped connection
-(`tests/windows_attach_console.rs`).
+(`tests/windows_attach_console.rs`); a hand run on a Windows 11 ARM64 desktop
+checked it end to end ([results](../../../scripts/pty-vm/README.md#windows-console-client-over-attach---host)).
 
 ## Gaps a user hits today
 
