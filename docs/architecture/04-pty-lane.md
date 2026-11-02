@@ -374,7 +374,7 @@ tendr that bridges them to the session's socket
   - The status goes on the terminal's last rows, written under the lock the
     output is written under, with the cursor saved and restored (DECSC,
     DECRC): tendr's line, and ssh's latest stderr line on the row below
-    (an approval URL, or the `Timeout, server not responding.` the lost
+    (such as the `Timeout, server not responding.` the lost
     connection's ssh said as it gave up), as printable ASCII cut to the
     width. It is erased before the new connection's output is written.
     While a connection is up its ssh stderr is kept off the screen too.

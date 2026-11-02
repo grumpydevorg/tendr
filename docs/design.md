@@ -279,10 +279,11 @@ of its own. The first connection keeps prompts: it runs before raw mode,
 so a passphrase or host-key prompt reads a normal terminal. A reconnect
 happens in raw mode, while the keyboard belongs to the attach; a prompt
 would eat keystrokes, or wait unseen. Under `BatchMode` a login that needs a
-prompt fails at once, and its stderr (an approval URL, say) goes into the
-status line instead. Every framed call has `ServerAliveInterval=5` and
-`ServerAliveCountMax=3`, so ssh notices a dead link within about 15 to 20 s
-instead of waiting on TCP.
+prompt fails at once, and its stderr goes into the status line instead. A
+login that stalls without a prompt (a lapsed Tailscale SSH check-mode
+approval) is bounded by the connect deadline instead. Every framed call has
+`ServerAliveInterval=5` and `ServerAliveCountMax=3`, so ssh notices a dead
+link within about 15 to 20 s instead of waiting on TCP.
 
 An attach always makes its own ssh connection (`-o ControlMaster=no -o
 ControlPath=none`). A mux client sends no keepalives of its own: the
