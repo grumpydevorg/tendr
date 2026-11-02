@@ -442,6 +442,9 @@ fn hello_reply(
         Ok(Frame::Rejected { class, reason }) => {
             Err(PtyExitCode::from(class).error(anyhow::anyhow!("{what} refused: {reason}")))
         }
+        Ok(Frame::AcceptedV2(_)) => protocol(format!(
+            "the session accepted the {what} in attach protocol version 2, which this connection did not ask for"
+        )),
         Ok(other) => protocol(format!(
             "unexpected {what} reply {other:?}; the session may predate attach protocol v1"
         )),

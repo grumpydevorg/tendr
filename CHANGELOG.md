@@ -11,7 +11,8 @@
   chunk with its byte offset. `attach --host` uses it when both hosts run
   this version, and falls back to version 1 for a 0.5.0 remote tendr or a
   session started by one. Nothing changes on screen yet: it is the ground
-  for resuming a dropped `attach --host`.
+  for resuming a dropped `attach --host`. One new failure: `attach --host`
+  exits 80 if the remote sends output that does not follow on from the last.
 
 ## v0.5.0 — framed `--host`, NDJSON exec, attach bridge
 

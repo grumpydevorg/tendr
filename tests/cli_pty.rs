@@ -2495,18 +2495,23 @@ fn a_v2_viewer_gets_every_output_byte_stamped_from_its_accept() {
     let run_id = uuid::Uuid::from_slice(&accept[8..24]).unwrap();
     assert_eq!(run_id.to_string(), viewed.run_id);
     let head = u64::from_be_bytes(accept[24..32].try_into().unwrap());
-    assert_eq!(
-        head,
-        BEFORE_VIEW.len() as u64,
-        "the output before the accept"
-    );
+    // Capture logs `before` just ahead of appending it to the ring, so the
+    // viewer can, rarely, be accepted first: at offset 0, with no modes yet.
+    let stamped = match head {
+        0 => viewed.frames.as_slice(),
+        14 => {
+            let (replay, stamped) = viewed.frames.split_first().unwrap();
+            assert_eq!(
+                replay,
+                &(MSG_DATA, b"\x1b[?2004h".to_vec()),
+                "the mode replay comes first, unstamped"
+            );
+            stamped
+        }
+        other => panic!("accepted at {other}, but the run wrote 14 bytes before"),
+    };
+    assert_eq!(BEFORE_VIEW.len(), 14);
 
-    let (replay, stamped) = viewed.frames.split_first().unwrap();
-    assert_eq!(
-        replay,
-        &(MSG_DATA, b"\x1b[?2004h".to_vec()),
-        "the mode replay comes first, unstamped"
-    );
     let mut next = head;
     let mut output = Vec::new();
     for (msg_type, payload) in stamped {
@@ -2518,10 +2523,10 @@ fn a_v2_viewer_gets_every_output_byte_stamped_from_its_accept() {
     }
     assert!(viewed.recorded.starts_with(BEFORE_VIEW));
     assert!(
-        output == viewed.recorded[BEFORE_VIEW.len()..],
-        "the viewer got {} bytes, not the {} recorded after its accept",
+        output == viewed.recorded[head as usize..],
+        "the viewer got {} bytes, not the {} recorded from its head",
         output.len(),
-        viewed.recorded.len() - BEFORE_VIEW.len()
+        viewed.recorded.len() as u64 - head
     );
     assert_eq!(
         next,
@@ -2547,11 +2552,12 @@ fn a_v1_viewer_gets_plain_output_as_before() {
         "only plain data"
     );
     let shown: Vec<u8> = viewed.frames.into_iter().flat_map(|(_, p)| p).collect();
-    let mut expected = b"\x1b[?2004h".to_vec();
-    expected.extend_from_slice(&viewed.recorded[BEFORE_VIEW.len()..]);
+    let replayed = [&b"\x1b[?2004h"[..], &viewed.recorded[BEFORE_VIEW.len()..]].concat();
+    // Accepted before capture put `before` in the ring (rare; see the v2
+    // test), it gets the whole output and nothing to replay.
     assert!(
-        shown == expected,
-        "the viewer got {} bytes, not the replay and the {} recorded after its accept",
+        shown == replayed || shown == viewed.recorded,
+        "the viewer got {} bytes, not the replay and the {} recorded after it",
         shown.len(),
         viewed.recorded.len() - BEFORE_VIEW.len()
     );

@@ -357,11 +357,10 @@ impl Frame {
             MSG_ACCEPTED => Self::Accepted(epoch("accepted")?),
             MSG_ACCEPTED_V2 => Self::AcceptedV2(ResumePoint::decode(&payload)?),
             MSG_OUTPUT if payload.len() >= 8 => {
-                let (offset, bytes) = payload.split_at(8);
-                Self::Output {
-                    offset: u64::from_be_bytes(offset.try_into().expect("8 bytes")),
-                    bytes: bytes.to_vec(),
-                }
+                let offset = u64::from_be_bytes(payload[..8].try_into().expect("8 bytes"));
+                let mut bytes = payload;
+                bytes.drain(..8);
+                Self::Output { offset, bytes }
             }
             MSG_OUTPUT => return Err(ProtocolError::Malformed("output")),
             MSG_REJECTED => match payload.split_first() {
@@ -392,9 +391,7 @@ pub fn write_frame(w: &mut impl Write, frame: &Frame) -> io::Result<()> {
         Frame::Repaint => write_msg(w, MSG_REPAINT, &[]),
         Frame::Accepted(epoch) => write_msg(w, MSG_ACCEPTED, &epoch.get().to_be_bytes()),
         Frame::AcceptedV2(point) => write_msg(w, MSG_ACCEPTED_V2, &point.encode()),
-        Frame::Output { offset, bytes } => {
-            write_msg_parts(w, MSG_OUTPUT, &[&offset.to_be_bytes(), bytes])
-        }
+        Frame::Output { offset, bytes } => write_output(w, *offset, bytes),
         Frame::Rejected { class, reason } => {
             let mut payload = Vec::with_capacity(1 + reason.len());
             payload.push(*class as u8);
@@ -444,17 +441,22 @@ pub const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 
 pub fn write_msg(w: &mut impl Write, msg_type: u8, payload: &[u8]) -> io::Result<()> {
-    write_msg_parts(w, msg_type, &[payload])
+    let len = payload.len() as u32;
+    w.write_all(&[msg_type])?;
+    w.write_all(&len.to_be_bytes())?;
+    w.write_all(payload)?;
+    w.flush()
 }
 
-/// [`write_msg`] for a payload in parts, written without joining them.
-fn write_msg_parts(w: &mut impl Write, msg_type: u8, parts: &[&[u8]]) -> io::Result<()> {
-    let len: usize = parts.iter().map(|part| part.len()).sum();
-    w.write_all(&[msg_type])?;
-    w.write_all(&(len as u32).to_be_bytes())?;
-    for part in parts {
-        w.write_all(part)?;
-    }
+/// Write a [`MSG_OUTPUT`] frame: the type, length and offset in one write,
+/// then the bytes, without joining them into one buffer.
+fn write_output(w: &mut impl Write, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    let mut header = [0u8; 13];
+    header[0] = MSG_OUTPUT;
+    header[1..5].copy_from_slice(&((8 + bytes.len()) as u32).to_be_bytes());
+    header[5..13].copy_from_slice(&offset.to_be_bytes());
+    w.write_all(&header)?;
+    w.write_all(bytes)?;
     w.flush()
 }
 

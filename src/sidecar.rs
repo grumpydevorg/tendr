@@ -2560,9 +2560,10 @@ fn handle_attach_connection(
         }
     };
 
-    // The reply and the install happen under the connection's lock, so a
-    // takeover's `MSG_RETIRED` cannot come ahead of the reply; the sender
-    // starts only after both, so no output does either.
+    // The install and the reply happen under the connection's lock, so
+    // nothing is written between them: a retirement decided after the install
+    // sends its `MSG_RETIRED` after the reply. The sender starts only after
+    // both, so no output comes ahead of the reply either.
     let disconnect = Box::new(move || {
         let _ = shutdown.shutdown(std::net::Shutdown::Both);
     });
