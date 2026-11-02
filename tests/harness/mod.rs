@@ -19,6 +19,8 @@ use tendr::model::meta::Meta;
 use tendr::model::state::RunStatus;
 use tendr::session::{self, LockGuard, SessionRoot};
 
+#[cfg(windows)]
+pub mod conpty;
 #[cfg(unix)]
 pub mod terminal;
 
