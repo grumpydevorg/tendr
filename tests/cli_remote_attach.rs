@@ -1677,12 +1677,16 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "host-ro-resume");
     // The flood passes the 4 KiB ring, but fits the pipes of the controller,
-    // which does not read, so it is never cut off.
+    // which does not read, so its sender never blocks. Capture never waits
+    // for a sender, though: it comes in 1200-byte steps (ONLCR), so a sender
+    // briefly descheduled still copies each one before the ring drops it,
+    // and the controller is never evicted.
     start_script(
         &root,
         "host-ro-resume",
         "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; printf abc; \
-         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; yes xxxxxxxxxx | head -n 600; \
+         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; \
+         i=0; while [ $i -lt 6 ]; do yes xxxxxxxxxx | head -n 100; sleep 0.1; i=$((i+1)); done; \
          printf FLOOD-END; sleep 60",
         &["GO1", "GO2"],
         &[("TENDR_TEST_OUTPUT_RING_BYTES", "4096")],
