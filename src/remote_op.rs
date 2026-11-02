@@ -161,6 +161,10 @@ pub struct WatchRequest {
 /// ([`tendr::attach_proto::Version::negotiate`]). A request from a client that
 /// predates the field has none, which means version 1, and a remote tendr
 /// that predates it ignores it.
+///
+/// `resume` is set when a client whose connection was lost asks to regain
+/// its control and output; it is sent only after a version 2 acceptance,
+/// and travels again as the frame that replaces the hello.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachRequest {
     pub session: String,
@@ -169,6 +173,38 @@ pub struct AttachRequest {
     pub escape: EscapeMode,
     #[serde(default)]
     pub protocol: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeRequest>,
+}
+
+/// Where a lost attach resumes from ([`tendr::attach_proto::ResumePoint`]):
+/// its run, the controller epoch it held, and the offset of the next output
+/// byte it did not get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeRequest {
+    pub run_id: tendr::model::ids::RunId,
+    pub epoch: u64,
+    pub offset: u64,
+}
+
+impl From<tendr::attach_proto::ResumePoint> for ResumeRequest {
+    fn from(point: tendr::attach_proto::ResumePoint) -> Self {
+        Self {
+            run_id: point.run_id,
+            epoch: point.epoch.get(),
+            offset: point.offset,
+        }
+    }
+}
+
+impl From<ResumeRequest> for tendr::attach_proto::ResumePoint {
+    fn from(request: ResumeRequest) -> Self {
+        Self {
+            run_id: request.run_id,
+            epoch: tendr::model::pty_control::ControllerEpoch::new(request.epoch),
+            offset: request.offset,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -360,6 +396,7 @@ impl TryFrom<&Commands> for RemoteOperation {
                     AttachEscape::None => EscapeMode::Disabled,
                 },
                 protocol: tendr::attach_proto::Version::LATEST as u8,
+                resume: None,
             }),
             Commands::Run { .. } => return local("run"),
             Commands::Exec { .. } => return local("exec"),

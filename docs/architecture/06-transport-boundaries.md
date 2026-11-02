@@ -157,6 +157,20 @@ the other operations, and keeps the terminal on the client
   exit code and stderr, as for a local attach (1, 80, 81, 84, 85), and the
   client exits with it; a remote that ends without answering and exits 0 is
   84 on the client.
+- A client resuming after a lost link puts its resume point (`resume`: run
+  id, epoch, offset) in the request, and sends `MSG_RESUME` with the same
+  point where the hello would go ([resuming a
+  viewer](04-pty-lane.md#resuming-a-viewer)). The remote tendr then skips the
+  human-control check: after a lost link sshd keeps the old remote tendr and
+  its connection open, so `meta.json` still names the client's own control,
+  and the sidecar decides. It passes the resume on, then the sidecar's answer
+  (`MSG_RESUMED` or `MSG_GONE`) as it came, and keeps the new epoch as this
+  client's, so a later takeover is read as one. A sidecar that cannot resume
+  refuses with the protocol class; the remote tendr exits 80, saying it
+  cannot resume, and neither attaches afresh nor falls back to version 1. A
+  0.5.0 remote tendr ignores `resume` and refuses `MSG_RESUME` as not its
+  hello (80), unless its own human-control check refuses first (81); it
+  never attaches afresh either.
 - Raw mode, the size check and SIGWINCH, the detach escape, and restoring
   the terminal and its modes all happen on the client, as for a local attach.
   A resize is a `MSG_RESIZE` frame.

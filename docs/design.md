@@ -233,6 +233,29 @@ steps are in [the attach bridge](architecture/06-transport-boundaries.md#the-att
 Source: step 1 of
 [remote frame transport](plans/active/01_remote-frame-transport.md).
 
+### A resume decides control and output on one connection
+
+*2026-11-02.* A viewer that lost its connection resumes with one request that
+the sidecar answers once: first whether it regains control, then whether the
+output from its offset is still held. Splitting the two (ask for control,
+then fetch bytes, or the other way round) would leave a window in which a
+takeover, a push or eviction from the ring lands between them, and the
+client would act on an answer that is no longer true: typing into a
+terminal it no longer controls, or showing output with a hole in it. Under
+the input writer and the sink lock, both answers hold for the same instant,
+and the ring cursor installed with the answer joins the missed bytes to the
+live ones.
+
+The resume is granted a new epoch, never the one the client held, because
+every ownership change advances the epoch by exactly one, and a resume is
+one: in the common half-open case the old connection still holds that
+epoch, and only a new one tells the two apart. The old connection's late
+disconnect then releases nothing, and its queued input cannot be written.
+The change is recorded with its own trigger, `resume`, so a client checking
+the event log for a takeover of its epoch never mistakes a resume for one,
+while a takeover of the resumed client still reads as a takeover. Source:
+step 1 of [remote frame transport](plans/active/01_remote-frame-transport.md).
+
 ### Windows uses Job Objects and a hidden console
 
 *2026-03 to 2026-04.* Windows has no SIGTERM. The sidecar runs the child in a

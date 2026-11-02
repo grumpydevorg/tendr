@@ -1873,6 +1873,9 @@ enum ControlChange {
 enum ChangeTrigger {
     Attach,
     Takeover,
+    /// A reconnecting client regained the control it held; never a takeover,
+    /// even though it may retire its own stale connection.
+    Resume,
     Detach,
 }
 
@@ -1890,6 +1893,7 @@ impl ControlChange {
         match self {
             Self::Human(Trigger::Attach, _) => ChangeTrigger::Attach,
             Self::Human(Trigger::Takeover, _) => ChangeTrigger::Takeover,
+            Self::Human(Trigger::Resume, _) => ChangeTrigger::Resume,
             Self::Released(_) => ChangeTrigger::Detach,
         }
     }
@@ -2362,35 +2366,70 @@ fn await_push_write(
     }
 }
 
-/// Install `holder`'s viewer, with a cursor at the ring's head, unless its
-/// connection has been retired. Returns the head, which is where a version 2
-/// accept says the viewer's output starts, and what its sender sends.
+/// Where an installed viewer's output starts.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement {
+    /// The offset of the first output byte the viewer is sent.
+    from: u64,
+    /// What the ring held, when the viewer asked to resume from an offset
+    /// outside it: it is then placed at the head instead.
+    gone: Option<output_ring::Span>,
+}
+
+/// Install `holder`'s viewer unless its connection has been retired, with a
+/// cursor at `resume` if the ring holds that offset, and otherwise (or with
+/// no `resume`) at the ring's head. Returns where its output starts, which
+/// the reply tells it, and what its sender sends.
 ///
-/// The registry check, the head and the install are all taken under the sink
-/// lock. Combined with retirement removing the holder from the registry
-/// synchronously (on the writer thread, before the successor is even granted
-/// control), a retired connection can never install its viewer over its
-/// successor's.
+/// The mode replay is sent first unless the viewer resumes where it left
+/// off: its terminal already has those modes.
+///
+/// The registry check, the span and the install are all taken under the
+/// sink lock. Combined with retirement removing the holder from the
+/// registry synchronously (on the writer thread, before the successor is
+/// even granted control), a retired connection can never install its viewer
+/// over its successor's.
 #[cfg(unix)]
 fn install_viewer(
     registry: &ConnectionRegistry,
     sink: &AttachSink,
     holder: crate::model::pty_control::HolderId,
+    resume: Option<u64>,
     disconnect: Box<dyn Fn() + Send>,
-) -> (u64, Option<ViewerStart>) {
+) -> (Placement, Option<ViewerStart>) {
     let mut tee = lock(sink);
-    let head = tee.ring.span().head;
+    // Stable while the tee's lock is held: capture appends under it.
+    let span = tee.ring.span();
+    let placement = match resume {
+        Some(offset) if (span.oldest..=span.head).contains(&offset) => Placement {
+            from: offset,
+            gone: None,
+        },
+        Some(_) => Placement {
+            from: span.head,
+            gone: Some(span),
+        },
+        None => Placement {
+            from: span.head,
+            gone: None,
+        },
+    };
     if !registry.contains(holder) {
-        return (head, None);
+        return (placement, None);
     }
-    // Under the tee's lock, which capture holds while it appends, so the
-    // modes replayed are exactly those of the output before the cursor: no
-    // output lands between the replay and the output that follows it.
-    let replay = tee.modes.replay();
+    // Under the tee's lock, so the modes replayed are exactly those of the
+    // output before the cursor: no output lands between the replay and the
+    // output that follows it.
+    let replay = if resume.is_some() && placement.gone.is_none() {
+        Vec::new()
+    } else {
+        tee.modes.replay()
+    };
     let cursor = tee
         .ring
-        .cursor_at(head)
-        .expect("a ring always holds its own head");
+        .cursor_at(placement.from)
+        .expect("the placement is in the span, read under the same lock");
     tee.viewer = Some(AttachViewer {
         holder,
         cursor: Arc::clone(&cursor),
@@ -2401,7 +2440,7 @@ fn install_viewer(
         cursor,
         replay,
     };
-    (head, Some(start))
+    (placement, Some(start))
 }
 
 /// Accept attach connections for the run `run_id` until the listener closes.
@@ -2485,10 +2524,52 @@ fn request_reject_class(error: &crate::pty_input::RequestError) -> RejectClass {
     }
 }
 
-/// One attach connection: a version 1 or 2 hello, claim or takeover through
-/// the input writer, then relay input and resizes until detach, disconnect,
-/// or retirement. A version 2 viewer of the run `run_id` is told where its
-/// output starts and gets it stamped with offsets.
+/// Refuse a resume the input writer turned down, saying why in the words of
+/// the resume rule.
+#[cfg(unix)]
+fn reject_resume(
+    stream: &mut std::os::unix::net::UnixStream,
+    error: &crate::pty_input::RequestError,
+) {
+    use crate::model::pty_control::ControlError;
+    use crate::pty_input::RequestError;
+    let why = match error {
+        RequestError::Control(ControlError::Stale { .. }) => {
+            "control has changed since that epoch".to_owned()
+        }
+        RequestError::Control(ControlError::Busy { .. }) => {
+            "an agent's push holds the terminal".to_owned()
+        }
+        other => other.to_string(),
+    };
+    reject_connection(
+        stream,
+        request_reject_class(error),
+        &format!("cannot resume: {why}"),
+    );
+}
+
+/// What a viewer's connection asked for in its first frame.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum Ask {
+    Attach,
+    Takeover,
+    /// Regain the control and the output a lost connection had.
+    Resume(crate::attach_proto::ResumePoint),
+}
+
+/// One attach connection: a version 1 or 2 hello, or a resume; a claim,
+/// takeover or resume through the input writer; then relay input and
+/// resizes until detach, disconnect, or retirement. A version 2 viewer of
+/// the run `run_id` is told where its output starts and gets it stamped
+/// with offsets.
+///
+/// A resume decides control and output on this one connection: once the
+/// control rule grants it ([`crate::model::pty_control::InputArbiter::resume`]),
+/// the answer is either resumed, with the output from the offset asked for
+/// and no mode replay, or gone, naming what the ring holds, with the mode
+/// replay and the output from the head.
 #[cfg(unix)]
 fn handle_attach_connection(
     mut stream: std::os::unix::net::UnixStream,
@@ -2508,8 +2589,23 @@ fn handle_attach_connection(
         stream: &stream,
         deadline: std::time::Instant::now() + attach_proto::HELLO_TIMEOUT,
     });
-    let (version, mode) = match hello {
-        Ok(Frame::Hello { version, mode }) => (version, mode),
+    let (version, ask) = match hello {
+        Ok(Frame::Hello {
+            mode: Mode::Push, ..
+        }) => {
+            let _ = stream.set_read_timeout(None);
+            return handle_push_connection(stream, writer, registry);
+        }
+        Ok(Frame::Hello {
+            version,
+            mode: Mode::Attach,
+        }) => (version, Ask::Attach),
+        Ok(Frame::Hello {
+            version,
+            mode: Mode::Takeover,
+        }) => (version, Ask::Takeover),
+        // Resuming is part of version 2.
+        Ok(Frame::Resume(point)) => (Version::V2, Ask::Resume(point)),
         Err(FrameError::Malformed(e @ ProtocolError::UnsupportedHello)) => {
             return reject_connection(&mut stream, RejectClass::Protocol, &e.to_string());
         }
@@ -2522,8 +2618,14 @@ fn handle_attach_connection(
         }
     };
     let _ = stream.set_read_timeout(None);
-    if mode == Mode::Push {
-        return handle_push_connection(stream, writer, registry);
+    if let Ask::Resume(point) = ask {
+        if point.run_id != run_id {
+            return reject_connection(
+                &mut stream,
+                RejectClass::Control,
+                "cannot resume: the run it was attached to is not running",
+            );
+        }
     }
 
     let (Ok(conn_stream), Ok(control), Ok(shutdown)) =
@@ -2547,15 +2649,18 @@ fn handle_attach_connection(
     if !registered {
         return reject_connection(&mut stream, RejectClass::Control, "session ended");
     }
-    let granted = if mode == Mode::Takeover {
-        writer.takeover(holder).map(|t| t.handle)
-    } else {
-        writer.claim(holder, ControllerKind::Human)
+    let granted = match ask {
+        Ask::Attach => writer.claim(holder, ControllerKind::Human),
+        Ask::Takeover => writer.takeover(holder).map(|t| t.handle),
+        Ask::Resume(point) => writer.resume(holder, point.epoch).map(|t| t.handle),
     };
     let handle = match granted {
         Ok(handle) => handle,
         Err(e) => {
             registry.remove(holder);
+            if matches!(ask, Ask::Resume(_)) {
+                return reject_resume(&mut stream, &e);
+            }
             return reject_request(&mut stream, &e);
         }
     };
@@ -2569,14 +2674,24 @@ fn handle_attach_connection(
     });
     let mut reply_to = lock(&conn);
     // Refused if this connection was retired in the meantime.
-    let (head, viewer) = install_viewer(registry, attach_sink, holder, disconnect);
-    let reply = match version {
-        Version::V1 => Frame::Accepted(handle.epoch()),
-        Version::V2 => Frame::AcceptedV2(ResumePoint {
-            run_id,
-            epoch: handle.epoch(),
-            offset: head,
-        }),
+    let resume = match ask {
+        Ask::Resume(point) => Some(point.offset),
+        Ask::Attach | Ask::Takeover => None,
+    };
+    let (placement, viewer) = install_viewer(registry, attach_sink, holder, resume, disconnect);
+    let point = ResumePoint {
+        run_id,
+        epoch: handle.epoch(),
+        offset: placement.from,
+    };
+    let reply = match (ask, placement.gone, version) {
+        (Ask::Resume(_), None, _) => Frame::Resumed(point),
+        (Ask::Resume(_), Some(span), _) => Frame::Gone {
+            point,
+            oldest: span.oldest,
+        },
+        (Ask::Attach | Ask::Takeover, _, Version::V1) => Frame::Accepted(handle.epoch()),
+        (Ask::Attach | Ask::Takeover, _, Version::V2) => Frame::AcceptedV2(point),
     };
     let accepted = write_frame(&mut *reply_to, &reply);
     drop(reply_to);
@@ -2943,12 +3058,113 @@ mod tests {
 
         // No waiting: the old connection may try to install at any instant after
         // the takeover is decided, including before any notification thread runs.
-        let (_, installed) = install_viewer(&registry, &sink, old, Box::new(|| {}));
+        let (_, installed) = install_viewer(&registry, &sink, old, None, Box::new(|| {}));
         assert!(
             installed.is_none(),
             "a retired connection installed its viewer"
         );
         assert!(lock(&sink).viewer.is_none());
+    }
+
+    mod resume_placement {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Append output as capture does: modes tracked, under the tee's lock.
+        fn capture(sink: &AttachSink, bytes: &[u8]) {
+            let mut tee = lock(sink);
+            tee.modes.feed(bytes);
+            tee.ring.append(bytes);
+        }
+
+        /// Read `len` bytes from a viewer's cursor, checking each read starts
+        /// where the last ended, from `from`.
+        fn read_viewer(start: &ViewerStart, from: u64, len: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            while out.len() < len {
+                match start.ring.next(&start.cursor, 7) {
+                    output_ring::Next::Bytes { offset, bytes } => {
+                        assert_eq!(offset, from + out.len() as u64);
+                        out.extend(bytes);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            out
+        }
+
+        proptest! {
+            /// A viewer resuming from any offset the ring holds gets exactly
+            /// the output from there, so what it had before plus what it gets
+            /// now is the whole output, with no mode replay. From any other
+            /// offset its output is gone: it is told the ring's exact span,
+            /// and gets the mode replay, then the output from the head. The
+            /// output after the replayed mode is printable text, so it turns
+            /// no other mode on.
+            #[test]
+            fn a_resumed_viewer_continues_exactly_where_it_stopped(
+                capacity in 1usize..96,
+                chunks in proptest::collection::vec(proptest::collection::vec(0x20u8..0x7f, 0..24), 0..12),
+                later in proptest::collection::vec(0x20u8..0x7f, 0..24),
+                at in 0u64..400,
+            ) {
+                use crate::model::pty_control::HolderId;
+                use std::os::unix::net::UnixStream;
+
+                let sink: AttachSink = Arc::new(Mutex::new(AttachTee {
+                    ring: Arc::new(OutputRing::with_capacity(capacity)),
+                    ..AttachTee::default()
+                }));
+                let registry = ConnectionRegistry::default();
+                let register = |holder| {
+                    let (conn, _peer) = UnixStream::pair().unwrap();
+                    let revoked = Arc::new(AtomicBool::new(false));
+                    let registered = registry.insert(
+                        holder,
+                        Registered { control: conn, retirement: Retirement::Push { revoked } },
+                    );
+                    assert!(registered);
+                };
+                // Bracketed paste on, then the first viewer, whose cursor
+                // makes the ring keep output.
+                capture(&sink, b"\x1b[?2004h");
+                register(HolderId::new(1));
+                install_viewer(&registry, &sink, HolderId::new(1), None, Box::new(|| {}));
+                for chunk in &chunks {
+                    capture(&sink, chunk);
+                }
+                let mut recording = b"\x1b[?2004h".to_vec();
+                recording.extend(chunks.concat());
+                let head = recording.len() as u64;
+                let oldest = head - (recording.len() - 8).min(capacity) as u64;
+
+                register(HolderId::new(2));
+                let (placement, start) =
+                    install_viewer(&registry, &sink, HolderId::new(2), Some(at), Box::new(|| {}));
+                let start = start.expect("a registered viewer is installed");
+                // Live output joins on, as much as the ring keeps behind the
+                // new cursor.
+                let room = capacity - (head - placement.from) as usize;
+                let later = &later[..later.len().min(room)];
+                capture(&sink, later);
+                recording.extend_from_slice(later);
+                let rest = recording.len() - placement.from as usize;
+                let suffix = read_viewer(&start, placement.from, rest);
+                if (oldest..=head).contains(&at) {
+                    prop_assert_eq!(placement, Placement { from: at, gone: None });
+                    prop_assert!(start.replay.is_empty(), "a resume replays no modes");
+                    let resumed = [&recording[..at as usize], &suffix[..]].concat();
+                    prop_assert_eq!(resumed, recording);
+                } else {
+                    prop_assert_eq!(
+                        placement,
+                        Placement { from: head, gone: Some(output_ring::Span { oldest, head }) }
+                    );
+                    prop_assert_eq!(&start.replay, b"\x1b[?2004h");
+                    prop_assert_eq!(&suffix[..], &recording[head as usize..]);
+                }
+            }
+        }
     }
 
     /// A client whose output is stalled cannot be sent `MSG_RETIRED`; it

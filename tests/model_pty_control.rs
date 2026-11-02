@@ -191,7 +191,7 @@ fn human_takeover_supersedes_an_earlier_human_even_if_still_connected() {
 
 #[test]
 fn takeover_at_exhausted_epoch_fails_without_changing_state() {
-    let mut arbiter = InputArbiter::resume(
+    let mut arbiter = InputArbiter::from_state(
         RunId::new(),
         ControllerState::Owned {
             epoch: epoch(u64::MAX),
@@ -206,7 +206,7 @@ fn takeover_at_exhausted_epoch_fails_without_changing_state() {
 
 #[test]
 fn claim_at_exhausted_epoch_fails_without_changing_state() {
-    let mut arbiter = InputArbiter::resume(
+    let mut arbiter = InputArbiter::from_state(
         RunId::new(),
         ControllerState::Unowned {
             epoch: epoch(u64::MAX),
@@ -222,6 +222,148 @@ fn claim_at_exhausted_epoch_fails_without_changing_state() {
             epoch: epoch(u64::MAX)
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Resume: a human regains the control it held at an epoch
+// ---------------------------------------------------------------------------
+
+const H3: HolderId = HolderId::new(3);
+
+fn stale() -> ControlError {
+    ControlError::Stale {
+        reason: StaleReason::EpochMismatch,
+    }
+}
+
+#[test]
+fn resume_after_the_holder_left_grants_the_next_epoch() {
+    let mut arbiter = InputArbiter::new(RunId::new());
+    let first = arbiter.claim(H1, ControllerKind::Human).unwrap();
+    arbiter.release(&first).unwrap();
+
+    let resumed = arbiter.resume(H2, epoch(1)).unwrap();
+
+    assert_eq!(resumed.handle.epoch(), epoch(2), "never epoch 1 again");
+    assert_eq!(resumed.handle.holder(), H2);
+    assert_eq!(resumed.handle.kind(), ControllerKind::Human);
+    assert_eq!(resumed.retired, None);
+    assert!(arbiter.authorize(&first).is_err());
+}
+
+/// The half-open case: the old connection still holds its epoch. The resume
+/// supersedes it, and its handle no longer authorizes.
+#[test]
+fn resume_retires_the_stale_connection_still_holding_its_epoch() {
+    let mut arbiter = InputArbiter::new(RunId::new());
+    let stale_handle = arbiter.claim(H1, ControllerKind::Human).unwrap();
+
+    let resumed = arbiter.resume(H2, epoch(1)).unwrap();
+
+    assert_eq!(resumed.handle.epoch(), epoch(2));
+    assert_eq!(resumed.retired, Some((H1, ControllerKind::Human)));
+    assert_eq!(
+        arbiter.release(&stale_handle),
+        Err(stale()),
+        "the old connection's late disconnect releases nothing"
+    );
+    assert_eq!(arbiter.authorize(&resumed.handle), Ok(()));
+}
+
+#[test]
+fn resume_after_a_human_took_control_since_is_refused() {
+    // Taken over, and the taker still holds it.
+    let mut arbiter = InputArbiter::new(RunId::new());
+    arbiter.claim(H1, ControllerKind::Human).unwrap();
+    arbiter.takeover(H3).unwrap();
+    let before = arbiter.state();
+    assert_eq!(arbiter.resume(H2, epoch(1)).unwrap_err(), stale());
+    assert_eq!(arbiter.state(), before);
+
+    // Attached and detached again in between: it still counts.
+    let mut arbiter = InputArbiter::new(RunId::new());
+    let first = arbiter.claim(H1, ControllerKind::Human).unwrap();
+    arbiter.release(&first).unwrap();
+    let other = arbiter.claim(H3, ControllerKind::Human).unwrap();
+    arbiter.release(&other).unwrap();
+    assert_eq!(arbiter.resume(H2, epoch(1)).unwrap_err(), stale());
+    assert_eq!(
+        arbiter.state(),
+        ControllerState::Unowned { epoch: epoch(2) }
+    );
+}
+
+#[test]
+fn resume_after_a_finished_push_succeeds() {
+    let mut arbiter = InputArbiter::new(RunId::new());
+    let human = arbiter.claim(H1, ControllerKind::Human).unwrap();
+    arbiter.release(&human).unwrap();
+    let push = arbiter.claim(H3, ControllerKind::Agent).unwrap();
+    arbiter.release(&push).unwrap();
+
+    let resumed = arbiter.resume(H2, epoch(1)).unwrap();
+    assert_eq!(resumed.handle.epoch(), epoch(3), "after the push's epoch");
+    assert_eq!(resumed.retired, None);
+}
+
+#[test]
+fn resume_while_a_push_runs_is_busy() {
+    let mut arbiter = InputArbiter::new(RunId::new());
+    let human = arbiter.claim(H1, ControllerKind::Human).unwrap();
+    arbiter.release(&human).unwrap();
+    arbiter.claim(H3, ControllerKind::Agent).unwrap();
+    let before = arbiter.state();
+
+    assert_eq!(
+        arbiter.resume(H2, epoch(1)),
+        Err(ControlError::Busy {
+            holder: H3,
+            kind: ControllerKind::Agent,
+            epoch: epoch(2)
+        })
+    );
+    assert_eq!(arbiter.state(), before);
+}
+
+#[test]
+fn resume_of_an_epoch_no_human_was_granted_is_refused() {
+    let mut arbiter = InputArbiter::new(RunId::new());
+    assert_eq!(arbiter.resume(H1, epoch(0)).unwrap_err(), stale());
+    let push = arbiter.claim(H3, ControllerKind::Agent).unwrap();
+    arbiter.release(&push).unwrap();
+    assert_eq!(arbiter.resume(H1, epoch(1)).unwrap_err(), stale());
+    assert_eq!(arbiter.resume(H1, epoch(7)).unwrap_err(), stale());
+}
+
+/// Only one client resumes from an epoch; the one that did can resume
+/// again from its own.
+#[test]
+fn a_resumed_epoch_is_the_only_one_left_to_resume() {
+    let mut arbiter = InputArbiter::new(RunId::new());
+    arbiter.claim(H1, ControllerKind::Human).unwrap();
+    arbiter.resume(H2, epoch(1)).unwrap();
+    assert_eq!(arbiter.resume(H3, epoch(1)).unwrap_err(), stale());
+    let again = arbiter.resume(H3, epoch(2)).unwrap();
+    assert_eq!(again.handle.epoch(), epoch(3));
+    assert_eq!(again.retired, Some((H2, ControllerKind::Human)));
+}
+
+#[test]
+fn resume_at_exhausted_epoch_fails_without_changing_state() {
+    let mut arbiter = InputArbiter::from_state(
+        RunId::new(),
+        ControllerState::Owned {
+            epoch: epoch(u64::MAX),
+            holder: H1,
+            kind: ControllerKind::Human,
+        },
+    );
+    let before = arbiter.state();
+    assert_eq!(
+        arbiter.resume(H2, epoch(u64::MAX)),
+        Err(ControlError::EpochExhausted)
+    );
+    assert_eq!(arbiter.state(), before);
 }
 
 #[test]
@@ -532,6 +674,8 @@ enum Op {
     Claim(u64, bool),
     Takeover(u64),
     Release(usize),
+    /// Resume from the epoch of the handle at this index.
+    Resume(u64, usize),
     Submit(usize, usize),
     Step(usize, Attempt),
     Expire(usize),
@@ -553,6 +697,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => (1u64..4, any::<bool>()).prop_map(|(h, human)| Op::Claim(h, human)),
         2 => (1u64..4).prop_map(Op::Takeover),
         1 => any::<usize>().prop_map(Op::Release),
+        1 => (1u64..4, any::<usize>()).prop_map(|(h, i)| Op::Resume(h, i)),
         2 => (any::<usize>(), 1usize..12).prop_map(|(h, len)| Op::Submit(h, len)),
         5 => (any::<usize>(), attempt_strategy()).prop_map(|(p, a)| Op::Step(p, a)),
         1 => any::<usize>().prop_map(Op::Expire),
@@ -566,6 +711,8 @@ proptest! {
         let mut handles = Vec::new();
         let mut pendings: Vec<(PendingInput, usize)> = Vec::new();
         let mut last_epoch = arbiter.state().epoch();
+        // The model of the resume rule: the last epoch a human was granted.
+        let mut last_human = None;
 
         for op in ops {
             let before = arbiter.state();
@@ -577,6 +724,9 @@ proptest! {
                             let was_unowned = matches!(before, ControllerState::Unowned { .. });
                             prop_assert!(was_unowned);
                             prop_assert_eq!(handle.epoch().get(), before.epoch().get() + 1);
+                            if human {
+                                last_human = Some(handle.epoch());
+                            }
                             handles.push(handle);
                         }
                         Err(ControlError::Busy { .. }) => {
@@ -593,7 +743,34 @@ proptest! {
                     for old in &handles {
                         prop_assert!(arbiter.authorize(old).is_err());
                     }
+                    last_human = Some(takeover.handle.epoch());
                     handles.push(takeover.handle);
+                }
+                Op::Resume(h, i) => {
+                    if handles.is_empty() { continue; }
+                    let from = handles[i % handles.len()].epoch();
+                    let unclaimed = match before {
+                        ControllerState::Unowned { .. } => true,
+                        ControllerState::Owned { epoch, kind, .. } => {
+                            epoch == from && kind == ControllerKind::Human
+                        }
+                    };
+                    match arbiter.resume(HolderId::new(h), from) {
+                        Ok(resumed) => {
+                            prop_assert_eq!(last_human, Some(from), "resumed past a later human");
+                            prop_assert!(unclaimed, "resumed over another holder");
+                            prop_assert_eq!(resumed.handle.epoch().get(), before.epoch().get() + 1);
+                            for old in &handles {
+                                prop_assert!(arbiter.authorize(old).is_err());
+                            }
+                            last_human = Some(resumed.handle.epoch());
+                            handles.push(resumed.handle);
+                        }
+                        Err(_) => {
+                            prop_assert!(last_human != Some(from) || !unclaimed);
+                            prop_assert_eq!(arbiter.state(), before);
+                        }
+                    }
                 }
                 Op::Release(i) => {
                     if handles.is_empty() { continue; }

@@ -24,11 +24,13 @@ lifecycle hardening, PowerShell state) belongs to
 
 1. **Resumable viewers.** A viewer reconnects with its run ID and the byte
    offset of the output it has written, and gets the retained output from
-   that offset on, with no gap. History that is gone is an error with the
-   available range (as `events --from-cursor` exits 44); it never skips
-   forward. Input is never resent automatically. Today a version 2 viewer
-   (`attach --host`) gets its offsets but cannot resume yet
-   ([PTY lane](../../architecture/04-pty-lane.md#output-and-viewers)). An
+   that offset on, with no gap. History that is gone is reported with the
+   available range, and the viewer goes on from the head with a visible
+   notice; nothing is skipped silently. Input is never resent automatically.
+   Today the sidecar and the attach bridge resume a version 2 viewer, or say
+   its output is gone and name the range
+   ([PTY lane](../../architecture/04-pty-lane.md#resuming-a-viewer)), but
+   `attach --host` does not yet reconnect by itself. An
    earlier design for typed PTY operations (send, resize, claim, release,
    observe; reads retryable, bounded writes never retried automatically,
    finite default deadlines) is slice 3 of the cloud PTY plan at `83f83ab`.

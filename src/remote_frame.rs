@@ -130,7 +130,13 @@ pub fn serve() -> anyhow::Result<()> {
         RemoteOperation::Attach(r) => {
             let namespace = crate::resolve_namespace(r.namespace)?;
             let version = tendr::attach_proto::Version::negotiate(r.protocol);
-            crate::commands::cmd_attach_bridge(&r.session, &namespace, r.takeover, version)
+            crate::commands::cmd_attach_bridge(
+                &r.session,
+                &namespace,
+                r.takeover,
+                version,
+                r.resume.map(Into::into),
+            )
         }
         operation => remote_op::dispatch(operation),
     }
@@ -477,6 +483,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(version(old), Version::V1);
+    }
+
+    /// A resume travels as data in the request, and a fresh attach's request
+    /// carries no `resume` at all, so it reads as before.
+    #[test]
+    fn a_resume_point_travels_in_the_attach_request() {
+        use tendr::attach_proto::ResumePoint;
+        use tendr::model::pty_control::ControllerEpoch;
+        let RemoteOperation::Attach(mut request) = op(&["attach", "s"]) else {
+            panic!("not an attach");
+        };
+        let fresh = encode(&RemoteOperation::Attach(request.clone())).unwrap();
+        assert!(!String::from_utf8_lossy(&fresh).contains("resume"));
+
+        let point = ResumePoint {
+            run_id: tendr::model::ids::RunId::new(),
+            epoch: ControllerEpoch::new(3),
+            offset: 1 << 40,
+        };
+        request.resume = Some(point.into());
+        let sent = encode(&RemoteOperation::Attach(request)).unwrap();
+        let RemoteOperation::Attach(received) = read(&sent).unwrap() else {
+            panic!("not an attach");
+        };
+        assert_eq!(received.resume.map(ResumePoint::from), Some(point));
     }
 
     #[cfg(unix)]

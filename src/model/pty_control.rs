@@ -12,6 +12,8 @@
 //! | `Unowned { e }` | [`InputArbiter::claim`] | `Owned { e + 1 }` and a run-bound handle |
 //! | `Owned { e }` | [`InputArbiter::claim`] | [`ControlError::Busy`]; state unchanged |
 //! | any `{ e }` | [`InputArbiter::takeover`] | `Owned { e + 1, Human }`; the previous holder, if any, is returned for retirement |
+//! | `Unowned { e }`, or `Owned { r, Human }` (the resumer's own stale connection) | [`InputArbiter::resume`] of `r`, the last epoch granted to a human | `Owned { e + 1, Human }`; that stale holder, if any, is returned for retirement |
+//! | anything else | [`InputArbiter::resume`] | [`ControlError::Busy`] or [`ControlError::Stale`]; state unchanged |
 //! | `Owned { e }` | [`InputArbiter::release`] with the current handle | `Unowned { e }` |
 //! | any | [`InputArbiter::release`] with any other handle | [`ControlError::Stale`]; state unchanged |
 //!
@@ -248,7 +250,7 @@ pub enum ControlError {
     EpochExhausted,
 }
 
-/// Result of a human takeover.
+/// Result of a human takeover or resume.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Takeover {
     /// The new controller's handle.
@@ -423,13 +425,16 @@ pub enum WriteStep {
 pub struct InputArbiter {
     run_id: RunId,
     state: ControllerState,
+    /// The last epoch granted to a human, by a claim, a takeover or a
+    /// resume. Only the holder of this epoch may resume.
+    last_human: Option<ControllerEpoch>,
 }
 
 impl InputArbiter {
     /// A never-owned PTY at [`ControllerEpoch::ZERO`].
     #[must_use]
     pub fn new(run_id: RunId) -> Self {
-        Self::resume(
+        Self::from_state(
             run_id,
             ControllerState::Unowned {
                 epoch: ControllerEpoch::ZERO,
@@ -437,10 +442,23 @@ impl InputArbiter {
         )
     }
 
-    /// Resume from a persisted state.
+    /// An arbiter in `state`. A human holder of `state` is the last human
+    /// granted control; otherwise no human was, so nobody can resume.
     #[must_use]
-    pub fn resume(run_id: RunId, state: ControllerState) -> Self {
-        Self { run_id, state }
+    pub fn from_state(run_id: RunId, state: ControllerState) -> Self {
+        let last_human = match state {
+            ControllerState::Owned {
+                epoch,
+                kind: ControllerKind::Human,
+                ..
+            } => Some(epoch),
+            _ => None,
+        };
+        Self {
+            run_id,
+            state,
+            last_human,
+        }
     }
 
     #[must_use]
@@ -492,6 +510,56 @@ impl InputArbiter {
                 ..
             } => Some((owner, kind)),
         };
+        let handle = self.own(next, holder, ControllerKind::Human);
+        Ok(Takeover { handle, retired })
+    }
+
+    /// A human regains the control it held at `epoch`, after its connection
+    /// was lost: `holder` is granted the next epoch, never `epoch` itself.
+    ///
+    /// It succeeds only if no human has been granted control since `epoch`
+    /// (claims, takeovers and resumes all count, even ones already
+    /// released) and nobody else holds control now. An agent push that has
+    /// finished does not block it; one still running does. If the holder of
+    /// `epoch` is still connected (its connection half-open), it is returned
+    /// for retirement, as a takeover returns the holder it supersedes.
+    ///
+    /// # Errors
+    ///
+    /// [`ControlError::Stale`] (`EpochMismatch`) if `epoch` is not the last
+    /// epoch granted to a human; [`ControlError::Busy`] if an agent holds
+    /// control; [`ControlError::EpochExhausted`]. The state is then
+    /// unchanged.
+    pub fn resume(
+        &mut self,
+        holder: HolderId,
+        epoch: ControllerEpoch,
+    ) -> Result<Takeover, ControlError> {
+        if self.last_human != Some(epoch) {
+            return Err(ControlError::Stale {
+                reason: StaleReason::EpochMismatch,
+            });
+        }
+        let retired = match self.state {
+            ControllerState::Unowned { .. } => None,
+            ControllerState::Owned {
+                epoch: owned,
+                holder: owner,
+                kind: ControllerKind::Human,
+            } if owned == epoch => Some((owner, ControllerKind::Human)),
+            ControllerState::Owned {
+                epoch,
+                holder,
+                kind,
+            } => {
+                return Err(ControlError::Busy {
+                    holder,
+                    kind,
+                    epoch,
+                });
+            }
+        };
+        let next = self.state.epoch().next()?;
         let handle = self.own(next, holder, ControllerKind::Human);
         Ok(Takeover { handle, retired })
     }
@@ -593,6 +661,9 @@ impl InputArbiter {
             holder,
             kind,
         };
+        if kind == ControllerKind::Human {
+            self.last_human = Some(epoch);
+        }
         ControllerHandle {
             key: HandleKey {
                 run_id: self.run_id,

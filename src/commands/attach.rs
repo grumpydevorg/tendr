@@ -47,12 +47,15 @@ pub fn cmd_attach(
 }
 
 /// The session `name` in `namespace`, if it can be attached: a PTY session
-/// whose run is running, and not under human control unless `takeover`.
-/// Shared by a local attach and the remote end of `attach --host`.
+/// whose run is running, and not under human control unless the attach may
+/// supersede its holder: a takeover, or a resume, where the sidecar decides
+/// (after a lost connection `meta.json` still names the resuming client's
+/// own control). Shared by a local attach and the remote end of
+/// `attach --host`.
 fn attachable(
     name: &str,
     namespace: &Namespace,
-    takeover: bool,
+    may_supersede: bool,
 ) -> anyhow::Result<(SessionDir, Meta)> {
     let session_name = SessionName::new(name)?;
     let root = SessionRoot::default_path()?;
@@ -75,7 +78,7 @@ fn attachable(
     }
 
     // Informational pre-check for a clear message; the sidecar is the authority.
-    if !takeover && pty.control == PtyControl::HumanControl {
+    if !may_supersede && pty.control == PtyControl::HumanControl {
         return Err(PtyExitCode::Control.error(anyhow::anyhow!(
             "session is already under human control (use --takeover to take it over)"
         )));
@@ -114,13 +117,12 @@ const SSH_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(unix)]
 const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// `attach --host` from a Unix client. `request` is the encoded remote frame
-/// of the attach request; the hello follows it on ssh's stdin, and then the
-/// typed attach frames, which the remote tendr bridges to the session's
-/// attach socket ([`cmd_attach_bridge`]). This end keeps the terminal: raw
-/// mode, resizes (SIGWINCH included) and the detach escape, exactly as a
-/// local attach. The remote sidecar keeps the controller epochs and the
-/// recording.
+/// `attach --host` from a Unix client. `frame` is the encoded remote frame
+/// of `request`; the hello follows it on ssh's stdin, and then the typed
+/// attach frames, which the remote tendr bridges to the session's attach
+/// socket ([`cmd_attach_bridge`]). This end keeps the terminal: raw mode,
+/// resizes (SIGWINCH included) and the detach escape, exactly as a local
+/// attach. The remote sidecar keeps the controller epochs and the recording.
 ///
 /// The version is agreed in the request, whose `protocol` names the newest
 /// this client speaks; the hello on ssh's stdin is always a version 1 hello,
@@ -128,6 +130,11 @@ const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// `protocol`. The answer's type says which version the session speaks: a
 /// version 2 acceptance starts the offsets this client tracks, a version 1
 /// one means plain output, as before.
+///
+/// Debug builds take `TENDR_TEST_ATTACH_RESUME` (`<run id> <epoch>
+/// <offset>`) and resume from that point ([`resume_host`]) instead of
+/// attaching afresh, so tests can drive a resume end to end; release builds
+/// ignore it.
 ///
 /// Returns the exit code. The remote side's own failures (no such session,
 /// a refusal, an unreachable socket) arrive as its exit code, with its
@@ -141,47 +148,50 @@ const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(unix)]
 pub fn cmd_attach_host(
     host: &str,
-    mut request: Vec<u8>,
-    takeover: bool,
-    escape: EscapeMode,
+    request: &crate::remote_op::AttachRequest,
+    mut frame: Vec<u8>,
 ) -> anyhow::Result<i32> {
     use tendr::attach_proto::Version;
-    use tendr::ssh::{AttachSsh, AttachStart};
 
     // Before ssh starts: the request may take over.
     require_terminal()?;
-    attach_proto::write_frame(
-        &mut request,
-        &Frame::Hello {
-            version: Version::V1,
-            mode: mode(takeover),
-        },
-    )?;
-    let (ssh, stdin, stdout) = match AttachSsh::start(host, &request)? {
-        AttachStart::Running { ssh, stdin, stdout } => (ssh, stdin, stdout),
-        AttachStart::Ended(code) => return unanswered(code),
-    };
-    // The remote side's answer is the sidecar's acceptance; a refusal or a
-    // failure of its own ends the connection, and its exit code says which.
-    let mut reader = std::io::BufReader::new(stdout);
-    let accept = match attach_proto::read_frame(&mut reader) {
-        Err(FrameError::Io(_)) => {
-            drop(stdin);
-            return match ssh.finish(None) {
-                Some(code) => unanswered(code?),
-                None => unreachable!("no grace"),
-            };
-        }
-        reply => match hello_reply(reply, "attach", Version::LATEST) {
-            Ok(accept) => accept,
-            Err(e) => {
-                drop(stdin);
-                let _ = ssh.finish(Some(SSH_LEAVE_GRACE));
-                return Err(e);
+    let (link, resume) = match test_resume_point() {
+        Some(point) => match resume_host(host, request, point)? {
+            Opened::Answered(link, resumption) => {
+                if let Resumption::Gone {
+                    point: head,
+                    oldest,
+                } = resumption
+                {
+                    eprintln!(
+                        "tendr: the output from offset {} is gone; the session holds {oldest} to {}, so the attach resumes from {}",
+                        point.offset, head.offset, head.offset
+                    );
+                }
+                (link, Some(resumption.point()))
             }
+            Opened::Ended(code) => return Ok(code),
         },
+        None => {
+            attach_proto::write_frame(
+                &mut frame,
+                &Frame::Hello {
+                    version: Version::V1,
+                    mode: mode(request.takeover),
+                },
+            )?;
+            // The remote side's answer is the sidecar's acceptance.
+            let opened = open_host(host, &frame, |reply| {
+                hello_reply(reply, "attach", Version::LATEST)
+            })?;
+            match opened {
+                Opened::Answered(link, accept) => (link, accept.resume_point()),
+                Opened::Ended(code) => return Ok(code),
+            }
+        }
     };
 
+    let HostLink { ssh, stdin, reader } = link;
     let link = unix_relay::Link {
         reader: Box::new(reader),
         writer: Box::new(std::io::BufWriter::new(stdin)),
@@ -191,7 +201,7 @@ pub fn cmd_attach_host(
     };
     // The remote side reports a takeover in band, even one that cut the
     // connection before the sidecar could say so.
-    let ending = unix_relay::relay(link, accept.resume_point(), escape, &|| false);
+    let ending = unix_relay::relay(link, resume, request.escape, &|| false);
     let closed = matches!(ending, Ok(unix_relay::Ending::SessionClosed));
     let finished = ssh.finish(Some(if closed {
         SSH_CLOSE_GRACE
@@ -208,6 +218,121 @@ pub fn cmd_attach_host(
         Some(code) => Ok(code?),
         None => Ok(0),
     }
+}
+
+/// The resume point of `TENDR_TEST_ATTACH_RESUME`, in debug builds only.
+#[cfg(unix)]
+fn test_resume_point() -> Option<attach_proto::ResumePoint> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let value = std::env::var("TENDR_TEST_ATTACH_RESUME").ok()?;
+    let mut parts = value.split_whitespace();
+    let run_id = uuid::Uuid::parse_str(parts.next()?).ok()?;
+    Some(attach_proto::ResumePoint {
+        run_id: tendr::model::ids::RunId::from_v7(run_id)?,
+        epoch: tendr::model::pty_control::ControllerEpoch::new(parts.next()?.parse().ok()?),
+        offset: parts.next()?.parse().ok()?,
+    })
+}
+
+/// An `attach --host` connection whose remote side has answered: ssh, its
+/// stdin for the client's frames, and its stdout, past the answer, for the
+/// session's.
+#[cfg(unix)]
+pub(super) struct HostLink {
+    ssh: tendr::ssh::AttachSsh,
+    stdin: std::process::ChildStdin,
+    reader: std::io::BufReader<std::process::ChildStdout>,
+}
+
+/// How opening an `attach --host` connection went.
+#[cfg(unix)]
+pub(super) enum Opened<A> {
+    /// The session answered `A`; the attach goes on over the link.
+    Answered(HostLink, A),
+    /// The remote side ended without answering, with this exit code, its
+    /// verdict: a refusal or a failure of its own (its message has been
+    /// passed on to stderr).
+    Ended(i32),
+}
+
+/// Start ssh with `request` (the remote frame and what replaces the hello),
+/// read the session's answer, and let `answer` classify it. A remote side
+/// that ends without answering is [`Opened::Ended`] with its exit code (84
+/// if it claims success); an answer `answer` refuses stops ssh.
+///
+/// # Errors
+/// `answer`'s error, and the ssh failures of [`tendr::ssh::AttachSsh`].
+#[cfg(unix)]
+fn open_host<A>(
+    host: &str,
+    request: &[u8],
+    answer: impl FnOnce(Result<Frame, FrameError>) -> anyhow::Result<A>,
+) -> anyhow::Result<Opened<A>> {
+    use tendr::ssh::{AttachSsh, AttachStart};
+
+    let (ssh, stdin, stdout) = match AttachSsh::start(host, request)? {
+        AttachStart::Running { ssh, stdin, stdout } => (ssh, stdin, stdout),
+        AttachStart::Ended(code) => return unanswered(code).map(Opened::Ended),
+    };
+    // A refusal or a failure of the remote side's own ends the connection,
+    // and its exit code says which.
+    let mut reader = std::io::BufReader::new(stdout);
+    match attach_proto::read_frame(&mut reader) {
+        Err(FrameError::Io(_)) => {
+            drop(stdin);
+            match ssh.finish(None) {
+                Some(code) => unanswered(code?).map(Opened::Ended),
+                None => unreachable!("no grace"),
+            }
+        }
+        reply => match answer(reply) {
+            Ok(answered) => Ok(Opened::Answered(HostLink { ssh, stdin, reader }, answered)),
+            Err(e) => {
+                drop(stdin);
+                let _ = ssh.finish(Some(SSH_LEAVE_GRACE));
+                Err(e)
+            }
+        },
+    }
+}
+
+/// Reconnect the `attach --host` of `request` after its connection was lost,
+/// resuming from `point`: the run, the epoch it held and the offset just
+/// past the last output byte written to the terminal (the version 2 resume
+/// point the relay keeps).
+///
+/// The request carries `point`, and a resume frame takes the hello's place
+/// on ssh's stdin, so a remote tendr that cannot resume refuses it rather
+/// than attach afresh. On [`Resumption::Resumed`] the relay goes on from
+/// `point.offset`: the session's stamped output follows from there, with no
+/// mode replay. On [`Resumption::Gone`] the output in between is lost: the
+/// caller writes the reset of the modes it has tracked (`TermModes::reset`)
+/// before relaying, since the mode replay that follows only turns modes on,
+/// then goes on from the head, and sends the size and the repaint nudge, as
+/// a fresh attach does.
+///
+/// # Errors
+/// A refusal (81 when control has changed since, the run has ended, or an
+/// agent's push holds the terminal; 80 when the session cannot resume), an
+/// answer outside the protocol (80), and the ssh failures of
+/// [`tendr::ssh::AttachSsh`].
+#[cfg(unix)]
+pub(super) fn resume_host(
+    host: &str,
+    request: &crate::remote_op::AttachRequest,
+    point: attach_proto::ResumePoint,
+) -> anyhow::Result<Opened<Resumption>> {
+    use crate::remote_op::{AttachRequest, RemoteOperation};
+
+    let mut frame = crate::remote_frame::encode(&RemoteOperation::Attach(AttachRequest {
+        takeover: false,
+        resume: Some(point.into()),
+        ..request.clone()
+    }))?;
+    attach_proto::write_frame(&mut frame, &Frame::Resume(point))?;
+    open_host(host, &frame, |reply| resume_reply(reply, point))
 }
 
 /// The exit code of an `attach --host` whose remote side ended without
@@ -324,7 +449,8 @@ pub(super) fn connect(
 ) -> anyhow::Result<(std::os::unix::net::UnixStream, Accept)> {
     use attach_proto::{RejectClass, Version};
     let mut stream = open_socket(session_dir)?;
-    let mut reply = exchange_hello(&mut stream, version, mode)?;
+    let hello = |version| Frame::Hello { version, mode };
+    let mut reply = exchange(&mut stream, &hello(version), verb(mode))?;
     let mut version = version;
     if version > Version::V1
         && matches!(
@@ -337,7 +463,7 @@ pub(super) fn connect(
     {
         version = Version::V1;
         stream = open_socket(session_dir)?;
-        reply = exchange_hello(&mut stream, version, mode)?;
+        reply = exchange(&mut stream, &hello(version), verb(mode))?;
     }
     let accept = hello_reply(reply, verb(mode), version)?;
     // From here an attach waits for output, and a push as long as the terminal
@@ -346,6 +472,67 @@ pub(super) fn connect(
         PtyExitCode::Runtime.error(anyhow::anyhow!("{} handshake failed: {e}", verb(mode)))
     })?;
     Ok((stream, accept))
+}
+
+/// What the sidecar answered a resume: control regained at a new epoch, and
+/// where the output goes on from.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Resumption {
+    /// The output follows from `point.offset`, the offset asked for, with
+    /// no mode replay: the terminal already has the modes.
+    Resumed(attach_proto::ResumePoint),
+    /// The output from the offset asked for is gone: the session holds only
+    /// `oldest` up to `point.offset`, its head. The mode replay follows,
+    /// unstamped, then the output from the head.
+    Gone {
+        point: attach_proto::ResumePoint,
+        oldest: u64,
+    },
+}
+
+#[cfg(unix)]
+impl Resumption {
+    /// The new epoch, and the offset the stamped output starts at.
+    pub(super) fn point(self) -> attach_proto::ResumePoint {
+        match self {
+            Self::Resumed(point) | Self::Gone { point, .. } => point,
+        }
+    }
+
+    /// The answer as the sidecar sent it.
+    fn frame(self) -> Frame {
+        match self {
+            Self::Resumed(point) => Frame::Resumed(point),
+            Self::Gone { point, oldest } => Frame::Gone { point, oldest },
+        }
+    }
+}
+
+/// [`connect`] for a resume from `point`: the resume frame takes the hello's
+/// place. A sidecar started by a tendr that cannot resume refuses it with
+/// the protocol class; that is "cannot resume" (80), never a fresh attach.
+#[cfg(unix)]
+fn connect_resume(
+    session_dir: &std::path::Path,
+    point: attach_proto::ResumePoint,
+) -> anyhow::Result<(std::os::unix::net::UnixStream, Resumption)> {
+    let mut stream = open_socket(session_dir)?;
+    let reply = exchange(&mut stream, &Frame::Resume(point), "resume")?;
+    if let Ok(Frame::Rejected {
+        class: attach_proto::RejectClass::Protocol,
+        reason,
+    }) = &reply
+    {
+        return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+            "cannot resume: the session was started by a tendr that cannot resume an attach ({reason}); attach again"
+        )));
+    }
+    let resumed = resume_reply(reply, point)?;
+    stream
+        .set_read_timeout(None)
+        .map_err(|e| PtyExitCode::Runtime.error(anyhow::anyhow!("resume handshake failed: {e}")))?;
+    Ok((stream, resumed))
 }
 
 /// Connect to the session's attach socket and check that its listener is
@@ -371,8 +558,9 @@ fn open_socket(session_dir: &std::path::Path) -> anyhow::Result<std::os::unix::n
     Ok(stream)
 }
 
-/// Send the hello in `version` and `mode`, and read the sidecar's reply under
-/// the reply deadline, for [`hello_reply`] to classify.
+/// Send `hello` (a hello, or the resume that replaces it), and read the
+/// sidecar's reply under the reply deadline, for [`hello_reply`] or
+/// [`resume_reply`] to classify.
 ///
 /// The sidecar refuses a peer of another user, or a connection beyond its
 /// limit, before reading the hello, and closes the connection. If that lands
@@ -380,12 +568,11 @@ fn open_socket(session_dir: &std::path::Path) -> anyhow::Result<std::os::unix::n
 /// read: it, not the failed write, decides the outcome. The write's error is
 /// the error only when no frame can be read.
 #[cfg(unix)]
-fn exchange_hello(
+fn exchange(
     stream: &mut std::os::unix::net::UnixStream,
-    version: attach_proto::Version,
-    mode: Mode,
+    hello: &Frame,
+    what: &str,
 ) -> anyhow::Result<Result<Frame, FrameError>> {
-    let what = verb(mode);
     let transport = |e: std::io::Error| {
         PtyExitCode::Runtime.error(anyhow::anyhow!("{what} handshake failed: {e}"))
     };
@@ -398,8 +585,7 @@ fn exchange_hello(
     if unbounded {
         stream.set_nonblocking(true).map_err(transport)?;
     }
-    let sent =
-        timeout.and_then(|()| attach_proto::write_frame(stream, &Frame::Hello { version, mode }));
+    let sent = timeout.and_then(|()| attach_proto::write_frame(stream, hello));
     // After a failed write the peer has closed its end, so this read returns
     // at once; otherwise it is bounded by the reply timeout.
     let reply = attach_proto::read_frame(stream);
@@ -439,12 +625,53 @@ fn hello_reply(
     match reply {
         Ok(Frame::Accepted(epoch)) => Ok(Accept::V1(epoch)),
         Ok(Frame::AcceptedV2(point)) if upto >= attach_proto::Version::V2 => Ok(Accept::V2(point)),
-        Ok(Frame::Rejected { class, reason }) => {
-            Err(PtyExitCode::from(class).error(anyhow::anyhow!("{what} refused: {reason}")))
-        }
         Ok(Frame::AcceptedV2(_)) => protocol(format!(
             "the session accepted the {what} in attach protocol version 2, which this connection did not ask for"
         )),
+        reply => reply_failure(reply, what),
+    }
+}
+
+/// What the sidecar's reply to a resume from `asked` means for the client.
+/// An answer must be for the same run, at a later epoch; a resumed one at
+/// the offset asked for, a gone one naming a span that starts after it (an
+/// offset past the head means this client's count is broken). Otherwise as
+/// [`hello_reply`].
+#[cfg(unix)]
+fn resume_reply(
+    reply: Result<Frame, FrameError>,
+    asked: attach_proto::ResumePoint,
+) -> anyhow::Result<Resumption> {
+    let ours = |point: attach_proto::ResumePoint| {
+        point.run_id == asked.run_id && point.epoch > asked.epoch
+    };
+    match reply {
+        Ok(Frame::Resumed(point)) if ours(point) && point.offset == asked.offset => {
+            Ok(Resumption::Resumed(point))
+        }
+        Ok(Frame::Gone { point, oldest }) if ours(point) && asked.offset < oldest => {
+            Ok(Resumption::Gone { point, oldest })
+        }
+        Ok(answer @ (Frame::Resumed(_) | Frame::Gone { .. })) => {
+            Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+                "the session's answer {answer:?} does not fit the resume from {asked:?}"
+            )))
+        }
+        reply => reply_failure(reply, "resume"),
+    }
+}
+
+/// A reply that accepts nothing: a refusal exits with its class's code; any
+/// other reply, or none before the deadline (a sidecar from before the hello
+/// waits silently), is a protocol failure (80); a connection that ends first
+/// is a transport failure (84).
+#[cfg(unix)]
+fn reply_failure<T>(reply: Result<Frame, FrameError>, what: &str) -> anyhow::Result<T> {
+    let protocol = |message: String| Err(PtyExitCode::Protocol.error(anyhow::anyhow!(message)));
+    match reply {
+        Ok(Frame::Rejected { class, reason }) => {
+            Err(PtyExitCode::from(class).error(anyhow::anyhow!("{what} refused: {reason}")))
+        }
         Ok(other) => protocol(format!(
             "unexpected {what} reply {other:?}; the session may predate attach protocol v1"
         )),
@@ -1406,7 +1633,7 @@ mod unix_relay {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{Accept, exchange_hello, hello_reply};
+    use super::{Accept, Resumption, exchange, hello_reply, resume_reply};
     use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
     use tendr::attach_proto::{Frame, FrameError, ProtocolError, RejectClass, ResumePoint};
@@ -1423,7 +1650,11 @@ mod tests {
 
     /// The hello and its reply, as a client speaking `version` sees them.
     fn hello(stream: &mut UnixStream, version: Version, mode: Mode) -> anyhow::Result<Accept> {
-        hello_reply(exchange_hello(stream, version, mode)?, "attach", version)
+        hello_reply(
+            exchange(stream, &Frame::Hello { version, mode }, "attach")?,
+            "attach",
+            version,
+        )
     }
 
     #[test]
@@ -1463,6 +1694,75 @@ mod tests {
             hello_reply(Ok(Frame::Accepted(epoch)), "attach", Version::V2).unwrap(),
             Accept::V1(epoch)
         );
+    }
+
+    /// A resume's answer counts only if it is for the run and offset asked,
+    /// at a later epoch; a gone answer must name a span that starts after
+    /// that offset. Anything else, a fresh acceptance included, is a
+    /// protocol failure, and a refusal exits with its class's code.
+    #[test]
+    fn a_resume_answer_must_fit_the_resume() {
+        let asked = ResumePoint {
+            run_id: RunId::new(),
+            epoch: ControllerEpoch::new(3),
+            offset: 100,
+        };
+        let code = |reply| resume_reply(Ok(reply), asked).err().map(|e| exit_code(&e));
+        let resumed = ResumePoint {
+            epoch: ControllerEpoch::new(5),
+            ..asked
+        };
+        assert_eq!(
+            resume_reply(Ok(Frame::Resumed(resumed)), asked).unwrap(),
+            Resumption::Resumed(resumed)
+        );
+        let head = ResumePoint {
+            offset: 500,
+            ..resumed
+        };
+        let gone = Frame::Gone {
+            point: head,
+            oldest: 101,
+        };
+        assert_eq!(
+            resume_reply(Ok(gone), asked).unwrap(),
+            Resumption::Gone {
+                point: head,
+                oldest: 101
+            }
+        );
+
+        for wrong in [
+            Frame::Resumed(ResumePoint {
+                run_id: RunId::new(),
+                ..resumed
+            }),
+            Frame::Resumed(asked),
+            Frame::Resumed(ResumePoint {
+                offset: 99,
+                ..resumed
+            }),
+            Frame::Gone {
+                point: head,
+                oldest: 100,
+            },
+            Frame::Gone {
+                point: ResumePoint {
+                    offset: 50,
+                    ..resumed
+                },
+                oldest: 10,
+            },
+            Frame::Accepted(ControllerEpoch::new(4)),
+            Frame::AcceptedV2(head),
+        ] {
+            assert_eq!(code(wrong.clone()), Some(80), "{wrong:?}");
+        }
+        let refusal = Frame::Rejected {
+            class: RejectClass::Control,
+            reason: "taken".to_owned(),
+        };
+        assert_eq!(code(refusal), Some(81));
     }
 
     /// Anything but a v1 reply, or no reply before the deadline, is a

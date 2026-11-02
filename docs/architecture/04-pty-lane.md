@@ -19,6 +19,8 @@ stateDiagram-v2
     AgentControl --> HumanControl: attach (hello, mode attach)\nwhile no human holds control
     HumanControl --> HumanControl: attach --takeover\nretires the previous client
     AgentControl --> HumanControl: attach --takeover\nrevokes an in-flight push
+    HumanControl --> HumanControl: resume\nretires the client's own stale connection
+    AgentControl --> HumanControl: resume\nif no human took control since
     HumanControl --> AgentControl: detach message\nor socket close
 
     AgentControl --> AgentControl: push accepted
@@ -56,9 +58,8 @@ flowchart LR
   not write to the session dir. Those side effects travel as typed effects
   on one channel to one *effects thread*, which writes them in order:
   - events: `pty.control_changed`, `pty.input_revoked`, `recording.stopped`.
-    `pty.control_changed` carries `control`, `trigger` (`attach`,
-    `takeover` or `detach`) and `epoch`: the controller epoch granted, or
-    the one a detach released.
+    `pty.control_changed` carries `control`, `trigger` and `epoch`
+    ([event protocol](07-event-protocol.md#1-envelope)).
   - `meta.json` patches: `pty.control`, `pty.recording`
 
   So a slow disk never delays a takeover's acknowledgement, an input step,
@@ -115,6 +116,9 @@ flowchart LR
     last ended. The mode replay is not the run's output and still goes as
     plain `MSG_DATA`, unstamped.
   - A version 1 client never receives either new type.
+- Instead of a hello, a version 2 viewer whose connection was lost can send
+  `MSG_RESUME` to regain its control and output
+  ([Resuming a viewer](#resuming-a-viewer)).
 - A plain attach is refused while a human holds control.
 - `--takeover` replaces the holder, which is disconnected and exits 81. The
   holder is told in one of two ways:
@@ -146,6 +150,48 @@ flowchart LR
   5 s. The socket is owner-only and peer-checked, so only the owner can cause
   this.
 
+### Resuming a viewer
+
+A version 2 viewer whose connection was lost opens a new one with
+`MSG_RESUME` in place of the hello: `[epoch u64][run id 16 bytes][offset
+u64]`, the run, the epoch it held and the offset just past the last output
+byte it wrote to its terminal. One connection decides both control and
+bytes ([design](../design.md#a-resume-decides-control-and-output-on-one-connection)).
+
+- A resume naming another run is refused with the control class (81).
+- The control rule is `InputArbiter::resume` (`src/model/pty_control.rs`).
+  It grants the epoch after the current one, never the epoch it held, and
+  only if both hold:
+  - no human has been granted control since that epoch, by an attach, a
+    takeover or another resume, even one already released;
+  - nobody else holds control now. An agent push that ran and finished in
+    between does not block it; one still running does.
+
+  Otherwise it is refused with the control class (81).
+- After a lost link, the old connection is often still open (sshd keeps the
+  old bridge alive) and still holds its epoch. The resume retires it as a
+  takeover retires a holder: `MSG_RETIRED` if it can be sent, otherwise just
+  the end of its connection, and the event log then shows a resume, not a
+  takeover of it. Its late disconnect releases nothing, because its epoch is
+  no longer current.
+- The change is recorded as `pty.control_changed` with trigger `resume`, never
+  `takeover`. So a client cut off without `MSG_RETIRED` never reads a resume
+  as a takeover, and a later takeover of the resumed client, which grants the
+  epoch after the resumed one, is still read as one (81).
+- Then the bytes, under the lock capture appends under:
+  - **Resumed** (`MSG_RESUMED`, the new epoch and the offset asked for) if the
+    output ring still holds that offset. The output from there follows,
+    stamped, with no mode replay: the terminal already has those modes.
+  - **Gone** (`MSG_GONE`, `[epoch][run id][head][oldest]`) otherwise. It
+    names exactly what the ring holds, `oldest` up to `head`. The mode replay
+    follows, unstamped, then the output from the head, stamped. A client
+    first turns off the modes it tracked, since the replay only turns modes
+    on, and after the replay sends its size and a repaint, as a fresh attach
+    does. An offset past the head is answered gone as well; the client
+    treats that as a protocol failure (80), since its own count is broken.
+- A sidecar that predates resuming refuses `MSG_RESUME` with the protocol
+  class, as it refuses anything that is not a hello.
+
 ### Refusals
 
 A refusal, `MSG_REJECTED`, has the payload `[class u8][reason UTF-8]`. The
@@ -155,7 +201,7 @@ for people.
 | Class | Name | Meaning | Client exit code |
 |---:|---|---|---:|
 | 1 | protocol | no hello, or an unsupported version or mode | 80 |
-| 2 | control | someone holds the terminal, or the run has ended | 81 |
+| 2 | control | someone holds the terminal, the run has ended, or a resume the control rule refuses | 81 |
 | 3 | runtime | the input writer stopped, or every connection slot is in use | 84 |
 | 4 | identity | the peer is another user | 85 |
 
@@ -304,6 +350,13 @@ tendr that bridges them to the session's socket
 - When the sidecar ends the connection of a client taken over without
   `MSG_RETIRED`, the bridge checks the event log as the local client does
   and sends `MSG_RETIRED` itself, so the client exits 81 when it reads again.
+- The client can resume from that point over a new ssh connection
+  (`commands::attach::resume_host`): the request carries the point, and a
+  `MSG_RESUME` takes the hello's place on ssh's stdin, which the bridge
+  passes on ([Resuming a viewer](#resuming-a-viewer)). A gone answer
+  requires the client to turn off the modes it has tracked before it writes
+  the replay. The client does not yet reconnect by itself when the link
+  drops.
 - A Windows client still runs the remote `tendr attach` under `ssh -t`; the
   remote end then is the client described above, driving a remote terminal.
 
@@ -361,7 +414,9 @@ tendr that bridges them to the session's socket
 - A version 2 viewer gets each byte's offset ([the attach
   handshake](#the-attach-handshake)); why offsets and not recording sequence
   numbers: [design](../design.md#viewers-count-output-in-bytes-and-agree-the-version-in-the-request).
-  A viewer cannot yet resume from where it stopped; that is step 1 of
+  A viewer that lost its connection can resume from its offset ([Resuming a
+  viewer](#resuming-a-viewer)); `attach --host` does not yet reconnect by
+  itself, which is step 1 of
   [remote frame transport](../plans/active/01_remote-frame-transport.md).
 - Capture also tracks the terminal modes the child's output turns on
   (`term_modes::TermModes`, which lists them): among them the alternate
