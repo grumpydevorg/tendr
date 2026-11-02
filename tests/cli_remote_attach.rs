@@ -17,8 +17,9 @@ use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// The ssh argv of every `--host` operation, attach included.
-const REMOTE_ARGV: [&str; 12] = [
+/// The ssh argv of an attach: every `--host` operation's, plus a connection
+/// of its own (no ControlMaster sharing).
+const ATTACH_ARGV: [&str; 16] = [
     "-T",
     "-o",
     "ConnectTimeout=10",
@@ -26,6 +27,10 @@ const REMOTE_ARGV: [&str; 12] = [
     "ServerAliveInterval=5",
     "-o",
     "ServerAliveCountMax=3",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
     "box",
     "tendr",
     "--hello",
@@ -94,7 +99,7 @@ impl Remote {
             .lines()
             .filter_map(|l| l.strip_prefix("ARG:"))
             .collect();
-        assert_eq!(argv, REMOTE_ARGV);
+        assert_eq!(argv, ATTACH_ARGV);
     }
 }
 
@@ -949,6 +954,8 @@ fn remote_resume_with_a_sidecar_that_cannot_resume_is_refused() {
 /// file exists, a call is a login that needs a prompt: it writes an
 /// approval URL to stderr and, under `BatchMode=yes`, fails at once. While
 /// the `stall` file exists, a call stalls before the remote tendr starts.
+/// Once the `give-up` file exists, the call under way says ssh's keepalive
+/// timeout on stderr and exits 255.
 struct Flaky {
     ssh: TempDir,
     files: TempDir,
@@ -962,11 +969,12 @@ impl Flaky {
         let files = TempDir::new().unwrap();
         let path = |name: &str| files.path().join(name).display().to_string();
         let ssh = fake_ssh(&format!(
-            "append {}\npidfile {}\nneeds-prompt {}\nstall-if {}\npump",
+            "append {}\npidfile {}\nneeds-prompt {}\nstall-if {}\ngive-up-if {}\npump",
             path("calls"),
             path("pid"),
             path("prompt"),
-            path("stall")
+            path("stall"),
+            path("give-up")
         ));
         Self { ssh, files }
     }
@@ -1017,6 +1025,12 @@ impl Flaky {
             "kill ssh {pid}"
         );
         pid
+    }
+
+    /// Lose the link as ssh's keepalives do: the current call says it timed
+    /// out and exits 255.
+    fn give_up(&self) {
+        std::fs::write(self.files.path().join("give-up"), b"").unwrap();
     }
 
     /// The calls so far: when each started (ms since the epoch), and its argv.
@@ -1191,6 +1205,52 @@ fn host_attach_reconnects_when_ssh_dies_mid_flood_with_no_gap_or_duplicate() {
             .iter()
             .all(|(_, argv)| argv.contains("BatchMode=yes")),
         "a reconnect never prompts: {calls:?}"
+    );
+}
+
+/// ssh's last words as its keepalives give up go to the status line, not
+/// into the session's screen: the terminal gets the run's output exactly,
+/// and the timeout is shown below the reconnect's line.
+#[test]
+fn host_attach_keeps_what_ssh_says_off_the_sessions_screen() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-quiet");
+    start_script(
+        &root,
+        "host-quiet",
+        NUMBERED_FLOOD,
+        &["GO", "STOP", "END"],
+        &[],
+    );
+    let link = Flaky::new();
+
+    let mut wrapped = link.attach(&root, "quiet", &["host-quiet"]);
+    wait_control(&root, "host-quiet", "HumanControl");
+    touch(&root, "GO");
+    wrapped.wait_output_contains("000000500 ");
+    link.give_up();
+    wait_resumes(&root, "host-quiet", 1);
+    touch(&root, "STOP");
+    wrapped.wait_output_contains("FLOOD-END");
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+
+    touch(&root, "END");
+    harness::wait_terminal(&root, "host-quiet");
+    let output = wrapped.cli.output();
+    assert!(
+        output.contains("\x1b[2KTimeout, server box not responding."),
+        "the timeout is on the status line: {output:?}"
+    );
+    let recording = String::from_utf8(harness::recorded_output(&root, "host-quiet")).unwrap();
+    let shown = without_status_line(&output);
+    assert!(
+        shown == recording,
+        "the terminal showed {} bytes, the run wrote {}; ssh's line on the screen: {}",
+        shown.len(),
+        recording.len(),
+        shown.contains("Timeout")
     );
 }
 

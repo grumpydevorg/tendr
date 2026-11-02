@@ -169,9 +169,10 @@ pub fn cmd_attach_host(
         },
     )?;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stderr = std::sync::Arc::new(unix_relay::StderrRoute::default());
     let dial = tendr::ssh::Dial {
         login: tendr::ssh::Login::Interactive,
-        stderr: Box::new(std::io::stderr()),
+        stderr: Box::new(unix_relay::SshStderr::new(std::sync::Arc::clone(&stderr))),
         cancel: std::sync::Arc::clone(&cancel),
     };
     // The remote side's answer is the sidecar's acceptance.
@@ -188,6 +189,7 @@ pub fn cmd_attach_host(
         request: request.clone(),
         ssh: Some(ssh),
         cancel,
+        stderr,
     };
     unix_relay::relay(
         link,
@@ -208,6 +210,9 @@ pub(super) struct HostEnd {
     /// Once set, every ssh of this attach stops, the one connecting
     /// included: the attach is leaving while it reconnects.
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Where every connection's ssh stderr goes once the relay owns the
+    /// terminal.
+    stderr: std::sync::Arc<unix_relay::StderrRoute>,
 }
 
 #[cfg(unix)]
@@ -223,19 +228,18 @@ impl HostEnd {
     }
 
     /// One attempt to resume from `point` over a new ssh, which never
-    /// prompts ([`tendr::ssh::Login::Batch`]) and whose stderr goes to
-    /// `stderr`. On success the new ssh is this end's.
+    /// prompts ([`tendr::ssh::Login::Batch`]) and whose stderr goes where
+    /// every connection's does once the relay owns the terminal. On success
+    /// the new ssh is this end's.
     ///
     /// # Errors
     /// As for [`resume_host`].
-    fn resume(
-        &mut self,
-        point: attach_proto::ResumePoint,
-        stderr: Box<dyn std::io::Write + Send>,
-    ) -> anyhow::Result<unix_relay::Attempt> {
+    fn resume(&mut self, point: attach_proto::ResumePoint) -> anyhow::Result<unix_relay::Attempt> {
         let dial = tendr::ssh::Dial {
             login: tendr::ssh::Login::Batch,
-            stderr,
+            stderr: Box::new(unix_relay::SshStderr::new(std::sync::Arc::clone(
+                &self.stderr,
+            ))),
             cancel: std::sync::Arc::clone(&self.cancel),
         };
         Ok(match resume_host(&self.host, &self.request, point, dial)? {
@@ -816,7 +820,7 @@ mod unix_relay {
 
     mod reconnect;
 
-    pub(super) use reconnect::Attempt;
+    pub(super) use reconnect::{Attempt, SshStderr, StderrRoute};
 
     /// Input that may wait for a session that is not accepting it. Beyond
     /// this, the attach client drops further keystrokes (and reports them)
@@ -980,6 +984,10 @@ mod unix_relay {
         // Restores the terminal on every way out of this function, panics
         // included.
         let terminal = RawTerminal::enter()?;
+        // From here on, what ssh says stays off the session's screen.
+        if let Some(end) = &host {
+            end.stderr.set(&status, &screen);
+        }
 
         let mut size = terminal_size();
         let mut connection = Some(Connection::open(link, &retired, &screen));
@@ -1218,7 +1226,7 @@ mod unix_relay {
     }
 
     /// What the session's output has done to the user's terminal.
-    struct Screen {
+    pub(super) struct Screen {
         /// What has been written to the terminal. Held while writing, so a
         /// reset cannot interleave with output, and so the resume point moves
         /// only past bytes the terminal took.

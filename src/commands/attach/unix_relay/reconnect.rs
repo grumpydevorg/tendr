@@ -14,11 +14,12 @@
 //! note once typed input has been discarded, and ssh's latest stderr line
 //! goes on a row of its own below it, so an approval URL is visible. They
 //! are drawn with the cursor saved and restored (DECSC, DECRC), and erased
-//! before any output follows.
+//! before any output follows. What ssh says while a connection is up is
+//! kept off the session's screen ([`SshStderr`]).
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::Duration;
 
 use tendr::attach_proto::ResumePoint;
@@ -31,8 +32,8 @@ use super::{Link, Screen, write_terminal};
 /// The longest pause between two failed attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// How many of an attempt's stderr lines are kept for the report when the
-/// remote ends the attach, and how long each may be.
+/// How many of ssh's stderr lines are kept for the report when the attach
+/// ends, and how long each may be.
 const KEPT_LINES: usize = 20;
 const KEPT_LINE_BYTES: usize = 1024;
 
@@ -141,12 +142,7 @@ fn reconnect(
             return None;
         }
         status.attempt(failures + 1, screen);
-        let stderr = Box::new(StatusSink {
-            status: Arc::clone(status),
-            screen: Arc::clone(screen),
-            partial: Vec::new(),
-        });
-        let attempt = end.resume(asked, stderr);
+        let attempt = end.resume(asked);
         if cancelled() {
             return None;
         }
@@ -207,16 +203,17 @@ fn pause_unless(cancel: &AtomicBool, pause: Duration) -> bool {
     }
 }
 
-/// The reconnect's status, on the terminal's last rows, and what an
-/// attempt's ssh said.
+/// The reconnect's status, on the terminal's last rows, and what ssh said
+/// since the current attempt began or the connection came up.
 #[derive(Default)]
 pub(in crate::commands::attach) struct Status {
     /// Held while drawing, so draws and erases do not interleave.
     state: Mutex<State>,
-    /// The current attempt's stderr lines, for the report if the remote ends
-    /// the attach: its reason is among them. Like `notices`, never held
-    /// while writing, so the main thread can take them when leaving
-    /// whatever the terminal does.
+    /// ssh's stderr lines since the current attempt began, or since the
+    /// connection came up, for the report when the attach ends: a remote's
+    /// reason for ending it is among them. Like `notices`, never held while
+    /// writing, so the main thread can take them when leaving whatever the
+    /// terminal does.
     lines: Mutex<Vec<String>>,
     /// The gone notices, said again once the terminal is restored, since a
     /// program on the alternate screen hides them.
@@ -278,11 +275,15 @@ impl Status {
         self.draw(&mut state, screen);
     }
 
-    /// A line of ssh's stderr, while a reconnect is under way; `false`
-    /// otherwise, for the caller to pass it on.
+    /// A line of ssh's stderr. While a reconnect is under way it goes on the
+    /// status line. While a connection is up it is kept: ssh says why it
+    /// gave up just before it exits, which the next reconnect's status line
+    /// then shows, and the report at the end of the attach says the rest.
+    /// `false` once the attach is leaving, for the caller to write it to
+    /// stderr itself.
     fn ssh_said(&self, line: &[u8], screen: &Screen) -> bool {
         let mut state = self.lock();
-        if !state.active {
+        if screen.done.load(Ordering::SeqCst) {
             return false;
         }
         let text = String::from_utf8_lossy(line);
@@ -448,25 +449,57 @@ fn gone_notice(asked: u64, oldest: u64, head: u64) -> String {
     )
 }
 
-/// An attempt's ssh stderr: each line goes to the status line while the
-/// reconnect is under way, and to stderr once the connection is up.
-struct StatusSink {
-    status: Arc<Status>,
-    screen: Arc<Screen>,
+/// Where an `attach --host` connection's ssh stderr goes, once the relay owns
+/// the terminal: see [`SshStderr`].
+#[derive(Default)]
+pub(in crate::commands::attach) struct StderrRoute(OnceLock<(Arc<Status>, Arc<Screen>)>);
+
+impl StderrRoute {
+    /// From now on, ssh's stderr lines go to `status`.
+    pub(in crate::commands::attach) fn set(&self, status: &Arc<Status>, screen: &Arc<Screen>) {
+        let _ = self.0.set((Arc::clone(status), Arc::clone(screen)));
+    }
+}
+
+/// An `attach --host` connection's ssh stderr, line by line: to tendr's
+/// stderr until the relay owns the terminal and once it is leaving, and
+/// otherwise to [`Status::ssh_said`], so that nothing ssh says, such as its
+/// `Timeout, server not responding.` as a link dies, lands in the session's
+/// screen.
+pub(in crate::commands::attach) struct SshStderr {
+    route: Arc<StderrRoute>,
     partial: Vec<u8>,
 }
 
-impl StatusSink {
+impl SshStderr {
+    pub(in crate::commands::attach) fn new(route: Arc<StderrRoute>) -> Self {
+        Self {
+            route,
+            partial: Vec::new(),
+        }
+    }
+
     fn line(&mut self, line: &[u8]) {
-        if !self.status.ssh_said(line, &self.screen) {
+        let said = self
+            .route
+            .0
+            .get()
+            .is_some_and(|(status, screen)| status.ssh_said(line, screen));
+        if !said {
             let mut stderr = std::io::stderr().lock();
             let _ = stderr.write_all(line).and_then(|()| stderr.flush());
         }
     }
 }
 
-impl Write for StatusSink {
+impl Write for SshStderr {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.route.0.get().is_none() {
+            // Not routed yet: straight to tendr's stderr, as for any call.
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr.write_all(buf).and_then(|()| stderr.flush());
+            return Ok(buf.len());
+        }
         self.partial.extend_from_slice(buf);
         while let Some(end) = self.partial.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.partial.drain(..=end).collect();
@@ -484,7 +517,7 @@ impl Write for StatusSink {
     }
 }
 
-impl Drop for StatusSink {
+impl Drop for SshStderr {
     fn drop(&mut self) {
         if !self.partial.is_empty() {
             let line = std::mem::take(&mut self.partial);

@@ -374,10 +374,13 @@ tendr that bridges them to the session's socket
   - The status goes on the terminal's last rows, written under the lock the
     output is written under, with the cursor saved and restored (DECSC,
     DECRC): tendr's line, and ssh's latest stderr line on the row below
-    (an approval URL), as printable ASCII cut to the width. It is erased
-    before the new connection's output is written. The stderr of the last
-    attempt is printed again once the terminal is restored, since it holds
-    the remote's reason for a refusal.
+    (an approval URL, or the `Timeout, server not responding.` the lost
+    connection's ssh said as it gave up), as printable ASCII cut to the
+    width. It is erased before the new connection's output is written.
+    While a connection is up its ssh stderr is kept off the screen too.
+    What ssh said on the last attempt, or since the last connection came
+    up, is printed once the terminal is restored, since it holds the
+    remote's reason for a refusal.
   - On `MSG_RESUMED` the new connection relays from the same offset. On
     `MSG_GONE` the client first writes the reset of the modes it tracked
     and a notice of how many bytes it missed and how many the session no

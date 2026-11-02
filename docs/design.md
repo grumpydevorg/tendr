@@ -274,8 +274,8 @@ refuses, or the user leaves with the escape or a signal. A laptop that
 sleeps or changes networks should come back to its session, and a person
 who wants out has the escape.
 
-A reconnect runs ssh with `BatchMode=yes`, so that call has a second
-constant argv. The first connection keeps prompts: it runs before raw mode,
+A reconnect runs ssh with `BatchMode=yes`, so that call has a constant argv
+of its own. The first connection keeps prompts: it runs before raw mode,
 so a passphrase or host-key prompt reads a normal terminal. A reconnect
 happens in raw mode, while the keyboard belongs to the attach; a prompt
 would eat keystrokes, or wait unseen. Under `BatchMode` a login that needs a
@@ -283,6 +283,16 @@ prompt fails at once, and its stderr (an approval URL, say) goes into the
 status line instead. Every framed call has `ServerAliveInterval=5` and
 `ServerAliveCountMax=3`, so ssh notices a dead link within about 15 to 20 s
 instead of waiting on TCP.
+
+An attach always makes its own ssh connection (`-o ControlMaster=no -o
+ControlPath=none`). A mux client sends no keepalives of its own: the
+master's settings decide when a dead link is noticed. With Rick's config
+(`ServerAliveInterval 60`, `ServerAliveCountMax 3`, `ControlPersist 600`),
+an attach over an open master noticed an iptables drop on the VM after
+240 s; on its own connection, after 20 s. The extra handshake (about 0.4 s
+to the VM) is paid once per connection. Short framed calls keep sharing:
+the master saves them about 0.3 s each, and over a dead master they still
+end, at the 30 s connect deadline.
 
 Input typed while reconnecting is discarded with one notice, never queued:
 keystrokes sent seconds late to a program that has moved on can do harm, and

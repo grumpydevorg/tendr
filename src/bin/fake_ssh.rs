@@ -34,6 +34,9 @@
 //! stall-if <path>   while <path> exists, stall before the remote command
 //!                   starts (sleep), as a lapsed check-mode approval does
 //! hold <pid> <secs> sleep until process <pid> is gone, at most <secs>
+//! give-up-if <path> from now on, once <path> exists: remove it, write
+//!                   `Timeout, server box not responding.` to stderr and
+//!                   exit 255, as ssh does when its keepalives go unanswered
 //! forward           act as the remote login shell: see `forward`
 //! pump              act as the remote login shell, as real ssh does (Unix
 //!                   only): see `pump`
@@ -153,11 +156,28 @@ fn main() {
                     Duration::from_secs(secs.parse().unwrap()),
                 );
             }
+            "give-up-if" => give_up_if(value.to_owned()),
             "forward" => forward(&argv),
             "pump" => pump(&argv),
             other => panic!("fake ssh: unknown action {other:?}"),
         }
     }
+}
+
+/// Watch for `path` on a thread of its own: once it exists, remove it, say
+/// what ssh says when its keepalives go unanswered, and exit as it does.
+fn give_up_if(path: String) {
+    std::thread::spawn(move || {
+        loop {
+            if std::fs::remove_file(&path).is_ok() {
+                let mut err = std::io::stderr().lock();
+                let _ = err.write_all(b"Timeout, server box not responding.\r\n");
+                let _ = err.flush();
+                std::process::exit(255);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
 }
 
 /// `\n` becomes a newline and `\\` a backslash; any other backslash stays.
