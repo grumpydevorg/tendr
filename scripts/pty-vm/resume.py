@@ -44,10 +44,11 @@ import os, re, select, shlex, subprocess, sys, threading, time, fcntl, struct, t
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VM = os.environ.get("VM_HOST") or sys.exit("set VM_HOST")
-SSH = "/usr/bin/ssh"
+SSH = os.environ.get("SSH_BIN", "/usr/bin/ssh")  # for the VM's own commands
 STATUS = re.compile(rb"\x1b7(?:\x1b\[\d+;1H\x1b\[0m\x1b\[2K[ -~]*)+\x1b8")
 NOTICE = re.compile(rb"\r\ntendr: reconnected; (\d+) bytes of output were written while disconnected, "
                     rb"and the session no longer held (\d+) of them, so none are shown\r\n")
+RING_BYTES = 32 << 20  # OUTPUT_RING_BYTES in src/sidecar/output_ring.rs
 T0 = time.monotonic()
 
 
@@ -296,9 +297,15 @@ def main():
         if scenario == "gone":
             t_gone = c.wait_for(b"no longer held", 150, after=t_heal or 0)
             log("gone notice at", t_gone, None if t_gone is None else round(t_gone - t_heal, 2), "s after heal")
+        inject_ok = None
         if inject:
-            inject.wait(n + 150)
-            log("inject:", inject.stdout.read().decode().strip())
+            try:
+                inject.wait(n + 150)
+            except subprocess.TimeoutExpired:
+                inject.kill()
+                inject.wait()
+            inject_ok = inject.returncode == 0
+            log("inject:", inject.returncode, inject.stdout.read().decode().strip())
             t_end = c.wait_for(b"A-END", 150)
             log("A-END reached the client at", t_end)
         t_back = c.first_time(b"\x1b8", after=t_heal or 0)
@@ -332,7 +339,7 @@ def main():
     verdict = "n/a"
     if scenario == "drop":
         tail = rec[base:]
-        at = shown.find(tail)
+        at = shown.find(tail) if tail else -1
         if at < 0:
             lo = shown.find(rec[base:base + 200])
             i = agree(shown, lo, rec, base) if lo >= 0 else 0
@@ -340,11 +347,14 @@ def main():
                 f"shown {shown[lo + i - 60:lo + i + 60]!r}\n  recorded {rec[base + i - 60:base + i + 60]!r}")
             verdict = "FAIL"
         else:
-            again = shown.find(tail, at + 1) if tail else -1
+            again = shown.find(tail, at + 1)
             before, after = shown[:at], shown[at + len(tail):]
             log(f"MATCH: recorded output {base}..{len(rec)} ({len(tail)} bytes) shown exactly, once={again < 0}; "
                 f"before it {len(before)} bytes {before[:300]!r}; after it {len(after)} bytes {after[:300]!r}")
-            verdict = "PASS" if again < 0 and b"A0000" not in before + after else "CHECK"
+            # The injected stream is in the match, whole, and nowhere else.
+            whole = inject_ok and b"A-END" in tail
+            stray = re.search(rb"A\d{9} ", before + after)
+            verdict = "PASS" if again < 0 and whole and not stray else "CHECK"
     elif scenario == "gone":
         m = NOTICE.search(shown)
         if not m:
@@ -359,7 +369,7 @@ def main():
             reset = pre[lo + i:]
             head = asked + missed
             post = shown[m.end():]
-            at = post.find(rec[head:])
+            at = post.find(rec[head:]) if head < len(rec) else -1
             log(f"gone: client offset {asked} (shown exactly up to it from {base}); notice: missed {missed}, "
                 f"not held {not_held}; head {head}; recording {len(rec)}")
             log(f"between the last shown byte and the notice ({len(reset)} bytes, the mode reset): {reset!r}")
@@ -367,7 +377,10 @@ def main():
                 f"after it {post[at + len(rec) - head:][:300]!r}")
             g_shown = len(re.findall(rb"G\d{9} ", shown))
             log("G fields shown:", g_shown, "G-END shown:", b"G-END" in shown)
-            verdict = "PASS" if at >= 0 and lo >= 0 and g_shown == 0 else "CHECK"
+            # What the session no longer held is what fell out of its ring.
+            ring = missed - not_held == RING_BYTES
+            log("missed - not held = ring:", ring)
+            verdict = "PASS" if at >= 0 and lo >= 0 and g_shown == 0 and ring else "CHECK"
     else:
         tail = shown[-400:]
         log("client's last bytes:", repr(tail))

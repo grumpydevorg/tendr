@@ -16,7 +16,10 @@ import glob, json, os, struct, subprocess, sys
 
 def recording_dir(session):
     status = json.loads(subprocess.check_output(["tendr", "status", session]))
-    rec = status["pty"]["recording"]["dir"]
+    rec = status["pty"]["recording"]
+    if rec.get("state") == "Stopped":
+        sys.exit(f"recout: {session}'s recording stopped, so it is not the run's whole output")
+    rec = rec["dir"]
     return os.path.expanduser(f"~/.tendr/sessions/default/{session}/{rec}")
 
 

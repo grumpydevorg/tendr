@@ -32,7 +32,9 @@ def main():
         n = min(chunk_fields, max(1, (total - written) // width))
         buf = "".join(f"{tag}{j:09d} " for j in range(i, i + n)).encode()
         i += n
-        os.write(fd, buf)  # a blocking fd: write() of a tty writes it all
+        view = memoryview(buf)
+        while view:
+            view = view[os.write(fd, view):]
         written += len(buf)
         if rate:
             ahead = written / rate - (time.monotonic() - start)
