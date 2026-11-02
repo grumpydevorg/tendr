@@ -75,7 +75,7 @@ bridge's remote end in `src/commands/attach/bridge.rs:30-34`). Needed:
 - a Windows console frontend (raw mode, VT flags, resize, restore on exit).
   A Unix client attaches over `ssh -T` through the attach bridge; a Windows
   client still uses `ssh -t` until it has this frontend, and then moves to
-  the bridge (remote frame transport, step 3).
+  the bridge (remote frame transport, step 2).
 
 ## Acceptance
 

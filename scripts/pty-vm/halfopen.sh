@@ -13,7 +13,9 @@
 # from the Mac with
 #   ssh -J <vm>.exe.xyz -p 2222 acc@127.0.0.1
 # where $SSH_CLIENT inside the session is "127.0.0.1 <port> 2222": pass that
-# port as --client-port. Default --dport is therefore 2222.
+# port as --client-port. Default --dport is therefore 2222. Without
+# --client-port every client's packets are dropped, new connections included,
+# as in a real outage; --both then drops sshd's replies to all of them too.
 #
 # Removal is layered so a rule cannot outlive the test: (1) the main flow heals
 # after N s; (2) a trap on EXIT/INT/TERM/HUP heals; (3) a systemd-run timer
@@ -61,8 +63,7 @@ log() { echo "$*" | tee -a "$LOG"; }
 
 rules=("-s $CLIENT_IP -p tcp --dport $DPORT${CLIENT_PORT:+ --sport $CLIENT_PORT}")
 if [ "$BOTH" = 1 ]; then
-  [ -n "$CLIENT_PORT" ] || { echo "halfopen.sh: --both needs --client-port" >&2; exit 2; }
-  rules+=("-d $CLIENT_IP -p tcp --sport $DPORT --dport $CLIENT_PORT")
+  rules+=("-d $CLIENT_IP -p tcp --sport $DPORT${CLIENT_PORT:+ --dport $CLIENT_PORT}")
 fi
 
 healed=0
