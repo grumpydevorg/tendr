@@ -225,10 +225,21 @@ const FRAME_OPTIONS: [&str; 6] = [
     "ServerAliveCountMax=3",
 ];
 
+/// An attach's own connection, never a channel of a shared one. A mux
+/// client sends no keepalives: the master's settings decide when a dead
+/// link is noticed, and with `ServerAliveInterval 60` that took 240 s on the
+/// VM instead of 20. A connection over a master whose link is dead waits
+/// out the connect deadline rather than failing at `ConnectTimeout`. Other
+/// framed calls keep sharing: they are short, and a shared connection
+/// saves about 0.3 s each.
+#[cfg(unix)]
+const ATTACH_OPTIONS: [&str; 4] = ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
+
 /// The argv of a framed call — constant by construction:
 /// `ssh -T -o ConnectTimeout=10 -o ServerAliveInterval=5 -o
-/// ServerAliveCountMax=3 <host> tendr [--hello] --exit-trailer <entry>`, with
-/// `-o BatchMode=yes` before the host for an attach's reconnect
+/// ServerAliveCountMax=3 <host> tendr [--hello] --exit-trailer <entry>`.
+/// An attach adds `-o ControlMaster=no -o ControlPath=none` before the host
+/// ([`ATTACH_OPTIONS`]), and its reconnect `-o BatchMode=yes` after them
 /// ([`Login::Batch`]). Nothing user-controlled rides in it, so there is no
 /// shell-quoting layer to traverse; the request travels on ssh's stdin as
 /// opaque bytes.
@@ -254,8 +265,11 @@ fn build_ssh_frame_command(
     let mut cmd = Command::new("ssh");
     cmd.arg("-T").args(FRAME_OPTIONS);
     #[cfg(unix)]
-    if streams == Streams::Attach(Login::Batch) {
-        cmd.args(["-o", "BatchMode=yes"]);
+    if let Streams::Attach(login) = streams {
+        cmd.args(ATTACH_OPTIONS);
+        if login == Login::Batch {
+            cmd.args(["-o", "BatchMode=yes"]);
+        }
     }
     cmd.args([host, "tendr"]);
     if connect_deadline().is_some() {
@@ -981,9 +995,10 @@ mod tests {
         );
     }
 
-    /// Every operation but exec runs this one argv, `attach` from a Unix
-    /// client included; the request is not an input to it. An attach's
-    /// reconnect adds only `BatchMode=yes`, so it never prompts.
+    /// Every operation but exec runs this one argv; the request is not an
+    /// input to it. A Unix client's `attach` adds only its own connection
+    /// (no ControlMaster), and its reconnect `BatchMode=yes`, so it never
+    /// prompts.
     #[test]
     fn remote_frame_argv_is_constant() {
         let remote = [
@@ -1000,22 +1015,24 @@ mod tests {
             "--exit-trailer",
             "_remote",
         ];
-        let streams = [
-            Streams::Request,
-            #[cfg(unix)]
-            Streams::Attach(Login::Interactive),
-        ];
-        for streams in streams {
-            let cmd = build_ssh_frame_command("user@box", Entry::Remote, streams).unwrap();
-            assert_eq!(argv(&cmd), remote, "{streams:?}");
-        }
+        let cmd = build_ssh_frame_command("user@box", Entry::Remote, Streams::Request).unwrap();
+        assert_eq!(argv(&cmd), remote);
         #[cfg(unix)]
         {
+            let mut attach = remote.to_vec();
+            attach.splice(7..7, ["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+            let cmd = build_ssh_frame_command(
+                "user@box",
+                Entry::Remote,
+                Streams::Attach(Login::Interactive),
+            )
+            .unwrap();
+            assert_eq!(argv(&cmd), attach, "an attach");
+            let mut batch = attach.clone();
+            batch.splice(11..11, ["-o", "BatchMode=yes"]);
             let cmd =
                 build_ssh_frame_command("user@box", Entry::Remote, Streams::Attach(Login::Batch))
                     .unwrap();
-            let mut batch = remote.to_vec();
-            batch.splice(7..7, ["-o", "BatchMode=yes"]);
             assert_eq!(argv(&cmd), batch, "a reconnect");
         }
     }

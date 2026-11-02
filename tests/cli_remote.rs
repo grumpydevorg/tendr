@@ -101,9 +101,8 @@ fn host_flag_is_accepted_by_parser() {
     );
 }
 
-/// The ssh argv of every `--host` operation but exec (and a Windows client's
-/// attach): constant, so nothing the user typed reaches the remote login
-/// shell.
+/// The ssh argv of every `--host` operation but exec and attach: constant, so
+/// nothing the user typed reaches the remote login shell.
 const REMOTE_ARGV: [&str; 12] = [
     "-T",
     "-o",
@@ -112,6 +111,28 @@ const REMOTE_ARGV: [&str; 12] = [
     "ServerAliveInterval=5",
     "-o",
     "ServerAliveCountMax=3",
+    "box",
+    "tendr",
+    "--hello",
+    "--exit-trailer",
+    "_remote",
+];
+
+/// The ssh argv of a Unix client's attach: [`REMOTE_ARGV`] plus a connection
+/// of its own (no ControlMaster sharing).
+#[cfg(unix)]
+const ATTACH_ARGV: [&str; 16] = [
+    "-T",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=3",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
     "box",
     "tendr",
     "--hello",
@@ -132,7 +153,8 @@ fn printed_args(stdout: &[u8]) -> Vec<String> {
 }
 
 /// Every operation, with a hostile value in every place a value can go, runs
-/// the same ssh argv: the request itself travels on ssh's stdin.
+/// the same ssh argv (a Unix client's attach its own constant one): the
+/// request itself travels on ssh's stdin.
 #[test]
 fn every_host_operation_sends_the_same_constant_argv() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -218,9 +240,9 @@ fn every_host_operation_sends_the_same_constant_argv() {
         );
     }
 
-    // attach from a Unix client runs the same argv. It needs a terminal on
-    // stdin before ssh starts, so it runs in one, and its ssh stdout carries
-    // the attach protocol, so the argv goes to a file.
+    // attach from a Unix client runs its own constant argv. It needs a
+    // terminal on stdin before ssh starts, so it runs in one, and its ssh
+    // stdout carries the attach protocol, so the argv goes to a file.
     #[cfg(unix)]
     {
         use harness::{Observation, poll_until};
@@ -265,7 +287,7 @@ fn every_host_operation_sends_the_same_constant_argv() {
                 },
             )
             .expect("attach ran ssh");
-        assert_eq!(printed, REMOTE_ARGV, "attach");
+        assert_eq!(printed, ATTACH_ARGV, "attach");
     }
 }
 

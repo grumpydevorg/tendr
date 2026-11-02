@@ -314,13 +314,17 @@ sidecar; otherwise the attach ends as before, with ssh's exit.
 
 - ssh checks the link every 5 s and gives up after three unanswered checks,
   so a dead network is noticed within about 15 to 20 s. Killing `ssh`, or a
-  remote host that drops the connection, is noticed at once.
+  remote host that drops the connection, is noticed at once. The attach
+  makes its own ssh connection even where your ssh config shares one
+  (`ControlMaster`), because a shared connection's checks are the master's.
 - While it reconnects, a line at the bottom of your terminal says so, and
-  ssh's latest error, such as a Tailscale approval URL to open in your
-  browser, goes on the last row below it. A reconnect never prompts (`ssh -o
-  BatchMode=yes`): a login that needs a passphrase or a host-key answer fails
-  at once and is tried again. Load the key into your agent, or approve the
-  URL, and the next attempt gets through.
+  ssh's latest error, such as its timeout or a Tailscale approval URL to
+  open in your browser, goes on the last row below it. What ssh says while
+  you are attached stays off the session's screen: the next reconnect shows
+  it there, or the attach prints it when it ends. A reconnect never prompts
+  (`ssh -o BatchMode=yes`): a login that needs a passphrase or a host-key
+  answer fails at once and is tried again. Load the key into your agent, or
+  approve the URL, and the next attempt gets through.
 - Attempts follow each other with pauses of 1, 2, 4, 8 and 16 s, then every
   30 s, for as long as it takes. `Ctrl-\ d`, SIGTERM, SIGHUP and SIGINT still
   leave (0, or 1 for a signal), and stop the attempt under way. The old
@@ -548,7 +552,11 @@ SSH check-mode approval waits about 30 minutes with no prompt.
   `wait --timeout 3600` and `log -f` are unaffected. `ssh` checks the link
   every 5 s (`ServerAliveInterval=5`, `ServerAliveCountMax=3`), so a dead
   network ends a command with ssh's 255 within about 15 to 20 s, instead of
-  leaving it hanging.
+  leaving it hanging. If your ssh config shares connections
+  (`ControlMaster`), a command that rides an existing master gets the
+  master's checks instead, and one that starts over a master whose network
+  is gone ends at the connect deadline. `attach` always makes its own
+  connection.
 - Time spent at an `ssh` prompt (passphrase, unknown host key) counts.
 - `TENDR_SSH_CONNECT_TIMEOUT` sets the limit in seconds; `0` turns it off.
 - A remote `tendr` too old for this client fails on the first flag it does

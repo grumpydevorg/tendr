@@ -256,8 +256,12 @@ before the remote tendr starts.
   terminal. A Unix client's `attach` has it, and enters raw mode only once
   the remote tendr has answered, so an ssh prompt still reads a normal
   terminal. Its reconnects have it too, and run in raw mode with
-  `BatchMode=yes`, so they never prompt; their stderr goes to the status
-  line instead of the terminal's scrolling text.
+  `BatchMode=yes`, so they never prompt. Once the attach is in raw mode,
+  no connection's ssh stderr reaches the terminal's scrolling text: a
+  reconnect's goes to the status line, and while a connection is up it is
+  kept, for the next reconnect's status line (ssh's `Timeout, server not
+  responding.` as it gives up) or, if the attach ends first, for the report
+  once the terminal is restored.
 - `TENDR_SSH_CONNECT_TIMEOUT=0` sends no `--hello`. Stderr is still relayed,
   for the exit trailer and an old remote's parse error.
 - A remote tendr that rejects `_remote`, `--hello` or `--exit-trailer` fails
@@ -271,11 +275,19 @@ before the remote tendr starts.
 - Every framed call's options are `-T -o ConnectTimeout=10 -o
   ServerAliveInterval=5 -o ServerAliveCountMax=3`, before the host. The
   keepalives make ssh notice a dead link within about 15 to 20 s and exit
-  255. An `attach` reconnect adds `-o BatchMode=yes`, its own constant argv:
+  255, when ssh makes its own connection. Over a shared connection
+  (`ControlMaster`) the master's keepalives apply instead.
+- A Unix client's `attach` adds `-o ControlMaster=no -o ControlPath=none`:
+  it always makes its own connection, so its keepalives apply. On the VM, an
+  attach riding a master with `ServerAliveInterval 60` noticed a dead link
+  after 240 s instead of 20. Other calls keep sharing, which saves each
+  about 0.3 s; over a master whose link is dead they end at the 30 s
+  connect deadline (82) rather than at `ConnectTimeout`.
+- An `attach` reconnect also adds `-o BatchMode=yes`, its own constant argv:
   the first connection may need a prompt, which reads the terminal before
   raw mode; a reconnect happens in raw mode, where a prompt would eat
   keystrokes ([design](../design.md#a-dropped-attach---host-reconnects-by-itself-judged-by-sshs-exit)).
-  `remote_frame_argv_is_constant` (`src/ssh.rs`) pins both.
+  `remote_frame_argv_is_constant` (`src/ssh.rs`) pins all three.
 - Every call but `attach` gives ssh tendr's stdout. Its stdin is tendr's
   own for `exec --frame-from-stdin`, otherwise a pipe tendr writes the
   request (and a `push` body) to. Its stderr is a pipe tendr relays.
