@@ -53,18 +53,44 @@ impl Remote {
 
     /// `tendr --host box attach <args>` in a fresh terminal.
     fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
-        attach_through(&self.ssh, "30", root, label, args)
+        attach_through(&self.ssh, "30", root, label, args, &[])
+    }
+
+    /// [`Remote::attach`], resuming from `point` through the debug-build
+    /// driver `TENDR_TEST_ATTACH_RESUME` instead of attaching afresh.
+    fn resume(
+        &self,
+        root: &TempDir,
+        label: &str,
+        args: &[&str],
+        point: tendr::attach_proto::ResumePoint,
+    ) -> WrappedAttach {
+        let point = format!(
+            "{} {} {}",
+            point.run_id.as_uuid(),
+            point.epoch.get(),
+            point.offset
+        );
+        attach_through(
+            &self.ssh,
+            "30",
+            root,
+            label,
+            args,
+            &[("TENDR_TEST_ATTACH_RESUME", &point)],
+        )
     }
 }
 
 /// `tendr --host box attach <args>` in a fresh terminal, through the fake ssh
-/// in `ssh`, with a connect deadline of `deadline` seconds.
+/// in `ssh`, with a connect deadline of `deadline` seconds and `env` added.
 fn attach_through(
     ssh: &TempDir,
     deadline: &str,
     root: &TempDir,
     label: &str,
     args: &[&str],
+    env: &[(&str, &str)],
 ) -> WrappedAttach {
     let argv: Vec<String> = [tendr_bin(), "--host".into(), "box".into(), "attach".into()]
         .into_iter()
@@ -72,16 +98,13 @@ fn attach_through(
         .collect();
     let path = shim_path_env(ssh);
     let tendr = tendr_bin();
-    WrappedAttach::spawn_argv_env(
-        root,
-        label,
-        &argv,
-        &[
-            ("PATH", path.to_str().unwrap()),
-            ("TENDR_TEST_BIN", &tendr),
-            ("TENDR_SSH_CONNECT_TIMEOUT", deadline),
-        ],
-    )
+    let mut all = vec![
+        ("PATH", path.to_str().unwrap()),
+        ("TENDR_TEST_BIN", tendr.as_str()),
+        ("TENDR_SSH_CONNECT_TIMEOUT", deadline),
+    ];
+    all.extend_from_slice(env);
+    WrappedAttach::spawn_argv_env(root, label, &argv, &all)
 }
 
 impl Remote {
@@ -443,13 +466,13 @@ fn host_attach_ssh_failures_keep_their_codes() {
     let root = TempDir::new().unwrap();
 
     let silent = fake_ssh("sleep 30");
-    let wrapped = attach_through(&silent, "1", &root, "deadline", &["s"]);
+    let wrapped = attach_through(&silent, "1", &root, "deadline", &["s"], &[]);
     assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 82);
     wrapped.assert_terminal_restored();
     wrapped.wait_output_contains("did not reach the remote tendr");
 
     let lost = fake_ssh(&format!("err {}\\n\nexit 255", tendr::ssh::HELLO_LINE));
-    let wrapped = attach_through(&lost, "30", &root, "lost", &["s"]);
+    let wrapped = attach_through(&lost, "30", &root, "lost", &["s"], &[]);
     assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 1);
     wrapped.assert_terminal_restored();
     wrapped.wait_output_contains("ssh transport failed");
@@ -635,9 +658,21 @@ struct FrameClient {
 
 impl FrameClient {
     fn start(root: &TempDir, json: &str) -> Self {
+        use tendr::attach_proto::{Frame, Mode, Version};
+        Self::start_with(
+            root,
+            json,
+            &Frame::Hello {
+                version: Version::V1,
+                mode: Mode::Attach,
+            },
+        )
+    }
+
+    /// [`FrameClient::start`], with `first` in place of the hello.
+    fn start_with(root: &TempDir, json: &str, first: &tendr::attach_proto::Frame) -> Self {
         use std::io::Write;
         use std::process::Stdio;
-        use tendr::attach_proto::{Frame, Mode, Version, write_frame};
         let mut child = std::process::Command::new(tendr_bin())
             .arg("_remote")
             .env("HOME", root.path())
@@ -646,16 +681,8 @@ impl FrameClient {
             .spawn()
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
-        let mut request = u32::try_from(json.len()).unwrap().to_be_bytes().to_vec();
-        request.extend_from_slice(json.as_bytes());
-        write_frame(
-            &mut request,
-            &Frame::Hello {
-                version: Version::V1,
-                mode: Mode::Attach,
-            },
-        )
-        .unwrap();
+        let mut request = remote_request(json);
+        tendr::attach_proto::write_frame(&mut request, first).unwrap();
         stdin.write_all(&request).unwrap();
         let stdout = child.stdout.take().unwrap();
         Self {
@@ -663,6 +690,12 @@ impl FrameClient {
             stdin: Some(stdin),
             stdout,
         }
+    }
+
+    /// The next frame from the remote side, decoded.
+    fn frame(&mut self) -> tendr::attach_proto::Frame {
+        let (msg_type, payload) = self.read();
+        tendr::attach_proto::Frame::decode(msg_type, payload).expect("a known frame")
     }
 
     fn read(&mut self) -> (u8, Vec<u8>) {
@@ -779,7 +812,7 @@ fn host_attach_sends_what_an_old_remote_reads() {
     let root = TempDir::new().unwrap();
     let sent = root.path().join("sent");
     let ssh = fake_ssh(&format!("stdin {}", sent.display()));
-    let wrapped = attach_through(&ssh, "1", &root, "old-remote", &["s", "--takeover"]);
+    let wrapped = attach_through(&ssh, "1", &root, "old-remote", &["s", "--takeover"], &[]);
     assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 82);
     wrapped.assert_terminal_restored();
 
@@ -815,4 +848,338 @@ fn host_attach_sends_what_an_old_remote_reads() {
         [tendr::attach_proto::MSG_HELLO, 0, 0, 0, 2, 1, 2],
         "a version 1 takeover hello"
     );
+}
+
+/// The remote frame of `json`: its length, then the JSON.
+fn remote_request(json: &str) -> Vec<u8> {
+    let mut request = u32::try_from(json.len()).unwrap().to_be_bytes().to_vec();
+    request.extend_from_slice(json.as_bytes());
+    request
+}
+
+/// This client's attach request for `session`, resuming from `resume`.
+fn attach_json(session: &str, resume: Option<tendr::attach_proto::ResumePoint>) -> String {
+    let resume = resume.map_or(String::new(), |p| {
+        format!(
+            r#","resume":{{"run_id":"{}","epoch":{},"offset":{}}}"#,
+            p.run_id.as_uuid(),
+            p.epoch.get(),
+            p.offset
+        )
+    });
+    format!(
+        r#"{{"v":1,"op":"attach","params":{{"session":"{session}","namespace":null,"takeover":false,"escape":"ctrl-backslash","protocol":2{resume}}}}}"#
+    )
+}
+
+/// A version 2 attach through `_remote`, and the point it was accepted at.
+fn attach_v2(root: &TempDir, session: &str) -> (FrameClient, tendr::attach_proto::ResumePoint) {
+    let mut client = FrameClient::start(root, &attach_json(session, None));
+    match client.frame() {
+        tendr::attach_proto::Frame::AcceptedV2(point) => (client, point),
+        other => panic!("attach not accepted: {other:?}"),
+    }
+}
+
+/// After a lost link, sshd keeps the old remote side and its socket open,
+/// so `meta.json` still says a human holds the session. A resume is not
+/// refused for that: the sidecar decides, resumes, and retires the old
+/// connection, whose remote side reports it taken over.
+#[test]
+fn remote_resume_is_not_refused_by_the_human_control_check() {
+    use tendr::attach_proto::{Frame, ResumePoint};
+    use tendr::model::pty_control::ControllerEpoch;
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-resume");
+    start_pty(&root, "host-resume", &["cat"]);
+
+    let (mut lost, accepted) = attach_v2(&root, "host-resume");
+    wait_control(&root, "host-resume", "HumanControl");
+
+    let mut resumed = FrameClient::start_with(
+        &root,
+        &attach_json("host-resume", Some(accepted)),
+        &Frame::Resume(accepted),
+    );
+    assert_eq!(
+        resumed.frame(),
+        Frame::Resumed(ResumePoint {
+            epoch: ControllerEpoch::new(2),
+            ..accepted
+        })
+    );
+    assert_eq!(lost.frame(), Frame::Retired(ControllerEpoch::new(2)));
+    assert_eq!(lost.child.wait().unwrap().code(), Some(81));
+    assert_eq!(resumed.detach(), Some(0));
+    wait_control(&root, "host-resume", "AgentControl");
+}
+
+/// A sidecar started by a tendr that cannot resume refuses the resume as it
+/// refuses anything but a hello. The remote side answers that it cannot
+/// resume (80), after that one connection: it neither attaches afresh nor
+/// falls back to version 1.
+#[test]
+fn remote_resume_with_a_sidecar_that_cannot_resume_is_refused() {
+    use tendr::attach_proto::{Frame, RejectClass, ResumePoint, write_frame};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-old-resume");
+    start_pty(&root, "host-old-resume", &["cat"]);
+    let seen = fake_listener(&root, "host-old-resume", "pre-resume", |mut client, _| {
+        let refusal = Frame::Rejected {
+            class: RejectClass::Protocol,
+            reason: "attach requires a protocol hello".to_owned(),
+        };
+        let _ = write_frame(&mut client, &refusal);
+        let _ = client.shutdown(std::net::Shutdown::Both);
+    });
+    let point = ResumePoint {
+        run_id: tendr::model::ids::RunId::new(),
+        epoch: tendr::model::pty_control::ControllerEpoch::new(1),
+        offset: 7,
+    };
+    let mut stdin = remote_request(&attach_json("host-old-resume", Some(point)));
+    write_frame(&mut stdin, &Frame::Resume(point)).unwrap();
+
+    let output = tendr(&root)
+        .arg("_remote")
+        .write_stdin(stdin)
+        .timeout(Duration::from_secs(30))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(80), "{output:?}");
+    assert!(output.stdout.is_empty(), "no frame is sent");
+    let mut resume = Vec::new();
+    write_frame(&mut resume, &Frame::Resume(point)).unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [resume[5..].to_vec()],
+        "the resume, once, and nothing else"
+    );
+    assert_eq!(
+        control(&root, "host-old-resume").as_deref(),
+        Some("AgentControl")
+    );
+}
+
+/// A PTY session that prints `first-part` once `go1` exists, then
+/// `second-part` once `go2` does.
+fn start_two_parts(root: &TempDir, session: &str) {
+    let (go1, go2) = (root.path().join("go1"), root.path().join("go2"));
+    let script = "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; printf first-part; \
+         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; printf second-part; sleep 60";
+    let output = tendr(root)
+        .args(["start", session, "--pty"])
+        .arg("--env")
+        .arg(format!("GO1={}", go1.display()))
+        .arg("--env")
+        .arg(format!("GO2={}", go2.display()))
+        .args(["--", "sh", "-c", script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "start {session}: {output:?}");
+    harness::wait_running(root, session);
+}
+
+/// `attach --host` resuming from the point a lost link reached shows only
+/// the output after it, then works as any attach, and the escape detaches.
+#[test]
+fn host_resume_shows_only_the_output_it_missed() {
+    use tendr::attach_proto::{Frame, ResumePoint};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-missed");
+    start_two_parts(&root, "host-missed");
+
+    let (mut lost, accepted) = attach_v2(&root, "host-missed");
+    std::fs::write(root.path().join("go1"), b"").unwrap();
+    let mut shown = Vec::new();
+    while !shown.ends_with(b"first-part") {
+        match lost.frame() {
+            Frame::Output { bytes, .. } => shown.extend(bytes),
+            other => panic!("{other:?}"),
+        }
+    }
+    let reached = ResumePoint {
+        offset: accepted.offset + shown.len() as u64,
+        ..accepted
+    };
+
+    let remote = Remote::new();
+    let mut wrapped = remote.resume(&root, "missed", &["host-missed"], reached);
+    std::fs::write(root.path().join("go2"), b"").unwrap();
+    wrapped.wait_output_contains("second-part");
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    wrapped.assert_terminal_restored();
+    assert!(
+        !wrapped.cli.output().contains("first-part"),
+        "output from before the resume point was shown again"
+    );
+    wait_control(&root, "host-missed", "AgentControl");
+    remote.assert_constant_argv();
+}
+
+/// A resumed `attach --host` that stops reading is taken over like any
+/// other: the takeover cuts it off without `MSG_RETIRED`, and its remote
+/// side reads the takeover of its resumed epoch from the event log, so it
+/// exits 81, not 0.
+#[test]
+fn host_resume_taken_over_while_stalled_exits_81() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-resume-take");
+    let child = format!("({PACED_FLOOD}) & exec cat -v");
+    start_pty(&root, "host-resume-take", &["sh", "-c", &child]);
+    let remote = Remote::new();
+
+    // A link that dropped after its acceptance; its end was noticed.
+    let (lost, accepted) = attach_v2(&root, "host-resume-take");
+    assert_eq!(lost.detach(), Some(0));
+    wait_control(&root, "host-resume-take", "AgentControl");
+
+    let first = remote.resume(&root, "take-1", &["host-resume-take"], accepted);
+    first.wait_output_contains("0000000000");
+    wait_control(&root, "host-resume-take", "HumanControl");
+    first.cli.pause_output();
+    std::thread::sleep(Duration::from_secs(3));
+
+    let mut second = remote.attach(&root, "take-2", &["host-resume-take", "--takeover"]);
+    second
+        .cli
+        .type_until_logged(&root, "host-resume-take", "second-client");
+    assert!(
+        !first.exited(),
+        "a client that is not reading stays blocked"
+    );
+
+    first.cli.resume_output();
+    assert_eq!(
+        first.wait_exit(Duration::from_secs(30)),
+        81,
+        "the stalled resumed client was taken over"
+    );
+    first.assert_terminal_restored();
+    first.wait_output_contains("another client took over this session");
+
+    second.cli.type_bytes(b"\x1cd");
+    assert_eq!(second.wait_exit(Duration::from_secs(15)), 0);
+    second.assert_terminal_restored();
+}
+
+/// `attach --host` resuming from output the session no longer holds goes
+/// on from the head: it shows nothing from before it.
+#[test]
+fn host_resume_past_the_ring_goes_on_from_the_head() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = SessionGuard::new(&root, "host-gone");
+    let (go1, go2) = (root.path().join("go1"), root.path().join("go2"));
+    // About 2 MB of `x` lines, far past a 64 KiB ring, then markers.
+    let script = format!(
+        "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; yes {} | head -n 20000; echo FLOOD-END; \
+         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; printf after-the-gap; sleep 60",
+        "x".repeat(100)
+    );
+    let output = tendr(&root)
+        .env("TENDR_TEST_OUTPUT_RING_BYTES", "65536")
+        .args(["start", "host-gone", "--pty"])
+        .arg("--env")
+        .arg(format!("GO1={}", go1.display()))
+        .arg("--env")
+        .arg(format!("GO2={}", go2.display()))
+        .args(["--", "sh", "-c", &script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    harness::wait_running(&root, "host-gone");
+
+    let (lost, accepted) = attach_v2(&root, "host-gone");
+    assert_eq!(lost.detach(), Some(0));
+    std::fs::write(&go1, b"").unwrap();
+    // The flood has all been captured: its end marker is in the tail of
+    // output.log, whose lines follow capture's reads, so they are joined.
+    let log = root
+        .path()
+        .join(".tendr/sessions/default/host-gone/output.log");
+    poll_until(Duration::from_secs(60), Duration::from_millis(100), || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut tail = Vec::new();
+        if let Ok(mut file) = std::fs::File::open(&log) {
+            let _ = file.seek(SeekFrom::End(-4096));
+            let _ = file.read_to_end(&mut tail);
+        }
+        let text: String = tail
+            .split(|&b| b == b'\n')
+            .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+            .filter_map(|l| l["content"].as_str().map(str::to_owned))
+            .collect();
+        if text.contains("FLOOD-END") {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(text)
+        }
+    })
+    .unwrap();
+
+    let remote = Remote::new();
+    let mut wrapped = remote.resume(&root, "gone", &["host-gone"], accepted);
+    wait_control(&root, "host-gone", "HumanControl");
+    std::fs::write(&go2, b"").unwrap();
+    wrapped.wait_output_contains("after-the-gap");
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    wrapped.assert_terminal_restored();
+    assert!(
+        !wrapped.cli.output().contains("xxxxxxxxxx"),
+        "output from before the head was shown"
+    );
+}
+
+/// What a resume sends a 0.5.0 remote tendr: the request, whose resume it
+/// ignores, then a resume frame where it requires the exact version 1 hello,
+/// so it refuses (80) rather than attach afresh.
+#[test]
+fn host_resume_sends_what_an_old_remote_refuses() {
+    use tendr::attach_proto::{MSG_RESUME, ResumePoint};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let sent = root.path().join("sent");
+    let ssh = fake_ssh(&format!("stdin {}", sent.display()));
+    let point = ResumePoint {
+        run_id: tendr::model::ids::RunId::new(),
+        epoch: tendr::model::pty_control::ControllerEpoch::new(4),
+        offset: 99,
+    };
+    let driver = format!(
+        "{} {} {}",
+        point.run_id.as_uuid(),
+        point.epoch.get(),
+        point.offset
+    );
+    let wrapped = attach_through(
+        &ssh,
+        "1",
+        &root,
+        "old-remote-resume",
+        &["s"],
+        &[("TENDR_TEST_ATTACH_RESUME", &driver)],
+    );
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 82);
+    wrapped.assert_terminal_restored();
+
+    let sent = std::fs::read(&sent).unwrap();
+    let len = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
+    let request: serde_json::Value = serde_json::from_slice(&sent[4..4 + len]).unwrap();
+    assert_eq!(
+        request["params"]["resume"],
+        serde_json::json!({
+            "run_id": point.run_id.as_uuid().to_string(),
+            "epoch": 4,
+            "offset": 99
+        })
+    );
+    assert_eq!(request["params"]["takeover"], false);
+    assert_eq!(sent[4 + len], MSG_RESUME, "not a hello");
 }

@@ -874,7 +874,7 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(2);
             });
-            match commands::cmd_attach_host(host, frame, request.takeover, request.escape) {
+            match commands::cmd_attach_host(host, request, frame) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("{e:#}");

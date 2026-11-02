@@ -12,7 +12,7 @@
 //! output holds up only the output; its resizes and its detach still reach
 //! the session, and a takeover by another client never waits for it.
 
-use tendr::attach_proto::Version;
+use tendr::attach_proto::{ResumePoint, Version};
 use tendr::model::ids::Namespace;
 
 /// `tendr _remote` for an attach request: check the session as a local
@@ -26,23 +26,32 @@ use tendr::model::ids::Namespace;
 /// sidecar started by a tendr that predates it ([`super::connect`]). The
 /// answer's type tells the client which.
 ///
+/// A request with `resume` is followed by the same resume frame in place of
+/// the hello, which this end passes on to the sidecar. It skips the
+/// human-control check, since after a lost connection `meta.json` still
+/// names the resuming client's own control, and the sidecar decides. A
+/// sidecar that cannot resume refuses it, and this end exits 80 saying so:
+/// it never attaches afresh instead.
+///
 /// Its exit code is that of a local attach: the checks' and the sidecar's
 /// refusals keep their codes, and a client taken over exits 81 (after the
 /// `MSG_RETIRED` that tells it so).
 ///
 /// # Errors
-/// The local attach's errors, and a request not followed by its hello (80).
+/// The local attach's errors, a request not followed by its hello or resume
+/// frame (80), and a session that cannot resume (80).
 pub fn cmd_attach_bridge(
     name: &str,
     namespace: &Namespace,
     takeover: bool,
     version: Version,
+    resume: Option<ResumePoint>,
 ) -> anyhow::Result<()> {
-    let (session, meta) = super::attachable(name, namespace, takeover)?;
+    let (session, meta) = super::attachable(name, namespace, takeover || resume.is_some())?;
 
     #[cfg(not(unix))]
     {
-        let _ = (session, meta, version);
+        let _ = (session, meta, version, resume);
         anyhow::bail!("attach is only supported on Unix");
     }
 
@@ -51,22 +60,42 @@ pub fn cmd_attach_bridge(
         use tendr::attach_proto::{self, Frame};
         use tendr::pty_exit::PtyExitCode;
 
-        let mode = super::mode(takeover);
-        match attach_proto::read_frame(&mut std::io::stdin().lock()) {
-            Ok(Frame::Hello { mode: hello, .. }) if hello == mode => {}
-            other => {
-                return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
-                    "the attach request must be followed by its {mode:?} hello, not {other:?}"
-                )));
+        let first = attach_proto::read_frame(&mut std::io::stdin().lock());
+        let (stream, answer, epoch) = match resume {
+            None => {
+                let mode = super::mode(takeover);
+                match first {
+                    Ok(Frame::Hello { mode: hello, .. }) if hello == mode => {}
+                    other => {
+                        return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+                            "the attach request must be followed by its {mode:?} hello, not {other:?}"
+                        )));
+                    }
+                }
+                let (stream, accept) = super::connect(session.path(), version, mode)?;
+                (stream, accept.frame(), accept.epoch())
             }
-        }
-        let (stream, accept) = super::connect(session.path(), version, mode)?;
+            Some(point) => {
+                match first {
+                    Ok(Frame::Resume(asked)) if asked == point => {}
+                    other => {
+                        return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+                            "the resume request must be followed by its resume frame, not {other:?}"
+                        )));
+                    }
+                }
+                let (stream, resumed) = super::connect_resume(session.path(), point)?;
+                (stream, resumed.frame(), resumed.point().epoch)
+            }
+        };
+        // A resumed client's control is its new epoch: a later takeover of
+        // it grants the one after.
         let control = super::Control {
             session_dir: session.path().to_path_buf(),
             run_id: meta.run_id(),
-            epoch: accept.epoch(),
+            epoch,
         };
-        if unix::run(stream, accept.frame(), control) == unix::End::TakenOver {
+        if unix::run(stream, answer, control) == unix::End::TakenOver {
             // The client has been told, and says so itself.
             std::process::exit(PtyExitCode::Control.code());
         }

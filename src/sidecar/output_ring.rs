@@ -83,12 +83,27 @@ pub(super) enum Next {
 
 impl Default for OutputRing {
     fn default() -> Self {
-        Self::with_capacity(OUTPUT_RING_BYTES)
+        Self::with_capacity(ring_bytes())
     }
 }
 
+/// [`OUTPUT_RING_BYTES`]. Debug builds take `TENDR_TEST_OUTPUT_RING_BYTES`
+/// instead, so tests reach the ring's edge without writing 32 MiB; release
+/// builds ignore it.
+fn ring_bytes() -> usize {
+    if cfg!(debug_assertions) {
+        if let Some(bytes) = std::env::var("TENDR_TEST_OUTPUT_RING_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            return bytes;
+        }
+    }
+    OUTPUT_RING_BYTES
+}
+
 impl OutputRing {
-    fn with_capacity(capacity: usize) -> Self {
+    pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
             state: Mutex::new(RingState {
                 bytes: VecDeque::new(),

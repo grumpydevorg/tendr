@@ -47,14 +47,31 @@ pub const MSG_ACCEPTED_V2: u8 = 0x0a;
 /// is not the run's own (the mode replay) still goes as unstamped
 /// [`MSG_DATA`]. A version 1 client never receives it.
 pub const MSG_OUTPUT: u8 = 0x0b;
+/// Client → sidecar, in place of the hello: a version 2 viewer whose
+/// connection was lost asks to regain the control and output it had.
+/// Payload: a [`ResumePoint`], encoded as for [`MSG_ACCEPTED_V2`]: the run,
+/// the epoch it held, and the offset of the next output byte it did not
+/// get. A sidecar that predates it refuses it with the protocol class, as it
+/// refuses anything but a hello.
+pub const MSG_RESUME: u8 = 0x0c;
+/// Sidecar → resuming viewer: control regained at a new epoch, and its
+/// output follows from the offset it asked for, stamped, with no mode
+/// replay. Payload: a [`ResumePoint`] with the new epoch and that offset.
+pub const MSG_RESUMED: u8 = 0x0d;
+/// Sidecar → resuming viewer: control regained at a new epoch, but the
+/// output ring no longer holds the offset it asked for. Payload: `[epoch u64
+/// BE][run id 16 bytes][head u64 BE][oldest u64 BE]`: the ring holds
+/// `oldest` up to `head`. The mode replay follows as unstamped [`MSG_DATA`],
+/// then the output from `head`, stamped.
+pub const MSG_GONE: u8 = 0x0e;
 
 /// The attach protocol version carried in [`MSG_HELLO`]. The discriminant is
 /// the wire byte.
 ///
 /// Version 2 changes only what a viewer (an attach or takeover) receives:
 /// [`MSG_ACCEPTED_V2`] instead of [`MSG_ACCEPTED`], and its output as
-/// [`MSG_OUTPUT`]. A push is answered the same in both, and both know the
-/// same refusal classes.
+/// [`MSG_OUTPUT`]; and a viewer may resume ([`MSG_RESUME`]). A push is
+/// answered the same in both, and both know the same refusal classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Version {
@@ -112,8 +129,8 @@ impl ResumePoint {
         buf
     }
 
-    fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
-        let malformed = ProtocolError::Malformed("accepted v2");
+    fn decode(payload: &[u8], what: &'static str) -> Result<Self, ProtocolError> {
+        let malformed = ProtocolError::Malformed(what);
         let bytes: &[u8; 32] = payload.try_into().map_err(|_| malformed)?;
         let (epoch, rest) = bytes.split_at(8);
         let (run_id, offset) = rest.split_at(16);
@@ -169,7 +186,8 @@ pub enum RejectClass {
     /// The hello was missing, or named a version or mode this sidecar does not
     /// speak.
     Protocol = 1,
-    /// Someone else holds the terminal, or the run has ended.
+    /// Someone else holds the terminal, the run has ended, or a resume finds
+    /// that control changed while its connection was lost.
     Control = 2,
     /// The sidecar cannot serve the connection: its input writer stopped, or
     /// every connection slot is in use.
@@ -301,6 +319,15 @@ pub enum Frame {
     AcceptedV2(ResumePoint),
     /// Sidecar → version 2 viewer: the run's output from `offset` on.
     Output { offset: u64, bytes: Vec<u8> },
+    /// Client → sidecar, in place of the hello: resume from this point.
+    Resume(ResumePoint),
+    /// Sidecar → resuming viewer: control regained at `point.epoch`; its
+    /// output follows from `point.offset`, the offset it asked for.
+    Resumed(ResumePoint),
+    /// Sidecar → resuming viewer: control regained at `point.epoch`, but
+    /// only `oldest` up to `point.offset`, the head, is still held; the mode
+    /// replay follows, then the output from the head.
+    Gone { point: ResumePoint, oldest: u64 },
     /// Sidecar → client: control refused, with why.
     Rejected { class: RejectClass, reason: String },
     /// Sidecar → client: another client took over at this epoch.
@@ -355,7 +382,21 @@ impl Frame {
                 _ => return Err(ProtocolError::UnsupportedHello),
             },
             MSG_ACCEPTED => Self::Accepted(epoch("accepted")?),
-            MSG_ACCEPTED_V2 => Self::AcceptedV2(ResumePoint::decode(&payload)?),
+            MSG_ACCEPTED_V2 => Self::AcceptedV2(ResumePoint::decode(&payload, "accepted v2")?),
+            MSG_RESUME => Self::Resume(ResumePoint::decode(&payload, "resume")?),
+            MSG_RESUMED => Self::Resumed(ResumePoint::decode(&payload, "resumed")?),
+            MSG_GONE => {
+                let malformed = ProtocolError::Malformed("gone");
+                if payload.len() != 40 {
+                    return Err(malformed);
+                }
+                let point = ResumePoint::decode(&payload[..32], "gone")?;
+                let oldest = u64::from_be_bytes(payload[32..].try_into().expect("8 bytes"));
+                if oldest > point.offset {
+                    return Err(malformed);
+                }
+                Self::Gone { point, oldest }
+            }
             MSG_OUTPUT if payload.len() >= 8 => {
                 let offset = u64::from_be_bytes(payload[..8].try_into().expect("8 bytes"));
                 let mut bytes = payload;
@@ -392,6 +433,14 @@ pub fn write_frame(w: &mut impl Write, frame: &Frame) -> io::Result<()> {
         Frame::Accepted(epoch) => write_msg(w, MSG_ACCEPTED, &epoch.get().to_be_bytes()),
         Frame::AcceptedV2(point) => write_msg(w, MSG_ACCEPTED_V2, &point.encode()),
         Frame::Output { offset, bytes } => write_output(w, *offset, bytes),
+        Frame::Resume(point) => write_msg(w, MSG_RESUME, &point.encode()),
+        Frame::Resumed(point) => write_msg(w, MSG_RESUMED, &point.encode()),
+        Frame::Gone { point, oldest } => {
+            let mut payload = [0u8; 40];
+            payload[..32].copy_from_slice(&point.encode());
+            payload[32..].copy_from_slice(&oldest.to_be_bytes());
+            write_msg(w, MSG_GONE, &payload)
+        }
         Frame::Rejected { class, reason } => {
             let mut payload = Vec::with_capacity(1 + reason.len());
             payload.push(*class as u8);
@@ -586,6 +635,16 @@ mod tests {
             Frame::InputDone(PushOutcome::Written { bytes: 9 }),
             Frame::InputDone(PushOutcome::Revoked(progress)),
             Frame::InputDone(PushOutcome::Closed(progress)),
+            Frame::Resume(point),
+            Frame::Resumed(point),
+            Frame::Gone {
+                point,
+                oldest: 1 << 39,
+            },
+            Frame::Gone {
+                point,
+                oldest: point.offset,
+            },
         ] {
             assert_eq!(round_trip(&frame), frame);
         }
@@ -621,6 +680,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, frame(0x0b, 10, b"\0\0\0\0\0\0\0\x05hi"));
+    }
+
+    /// The resume frames' wire formats: the resume and its answer are the
+    /// v2 accept's `[epoch][run id][offset]`; gone adds `[oldest]`.
+    #[test]
+    fn resume_frames_keep_their_wire_format() {
+        let run_id = RunId::new();
+        let point = ResumePoint {
+            run_id,
+            epoch: ControllerEpoch::new(0x0102),
+            offset: 0x0304,
+        };
+        let mut payload = vec![0, 0, 0, 0, 0, 0, 1, 2];
+        payload.extend_from_slice(run_id.as_uuid().as_bytes());
+        payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 3, 4]);
+        for (sent, msg_type) in [(Frame::Resume(point), 0x0c), (Frame::Resumed(point), 0x0d)] {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &sent).unwrap();
+            assert_eq!(bytes, frame(msg_type, 32, &payload));
+        }
+        let mut gone = Vec::new();
+        write_frame(
+            &mut gone,
+            &Frame::Gone {
+                point,
+                oldest: 0x0203,
+            },
+        )
+        .unwrap();
+        payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 2, 3]);
+        assert_eq!(gone, frame(0x0e, 40, &payload));
+    }
+
+    /// A gone answer whose oldest offset is past its head, or of the wrong
+    /// length, does not decode.
+    #[test]
+    fn a_malformed_gone_does_not_decode() {
+        let point = ResumePoint {
+            run_id: RunId::new(),
+            epoch: ControllerEpoch::new(2),
+            offset: 10,
+        };
+        let gone = |oldest: u64| [point.encode().as_slice(), &oldest.to_be_bytes()].concat();
+        assert_eq!(
+            Frame::decode(MSG_GONE, gone(10)),
+            Ok(Frame::Gone { point, oldest: 10 })
+        );
+        for bad in [gone(11), gone(0)[..39].to_vec(), point.encode().to_vec()] {
+            assert_eq!(
+                Frame::decode(MSG_GONE, bad),
+                Err(ProtocolError::Malformed("gone"))
+            );
+        }
+        assert_eq!(
+            Frame::decode(MSG_RESUME, vec![0; 31]),
+            Err(ProtocolError::Malformed("resume"))
+        );
     }
 
     #[test]

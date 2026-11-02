@@ -64,6 +64,10 @@ pub enum Trigger {
     Attach,
     /// A takeover, retiring any current controller.
     Takeover,
+    /// A reconnecting client regaining the control it held
+    /// ([`InputArbiter::resume`]), retiring its own stale connection if that
+    /// is still open.
+    Resume,
 }
 
 /// Side effects of ownership changes, run on the writer thread. Implementations
@@ -73,7 +77,8 @@ pub trait ControlHooks: Send + 'static {
     fn human_control(&mut self, trigger: Trigger, epoch: ControllerEpoch);
     /// No human holds control any more; `epoch` is the one released.
     fn human_released(&mut self, epoch: ControllerEpoch);
-    /// `holder` was superseded by a takeover at `epoch` and must be retired.
+    /// `holder` was superseded by a takeover or resume at `epoch` and must be
+    /// retired.
     fn retire(&mut self, holder: HolderId, kind: ControllerKind, epoch: ControllerEpoch);
     /// A request from a superseded controller was stopped.
     fn input_revoked(&mut self, kind: ControllerKind, accepted: usize, total: usize);
@@ -87,6 +92,11 @@ enum Control {
     },
     Takeover {
         holder: HolderId,
+        reply: SyncSender<Result<Takeover, ControlError>>,
+    },
+    Resume {
+        holder: HolderId,
+        epoch: ControllerEpoch,
         reply: SyncSender<Result<Takeover, ControlError>>,
     },
     Resize {
@@ -211,6 +221,29 @@ impl InputWriter {
     pub fn takeover(&self, holder: HolderId) -> Result<Takeover, RequestError> {
         let (reply, rx) = sync_channel(1);
         self.push_control(Control::Takeover { holder, reply });
+        Ok(rx.recv().map_err(|_| RequestError::WriterGone)??)
+    }
+
+    /// Regain, as `holder`, the human control held at `epoch`
+    /// ([`InputArbiter::resume`]), retiring its stale holder if one is still
+    /// connected.
+    ///
+    /// # Errors
+    ///
+    /// [`ControlError::Stale`] if a human has been granted control since;
+    /// [`ControlError::Busy`] if an agent holds it;
+    /// [`ControlError::EpochExhausted`]; [`RequestError::WriterGone`].
+    pub fn resume(
+        &self,
+        holder: HolderId,
+        epoch: ControllerEpoch,
+    ) -> Result<Takeover, RequestError> {
+        let (reply, rx) = sync_channel(1);
+        self.push_control(Control::Resume {
+            holder,
+            epoch,
+            reply,
+        });
         Ok(rx.recv().map_err(|_| RequestError::WriterGone)??)
     }
 
@@ -576,12 +609,16 @@ fn apply_control<P: WritablePty, H: ControlHooks>(
         }
         Control::Takeover { holder, reply } => {
             let result = arbiter.takeover(holder);
-            if let Ok(takeover) = &result {
-                hooks.human_control(Trigger::Takeover, takeover.handle.epoch());
-                if let Some((retired, kind)) = takeover.retired {
-                    hooks.retire(retired, kind, takeover.handle.epoch());
-                }
-            }
+            grant(&result, Trigger::Takeover, hooks);
+            let _ = reply.send(result);
+        }
+        Control::Resume {
+            holder,
+            epoch,
+            reply,
+        } => {
+            let result = arbiter.resume(holder, epoch);
+            grant(&result, Trigger::Resume, hooks);
             let _ = reply.send(result);
         }
         Control::Resize { key, size } => {
@@ -623,6 +660,21 @@ fn apply_control<P: WritablePty, H: ControlHooks>(
                 false,
                 "disconnect needs the queues; the writer loop serves it"
             );
+        }
+    }
+}
+
+/// Report a human granted control by `trigger`, and the controller it
+/// superseded, if any, for retirement.
+fn grant<H: ControlHooks>(
+    result: &Result<Takeover, ControlError>,
+    trigger: Trigger,
+    hooks: &mut H,
+) {
+    if let Ok(granted) = result {
+        hooks.human_control(trigger, granted.handle.epoch());
+        if let Some((retired, kind)) = granted.retired {
+            hooks.retire(retired, kind, granted.handle.epoch());
         }
     }
 }
@@ -1014,5 +1066,34 @@ mod tests {
             revoked,
             ["input_revoked:Human:0:3", "input_revoked:Agent:0:2"]
         );
+    }
+
+    /// A resume over a half-open connection is reported as a resume, retires
+    /// the stale holder, and that holder's late disconnect releases nothing.
+    #[test]
+    fn a_resume_retires_the_stale_holder_whose_disconnect_then_releases_nothing() {
+        let hooks = Recorded::default();
+        let writer = InputWriter::spawn(RunId::new(), SlowPty::default(), hooks.clone());
+        let stale_holder = writer.next_holder();
+        let stale = writer.claim(stale_holder, ControllerKind::Human).unwrap();
+        let resumed = writer.resume(writer.next_holder(), stale.epoch()).unwrap();
+        assert_eq!(resumed.handle.epoch(), ControllerEpoch::new(2));
+
+        writer.disconnect(stale);
+        assert!(
+            writer
+                .claim(writer.next_holder(), ControllerKind::Agent)
+                .is_err(),
+            "the resumed client still holds control"
+        );
+        assert_eq!(
+            hooks.calls(),
+            [
+                "human_control:Attach".to_owned(),
+                "human_control:Resume".to_owned(),
+                format!("retire:{}:Human:2", stale_holder.get()),
+            ]
+        );
+        writer.disconnect(resumed.handle);
     }
 }
