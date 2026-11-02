@@ -52,6 +52,12 @@
   own. tendr now starts DuckDB as it starts ssh, giving it only what it
   means to: its stdout and stderr for a query, all three for `--shell`.
 
+- **A client behind when the run ends gets the run's last output.** The
+  session closed every connection as soon as the run ended, so a client
+  still behind, a pipe consumer of `attach --read-only` included, could miss
+  the last bytes. It now sends every client everything first, waiting up to
+  2 s for one that is slow to read.
+
 ## v0.6.0 — `attach --host` survives dropped connections
 
 Works with 0.5.0 in both directions over `--host`: an attach between a 0.6.0

@@ -79,9 +79,11 @@ struct ViewerStart {
 }
 
 /// Send a viewer its mode replay, then its output from the ring, until its
-/// cursor or its connection closes or the ring evicts its cursor. A version 2
-/// viewer gets that output stamped with its offsets; the replay, which is
-/// not the run's output, is never stamped.
+/// cursor or its connection closes, the ring evicts its cursor, or it has
+/// sent all of a finished ring's output. A version 2 viewer gets that output
+/// stamped with its offsets; the replay, which is not the run's output, is
+/// never stamped. However it ends, it closes its cursor, which tells the
+/// run's end ([`flush_viewers`]) that it is done.
 #[cfg(unix)]
 fn run_viewer_sender(
     viewer: ViewerStart,
@@ -106,6 +108,7 @@ fn run_viewer_sender(
             return ring.close(&cursor);
         }
     }
+    ring.close(&cursor);
 }
 
 /// Tees PTY output to the attached clients, and tracks the terminal modes
@@ -1886,26 +1889,57 @@ impl ConnectionRegistry {
 }
 
 /// Ends a PTY session's attach side when its run ends, before the terminal
-/// record is written: every connection is shut down (PR #68 review, finding 1),
-/// and the run's side effects already decided are recorded, so they precede the
-/// terminal event and meta write. The effects thread then stops, so nothing
-/// reaches the session paths after the terminal record, when they may belong
-/// to a replacement run (finding 3; invalid-states review, findings 1 and 5).
+/// record is written: every viewer is first sent the run's output up to its
+/// last byte ([`flush_viewers`]), then every connection is shut down (PR #68
+/// review, finding 1), and the run's side effects already decided are
+/// recorded, so they precede the terminal event and meta write. The effects
+/// thread then stops, so nothing reaches the session paths after the
+/// terminal record, when they may belong to a replacement run (finding 3;
+/// invalid-states review, findings 1 and 5).
 #[cfg(unix)]
 struct PtyTeardown {
     registry: ConnectionRegistry,
     effects: RunEffects,
+    sink: AttachSink,
 }
 
 #[cfg(unix)]
 impl PtyTeardown {
     fn run(&self) {
+        flush_viewers(&self.sink, RUN_END_FLUSH);
         self.registry.close();
         self.effects.flush_and_stop();
     }
 }
 #[cfg(not(unix))]
 type PtyTeardown = std::convert::Infallible;
+
+/// How long the run's end waits for its viewers to be sent the last of its
+/// output before it shuts their connections: a viewer that is not reading
+/// is cut off then, and gets no more.
+#[cfg(unix)]
+const RUN_END_FLUSH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// At the run's end, once capture has appended its last output: finish the
+/// ring, so each viewer's sender ends once it has sent everything, and wait
+/// up to `within` for every viewer installed now (the controller's and the
+/// watchers') to have been sent it all. Shutting a connection before then
+/// would cut its client off short of the run's last bytes.
+#[cfg(unix)]
+fn flush_viewers(sink: &AttachSink, within: std::time::Duration) {
+    let (ring, cursors) = {
+        let tee = lock(sink);
+        let cursors: Vec<_> = tee
+            .viewer
+            .iter()
+            .chain(&tee.watchers)
+            .map(|viewer| Arc::clone(&viewer.cursor))
+            .collect();
+        (Arc::clone(&tee.ring), cursors)
+    };
+    ring.finish();
+    ring.wait_closed(&cursors, std::time::Instant::now() + within);
+}
 
 /// A change of who owns the PTY's input, with the controller epoch it
 /// concerns: the one granted, or the one released.
@@ -3537,12 +3571,17 @@ mod tests {
             Arc::clone(&control),
         );
         let registry = ConnectionRegistry::default();
+        let sink: AttachSink = Arc::default();
         let hooks = SidecarControlHooks {
             effects: effects.sender(),
             registry: registry.clone(),
-            attach_sink: Arc::default(),
+            attach_sink: Arc::clone(&sink),
         };
-        let teardown = PtyTeardown { registry, effects };
+        let teardown = PtyTeardown {
+            registry,
+            effects,
+            sink,
+        };
         (hooks, control, teardown)
     }
 

@@ -543,6 +543,12 @@ tendr that bridges them to the session's socket
   connection of each one the ring evicted (it fell 32 MiB behind); a
   controller cut off this way loses control. Capture never waits for a
   viewer, so a viewer never stalls capture, the child, or other viewers.
+- At the run's end, once capture has appended its last output, the sidecar
+  finishes the ring and waits up to 2 s for every viewer's sender, the
+  controller's and the watchers', to have sent everything up to the final
+  offset (`sidecar::flush_viewers`); only then does it shut the connections
+  down. Without it a viewer behind at the end lost the run's last bytes. A
+  viewer that is not reading is cut off at the 2 s, short of them.
 - A version 2 viewer gets each byte's offset ([the attach
   handshake](#the-attach-handshake)); why offsets and not recording sequence
   numbers: [design](../design.md#viewers-count-output-in-bytes-and-agree-the-version-in-the-request).

@@ -278,6 +278,37 @@ pub fn logged_output(root: &TempDir, session: &str) -> String {
         .collect()
 }
 
+/// Wait until the tail of a default-namespace session's `output.log` holds
+/// `marker`: capture logs each read just before it adds it to the output
+/// ring, so the output up to the marker has then all been captured. The
+/// log's lines follow capture's reads, so they are joined. Reads only the
+/// tail, so a large log costs nothing more.
+#[allow(dead_code)]
+pub fn wait_log_tail(root: &TempDir, session: &str, marker: &str) {
+    let log = root
+        .path()
+        .join(format!(".tendr/sessions/default/{session}/output.log"));
+    poll_until(Duration::from_secs(60), Duration::from_millis(100), || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut tail = Vec::new();
+        if let Ok(mut file) = std::fs::File::open(&log) {
+            let _ = file.seek(SeekFrom::End(-4096));
+            let _ = file.read_to_end(&mut tail);
+        }
+        let text: String = tail
+            .split(|&b| b == b'\n')
+            .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+            .filter_map(|l| l["content"].as_str().map(str::to_owned))
+            .collect();
+        if text.contains(marker) {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("{} bytes of log tail", tail.len()))
+        }
+    })
+    .unwrap_or_else(|e| panic!("{session} never logged {marker}: {e}"));
+}
+
 // Polling. A wait on the filesystem or a process (meta.json, event logs, a
 // path, PID liveness, `try_wait`, `try_acquire`, `tendr log` or `status`
 // output) goes through `poll_until` or a wrapper below. The rules:
