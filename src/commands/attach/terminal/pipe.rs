@@ -114,4 +114,8 @@ impl Output for PipeOutput {
     fn size(&self) -> Option<Geometry> {
         Some(self.size)
     }
+
+    fn is_terminal(&self) -> bool {
+        true
+    }
 }

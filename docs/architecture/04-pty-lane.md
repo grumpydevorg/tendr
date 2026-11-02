@@ -197,6 +197,16 @@ flowchart LR
   escape. With `--host` it is refused (exit 2) until the attach bridge
   passes watchers through; a Windows client passes `--read-only` to the
   remote `tendr attach` it runs under `ssh -t`.
+- With no terminal (stdin or stdout is not one), `attach --read-only`
+  streams instead: the client's no-terminal layer never reads stdin and
+  waits only on the connection and the cancelling signals. stdout gets the
+  mode replay and then the run's output bytes, and nothing else: no status
+  line, and no mode resets when leaving. Every notice goes to stderr. When
+  the sidecar closes the connection, the client reads `meta.json` for up to
+  2 s: the run ended (0), or the watcher was cut off, evicted a ring behind
+  or shut by the sidecar (84). A write to stdout that fails (a pipeline's
+  consumer gone) sends `MSG_DETACH` and exits 1; a cancelling signal exits
+  1 as for any attach.
 
 ### Resuming a viewer
 

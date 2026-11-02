@@ -236,10 +236,14 @@ pub(super) fn relay(
     let mut dropped = 0usize;
     let ending = loop {
         if connection.as_ref().is_some_and(Connection::closed) {
-            let lost = resumable
-                && !retired.load(Ordering::SeqCst)
-                && screen.broken.get().is_none()
-                && !screen.terminal_gone.load(Ordering::SeqCst);
+            // The terminal, or stdout without one, refused the output (a
+            // pipeline's consumer gone): nothing to reconnect for, and the
+            // session is still there to tell.
+            if screen.terminal_gone.load(Ordering::SeqCst) {
+                break Ending::OutputGone;
+            }
+            let lost =
+                resumable && !retired.load(Ordering::SeqCst) && screen.broken.get().is_none();
             match (host.take(), connection.take()) {
                 (Some(end), Some(old)) if lost => {
                     reconnecting = Some(reconnect::Job::start(
@@ -336,7 +340,10 @@ pub(super) fn relay(
     };
 
     if let Some(connection) = &connection {
-        if matches!(ending, Ending::Detached | Ending::Left(_)) {
+        if matches!(
+            ending,
+            Ending::Detached | Ending::Left(_) | Ending::OutputGone
+        ) {
             connection.outbox.push_control(Frame::Detach);
             connection.outbox.wait_controls_sent(DETACH_GRACE);
         }
@@ -410,6 +417,11 @@ pub(super) fn relay(
             "tendr: another client took over this session"
         )));
     }
+    if ending == Ending::OutputGone {
+        return Err(anyhow::anyhow!(
+            "tendr: the output closed; detached from the session"
+        ));
+    }
     if ending != Ending::SessionClosed {
         return Ok(0);
     }
@@ -453,6 +465,8 @@ enum Ending {
     Detached,
     SessionClosed,
     KeyboardClosed,
+    /// The terminal, or stdout without one, refused the session's output.
+    OutputGone,
     /// The user's side ended it from outside the keyboard.
     Left(Leave),
 }
@@ -513,6 +527,11 @@ impl Screen {
     /// The terminal's size, as [`Output::size`].
     fn size(&self) -> Option<tendr::recording::Geometry> {
         self.output.size()
+    }
+
+    /// Whether the output is a terminal, as [`Output::is_terminal`].
+    pub(super) fn is_terminal(&self) -> bool {
+        self.output.is_terminal()
     }
 }
 

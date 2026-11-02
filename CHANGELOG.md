@@ -13,6 +13,11 @@
   watching never changes who holds the terminal. A session started by an
   older `tendr` refuses it (80). Not yet over `--host` from a Unix client.
 
+- **`attach --read-only` streams to a pipe.** With no terminal, it writes
+  the session's output to stdout and every notice to stderr, never reads
+  stdin, and exits 0 when the run ends, 84 when cut off, and 1 when its
+  reader goes away, so an agent can watch a PTY session live.
+
 ### Changed
 
 - **Connections stalled before their hello no longer starve attaches.** A
