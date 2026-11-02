@@ -22,10 +22,14 @@ use tempfile::TempDir;
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// The ssh argv of every framed `--host` call.
-const REMOTE_ARGV: [&str; 8] = [
+const REMOTE_ARGV: [&str; 12] = [
     "-T",
     "-o",
     "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=3",
     "box",
     "tendr",
     "--hello",

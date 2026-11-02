@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- **`attach --host` survives dropped connections.** When the link drops,
+  tendr reconnects by itself, keeps your terminal as it was, and shows every
+  byte of output it missed, once, as if nothing had happened; then the
+  program redraws. A status line at the bottom says it is reconnecting, with
+  ssh's error (such as a Tailscale approval URL) below it. It tries again
+  after 1, 2, 4, 8 and 16 s, then every 30 s, until it gets through, the
+  remote refuses, or you leave with `Ctrl-\ d` or a signal. Reconnects never
+  prompt (`ssh -o BatchMode=yes`), and input is never resent: what you type
+  while it reconnects is discarded. If more than the session's 32 MiB of
+  output went by, a notice says how much you missed, and the terminal modes
+  are reset and set again. It exits 81 if someone took the terminal
+  meanwhile or the run ended. Both hosts must run this version.
+
 ### Changed
 
 - **An attached viewer can now fall 32 MiB behind, up from 8 MiB**, before
@@ -10,9 +25,13 @@
   version 2 viewer is told where in the run's output it starts and gets each
   chunk with its byte offset. `attach --host` uses it when both hosts run
   this version, and falls back to version 1 for a 0.5.0 remote tendr or a
-  session started by one. Nothing changes on screen yet: it is the ground
-  for resuming a dropped `attach --host`. One new failure: `attach --host`
-  exits 80 if the remote sends output that does not follow on from the last.
+  session started by one, which do not reconnect. One new failure: `attach
+  --host` exits 80 if the remote sends output that does not follow on from
+  the last.
+- **`--host` commands notice a dead link.** ssh now runs with
+  `ServerAliveInterval=5` and `ServerAliveCountMax=3`, so a call whose
+  network dies ends with ssh's failure within about 15 to 20 s instead of
+  hanging.
 
 ## v0.5.0 — framed `--host`, NDJSON exec, attach bridge
 

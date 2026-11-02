@@ -24,10 +24,22 @@
 //! close-stderr      close our stderr
 //! sleep <secs>      sleep
 //! exit <code>       exit with <code>
+//! append <path>     append a line to <path>: the time in milliseconds since
+//!                   the epoch, then the argv joined by spaces
+//! needs-prompt <path>
+//!                   while <path> exists, act as an ssh whose login needs a
+//!                   prompt: write a line with an approval URL to stderr,
+//!                   then exit 255 at once under `-o BatchMode=yes`, or wait
+//!                   at the prompt (sleep) without it
+//! stall-if <path>   while <path> exists, stall before the remote command
+//!                   starts (sleep), as a lapsed check-mode approval does
+//! hold <pid> <secs> sleep until process <pid> is gone, at most <secs>
 //! forward           act as the remote login shell: see `forward`
+//! pump              act as the remote login shell, as real ssh does (Unix
+//!                   only): see `pump`
 //! ```
 //!
-//! Without an `exit` or `forward`, it exits 0 after the last action.
+//! Without an `exit`, `forward` or `pump`, it exits 0 after the last action.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -106,7 +118,41 @@ fn main() {
             "close-stderr" => close_stderr(),
             "sleep" => std::thread::sleep(Duration::from_secs_f64(value.parse().unwrap())),
             "exit" => std::process::exit(value.parse().unwrap()),
+            "append" => {
+                let millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(value)
+                    .unwrap();
+                writeln!(file, "{millis} {}", argv.join(" ")).unwrap();
+            }
+            "needs-prompt" => {
+                if std::path::Path::new(value).exists() {
+                    eprintln!("fake ssh: login needs approval: visit https://approve.invalid/a/1");
+                    if argv.iter().any(|a| a == "BatchMode=yes") {
+                        std::process::exit(255);
+                    }
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+            "stall-if" => {
+                if std::path::Path::new(value).exists() {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+            "hold" => {
+                let (pid, secs) = value.split_once(' ').expect("fake ssh: hold <pid> <secs>");
+                hold(
+                    pid.parse().unwrap(),
+                    Duration::from_secs(secs.parse().unwrap()),
+                );
+            }
             "forward" => forward(&argv),
+            "pump" => pump(&argv),
             other => panic!("fake ssh: unknown action {other:?}"),
         }
     }
@@ -134,12 +180,11 @@ fn unescape(text: &str) -> String {
     out
 }
 
-/// Emulate `ssh` handing the remote command to a POSIX login shell: drop the
-/// ssh options and the destination, join the rest with spaces, split that as
-/// the shell would, and run the result with stdin, stdout and stderr
-/// inherited, exiting with its code. The remote `tendr` is the binary named
-/// by `TENDR_TEST_BIN`.
-fn forward(argv: &[String]) -> ! {
+/// The remote command of an ssh `argv`, as a POSIX login shell splits it:
+/// drop the ssh options and the destination, join the rest with spaces, and
+/// split that as the shell would. It must run tendr, which is the binary
+/// named by `TENDR_TEST_BIN`.
+fn remote_tendr(argv: &[String]) -> Command {
     let mut rest = argv.iter();
     // ssh options before the destination: `-o` takes a value, the others
     // tendr passes (`-T`, `-t`) do not.
@@ -159,7 +204,113 @@ fn forward(argv: &[String]) -> ! {
     let tendr = std::env::var_os("TENDR_TEST_BIN").expect("TENDR_TEST_BIN is set");
     let mut cmd = Command::new(tendr);
     cmd.args(args);
-    exec(cmd)
+    cmd
+}
+
+/// Emulate `ssh` handing the remote command to a POSIX login shell
+/// ([`remote_tendr`]), and run it with stdin, stdout and stderr inherited,
+/// exiting with its code.
+fn forward(argv: &[String]) -> ! {
+    exec(remote_tendr(argv))
+}
+
+/// Emulate `ssh` as it carries the remote command's streams: run the remote
+/// tendr ([`remote_tendr`]) on pipes and copy between them and ours, then
+/// exit with its code. Killing this process then closes our caller's pipes,
+/// while the remote side's stay open, as sshd keeps them when the network
+/// drops: a `hold` process keeps the other end of each, without reading,
+/// until the remote exits (or a minute passes). The end of our stdin is
+/// passed on as an end of input, as ssh's EOF is.
+#[cfg(unix)]
+fn pump(argv: &[String]) -> ! {
+    use std::os::fd::OwnedFd;
+
+    let pipe = || -> (OwnedFd, OwnedFd) {
+        let (read, write) = rustix::pipe::pipe().expect("fake ssh: pipe");
+        for end in [&read, &write] {
+            rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC).unwrap();
+        }
+        (read, write)
+    };
+    let (in_read, in_write) = pipe();
+    let (out_read, out_write) = pipe();
+    let (err_read, err_write) = pipe();
+    let mut remote = remote_tendr(argv)
+        .stdin(Stdio::from(in_read))
+        .stdout(Stdio::from(out_write))
+        .stderr(Stdio::from(err_write))
+        .spawn()
+        .expect("fake ssh: spawn the remote tendr");
+    let holder = Command::new(std::env::current_exe().unwrap())
+        .env(ENV, format!("hold {} 60", remote.id()))
+        .stdin(Stdio::from(in_write.try_clone().unwrap()))
+        .stdout(Stdio::from(out_read.try_clone().unwrap()))
+        .stderr(Stdio::from(err_read.try_clone().unwrap()))
+        .spawn()
+        .expect("fake ssh: spawn the holder");
+    let holder = std::sync::Arc::new(std::sync::Mutex::new(holder));
+
+    let copy = |from: OwnedFd, to: Box<dyn std::io::Write + Send>| {
+        std::thread::spawn(move || {
+            let mut from = std::fs::File::from(from);
+            let mut to = to;
+            let mut buf = [0u8; 8192];
+            while let Ok(n @ 1..) = std::io::Read::read(&mut from, &mut buf) {
+                if to.write_all(&buf[..n]).and_then(|()| to.flush()).is_err() {
+                    break;
+                }
+            }
+        })
+    };
+    let stdout = copy(out_read, Box::new(std::io::stdout()));
+    let stderr = copy(err_read, Box::new(std::io::stderr()));
+    let held = std::sync::Arc::clone(&holder);
+    std::thread::spawn(move || {
+        let _ = std::io::copy(
+            &mut std::io::stdin().lock(),
+            &mut std::fs::File::from(in_write),
+        );
+        // Our input ended (the copy dropped its end): the remote's ends with
+        // it once the holder lets go of its own.
+        let mut holder = held.lock().unwrap();
+        let _ = holder.kill();
+        let _ = holder.wait();
+    });
+
+    let status = remote.wait().expect("fake ssh: wait for the remote tendr");
+    let _ = stdout.join();
+    let _ = stderr.join();
+    let mut holder = holder.lock().unwrap();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    std::process::exit(status.code().unwrap_or(255));
+}
+
+#[cfg(windows)]
+fn pump(_: &[String]) -> ! {
+    panic!("fake ssh: pump is Unix-only");
+}
+
+/// Sleep until process `pid` is gone, at most `limit`.
+fn hold(pid: u32, limit: Duration) {
+    let until = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < until && alive(pid) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill(2) with signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn alive(_: u32) -> bool {
+    false
 }
 
 #[cfg(unix)]

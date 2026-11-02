@@ -196,12 +196,22 @@ the other operations, and keeps the terminal on the client
 - When the client leaves, it closes ssh stdin, after a `MSG_DETACH` if the
   user detached; the remote tendr passes the detach on, closes the socket
   and exits. The client waits at most 1 s for ssh to end, then stops it; the
-  session treats a lost connection as a detach either way. When the session
-  closes the connection, the client takes ssh's exit within 5 s: a lost
-  connection (ssh's 255 without a trailer) exits 1, as before. If the client
+  session treats a lost connection as a detach either way. If the client
   hangs up while both directions are blocked, the remote tendr notices within
   0.2 s (ssh's stdin or stdout reports a hang-up), gives a detach just before
   it 0.2 s more to pass, and closes the socket.
+- When the connection ends from the far side, the client takes ssh's exit
+  within 5 s. The remote's code, from its exit trailer, is the remote's
+  verdict, and the client exits with it. ssh's 255 without a trailer, ssh
+  killed by a signal, or ssh still running after the 5 s is a lost link: a
+  version 2 attach reconnects and resumes
+  ([04-pty-lane.md](04-pty-lane.md#attaching-over---host)), and a version 1
+  attach exits as before (1 for ssh's 255). A reconnect runs the same remote
+  command with `-o BatchMode=yes` added ([What ssh is given](#what-ssh-is-given)),
+  sends its resume point as above, and takes the remote's refusal (81, or 80
+  for a session that cannot resume) as the end; there is no separate status
+  call. After a lost link the old remote tendr usually stays connected to the
+  session (sshd has not noticed); the resume retires it.
 - Session and namespace names travel as data in the frame, so the plain-name
   rule of the `ssh -t` command line does not apply.
 
@@ -236,7 +246,7 @@ before the remote tendr starts.
   (default 30), tendr sends ssh SIGTERM, then SIGKILL one second later. The
   call exits 82.
 - After the hello there is no deadline, so `wait` and `log -f` run as long
-  as they need.
+  as they need. The keepalives below end a call on a dead link instead.
 - ssh's own `ConnectTimeout` ends at key exchange. Authentication can still
   stall afterwards; for example, a lapsed Tailscale SSH check-mode approval
   waits about 30 minutes with no output.
@@ -245,7 +255,9 @@ before the remote tendr starts.
 - A Windows client's `attach` gets no deadline, because its stderr shares the
   terminal. A Unix client's `attach` has it, and enters raw mode only once
   the remote tendr has answered, so an ssh prompt still reads a normal
-  terminal.
+  terminal. Its reconnects have it too, and run in raw mode with
+  `BatchMode=yes`, so they never prompt; their stderr goes to the status
+  line instead of the terminal's scrolling text.
 - `TENDR_SSH_CONNECT_TIMEOUT=0` sends no `--hello`. Stderr is still relayed,
   for the exit trailer and an old remote's parse error.
 - A remote tendr that rejects `_remote`, `--hello` or `--exit-trailer` fails
@@ -256,6 +268,14 @@ before the remote tendr starts.
 
 ### What ssh is given
 
+- Every framed call's options are `-T -o ConnectTimeout=10 -o
+  ServerAliveInterval=5 -o ServerAliveCountMax=3`, before the host. The
+  keepalives make ssh notice a dead link within about 15 to 20 s and exit
+  255. An `attach` reconnect adds `-o BatchMode=yes`, its own constant argv:
+  the first connection may need a prompt, which reads the terminal before
+  raw mode; a reconnect happens in raw mode, where a prompt would eat
+  keystrokes ([design](../design.md#a-dropped-attach---host-reconnects-by-itself-judged-by-sshs-exit)).
+  `remote_frame_argv_is_constant` (`src/ssh.rs`) pins both.
 - Every call but `attach` gives ssh tendr's stdout. Its stdin is tendr's
   own for `exec --frame-from-stdin`, otherwise a pipe tendr writes the
   request (and a `push` body) to. Its stderr is a pipe tendr relays.

@@ -39,9 +39,15 @@ pub fn cmd_attach(
             run_id: meta.run_id(),
             epoch: accept.epoch(),
         };
-        unix_relay::relay(unix_relay::Link::socket(stream)?, None, escape, &|| {
-            control.taken_over_by().is_some()
-        })
+        let recorded_takeover = || control.taken_over_by().is_some();
+        unix_relay::relay(
+            unix_relay::Link::socket(stream)?,
+            None,
+            escape,
+            unix_relay::Peer::Local {
+                recorded_takeover: &recorded_takeover,
+            },
+        )
         .map(drop)
     }
 }
@@ -113,7 +119,8 @@ fn require_terminal() -> anyhow::Result<()> {
 const SSH_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long `attach --host` waits for ssh to end, for its exit code, once
-/// the remote end has closed the connection.
+/// the remote end has closed the connection. ssh still running after it
+/// counts as a lost connection.
 #[cfg(unix)]
 const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -131,10 +138,9 @@ const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// version 2 acceptance starts the offsets this client tracks, a version 1
 /// one means plain output, as before.
 ///
-/// Debug builds take `TENDR_TEST_ATTACH_RESUME` (`<run id> <epoch>
-/// <offset>`) and resume from that point ([`resume_host`]) instead of
-/// attaching afresh, so tests can drive a resume end to end; release builds
-/// ignore it.
+/// A version 2 attach whose connection drops reconnects by itself and
+/// resumes where its terminal stopped ([`resume_host`]), until it resumes,
+/// the remote refuses, or the user leaves.
 ///
 /// Returns the exit code. The remote side's own failures (no such session,
 /// a refusal, an unreachable socket) arrive as its exit code, with its
@@ -155,85 +161,92 @@ pub fn cmd_attach_host(
 
     // Before ssh starts: the request may take over.
     require_terminal()?;
-    let (link, resume) = match test_resume_point() {
-        Some(point) => match resume_host(host, request, point)? {
-            Opened::Answered(link, resumption) => {
-                if let Resumption::Gone {
-                    point: head,
-                    oldest,
-                } = resumption
-                {
-                    eprintln!(
-                        "tendr: the output from offset {} is gone; the session holds {oldest} to {}, so the attach resumes from {}",
-                        point.offset, head.offset, head.offset
-                    );
-                }
-                (link, Some(resumption.point()))
-            }
-            Opened::Ended(code) => return Ok(code),
+    attach_proto::write_frame(
+        &mut frame,
+        &Frame::Hello {
+            version: Version::V1,
+            mode: mode(request.takeover),
         },
-        None => {
-            attach_proto::write_frame(
-                &mut frame,
-                &Frame::Hello {
-                    version: Version::V1,
-                    mode: mode(request.takeover),
-                },
-            )?;
-            // The remote side's answer is the sidecar's acceptance.
-            let opened = open_host(host, &frame, |reply| {
-                hello_reply(reply, "attach", Version::LATEST)
-            })?;
-            match opened {
-                Opened::Answered(link, accept) => (link, accept.resume_point()),
-                Opened::Ended(code) => return Ok(code),
-            }
-        }
+    )?;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dial = tendr::ssh::Dial {
+        login: tendr::ssh::Login::Interactive,
+        stderr: Box::new(std::io::stderr()),
+        cancel: std::sync::Arc::clone(&cancel),
     };
-
-    let HostLink { ssh, stdin, reader } = link;
-    let link = unix_relay::Link {
-        reader: Box::new(reader),
-        writer: Box::new(std::io::BufWriter::new(stdin)),
-        // The sender closes ssh's stdin when the relay closes its outbox,
-        // and `finish` stops ssh if it does not end by itself.
-        close: Box::new(|| {}),
+    // The remote side's answer is the sidecar's acceptance.
+    let opened = open_host(host, &frame, dial, |reply| {
+        hello_reply(reply, "attach", Version::LATEST)
+    })?;
+    let (link, accept) = match opened {
+        Opened::Answered(link, accept) => (link, accept),
+        Opened::Ended(code) => return Ok(code),
     };
-    // The remote side reports a takeover in band, even one that cut the
-    // connection before the sidecar could say so.
-    let ending = unix_relay::relay(link, resume, request.escape, &|| false);
-    let closed = matches!(ending, Ok(unix_relay::Ending::SessionClosed));
-    let finished = ssh.finish(Some(if closed {
-        SSH_CLOSE_GRACE
-    } else {
-        SSH_LEAVE_GRACE
-    }));
-    ending?;
-    if !closed {
-        return Ok(0);
-    }
-    // The connection ended from the far side: the session's run ended, or
-    // the connection was lost (ssh's 255).
-    match finished {
-        Some(code) => Ok(code?),
-        None => Ok(0),
-    }
+    let (link, ssh) = link.split();
+    let end = HostEnd {
+        host: host.to_owned(),
+        request: request.clone(),
+        ssh: Some(ssh),
+        cancel,
+    };
+    unix_relay::relay(
+        link,
+        accept.resume_point(),
+        request.escape,
+        unix_relay::Peer::Host(Box::new(end)),
+    )
 }
 
-/// The resume point of `TENDR_TEST_ATTACH_RESUME`, in debug builds only.
+/// The ssh end of an `attach --host`: the current connection's ssh, and what
+/// a reconnect needs to open the next.
 #[cfg(unix)]
-fn test_resume_point() -> Option<attach_proto::ResumePoint> {
-    if !cfg!(debug_assertions) {
-        return None;
+pub(super) struct HostEnd {
+    host: String,
+    request: crate::remote_op::AttachRequest,
+    /// The current connection's ssh, until it is finished.
+    ssh: Option<tendr::ssh::AttachSsh>,
+    /// Once set, every ssh of this attach stops, the one connecting
+    /// included: the attach is leaving while it reconnects.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(unix)]
+impl HostEnd {
+    /// Wait at most `grace` for the current connection's ssh to end, then
+    /// stop it: the call's exit code, or `None` if ssh had to be stopped or
+    /// was already finished.
+    fn finish(&mut self, grace: std::time::Duration) -> Option<anyhow::Result<i32>> {
+        self.ssh
+            .take()?
+            .finish(Some(grace))
+            .map(|code| code.map_err(anyhow::Error::from))
     }
-    let value = std::env::var("TENDR_TEST_ATTACH_RESUME").ok()?;
-    let mut parts = value.split_whitespace();
-    let run_id = uuid::Uuid::parse_str(parts.next()?).ok()?;
-    Some(attach_proto::ResumePoint {
-        run_id: tendr::model::ids::RunId::from_v7(run_id)?,
-        epoch: tendr::model::pty_control::ControllerEpoch::new(parts.next()?.parse().ok()?),
-        offset: parts.next()?.parse().ok()?,
-    })
+
+    /// One attempt to resume from `point` over a new ssh, which never
+    /// prompts ([`tendr::ssh::Login::Batch`]) and whose stderr goes to
+    /// `stderr`. On success the new ssh is this end's.
+    ///
+    /// # Errors
+    /// As for [`resume_host`].
+    fn resume(
+        &mut self,
+        point: attach_proto::ResumePoint,
+        stderr: Box<dyn std::io::Write + Send>,
+    ) -> anyhow::Result<unix_relay::Attempt> {
+        let dial = tendr::ssh::Dial {
+            login: tendr::ssh::Login::Batch,
+            stderr,
+            cancel: std::sync::Arc::clone(&self.cancel),
+        };
+        Ok(match resume_host(&self.host, &self.request, point, dial)? {
+            Opened::Answered(link, resumption) => {
+                let (link, ssh) = link.split();
+                self.ssh = Some(ssh);
+                unix_relay::Attempt::Resumed(link, resumption)
+            }
+            Opened::Ended(code) => unix_relay::Attempt::Ended(code),
+        })
+    }
 }
 
 /// An `attach --host` connection whose remote side has answered: ssh, its
@@ -244,6 +257,21 @@ pub(super) struct HostLink {
     ssh: tendr::ssh::AttachSsh,
     stdin: std::process::ChildStdin,
     reader: std::io::BufReader<std::process::ChildStdout>,
+}
+
+#[cfg(unix)]
+impl HostLink {
+    /// The relay's link over ssh's stdin and stdout, and ssh. The sender
+    /// closes ssh's stdin when the relay closes its outbox, and
+    /// [`HostEnd::finish`] stops ssh if it does not end by itself.
+    fn split(self) -> (unix_relay::Link, tendr::ssh::AttachSsh) {
+        let link = unix_relay::Link {
+            reader: Box::new(self.reader),
+            writer: Box::new(std::io::BufWriter::new(self.stdin)),
+            close: Box::new(|| {}),
+        };
+        (link, self.ssh)
+    }
 }
 
 /// How opening an `attach --host` connection went.
@@ -268,11 +296,12 @@ pub(super) enum Opened<A> {
 fn open_host<A>(
     host: &str,
     request: &[u8],
+    dial: tendr::ssh::Dial,
     answer: impl FnOnce(Result<Frame, FrameError>) -> anyhow::Result<A>,
 ) -> anyhow::Result<Opened<A>> {
-    use tendr::ssh::{AttachSsh, AttachStart};
+    use tendr::ssh::{AttachSsh, AttachStart, SshError};
 
-    let (ssh, stdin, stdout) = match AttachSsh::start(host, request)? {
+    let (ssh, stdin, stdout) = match AttachSsh::start(host, request, dial)? {
         AttachStart::Running { ssh, stdin, stdout } => (ssh, stdin, stdout),
         AttachStart::Ended(code) => return unanswered(code).map(Opened::Ended),
     };
@@ -284,7 +313,8 @@ fn open_host<A>(
             drop(stdin);
             match ssh.finish(None) {
                 Some(code) => unanswered(code?).map(Opened::Ended),
-                None => unreachable!("no grace"),
+                // Without a grace, only a cancel stops it.
+                None => Err(SshError::Cancelled.into()),
             }
         }
         reply => match answer(reply) {
@@ -301,17 +331,17 @@ fn open_host<A>(
 /// Reconnect the `attach --host` of `request` after its connection was lost,
 /// resuming from `point`: the run, the epoch it held and the offset just
 /// past the last output byte written to the terminal (the version 2 resume
-/// point the relay keeps).
+/// point the relay keeps). `dial` says how ssh connects.
 ///
 /// The request carries `point`, and a resume frame takes the hello's place
-/// on ssh's stdin, so a remote tendr that cannot resume refuses it rather
-/// than attach afresh. On [`Resumption::Resumed`] the relay goes on from
-/// `point.offset`: the session's stamped output follows from there, with no
-/// mode replay. On [`Resumption::Gone`] the output in between is lost: the
-/// caller writes the reset of the modes it has tracked (`TermModes::reset`)
-/// before relaying, since the mode replay that follows only turns modes on,
-/// then goes on from the head, and sends the size and the repaint nudge, as
-/// a fresh attach does.
+/// on ssh's stdin ([`resume_request`]), so a remote tendr that cannot resume
+/// refuses it rather than attach afresh. On [`Resumption::Resumed`] the relay
+/// goes on from `point.offset`: the session's stamped output follows from
+/// there, with no mode replay. On [`Resumption::Gone`] the output in between
+/// is lost: the caller writes the reset of the modes it has tracked
+/// (`TermModes::reset`) before relaying, since the mode replay that follows
+/// only turns modes on, then goes on from the head, and sends the size and
+/// the repaint nudge, as a fresh attach does.
 ///
 /// # Errors
 /// A refusal (81 when control has changed since, the run has ended, or an
@@ -319,11 +349,24 @@ fn open_host<A>(
 /// answer outside the protocol (80), and the ssh failures of
 /// [`tendr::ssh::AttachSsh`].
 #[cfg(unix)]
-pub(super) fn resume_host(
+fn resume_host(
     host: &str,
     request: &crate::remote_op::AttachRequest,
     point: attach_proto::ResumePoint,
+    dial: tendr::ssh::Dial,
 ) -> anyhow::Result<Opened<Resumption>> {
+    let frame = resume_request(request, point)?;
+    open_host(host, &frame, dial, |reply| resume_reply(reply, point))
+}
+
+/// What a resume from `point` writes to ssh's stdin: the remote frame of
+/// `request` carrying `point`, never a takeover, then the resume frame where
+/// the hello would go.
+#[cfg(unix)]
+fn resume_request(
+    request: &crate::remote_op::AttachRequest,
+    point: attach_proto::ResumePoint,
+) -> anyhow::Result<Vec<u8>> {
     use crate::remote_op::{AttachRequest, RemoteOperation};
 
     let mut frame = crate::remote_frame::encode(&RemoteOperation::Attach(AttachRequest {
@@ -332,7 +375,7 @@ pub(super) fn resume_host(
         ..request.clone()
     }))?;
     attach_proto::write_frame(&mut frame, &Frame::Resume(point))?;
-    open_host(host, &frame, |reply| resume_reply(reply, point))
+    Ok(frame)
 }
 
 /// The exit code of an `attach --host` whose remote side ended without
@@ -710,6 +753,10 @@ fn reply_failure<T>(reply: Result<Frame, FrameError>, what: &str) -> anyhow::Res
 /// - a **reader thread** writes session output to the terminal; if the terminal
 ///   stops reading, only this thread waits.
 ///
+/// When an `attach --host` connection is lost, a fourth path, the
+/// [`reconnect`](unix_relay::reconnect) thread, judges ssh's end and opens a
+/// new connection, while the main thread keeps the keyboard.
+///
 /// Leaving never joins a blocked thread: the connection is closed, the
 /// terminal is restored (without waiting for pending output to drain), and
 /// the process exits.
@@ -732,6 +779,10 @@ mod unix_relay {
     use tendr::pty_exit::PtyExitCode;
     use tendr::term_modes::TermModes;
 
+    mod reconnect;
+
+    pub(super) use reconnect::Attempt;
+
     /// Input that may wait for a session that is not accepting it. Beyond
     /// this, the attach client drops further keystrokes (and reports them)
     /// rather than buffering without bound, and the escape is still
@@ -752,6 +803,9 @@ mod unix_relay {
     /// terminal that is slow, gone or not reading. After a signal the shorter
     /// [`REPORT_GRACE`] applies: SIGHUP means the terminal is gone.
     const MODES_GRACE: Duration = Duration::from_secs(1);
+    /// How long leaving during a reconnect waits for it to stop its ssh,
+    /// which gets SIGTERM, then SIGKILL a second later.
+    const RECONNECT_STOP_GRACE: Duration = Duration::from_secs(2);
 
     /// One attach connection as the relay sees it: frames in, frames out.
     pub(super) struct Link {
@@ -760,7 +814,7 @@ mod unix_relay {
         /// Ends the connection when the relay leaves, unblocking the reader
         /// and the sender; the session treats a closed connection as a
         /// detach.
-        pub(super) close: Box<dyn FnOnce()>,
+        pub(super) close: Box<dyn FnOnce() + Send>,
     }
 
     impl Link {
@@ -778,20 +832,99 @@ mod unix_relay {
         }
     }
 
-    /// Relay until the attach ends; how it ended, unless another client took
-    /// it over (an error, exit 81) or the session's output broke the protocol
-    /// (exit 80). `resume` is where a version 2 attach's stamped output starts;
-    /// `None` for version 1. `recorded_takeover` is asked when the session
-    /// closes the connection without saying so.
+    /// The far end of the relay.
+    pub(super) enum Peer<'a> {
+        /// The session's attach socket on this machine. `recorded_takeover`
+        /// is asked when the session closes the connection without saying
+        /// it was taken over.
+        Local {
+            recorded_takeover: &'a dyn Fn() -> bool,
+        },
+        /// The remote tendr, over ssh (`attach --host`). Its end of a
+        /// connection says whether the remote ended it or the link was lost,
+        /// and a version 2 attach whose link was lost reconnects through it.
+        Host(Box<super::HostEnd>),
+    }
+
+    /// One connection's paths to the session: the sender, writing its
+    /// outbox, and the reader.
+    struct Connection {
+        outbox: Arc<Outbox>,
+        /// Set once the connection has ended: by the reader at the end of
+        /// the session's output, or by the sender on a failed write.
+        closed: Arc<AtomicBool>,
+        reader: std::thread::JoinHandle<()>,
+        close: Box<dyn FnOnce() + Send>,
+    }
+
+    impl Connection {
+        fn open(link: Link, retired: &Arc<AtomicBool>, screen: &Arc<Screen>) -> Self {
+            let closed = Arc::new(AtomicBool::new(false));
+            let outbox = Arc::new(Outbox::default());
+            spawn_sender(link.writer, Arc::clone(&outbox), Arc::clone(&closed));
+            let reader = spawn_reader(
+                link.reader,
+                Arc::clone(&closed),
+                Arc::clone(retired),
+                Arc::clone(screen),
+            );
+            Self {
+                outbox,
+                closed,
+                reader,
+                close: link.close,
+            }
+        }
+
+        fn closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+
+        /// Send the terminal's size, then the repaint nudge: an attach at
+        /// the session's size makes the child draw nothing, so the sidecar
+        /// nudges it into redrawing, which only a resize lets apply.
+        fn greet(&self, size: Option<tendr::recording::Geometry>) {
+            if let Some(size) = size {
+                self.outbox.push_control(Frame::Resize(size));
+                self.outbox.push_control(Frame::Repaint);
+            }
+        }
+
+        /// End the connection, which unblocks its sender and reader; the
+        /// session treats a closed connection as a detach. Returns the
+        /// reader, which may still be writing to the terminal.
+        fn close(self) -> std::thread::JoinHandle<()> {
+            (self.close)();
+            self.outbox.close();
+            self.reader
+        }
+    }
+
+    /// Relay until the attach ends, and return its exit code: for `attach
+    /// --host`, the remote's when the remote ended it, otherwise 0. Another
+    /// client taking it over is an error (exit 81), and so is session output
+    /// that breaks the protocol (exit 80). `resume` is where a version 2
+    /// attach's stamped output starts; `None` for version 1.
+    ///
+    /// A version 2 `attach --host` whose connection the far side ends, without
+    /// a takeover or a broken protocol, hands ssh's end to a
+    /// [`reconnect::Job`]: the remote's exit code ends the attach with it, and
+    /// a lost link is resumed. Meanwhile keystrokes are discarded, with one
+    /// notice in the status line; the escape and the signals still leave, and
+    /// stop the reconnect's ssh.
     pub(super) fn relay(
         link: Link,
         resume: Option<attach_proto::ResumePoint>,
         escape: EscapeMode,
-        recorded_takeover: &dyn Fn() -> bool,
-    ) -> anyhow::Result<Ending> {
-        let closed = Arc::new(AtomicBool::new(false));
+        peer: Peer<'_>,
+    ) -> anyhow::Result<i32> {
+        let (recorded_takeover, mut host) = match peer {
+            Peer::Local { recorded_takeover } => (Some(recorded_takeover), None),
+            Peer::Host(end) => (None, Some(*end)),
+        };
+        // Only a version 2 attach knows where to resume from.
+        let resumable = resume.is_some();
         let retired = Arc::new(AtomicBool::new(false));
-        let outbox = Arc::new(Outbox::default());
         let screen = Arc::new(Screen {
             shown: Mutex::new(Shown {
                 modes: TermModes::default(),
@@ -800,7 +933,9 @@ mod unix_relay {
             done: AtomicBool::new(false),
             bracketed_paste: AtomicBool::new(false),
             broken: OnceLock::new(),
+            terminal_gone: AtomicBool::new(false),
         });
+        let status = Arc::new(reconnect::Status::default());
 
         // Installed before raw mode, so no cancelling signal can arrive between
         // the two and leave the terminal raw; restored when dropped, after the
@@ -811,21 +946,15 @@ mod unix_relay {
         // included.
         let terminal = RawTerminal::enter()?;
 
-        spawn_sender(link.writer, Arc::clone(&outbox), Arc::clone(&closed));
-        spawn_reader(
-            link.reader,
-            Arc::clone(&closed),
-            Arc::clone(&retired),
-            Arc::clone(&screen),
-        );
-
         let mut size = terminal_size();
-        if let Some(size) = size {
-            outbox.push_control(Frame::Resize(size));
-            // An attach at the session's size makes the child draw nothing,
-            // so ask the sidecar to nudge it into redrawing.
-            outbox.push_control(Frame::Repaint);
+        let mut connection = Some(Connection::open(link, &retired, &screen));
+        let mut reconnecting: Option<reconnect::Job> = None;
+        if let Some(connection) = &connection {
+            connection.greet(size);
         }
+        // The remote's exit code, or its failure, when a reconnect ended the
+        // attach.
+        let mut verdict = None;
 
         let size_poll = size_poll_interval();
         let mut size_due = Instant::now() + size_poll;
@@ -834,8 +963,40 @@ mod unix_relay {
         let mut buf = [0u8; 4096];
         let mut dropped = 0usize;
         let ending = loop {
-            if closed.load(Ordering::SeqCst) {
-                break Ending::SessionClosed;
+            if connection.as_ref().is_some_and(Connection::closed) {
+                let lost = resumable
+                    && !retired.load(Ordering::SeqCst)
+                    && screen.broken.get().is_none()
+                    && !screen.terminal_gone.load(Ordering::SeqCst);
+                match (host.take(), connection.take()) {
+                    (Some(end), Some(old)) if lost => {
+                        reconnecting = Some(reconnect::Job::start(
+                            end,
+                            old.close(),
+                            Arc::clone(&screen),
+                            Arc::clone(&status),
+                        ));
+                    }
+                    (end, old) => {
+                        (host, connection) = (end, old);
+                        break Ending::SessionClosed;
+                    }
+                }
+            }
+            if let Some((end, outcome)) = reconnecting.as_ref().and_then(reconnect::Job::outcome) {
+                reconnecting = None;
+                host = end;
+                match outcome {
+                    reconnect::Outcome::Resumed(link) => {
+                        let resumed = Connection::open(link, &retired, &screen);
+                        resumed.greet(size);
+                        connection = Some(resumed);
+                    }
+                    reconnect::Outcome::Ended(result) => {
+                        verdict = Some(result);
+                        break Ending::SessionClosed;
+                    }
+                }
             }
             let mut timeout = size_due.saturating_duration_since(Instant::now()).min(POLL);
             if let Some(due) = parser.partial_deadline() {
@@ -858,8 +1019,10 @@ mod unix_relay {
                 let now = terminal_size();
                 if now.is_some() && now != size {
                     size = now;
-                    if let Some(size) = now {
-                        outbox.push_control(Frame::Resize(size));
+                    // While reconnecting, the size goes with the next
+                    // connection's greeting.
+                    if let (Some(connection), Some(size)) = (&connection, now) {
+                        connection.outbox.push_control(Frame::Resize(size));
                     }
                 }
             }
@@ -868,7 +1031,7 @@ mod unix_relay {
                 // Esc key, say) is forwarded once it has waited long enough.
                 let mut forward = Vec::new();
                 parser.flush_expired(Instant::now(), &mut forward);
-                queue_keystrokes(&outbox, forward, &mut dropped);
+                send_keystrokes(connection.as_ref(), &status, &screen, forward, &mut dropped);
                 continue;
             }
             let n = match stdin.read(&mut buf) {
@@ -880,22 +1043,30 @@ mod unix_relay {
             let mut forward = Vec::new();
             parser.set_bracketed_paste(screen.bracketed_paste.load(Ordering::SeqCst));
             let decision = parser.feed(&buf[..n], &mut forward);
-            queue_keystrokes(&outbox, forward, &mut dropped);
+            send_keystrokes(connection.as_ref(), &status, &screen, forward, &mut dropped);
             if decision == Escape::Detach {
                 break Ending::Detached;
             }
         };
 
-        if matches!(ending, Ending::Detached | Ending::Signalled(_)) {
-            outbox.push_control(Frame::Detach);
-            outbox.wait_controls_sent(DETACH_GRACE);
+        if let Some(connection) = &connection {
+            if matches!(ending, Ending::Detached | Ending::Signalled(_)) {
+                connection.outbox.push_control(Frame::Detach);
+                connection.outbox.wait_controls_sent(DETACH_GRACE);
+            }
         }
-        // Unblocks the sender and reader; the session treats a closed
-        // connection as a detach.
-        (link.close)();
-        outbox.close();
+        // Unblocks the sender and reader, which are not waited for.
+        drop(connection.map(Connection::close));
+        // Leaving while reconnecting: stop it, and its ssh. A connection it
+        // resumed just now ends as it is dropped, which closes ssh's stdin.
+        if let Some(job) = reconnecting {
+            if let Some((end, _)) = job.stop(RECONNECT_STOP_GRACE) {
+                host = end;
+            }
+        }
         turn_off_modes(
             &screen,
+            &status,
             if matches!(ending, Ending::Signalled(_)) {
                 REPORT_GRACE
             } else {
@@ -911,8 +1082,10 @@ mod unix_relay {
         // so at the end of its connection the event log decides.
         let taken_over = ending != Ending::Detached
             && (retired.load(Ordering::SeqCst)
-                || (ending == Ending::SessionClosed && recorded_takeover()));
-        let mut notes = Vec::new();
+                || (ending == Ending::SessionClosed && recorded_takeover.is_some_and(|f| f())));
+        // What the remote said on the reconnect's last attempt, such as why
+        // it refused to resume, which the status line could only glimpse.
+        let mut notes = status.take_lines();
         if let Ending::Signalled(cancel) = ending {
             notes.push(format!("tendr: attach ended by {}", cancel.name()));
         }
@@ -933,6 +1106,13 @@ mod unix_relay {
         for note in notes {
             eprintln!("{note}");
         }
+        let finished = host.as_mut().and_then(|end| {
+            end.finish(if ending == Ending::SessionClosed {
+                super::SSH_CLOSE_GRACE
+            } else {
+                super::SSH_LEAVE_GRACE
+            })
+        });
         if ending == Ending::SessionClosed {
             if let Some(why) = screen.broken.get() {
                 return Err(PtyExitCode::Protocol.error(anyhow::anyhow!("tendr: {why}")));
@@ -945,23 +1125,40 @@ mod unix_relay {
                 "tendr: another client took over this session"
             )));
         }
-        Ok(ending)
+        if ending != Ending::SessionClosed {
+            return Ok(0);
+        }
+        // The far side ended the connection: the remote's code, or ssh's
+        // failure (a lost version 1 connection) when there is no code.
+        verdict.or(finished).unwrap_or(Ok(0))
     }
 
-    /// Queue keystrokes for the session, counting them in `dropped` if the
-    /// outbox is full.
-    fn queue_keystrokes(outbox: &Outbox, forward: Vec<u8>, dropped: &mut usize) {
-        if !forward.is_empty() {
-            let len = forward.len();
-            if !outbox.push_data(forward) {
-                *dropped += len;
-            }
+    /// Send keystrokes to the session, counting them in `dropped` if the
+    /// outbox is full. With no connection, while reconnecting, they are
+    /// discarded: never sent late to a program that has moved on.
+    fn send_keystrokes(
+        connection: Option<&Connection>,
+        status: &Arc<reconnect::Status>,
+        screen: &Arc<Screen>,
+        forward: Vec<u8>,
+        dropped: &mut usize,
+    ) {
+        if forward.is_empty() {
+            return;
+        }
+        let Some(connection) = connection else {
+            status.discard(screen);
+            return;
+        };
+        let len = forward.len();
+        if !connection.outbox.push_data(forward) {
+            *dropped += len;
         }
     }
 
     /// How a relay ended.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum Ending {
+    enum Ending {
         Detached,
         SessionClosed,
         KeyboardClosed,
@@ -1000,6 +1197,16 @@ mod unix_relay {
         /// Why the reader stopped on output outside the protocol, if it did.
         /// Set before it marks the connection closed.
         broken: OnceLock<String>,
+        /// The terminal refused a write: the reader stopped for the
+        /// terminal's sake, not the connection's, so there is nothing to
+        /// reconnect for. Set before it marks the connection closed.
+        terminal_gone: AtomicBool,
+    }
+
+    impl Screen {
+        fn lock(&self) -> MutexGuard<'_, Shown> {
+            self.shown.lock().unwrap_or_else(|e| e.into_inner())
+        }
     }
 
     /// The terminal as the session's output has left it.
@@ -1013,24 +1220,28 @@ mod unix_relay {
     }
 
     /// Turn off the terminal modes the session turned on (the alternate
-    /// screen, mouse reports, keyboard protocols), so the user's shell gets its
-    /// terminal back. Waits for a write in progress, but not for longer than
-    /// `grace`: a terminal that is not reading cannot hold the exit.
-    fn turn_off_modes(screen: &Arc<Screen>, grace: Duration) {
+    /// screen, mouse reports, keyboard protocols), and erase a reconnect's
+    /// status line, so the user's shell gets its terminal back. Waits for a
+    /// write in progress, but not for longer than `grace`: a terminal that is
+    /// not reading cannot hold the exit.
+    fn turn_off_modes(screen: &Arc<Screen>, status: &Arc<reconnect::Status>, grace: Duration) {
         screen.done.store(true, Ordering::SeqCst);
         let (done, written) = std::sync::mpsc::channel();
-        let screen = Arc::clone(screen);
+        let (screen, status) = (Arc::clone(screen), Arc::clone(status));
         std::thread::spawn(move || {
-            let shown = screen.shown.lock().unwrap_or_else(|e| e.into_inner());
-            let reset = shown.modes.reset();
-            if !reset.is_empty() {
-                let mut stdout = std::io::stdout().lock();
-                let _ = stdout.write_all(&reset).and_then(|()| stdout.flush());
-            }
-            drop(shown);
+            status.leave(&screen);
             let _ = done.send(());
         });
         let _ = written.recv_timeout(grace);
+    }
+
+    /// Write `bytes` to the terminal, if it takes them. The caller holds
+    /// [`Screen::shown`], so nothing else writes in between.
+    fn write_terminal(bytes: &[u8]) {
+        if !bytes.is_empty() {
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(bytes).and_then(|()| stdout.flush());
+        }
     }
 
     /// Raw mode for the user's terminal, restored on drop.
@@ -1226,7 +1437,7 @@ mod unix_relay {
         closed: Arc<AtomicBool>,
         retired: Arc<AtomicBool>,
         screen: Arc<Screen>,
-    ) {
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             loop {
                 let shown = match attach_proto::read_frame(&mut stream) {
@@ -1249,7 +1460,7 @@ mod unix_relay {
                 }
             }
             closed.store(true, Ordering::SeqCst);
-        });
+        })
     }
 
     /// Write the session's output to the terminal: `Ok(true)` to go on,
@@ -1283,6 +1494,7 @@ mod unix_relay {
             .store(shown.modes.bracketed_paste(), Ordering::SeqCst);
         let mut stdout = std::io::stdout().lock();
         if stdout.write_all(bytes).is_err() || stdout.flush().is_err() {
+            screen.terminal_gone.store(true, Ordering::SeqCst);
             return Ok(false);
         }
         if let (Some(_), Some(point)) = (offset, shown.resume.as_mut()) {
@@ -1633,7 +1845,7 @@ mod unix_relay {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{Accept, Resumption, exchange, hello_reply, resume_reply};
+    use super::{Accept, Resumption, exchange, hello_reply, resume_reply, resume_request};
     use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
     use tendr::attach_proto::{Frame, FrameError, ProtocolError, RejectClass, ResumePoint};
@@ -1646,6 +1858,45 @@ mod tests {
         hello_reply(reply, "attach", Version::V1)
             .err()
             .map(|e| exit_code(&e))
+    }
+
+    /// A resume carries its point in the request, never takes over, and
+    /// sends the resume frame where the hello goes. A 0.5.0 remote tendr,
+    /// which ignores the request's unknown fields and requires the exact
+    /// version 1 hello, refuses it rather than attach afresh.
+    #[test]
+    fn a_resume_sends_its_point_in_the_request_and_in_place_of_the_hello() {
+        let request = crate::remote_op::AttachRequest {
+            session: "s".to_owned(),
+            namespace: None,
+            takeover: true,
+            escape: tendr::attach_escape::EscapeMode::CtrlBackslash,
+            protocol: 2,
+            resume: None,
+        };
+        let point = ResumePoint {
+            run_id: RunId::new(),
+            epoch: ControllerEpoch::new(4),
+            offset: 99,
+        };
+        let sent = resume_request(&request, point).unwrap();
+        let len = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
+        let json: serde_json::Value = serde_json::from_slice(&sent[4..4 + len]).unwrap();
+        assert_eq!(
+            json["params"]["resume"],
+            serde_json::json!({
+                "run_id": point.run_id.as_uuid().to_string(),
+                "epoch": 4,
+                "offset": 99
+            })
+        );
+        assert_eq!(json["params"]["takeover"], false);
+        let mut rest = &sent[4 + len..];
+        assert_eq!(
+            tendr::attach_proto::read_frame(&mut rest).unwrap(),
+            Frame::Resume(point)
+        );
+        assert!(rest.is_empty());
     }
 
     /// The hello and its reply, as a client speaking `version` sees them.

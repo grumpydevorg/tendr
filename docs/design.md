@@ -256,6 +256,40 @@ the event log for a takeover of its epoch never mistakes a resume for one,
 while a takeover of the resumed client still reads as a takeover. Source:
 step 1 of [remote frame transport](plans/active/01_remote-frame-transport.md).
 
+### A dropped `attach --host` reconnects by itself, judged by ssh's exit
+
+*2026-11-02.* When an `attach --host` connection ends from the far side,
+ssh's own end says what happened, and nothing else is asked. The remote's
+exit code (from its trailer) is its verdict, and the attach ends with it;
+ssh's 255 without a trailer, ssh killed, or ssh still running 5 s after its
+output ended is a lost link, and the client reconnects. A separate status
+call before reconnecting would need the same link that just failed, and
+could be stale by the time the resume lands. The resume itself is the end
+signal: its refusal (the control rule, a run that has ended, a remote that
+cannot resume) carries the code to exit with.
+
+It retries without a limit on the number of attempts (Rick's decision),
+with pauses doubling from 1 s to at most 30 s, until it resumes, the remote
+refuses, or the user leaves with the escape or a signal. A laptop that
+sleeps or changes networks should come back to its session, and a person
+who wants out has the escape.
+
+A reconnect runs ssh with `BatchMode=yes`, so that call has a second
+constant argv. The first connection keeps prompts: it runs before raw mode,
+so a passphrase or host-key prompt reads a normal terminal. A reconnect
+happens in raw mode, while the keyboard belongs to the attach; a prompt
+would eat keystrokes, or wait unseen. Under `BatchMode` a login that needs a
+prompt fails at once, and its stderr (an approval URL, say) goes into the
+status line instead. Every framed call has `ServerAliveInterval=5` and
+`ServerAliveCountMax=3`, so ssh notices a dead link within about 15 to 20 s
+instead of waiting on TCP.
+
+Input typed while reconnecting is discarded with one notice, never queued:
+keystrokes sent seconds late to a program that has moved on can do harm, and
+the user cannot see what they would land on until the screen is back.
+Source: step 1 of
+[remote frame transport](plans/active/01_remote-frame-transport.md).
+
 ### Windows uses Job Objects and a hidden console
 
 *2026-03 to 2026-04.* Windows has no SIGTERM. The sidecar runs the child in a
