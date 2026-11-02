@@ -183,13 +183,6 @@ impl ConPty {
         .unwrap_or_else(|e| panic!("waiting for {what}: {e}\n{}", self.describe_output()))
     }
 
-    /// Wait until the drawn text contains `needle`.
-    pub fn wait_contains(&self, needle: &str, timeout: Duration) {
-        self.wait_for(&format!("{needle:?}"), timeout, |text| {
-            text.contains(needle).then_some(())
-        });
-    }
-
     /// The client's exit code if it exits within `timeout`.
     pub fn wait_exit(&self, timeout: Duration) -> Option<u32> {
         // Below INFINITE (u32::MAX), which would never time out.
@@ -549,7 +542,18 @@ impl ConmodeReport {
             };
             *slot = value.to_owned();
         }
-        Some(report)
+        // A repaint fragment can hold `conmode;` and `;end` around a partial
+        // line; only a report with every field counts.
+        [
+            &report.tag,
+            &report.conin,
+            &report.conout,
+            &report.cp,
+            &report.window,
+        ]
+        .iter()
+        .all(|field| !field.is_empty())
+        .then_some(report)
     }
 
     /// A console mode field as a number, if it is not an error.

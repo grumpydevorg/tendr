@@ -34,12 +34,15 @@ fn conmode_reports_the_pseudo_console_it_runs_in() {
     let cp: u32 = report.cp.parse().expect("output code page");
     assert_ne!(cp, 0, "{report:?}");
 
+    // The report is drawn before conmode has finished exiting; wait for the
+    // exit so close() doesn't terminate it.
+    assert_eq!(pty.wait_exit(WAIT), Some(0), "{}", pty.text());
     let closed = pty.close();
     assert_eq!(closed.exit_code, 0, "{}", closed.text());
 }
 
 #[test]
-fn typed_line_reaches_the_child_and_its_echo_is_drawn() {
+fn typed_line_is_echoed_by_the_child() {
     let mut pty = ConPty::spawn(&[&conmode_bin(), "--serve"], 80, 25);
     report_tagged(&pty, "start");
 
@@ -58,17 +61,18 @@ fn resize_is_seen_by_the_child() {
     let mut pty = ConPty::spawn(&[&conmode_bin(), "--serve"], 80, 25);
     report_tagged(&pty, "start");
 
-    // Grow, then shrink. Reports stay narrower than every width used, so a
-    // reflow can't split one.
+    // Grow, then shrink. A report is at most 65 columns (`tag=r9999`,
+    // `cp=65001`, `window=100x30`), so no width used here can wrap one.
+    let mut asked = 0;
     for (cols, rows) in [(100, 30), (72, 20)] {
         pty.resize(cols, rows);
         let want = format!("{cols}x{rows}");
         // conhost applies a resize asynchronously, so ask until a report shows
         // it. Each request waits for its own tagged answer.
-        let mut asked = 0;
+        let first = asked + 1;
         poll_until(WAIT, Duration::from_millis(50), || {
             asked += 1;
-            let tag = format!("size-{want}-{asked}");
+            let tag = format!("r{asked}");
             pty.write(format!("{tag}\r").as_bytes());
             let report = report_tagged(&pty, &tag);
             if report.window == want {
@@ -78,7 +82,10 @@ fn resize_is_seen_by_the_child() {
             }
         })
         .unwrap_or_else(|e| panic!("resize to {want} never seen: {e}"));
-        eprintln!("resize to {want} seen after {asked} request(s)");
+        eprintln!(
+            "resize to {want} seen after {} request(s)",
+            asked - first + 1
+        );
     }
 
     pty.write(b"quit\r");
