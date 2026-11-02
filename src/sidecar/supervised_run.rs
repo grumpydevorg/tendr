@@ -40,8 +40,8 @@ use super::{
 };
 #[cfg(unix)]
 use super::{
-    ConnectionRegistry, RunEffects, SidecarControlHooks, UnixPtyInput, recorder_limits,
-    run_attach_listener, start_pty_recording,
+    AttachPools, ConnectionRegistry, RunEffects, SidecarControlHooks, UnixPtyInput,
+    recorder_limits, run_attach_listener, start_pty_recording,
 };
 use crate::model::ids::{EpochTimestamp, ProcessIdentity};
 use crate::model::meta::Meta;
@@ -412,7 +412,14 @@ impl RunCore {
                 self.meta.run_id(),
             );
             std::thread::spawn(move || {
-                run_attach_listener(&socket.listener, run_id, &writer, &registry, &sink);
+                run_attach_listener(
+                    &socket.listener,
+                    run_id,
+                    &writer,
+                    &registry,
+                    &sink,
+                    &AttachPools::default(),
+                );
             });
         }
         let started = StartedPty {

@@ -144,11 +144,17 @@ flowchart LR
 - The hello must complete within one overall deadline of 5 s
   (`attach_proto::HELLO_TIMEOUT`). Any frame that declares more than 64 KiB
   closes the connection.
-- A sidecar admits at most eight attach connections at once
-  (`MAX_ATTACH_CONNECTIONS`), counting those still waiting for their hello.
-  Eight connections that never send a hello can refuse a takeover for up to
-  5 s. The socket is owner-only and peer-checked, so only the owner can cause
-  this.
+- A sidecar admits attach connections from separate pools, each slot
+  returned when its connection ends however it ends. A connection holds a
+  **pending** slot (five, `PENDING_CONNECTIONS`) until its first frame (hello
+  or resume) is read, then gives it back before taking the slot of the mode
+  it asked for: attaches, takeovers, resumes and pushes share eight
+  (`CONTROLLER_CONNECTIONS`; a retiring controller keeps its connection for
+  up to `TAKEOVER_RECORD_GRACE`, so repeated takeovers need the cap). A
+  connection that finds its pool full is refused with a runtime refusal.
+  Five connections that never send a hello refuse every new connection for
+  up to 5 s; four leave room. The socket is owner-only and peer-checked, so
+  only the owner can cause this.
 
 ### Resuming a viewer
 

@@ -2992,14 +2992,10 @@ fn thirty_two_half_open_takeovers_do_not_grow_connections_or_threads() {
     // do, before treating the PTY as unowned.
     wait_for_pty_control(&root, "pty-32-takeovers", "AgentControl");
 
-    // Admission still works: the pool of 8 (hellos included) has room again.
-    // Hold eight connections open without ever sending a hello, so none of
-    // them can contend for control or be rejected for any reason but a full
-    // pool, and confirm the sidecar still lets every one of them past the
-    // connection-count gate. A ninth must then be turned away with exactly
-    // the rejection that would show a leaked admission slot.
-    let mut pending = Vec::new();
-    for i in 0..8 {
+    // Admission still works after the takeovers, and a connection that never
+    // sends its hello holds only a pending slot. Four of them stalled leave
+    // room for a controller.
+    let stall = |i: usize| {
         let mut conn =
             UnixStream::connect(&sock_path).unwrap_or_else(|e| panic!("connection {i}: {e}"));
         conn.set_read_timeout(Some(Duration::from_millis(200)))
@@ -3012,26 +3008,50 @@ fn thirty_two_half_open_takeovers_do_not_grow_connections_or_threads() {
                 ) => {}
             Err(e) => panic!("connection {i}: unexpected error waiting on it: {e}"),
             Ok((msg_type, payload)) => panic!(
-                "connection {i} was already answered before it ever sent a hello: \
+                "connection {i} was answered before it ever sent a hello: \
                  {msg_type} {payload:?}"
             ),
         }
-        pending.push(conn);
-    }
-    let mut ninth = UnixStream::connect(&sock_path).expect("connect a ninth, hello-less too");
-    ninth
+        conn
+    };
+    let stalled_since = Instant::now();
+    let mut stalled: Vec<UnixStream> = (0..4).map(stall).collect();
+    drop(attach_as_human(&sock_path));
+    wait_for_pty_control(&root, "pty-32-takeovers", "AgentControl");
+
+    // A fifth fills the pending pool: the next connection is refused at once.
+    stalled.push(stall(4));
+    let mut sixth = UnixStream::connect(&sock_path).expect("connect a sixth, hello-less too");
+    sixth
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let (msg_type, reason) = read_msg(&mut ninth).expect("the ninth gets a reply");
+    let (msg_type, reason) = read_msg(&mut sixth).expect("the sixth gets a reply");
     let reason_text = String::from_utf8_lossy(&reason);
     assert_eq!(
         msg_type, MSG_REJECTED,
-        "the ninth should find the pool full: {reason_text}"
+        "the sixth should find the pending pool full: {reason_text}"
     );
     assert!(
         reason_text.contains("too many attach connections"),
-        "unexpected rejection reason for the ninth: {reason_text}"
+        "unexpected rejection reason for the sixth: {reason_text}"
     );
+
+    // For at most the hello deadline: the stalled connections are closed and
+    // their slots returned, so a controller is admitted again.
+    for (i, conn) in stalled.iter_mut().enumerate() {
+        let seen = read_until_closed(conn);
+        assert!(
+            seen.iter().all(|(t, _)| *t == MSG_REJECTED),
+            "stalled connection {i}: {seen:?}"
+        );
+    }
+    let hello_deadline = tendr::attach_proto::HELLO_TIMEOUT;
+    assert!(
+        stalled_since.elapsed() < hello_deadline + Duration::from_secs(3),
+        "stalled connections were held for {:?}",
+        stalled_since.elapsed()
+    );
+    drop(attach_as_human(&sock_path));
 }
 
 #[test]
