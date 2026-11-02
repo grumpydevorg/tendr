@@ -253,6 +253,40 @@ fn session_names_arrive_as_data() {
     failures.assert_none(&remote, "session_names_arrive_as_data");
 }
 
+/// `attach` from this Windows client runs over the attach bridge: an ssh
+/// connection of its own (`-o ControlMaster=no -o ControlPath=none`, which
+/// Win32-OpenSSH must accept), the request on ssh's stdin, and any session
+/// name, which the remote tendr looks up as typed. It runs on the debug
+/// build's test terminal, since the job has no console.
+#[test]
+fn attach_names_arrive_as_data_over_the_bridge() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(remote) = Remote::connect("attach_names_arrive_as_data_over_the_bridge") else {
+        return;
+    };
+    let mut failures = Failures::default();
+    for name in hostile_values(&remote.m()) {
+        let args = ["attach", &name, "--namespace", &remote.namespace];
+        let output = assert_cmd::Command::cargo_bin("tendr")
+            .unwrap()
+            .args(["--host", &remote.host])
+            .args(args)
+            .env("TENDR_TEST_ATTACH_TERMINAL", "24x80")
+            .write_stdin(b"")
+            .timeout(CALL_DEADLINE)
+            .output()
+            .unwrap_or_else(|e| panic!("tendr --host {} {args:?} did not run: {e}", remote.host));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        failures.check(
+            output.status.code() == Some(1)
+                && stderr.contains(&format!("session not found: {name}")),
+            || format!("attach {name:?}: {}", describe(&output)),
+        );
+        failures.check_markers(&remote, &format!("attach {name:?}"));
+    }
+    failures.assert_none(&remote, "attach_names_arrive_as_data_over_the_bridge");
+}
+
 /// Hostile names that are valid Windows file names: `start` creates the
 /// session under exactly that name, and `status` and `list` find it.
 #[test]

@@ -253,7 +253,7 @@ sequenceDiagram
     alt local
         Human->>CLI: attach <session>
         CLI->>Socket: connect using a.sock.path, MSG_HELLO (mode attach)
-    else remote (Unix client)
+    else remote (Unix or Windows client)
         Human->>CLI: tendr --host box attach <session>
         CLI->>SSH: remote frame (attach request), MSG_HELLO
         SSH->>Bridge: the same bytes on stdin
@@ -270,12 +270,10 @@ sequenceDiagram
 
 Notes:
 
-- Remote attach still talks to the sidecar on the far host. From a Unix
-  client the terminal stays local: ssh carries the attach protocol, and the
-  remote tendr only bridges it to the socket
+- Remote attach still talks to the sidecar on the far host. The terminal
+  stays local, a Unix terminal or a Windows console: ssh carries the attach
+  protocol, and the remote tendr only bridges it to the socket
   ([06-transport-boundaries.md](06-transport-boundaries.md#the-attach-bridge)).
-- A Windows client still attaches under `ssh -t`, with the remote
-  `tendr attach` driving a remote terminal.
 - Handshake, refusals and exit codes: [04-pty-lane.md](04-pty-lane.md).
 
 ## `run`

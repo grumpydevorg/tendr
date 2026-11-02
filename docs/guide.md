@@ -304,8 +304,7 @@ concurrent `push` is refused, not interleaved.
   watchers attached. To take control, attach again with `--takeover` (it
   cannot be combined with
   `--read-only`). A session started by a `tendr` without read-only viewers
-  refuses it with 80. `--read-only` does not yet work with `--host` from a
-  Unix client (2); from Windows it is passed to the remote `tendr attach`.
+  refuses it with 80. `--read-only` does not yet work with `--host` (2).
 - With no terminal (stdin or stdout redirected), `attach --read-only`
   streams the session's output to stdout, for an agent or script watching a
   PTY session live: `tendr attach --read-only build | grep -m1 'error'`. It
@@ -317,7 +316,11 @@ concurrent `push` is refused, not interleaved.
   and 1 when its stdout closes (the reader gone), which detaches it. Without
   `--read-only`, attach still needs a terminal.
 - SIGTERM, SIGHUP or SIGINT (closing the window sends SIGHUP) also detach. It
-  exits 1 with `tendr: attach ended by SIGTERM` (or the signal received).
+  exits 1 with `tendr: attach ended by SIGTERM` (or the signal received). On
+  Windows, closing the console window, Ctrl-Break, or a Ctrl-C event that
+  another program raises in the console, does the same
+  (`tendr: attach ended by CTRL_BREAK_EVENT`); Ctrl-C typed at the keyboard
+  goes to the session.
 - `tendr --host <host> attach <name>` attaches to a session on another host.
   Your terminal stays on your machine: raw mode, window resizes and the
   detach escape work exactly as above, and the session on the remote host
@@ -325,9 +328,10 @@ concurrent `push` is refused, not interleaved.
   only the attach traffic, so any session name works, and the exit codes are
   those of a local attach. A client whose terminal or connection stops
   reading does not hold up its own detach, nor another client's
-  `--takeover`. From Windows, attach still runs the remote `tendr attach`
-  under `ssh -t`, so names must be plain (see
-  [Reach remote hosts](#reach-remote-hosts-with---host)).
+  `--takeover`. It works the same from Windows, in Windows Terminal or a
+  conhost window on Windows 10 1809 or later. A console without virtual
+  terminal support (an older Windows, or the console's "Use legacy console"
+  setting) and mintty (Git Bash's terminal) are refused before ssh starts.
 
 **When an `attach --host` connection drops**, tendr reconnects by itself
 and carries on where your terminal stopped, with the screen as it was. The
@@ -540,7 +544,7 @@ Start work under `--host`, disconnect, and come back later to `log`, `status`,
 |Commands|With `--host`|
 |---|---|
 |`start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `exec`|Run on the remote host. The request travels as data on the SSH stdin, so no remote shell parses it. Through a POSIX login shell, output and exit codes are byte for byte those of the command run there.|
-|`attach`|From macOS or Linux, the request travels the same way, and your terminal stays local ([Answer prompts and attach](#answer-prompts-and-attach)). From Windows, it runs on the remote host under `ssh -t`, and the session and namespace must be plain names: letters, digits, `-` and `_`, starting with a letter. Any other name exits 2.|
+|`attach`|The request travels the same way, from macOS, Linux or Windows, and your terminal stays local ([Answer prompts and attach](#answer-prompts-and-attach)).|
 |`run`, `wrap`, `prune`, `query`, `guide`, `skill`|Refused with exit 2 and a ready-to-paste fallback for a POSIX shell, such as `try (POSIX shell):  ssh data-box 'tendr run deploy.sh'`.|
 |`events`, `emit`|Refused with exit 1.|
 
@@ -569,8 +573,8 @@ yourself, quote for the remote shell, for example with
 
 **Connect deadline.** Every `--host` command must authenticate and start the
 remote `tendr` within 30 s, or tendr stops `ssh` and exits 82, naming the
-host (`attach` from Windows has no deadline). Without it, a lapsed Tailscale
-SSH check-mode approval waits about 30 minutes with no prompt.
+host. Without it, a lapsed Tailscale SSH check-mode approval waits about 30
+minutes with no prompt.
 
 - Once the remote `tendr` starts, the command runs as long as it needs, so
   `wait --timeout 3600` and `log -f` are unaffected. `ssh` checks the link
@@ -752,10 +756,10 @@ or an I/O error.
 |Command|Code|Meaning|
 |---|---|---|
 |any|2|Usage error from argument parsing|
-|any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); an `attach` name that is not plain, from Windows; a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request (1 when the remote login shell is PowerShell)|
+|any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request (1 when the remote login shell is PowerShell)|
 |`events`, `emit` with `--host`|1|Not supported over SSH|
-|any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 without one from the remote is `ssh` failing to connect (`attach` from macOS or Linux reconnects instead, once it is attached)|
-|any, with `--host` except `attach` from Windows|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s); while `attach --host` reconnects, it tries again instead|
+|any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 without one from the remote is `ssh` failing to connect (`attach` reconnects instead, once it is attached)|
+|any, with `--host`|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s); while `attach --host` reconnects, it tries again instead|
 |`start`|2, 5|The child failed to spawn; the sidecar failed|
 |`run`|the child's|The child's own code, or 2 spawn failed, 3 sidecar lost, 4 dependency failed, 5 sidecar failed, 124 timed out, 137 killed|
 |`wait`|1|`--timeout` passed before the sessions ended|

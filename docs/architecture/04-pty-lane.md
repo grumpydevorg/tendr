@@ -195,8 +195,7 @@ flowchart LR
 - `attach --read-only` is the watcher client: it drops keystrokes, says so
   once on the status line at the first one, and still detaches with the
   escape. With `--host` it is refused (exit 2) until the attach bridge
-  passes watchers through; a Windows client passes `--read-only` to the
-  remote `tendr attach` it runs under `ssh -t`.
+  passes watchers through.
 - With no terminal (stdin or stdout is not one), `attach --read-only`
   streams instead: the client's no-terminal layer never reads stdin and
   waits only on the connection and the cancelling signals. stdout gets the
@@ -370,7 +369,8 @@ A `push` to a pipe session that is not running exits 1.
   it until the next byte, with no deadline. Turning bracketed paste off ends
   a paste.
 - The terminal size is checked every 100 ms and changes are forwarded.
-  SIGWINCH only brings that check forward, because signals coalesce.
+  SIGWINCH (on Windows, `WINDOW_BUFFER_SIZE_EVENT`) only brings that check
+  forward, because such notices coalesce.
 - SIGHUP, SIGTERM and SIGINT end the attach like a detach: a detach message
   with the same bounded grace, then the terminal is restored. The client
   exits 1 with `tendr: attach ended by SIG…`. A signal inherited as ignored
@@ -386,8 +386,8 @@ A `push` to a pipe session that is not running exits 1.
 
 ### Attaching over `--host`
 
-From a Unix client, `attach --host` runs this same client on the laptop:
-raw mode, the size check and SIGWINCH, the escape, mode tracking and
+`attach --host` runs this same client on the laptop, Unix or Windows: raw
+mode, the size check, the escape, mode tracking and
 restoring the terminal. Only its connection differs. Instead of the attach
 socket it speaks the same frames over ssh's stdin and stdout, to a remote
 tendr that bridges them to the session's socket
@@ -437,8 +437,9 @@ tendr that bridges them to the session's socket
     session that cannot resume).
   - Meanwhile the main thread keeps the keyboard: it discards keystrokes,
     noting it once in the status line, and leaves on the escape, SIGHUP,
-    SIGTERM or SIGINT, which stop the reconnect's ssh (a flag polled every
-    20 ms by its wait, then SIGTERM and SIGKILL) for up to 2 s.
+    SIGTERM, SIGINT or a console control event, which stop the reconnect's
+    ssh (a flag polled every 20 ms by its wait, then SIGTERM and SIGKILL, or
+    on Windows `TerminateProcess`) for up to 2 s.
   - The status goes on the terminal's last rows, written under the lock the
     output is written under, with the cursor saved and restored (DECSC,
     DECRC): tendr's line, and ssh's latest stderr line on the row below
@@ -456,8 +457,37 @@ tendr that bridges them to the session's socket
     notice is printed again once the terminal is restored, since a program
     on the alternate screen covers it. Either way it then sends its size and
     the repaint nudge, the size first so the nudge can apply.
-- A Windows client still runs the remote `tendr attach` under `ssh -t`; the
-  remote end then is the client described above, driving a remote terminal.
+- A Windows client drives its console through the Windows terminal layer
+  (`src/commands/attach/terminal/windows.rs`), and ssh through
+  `tendr::platform::spawn_external`, as every other ssh tendr starts:
+  - The console's input and output modes and output code page are taken
+    before ssh starts, since ssh shares the console, and put back on every
+    way out: a refusal, the connect deadline, a panic, a leave.
+  - Input mode: the console's own plus virtual terminal input, window and
+    mouse events, without line input, echo, processed input or QuickEdit.
+    Keys and mouse reports therefore arrive as the bytes a Unix terminal
+    sends, and `Ctrl-C` as 0x03 for the session. Output mode adds virtual
+    terminal processing and `DISABLE_NEWLINE_AUTO_RETURN`. A console that
+    cannot take them (before Windows 10 1809, or "Use legacy console") is
+    refused before ssh starts, and so is a stdin that is a terminal but not
+    a console (mintty).
+  - The keyboard is read with `ReadConsoleInputW`, waiting on the console
+    and an event the control handler sets. Key presses give their UTF-16
+    character `wRepeatCount` times, joined into UTF-8 across events and
+    reads; releases give nothing, except Alt's after an Alt-numpad entry.
+    A batch of records with no typing is not the end of input. A press
+    with neither a character nor a key is Ctrl-Space, sent as NUL.
+  - Output is written with `WriteFile` under the UTF-8 output code page,
+    so session output that is not UTF-8 is shown, not refused as Rust's
+    console `Stdout` would. The size is the visible window (`srWindow`).
+  - `CTRL_BREAK_EVENT` (the keyboard's Ctrl-Break, or another program's),
+    `CTRL_C_EVENT` raised by another program in the console, and
+    `CTRL_CLOSE_EVENT` end the attach as the Unix signals do
+    (`tendr: attach ended by CTRL_BREAK_EVENT`). The close event's handler
+    waits, under Windows's 5 s limit, until the console has been put back.
+  - Restoring discards typed-ahead input (`FlushConsoleInputBuffer`).
+  - Drop classification is shared: ssh's 255 without an exit trailer is a
+    lost link, and the attach reconnects.
 
 ## Output and viewers
 

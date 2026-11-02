@@ -18,8 +18,7 @@ flowchart TD
     Human["human terminal"] -->|Unix socket + attach protocol| Sidecar
 
     Remote["remote caller"] -->|ssh -T, request on stdin| RemoteCLI["remote tendr CLI"]
-    AttachUnix["remote attach (Unix client)"] -->|ssh -T, request then attach frames| RemoteCLI
-    AttachWindows["remote attach (Windows client)"] -->|ssh -t| RemoteCLI
+    Attach["remote attach"] -->|ssh -T, request then attach frames| RemoteCLI
     RemoteCLI -->|same local boundaries on remote host| Session
     RemoteCLI -->|same local boundaries on remote host| Sidecar
 ```
@@ -34,7 +33,7 @@ flowchart TD
 | `output.log` | Appended by the sidecar, `wrap` and `exec`. Read by `log`, `watch`, `exec` and `events --include-logs`. | JSONL lines tagged `O`, `E` or `A`. |
 | `events/*.jsonl` | Appended by the sidecar, `emit`, `exec`, `wrap` and reconciliation. Read by `events`, `watch` and `query`. | Event envelopes ([07-event-protocol.md](07-event-protocol.md)). |
 | PTY attach socket | Unix socket under `~/.tendr/sockets`, found through `a.sock.path`. | The attach protocol: `MSG_HELLO`, `MSG_DATA`, `MSG_RESIZE`, `MSG_DETACH` and others ([04-pty-lane.md](04-pty-lane.md)). |
-| SSH | `--host` on a remote-capable command. | One request as data on ssh stdin, run by the remote tendr; for `attach`, attach protocol frames follow it both ways. A Windows client's `attach` sends a command line of plain names instead. |
+| SSH | `--host` on a remote-capable command. | One request as data on ssh stdin, run by the remote tendr; for `attach`, attach protocol frames follow it both ways. |
 
 ## SSH transport
 
@@ -55,9 +54,8 @@ remote login shell, whether that is bash, `cmd.exe` or PowerShell:
 
 | Operations | Remote command line | Request |
 |---|---|---|
-| `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, and `attach` from a Unix client | `ssh -T … tendr [--hello] --exit-trailer _remote` | The remote frame on ssh stdin |
+| `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `attach` | `ssh -T … tendr [--hello] --exit-trailer _remote` | The remote frame on ssh stdin |
 | `exec` | `ssh -T … tendr [--hello] --exit-trailer exec --frame-from-stdin` | The exec frame on ssh stdin |
-| `attach` from a Windows client | `ssh -t … tendr attach <name> [--namespace <ns>] [--takeover \| --read-only] [--escape none]` | The command line itself |
 
 ### The remote frame
 
@@ -127,11 +125,12 @@ travels on stderr:
 
 ### The attach bridge
 
-`attach --host` from a Unix client runs the same constant command line as
-the other operations, and keeps the terminal on the client
+`attach --host`, from a Unix or a Windows client, runs the same constant
+command line as the other operations, and keeps the terminal on the client
 (`commands::attach::cmd_attach_host` and `commands::attach::bridge`):
 
-- The client checks that its stdin is a terminal before ssh starts, since the
+- The client checks that its stdin is a terminal (on Windows, a console
+  that takes virtual terminal modes) before ssh starts, since the
   request may take over. On ssh stdin it sends the remote frame (`op:
   attach`), then the attach protocol's hello (`MSG_HELLO`, mode `attach` or
   `takeover`). After that, ssh stdin carries the client's frames and ssh
@@ -171,8 +170,9 @@ the other operations, and keeps the terminal on the client
   0.5.0 remote tendr ignores `resume` and refuses `MSG_RESUME` as not its
   hello (80), unless its own human-control check refuses first (81); it
   never attaches afresh either.
-- Raw mode, the size check and SIGWINCH, the detach escape, and restoring
-  the terminal and its modes all happen on the client, as for a local attach.
+- Raw mode, the size check and SIGWINCH (`WINDOW_BUFFER_SIZE_EVENT` on
+  Windows), the detach escape, and restoring the terminal and its modes all
+  happen on the client, as for a local attach.
   A resize is a `MSG_RESIZE` frame.
 - The remote tendr has no lifecycle authority: the sidecar grants and
   retires controllers, keeps the epochs and records the run. Each direction
@@ -212,17 +212,8 @@ the other operations, and keeps the terminal on the client
   for a session that cannot resume) as the end; there is no separate status
   call. After a lost link the old remote tendr usually stays connected to the
   session (sshd has not noticed); the resume retires it.
-- Session and namespace names travel as data in the frame, so the plain-name
-  rule of the `ssh -t` command line does not apply.
-
-A Windows client has no local console frontend for the attach protocol yet
-([windows-parity](../plans/backlog/windows-parity.md#no-pty-or-attach)), so it
-still attaches under `ssh -t` with a rebuilt command line, and the remote
-`tendr attach` drives a remote terminal. Its session and namespace must match
-`[A-Za-z][A-Za-z0-9_-]{0,254}`, and its flag values are fixed tokens; any
-other name exits 2 before ssh starts. A name starts with a letter because
-PowerShell reads a bare token that starts with a digit as a number (`0x1F`
-arrives as `31`).
+- Session and namespace names travel as data in the frame, so any name
+  works, from any client.
 
 ### Remote `exec`
 
@@ -237,14 +228,13 @@ the SSH boundary.
 The connect deadline (`src/ssh.rs`) catches an SSH connection that stalls
 before the remote tendr starts.
 
-- Every call except a Windows client's `attach` runs the remote as
-  `tendr --hello …`. Its first stderr line is `ssh::HELLO_LINE`
-  (`tendr-hello 1`).
+- Every call runs the remote as `tendr --hello …`. Its first stderr line is
+  `ssh::HELLO_LINE` (`tendr-hello 1`).
 - The local end reads stderr, drops the hello line, and passes the rest
   through.
 - If the hello has not arrived within `TENDR_SSH_CONNECT_TIMEOUT` seconds
-  (default 30), tendr sends ssh SIGTERM, then SIGKILL one second later. The
-  call exits 82.
+  (default 30), tendr sends ssh SIGTERM, then SIGKILL one second later (on
+  Windows it terminates ssh at once). The call exits 82.
 - After the hello there is no deadline, so `wait` and `log -f` run as long
   as they need. The keepalives below end a call on a dead link instead.
 - ssh's own `ConnectTimeout` ends at key exchange. Authentication can still
@@ -252,9 +242,8 @@ before the remote tendr starts.
   waits about 30 minutes with no output.
 - The marker comes from the remote tendr, not from ssh's log. ssh's log is
   unreliable across ControlMaster reuse and OpenSSH versions.
-- A Windows client's `attach` gets no deadline, because its stderr shares the
-  terminal. A Unix client's `attach` has it, and enters raw mode only once
-  the remote tendr has answered, so an ssh prompt still reads a normal
+- `attach` has it too, and enters raw mode only once the remote tendr has
+  answered, so an ssh prompt still reads a normal
   terminal. Its reconnects have it too, and run in raw mode with
   `BatchMode=yes`, so they never prompt. Once the attach is in raw mode,
   no connection's ssh stderr reaches the terminal's scrolling text: a
@@ -277,7 +266,8 @@ before the remote tendr starts.
   keepalives make ssh notice a dead link within about 15 to 20 s and exit
   255, when ssh makes its own connection. Over a shared connection
   (`ControlMaster`) the master's keepalives apply instead.
-- A Unix client's `attach` adds `-o ControlMaster=no -o ControlPath=none`:
+- `attach` adds `-o ControlMaster=no -o ControlPath=none`, which
+  Win32-OpenSSH accepts too (CI's `windows-openssh` job attaches through it):
   it always makes its own connection, so its keepalives apply. On the VM, an
   attach riding a master with `ServerAliveInterval 60` noticed a dead link
   after 240 s instead of 20
@@ -293,9 +283,8 @@ before the remote tendr starts.
 - Every call but `attach` gives ssh tendr's stdout. Its stdin is tendr's
   own for `exec --frame-from-stdin`, otherwise a pipe tendr writes the
   request (and a `push` body) to. Its stderr is a pipe tendr relays.
-  A Unix client's `attach` gives ssh a pipe each for stdin and stdout, which
-  carry the attach protocol after the request, and the relayed stderr pipe.
-  A Windows client's `attach` gives ssh all three of tendr's streams.
+  `attach` gives ssh a pipe each for stdin and stdout, which carry the
+  attach protocol after the request, and the relayed stderr pipe.
 - No other stream of tendr's reaches ssh. Windows hands a child every
   inheritable handle in its parent, and the std handles tendr inherited are
   inheritable, so `spawn_external` in `src/platform/mod.rs` clears

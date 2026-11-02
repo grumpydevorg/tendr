@@ -80,7 +80,8 @@ pub(super) struct Link {
 pub(super) enum Peer<'a> {
     /// The session's attach socket on this machine. `recorded_takeover`
     /// is asked when the session closes the connection without saying
-    /// it was taken over.
+    /// it was taken over. Unix only: a Windows session has no attach socket.
+    #[cfg_attr(windows, allow(dead_code))]
     Local {
         recorded_takeover: &'a dyn Fn() -> bool,
     },
@@ -617,7 +618,8 @@ impl Outbox {
     }
 
     /// Queue input, waiting while the backlog is full; `false` once
-    /// closed.
+    /// closed. The remote bridge's, which runs on Unix only.
+    #[cfg(unix)]
     pub(super) fn push_data_waiting(&self, bytes: Vec<u8>) -> bool {
         let mut state = self.lock();
         while !state.closed

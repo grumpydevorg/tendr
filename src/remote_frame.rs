@@ -439,8 +439,7 @@ mod tests {
     }
 
     /// Attach names travel as data like any other, and are checked as any
-    /// other: the plain-name rule of a Windows client's `ssh -t` command line
-    /// does not apply.
+    /// other: names a shell would act on reach the remote tendr intact.
     #[test]
     fn attach_is_carried_and_checked() {
         let operation = decode(

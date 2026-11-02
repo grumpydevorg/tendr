@@ -7,18 +7,18 @@ depends_on: []
 
 **Status:** every `--host` operation travels as a frame on ssh stdin
 ([remote frame](../../architecture/06-transport-boundaries.md#the-remote-frame)),
-and `attach` from a Unix client bridges the attach protocol over it
-([attach bridge](../../architecture/06-transport-boundaries.md#the-attach-bridge)).
+and `attach` bridges the attach protocol over it, from a Unix or a Windows
+client ([attach bridge](../../architecture/06-transport-boundaries.md#the-attach-bridge)).
 A dropped `attach --host` link resumes where its terminal left off, accepted
 on the VM on 2026-11-02
 ([results](../../../scripts/pty-vm/README.md#resuming-attach---host)). What
-is left is read-only viewers and moving Windows clients off `ssh -t`.
+is left is read-only viewers.
 
 Goal: a viewer that loses its connection can resume where it left off, and no
 client needs a remote terminal or a rebuilt command line.
 
-Windows-specific work outside the transport (ConPTY, the console frontend,
-lifecycle hardening, PowerShell state) belongs to
+Windows-specific work outside the transport (ConPTY, Windows as the attach
+target, lifecycle hardening, PowerShell state) belongs to
 [windows-parity](../backlog/windows-parity.md).
 
 ## Steps
@@ -28,12 +28,6 @@ lifecycle hardening, PowerShell state) belongs to
    replacement controller. Today one pool of eight holds every connection,
    hellos included
    ([PTY lane](../../architecture/04-pty-lane.md#the-attach-handshake)).
-2. **Delete the `ssh -t` path** and the plain-name rule for `attach`, once
-   Windows clients can attach: today's `ssh -t` lets a Windows client attach
-   to a Unix host with no Windows terminal code, and the bridge needs a local
-   Windows console frontend
-   ([windows-parity](../backlog/windows-parity.md#no-pty-or-attach)). Windows
-   as the attach target needs ConPTY and a named-pipe carrier, also there.
 
 ## Acceptance
 

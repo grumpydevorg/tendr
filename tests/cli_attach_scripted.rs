@@ -7,10 +7,9 @@
 //! piped stdin is its keyboard and piped stdout its screen.
 //!
 //! The real-remote tests (`cli_remote_attach.rs`) stay the oracle for the
-//! client and the sidecar agreeing. Unix only for now: a Windows client
-//! runs `attach --host` under `ssh -t` until it speaks the attach protocol
-//! itself.
-#![cfg(unix)]
+//! client and the sidecar agreeing; they need a Unix remote, while these run
+//! on every client platform. The Windows console layer under them has its
+//! own tests under a pseudo console (`windows_attach_console.rs`).
 
 mod harness;
 
@@ -20,7 +19,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use harness::{Observation, SessionGuard, fake_ssh, poll_until, shim_path_env};
+use harness::{Observation, fake_ssh, poll_until, shim_path_env};
 use tempfile::TempDir;
 use tendr::attach_proto::{Frame, Mode, Version};
 use tendr::recording::Geometry;
@@ -312,11 +311,12 @@ fn a_scripted_resume_that_is_gone_says_what_was_missed() {
 /// A read-only attach drops what is typed and says so once on the screen,
 /// through the terminal layer like every write. `attach --host` refuses
 /// `--read-only` before ssh for now, so this one is local, against a real
-/// session.
+/// session, which needs a PTY: Unix only.
+#[cfg(unix)]
 #[test]
 fn a_read_only_attach_says_typing_is_dropped() {
     let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro");
+    let _kill = harness::SessionGuard::new(&root, "ro");
     let started = harness::tendr(&root)
         .args(["start", "ro", "--pty", "--stdin", "--", "sh"])
         .output()

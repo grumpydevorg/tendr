@@ -1,5 +1,4 @@
 use tendr::attach_escape::EscapeMode;
-#[cfg(unix)]
 use tendr::attach_proto::{self, Frame, FrameError, Mode};
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::model::meta::Meta;
@@ -157,7 +156,6 @@ fn attachable(
 
 /// The hello's mode: `read_only` and `takeover` never come together (the
 /// command line refuses it).
-#[cfg(unix)]
 fn mode(takeover: bool, read_only: bool) -> Mode {
     match (read_only, takeover) {
         (true, _) => Mode::Watch,
@@ -170,16 +168,14 @@ fn mode(takeover: bool, read_only: bool) -> Mode {
 /// on this side (a detach, or the keyboard closing) before stopping it. The
 /// remote side ends as soon as it reads the end of its input; the session
 /// treats a lost connection as a detach either way.
-#[cfg(unix)]
 const SSH_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long `attach --host` waits for ssh to end, for its exit code, once
 /// the remote end has closed the connection. ssh still running after it
 /// counts as a lost connection.
-#[cfg(unix)]
 const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// `attach --host` from a Unix client. `frame` is the encoded remote frame
+/// `attach --host`. `frame` is the encoded remote frame
 /// of `request`; the hello follows it on ssh's stdin, and then the typed
 /// attach frames, which the remote tendr bridges to the session's attach
 /// socket ([`cmd_attach_bridge`]). This end keeps the terminal: raw mode,
@@ -206,7 +202,6 @@ const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// A takeover of this attach (81), an answer or output outside the protocol
 /// (80), a remote that ended without answering (84), and the ssh failures of
 /// [`tendr::ssh::AttachSsh`].
-#[cfg(unix)]
 pub fn cmd_attach_host(
     host: &str,
     request: &crate::remote_op::AttachRequest,
@@ -260,7 +255,6 @@ pub fn cmd_attach_host(
 
 /// The ssh end of an `attach --host`: the current connection's ssh, and what
 /// a reconnect needs to open the next.
-#[cfg(unix)]
 pub(super) struct HostEnd {
     host: String,
     request: crate::remote_op::AttachRequest,
@@ -274,7 +268,6 @@ pub(super) struct HostEnd {
     stderr: std::sync::Arc<client::StderrRoute>,
 }
 
-#[cfg(unix)]
 impl HostEnd {
     /// Wait at most `grace` for the current connection's ssh to end, then
     /// stop it: the call's exit code, or `None` if ssh had to be stopped or
@@ -313,14 +306,12 @@ impl HostEnd {
 /// An `attach --host` connection whose remote side has answered: ssh, its
 /// stdin for the client's frames, and its stdout, past the answer, for the
 /// session's.
-#[cfg(unix)]
 pub(super) struct HostLink {
     ssh: tendr::ssh::AttachSsh,
     stdin: std::process::ChildStdin,
     reader: std::io::BufReader<std::process::ChildStdout>,
 }
 
-#[cfg(unix)]
 impl HostLink {
     /// The relay's link over ssh's stdin and stdout, and ssh. The sender
     /// closes ssh's stdin when the relay closes its outbox, and
@@ -336,10 +327,9 @@ impl HostLink {
 }
 
 /// How opening an `attach --host` connection went.
-#[cfg(unix)]
 pub(super) enum Opened<A> {
     /// The session answered `A`; the attach goes on over the link.
-    Answered(HostLink, A),
+    Answered(Box<HostLink>, A),
     /// The remote side ended without answering, with this exit code, its
     /// verdict: a refusal or a failure of its own (its message has been
     /// passed on to stderr).
@@ -354,7 +344,6 @@ pub(super) enum Opened<A> {
 ///
 /// # Errors
 /// `answer`'s error, and the ssh failures of [`tendr::ssh::AttachSsh`].
-#[cfg(unix)]
 fn open_host<A>(
     host: &str,
     request: &[u8],
@@ -374,7 +363,10 @@ fn open_host<A>(
     // connect deadline there is no hello at all.
     match read_answer(stdout, &cancel) {
         Some((reader, reply)) if !matches!(reply, Err(FrameError::Io(_))) => match answer(reply) {
-            Ok(answered) => Ok(Opened::Answered(HostLink { ssh, stdin, reader }, answered)),
+            Ok(answered) => Ok(Opened::Answered(
+                Box::new(HostLink { ssh, stdin, reader }),
+                answered,
+            )),
             Err(e) => {
                 drop(stdin);
                 let _ = ssh.finish(Some(SSH_LEAVE_GRACE));
@@ -393,14 +385,12 @@ fn open_host<A>(
 }
 
 /// How often waiting for the session's answer looks at the cancel flag.
-#[cfg(unix)]
 const ANSWER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Read the session's answer from `stdout` on a thread of its own, and wait
 /// for it where `cancel` can stop the wait: the reader and the answer, or
 /// `None` once `cancel` is set (or the thread died). The caller then ends
 /// ssh, which ends the read, and the thread with it.
-#[cfg(unix)]
 fn read_answer(
     stdout: std::process::ChildStdout,
     cancel: &std::sync::atomic::AtomicBool,
@@ -448,7 +438,6 @@ fn read_answer(
 /// agent's push holds the terminal; 80 when the session cannot resume), an
 /// answer outside the protocol (80), and the ssh failures of
 /// [`tendr::ssh::AttachSsh`].
-#[cfg(unix)]
 fn resume_host(
     host: &str,
     request: &crate::remote_op::AttachRequest,
@@ -462,7 +451,6 @@ fn resume_host(
 /// What a resume from `point` writes to ssh's stdin: the remote frame of
 /// `request` carrying `point`, never a takeover, then the resume frame where
 /// the hello would go.
-#[cfg(unix)]
 fn resume_request(
     request: &crate::remote_op::AttachRequest,
     point: attach_proto::ResumePoint,
@@ -480,7 +468,6 @@ fn resume_request(
 
 /// The exit code of an `attach --host` whose remote side ended without
 /// accepting: its own code, or 84 if it claims success.
-#[cfg(unix)]
 fn unanswered(code: i32) -> anyhow::Result<i32> {
     if code == 0 {
         Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
@@ -538,7 +525,6 @@ const HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// point in the run, from which a viewer's stamped output starts; or, for a
 /// read-only viewer, its point in the run with no epoch, since it holds no
 /// control.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Accept {
     V1(tendr::model::pty_control::ControllerEpoch),
@@ -546,10 +532,10 @@ pub(super) enum Accept {
     Watch(attach_proto::WatchPoint),
 }
 
-#[cfg(unix)]
 impl Accept {
     /// The controller epoch granted; `None` for a watcher, which holds
     /// none, so no takeover check applies to it.
+    #[cfg(unix)]
     fn epoch(self) -> Option<tendr::model::pty_control::ControllerEpoch> {
         match self {
             Self::V1(epoch) => Some(epoch),
@@ -577,6 +563,7 @@ impl Accept {
     }
 
     /// The acceptance as the sidecar sent it.
+    #[cfg(unix)]
     fn frame(self) -> Frame {
         match self {
             Self::V1(epoch) => Frame::Accepted(epoch),
@@ -639,7 +626,6 @@ pub(super) fn connect(
 
 /// What the sidecar answered a resume: control regained at a new epoch, and
 /// where the output goes on from.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Resumption {
     /// The output follows from `point.offset`, the offset asked for, with
@@ -654,7 +640,6 @@ pub(super) enum Resumption {
     },
 }
 
-#[cfg(unix)]
 impl Resumption {
     /// The new epoch, and the offset the stamped output starts at.
     pub(super) fn point(self) -> attach_proto::ResumePoint {
@@ -664,6 +649,7 @@ impl Resumption {
     }
 
     /// The answer as the sidecar sent it.
+    #[cfg(unix)]
     fn frame(self) -> Frame {
         match self {
             Self::Resumed(point) => Frame::Resumed(point),
@@ -763,7 +749,6 @@ fn exchange(
     Ok(reply)
 }
 
-#[cfg(unix)]
 fn verb(mode: Mode) -> &'static str {
     match mode {
         Mode::Attach | Mode::Takeover => "attach",
@@ -781,7 +766,6 @@ fn verb(mode: Mode) -> &'static str {
 /// or none before the deadline (a sidecar from before the hello waits
 /// silently), is a protocol failure (80); a connection that ends first is a
 /// transport failure (84).
-#[cfg(unix)]
 fn hello_reply(
     reply: Result<Frame, FrameError>,
     mode: Mode,
@@ -809,7 +793,6 @@ fn hello_reply(
 /// the offset asked for, a gone one naming a span that starts after it (an
 /// offset past the head means this client's count is broken). Otherwise as
 /// [`hello_reply`].
-#[cfg(unix)]
 fn resume_reply(
     reply: Result<Frame, FrameError>,
     asked: attach_proto::ResumePoint,
@@ -837,7 +820,6 @@ fn resume_reply(
 /// other reply, or none before the deadline (a sidecar from before the hello
 /// waits silently), is a protocol failure (80); a connection that ends first
 /// is a transport failure (84).
-#[cfg(unix)]
 fn reply_failure<T>(reply: Result<Frame, FrameError>, what: &str) -> anyhow::Result<T> {
     let protocol = |message: String| Err(PtyExitCode::Protocol.error(anyhow::anyhow!(message)));
     match reply {
@@ -869,9 +851,7 @@ fn reply_failure<T>(reply: Result<Frame, FrameError>, what: &str) -> anyhow::Res
     }
 }
 
-#[cfg(unix)]
 mod client;
-#[cfg(unix)]
 mod terminal;
 
 #[cfg(unix)]

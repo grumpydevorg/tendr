@@ -13,9 +13,10 @@
 //! - [`Output`]: its screen and size, shared by the relay's threads, which
 //!   write only while holding the relay's screen lock.
 //!
-//! The layers: the user's Unix terminal ([`unix`]), no terminal at all for a
-//! read-only attach whose stdin or stdout is not one ([`absent`]), and in
-//! debug builds a test terminal on piped stdio ([`pipe`]).
+//! The layers: the user's Unix terminal (`unix`), the user's Windows
+//! console (`windows`), no terminal at all for a read-only attach whose
+//! stdin or stdout is not one ([`absent`]), and in debug builds a test
+//! terminal on piped stdio ([`pipe`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +24,10 @@ use std::time::Duration;
 use tendr::recording::Geometry;
 
 mod pipe;
+#[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 /// What one wait for the keyboard got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,14 +113,20 @@ pub(super) fn open() -> anyhow::Result<Box<dyn Terminal>> {
         return Ok(Box::new(pipe));
     }
     require_terminal()?;
-    Ok(Box::new(unix::UnixTerminal::open()?))
+    #[cfg(unix)]
+    let terminal = unix::UnixTerminal::open()?;
+    #[cfg(windows)]
+    let terminal = windows::WindowsTerminal::open()?;
+    Ok(Box::new(terminal))
 }
 
 /// Whether a read-only attach runs with no terminal: its stdin or stdout is
-/// not one, and no test terminal is selected ([`pipe`]).
+/// not one, and no test terminal is selected ([`pipe`]). Unix only, as is a
+/// local attach.
 ///
 /// # Errors
 /// When `TENDR_TEST_ATTACH_TERMINAL` is set but malformed.
+#[cfg(unix)]
 pub(super) fn absent() -> anyhow::Result<bool> {
     use std::io::IsTerminal;
     Ok(pipe::from_env()?.is_none()
@@ -126,6 +136,7 @@ pub(super) fn absent() -> anyhow::Result<bool> {
 /// No terminal, for a read-only attach ([`absent`]): stdin is never read,
 /// stdout gets the session's output and nothing else, and only the
 /// cancelling signals leave.
+#[cfg(unix)]
 pub(super) fn none() -> Box<dyn Terminal> {
     Box::new(unix::Absent)
 }
