@@ -216,11 +216,11 @@ pub(super) fn relay(
         terminal_gone: AtomicBool::new(false),
         output: terminal.output(),
     });
-    // From here on, what ssh says stays off the session's screen. Without a
-    // terminal it goes to stderr as it comes, where the session's output is
-    // not.
+    // From here on, what ssh says stays off the session's screen. With no
+    // status rows to show it on (no terminal), it goes to stderr as it
+    // comes, where the session's output is not.
     if let Some(end) = &host {
-        if screen.is_terminal() {
+        if screen.has_status_rows() {
             end.stderr.set(&status, &screen);
         }
     }
@@ -538,6 +538,14 @@ impl Screen {
     /// Whether the output is a terminal, as [`Output::is_terminal`].
     pub(super) fn is_terminal(&self) -> bool {
         self.output.is_terminal()
+    }
+
+    /// Whether a reconnect's status can be drawn on the terminal's last
+    /// rows: there is a terminal of a known size. Without one (stdout not a
+    /// terminal, or a terminal stdout while stdin is not one, which leaves
+    /// the attach without a terminal layer) the status goes to stderr.
+    fn has_status_rows(&self) -> bool {
+        self.size().is_some()
     }
 }
 

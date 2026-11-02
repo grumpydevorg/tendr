@@ -329,14 +329,15 @@ impl Status {
 
     /// Draw the status as it stands, unless no reconnect is under way or
     /// the attach is leaving: tendr's line, and below it ssh's latest line,
-    /// on a row of its own so that an approval URL fits. Without a terminal
-    /// tendr's line goes to stderr instead, where ssh's lines already go.
+    /// on a row of its own so that an approval URL fits. With no rows to
+    /// draw on (no terminal, or stdout a terminal but stdin not), tendr's
+    /// line goes to stderr instead, where ssh's lines already go.
     fn draw(&self, state: &mut State, screen: &Screen) {
         if !state.active {
             return;
         }
         let mut text = vec![state.text(self.discarded.load(Ordering::SeqCst))];
-        if !screen.is_terminal() {
+        if !screen.has_status_rows() {
             eprintln!("{}", text[0]);
             return;
         }
