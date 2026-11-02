@@ -36,8 +36,8 @@ pub enum SshError {
 
     /// The ssh process ended without the remote's verdict other than by
     /// failing to connect: killed by a signal (Unix), ended by Windows with
-    /// an NTSTATUS code, or, for an attach on Windows, exit 1 without an
-    /// exit trailer (see `classify`).
+    /// an NTSTATUS code, or, for an attach link already up or reconnecting
+    /// on Windows, exit 1 without an exit trailer (see `classify`).
     #[error("ssh process terminated abnormally")]
     Abnormal,
 
@@ -344,6 +344,13 @@ impl AttachSsh {
     pub fn start(host: &str, request: &[u8], dial: Dial) -> Result<AttachStart, SshError> {
         use std::io::Write;
 
+        // The first dial keeps a 1 without a trailer: the remote's shell
+        // may give it, before any link was up. A reconnect's dial reads it as
+        // a lost link, as the end of a connection does.
+        let call = match dial.login {
+            Login::Interactive => Call::Operation,
+            Login::Batch => Call::Attach,
+        };
         let mut cmd = build_ssh_frame_command(host, Entry::Remote, Streams::Attach(dial.login))?;
         let mut child = spawn_external(&mut cmd).map_err(SshError::SpawnFailed)?;
         let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -364,11 +371,9 @@ impl AttachSsh {
                 stdin,
                 stdout,
             }),
-            Progress::Exited(status, trailer) => Ok(AttachStart::Ended(exit_code(
-                status.code(),
-                trailer,
-                Call::Attach,
-            )?)),
+            Progress::Exited(status, trailer) => {
+                Ok(AttachStart::Ended(exit_code(status.code(), trailer, call)?))
+            }
             Progress::Cancelled => Err(SshError::Cancelled),
             Progress::Limit => unreachable!("no time limit"),
         }
@@ -402,9 +407,11 @@ impl AttachSsh {
 /// Which call's exit [`exit_code`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Call {
-    /// A one-shot operation: `exec`, `ls`, `push` and the rest.
+    /// A one-shot operation (`exec`, `ls`, `push` and the rest), or the
+    /// first dial of an `attach --host`.
     Operation,
-    /// An `attach --host` connection, whose lost link is reconnected.
+    /// An `attach --host` link once a connection has been up: the end of a
+    /// connection, and a reconnect's dial.
     Attach,
 }
 
@@ -422,12 +429,14 @@ fn exit_code(code: Option<i32>, trailer: Option<i32>, call: Call) -> Result<i32,
 /// - on a `windows` client, an NTSTATUS code (the top two, severity, bits
 ///   not both clear, such as `0xC000013A` after Ctrl-C or Ctrl-Break) is
 ///   ssh.exe ended by Windows, as a signal ends it on Unix;
-/// - on a `windows` client, 1 for an attach is ssh.exe's own end, a lost
-///   link: `TerminateProcess`, as Task Manager and `Child::kill` use it,
-///   gives 1, and no remote tendr ends that way without a trailer: its
-///   wrapper writes one for every code (06-transport-boundaries.md, "The
-///   exit trailer"), and parse errors exit 2. Other calls keep the 1, which
-///   a remote shell that could not run tendr may give, with its message;
+/// - on a `windows` client, 1 for an attach link ([`Call::Attach`]) is
+///   ssh.exe's own end, a lost link: `TerminateProcess`, as Task Manager
+///   and `Child::kill` use it, gives 1, and the Unix remote an attach runs
+///   on never ends that way without a trailer: tendr's wrapper writes one
+///   for every code (06-transport-boundaries.md, "The exit trailer"), parse
+///   errors exit 2, and a shell that cannot find tendr exits 127. Other
+///   calls keep the 1, which a PowerShell login shell gives for a tendr
+///   that fails before its wrapper runs, with the remote's message;
 /// - any other code is passed on.
 fn classify(
     code: Option<i32>,

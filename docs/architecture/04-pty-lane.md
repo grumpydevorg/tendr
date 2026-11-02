@@ -515,14 +515,17 @@ tendr that bridges them to the session's socket
   - Drop classification is shared, with Windows's ways for ssh.exe to be
     killed in place of a signal (`ssh::classify`): an NTSTATUS exit (the
     two severity bits not both clear, such as `0xC000013A` after Ctrl-C or
-    Ctrl-Break, or a crash) and, for an attach, exit 1 without an exit
-    trailer (`TerminateProcess`, as Task Manager uses it, gives 1) are lost
-    links, and the attach reconnects. A remote tendr never ends with 1 and
-    no trailer: its wrapper writes one for every code
-    ([the exit trailer](06-transport-boundaries.md#the-exit-trailer)). A
-    Unix client keeps 1 as the remote's code. The status line, its backoff,
-    a resume, a gone answer and the escape mid-reconnect are tested under a
-    pseudo console (`tests/windows_attach_console.rs`).
+    Ctrl-Break, or a crash) and, once a connection has been up, exit 1
+    without an exit trailer (`TerminateProcess`, as Task Manager uses it,
+    gives 1), at the connection's end or on a reconnect's dial, are lost
+    links, and the attach reconnects. The Unix remote an attach runs on
+    never ends with 1 and no trailer
+    ([the exit trailer](06-transport-boundaries.md#the-exit-trailer)); the
+    first dial still keeps a 1, which a PowerShell login shell gives for a
+    tendr too old to write a trailer. A Unix client keeps 1 as the remote's
+    code. The status line, its backoff, a resume, a gone answer and the
+    escape mid-reconnect are tested under a pseudo console
+    (`tests/windows_attach_console.rs`).
 
 ## Output and viewers
 
