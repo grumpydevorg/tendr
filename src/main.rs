@@ -462,7 +462,8 @@ enum Commands {
         /// keystrokes (the detach escape still works, so not with `--escape
         /// none`). Sends no size, so a full-screen program shows nothing new
         /// until it next redraws, at the controller's size. Up to eight per
-        /// session
+        /// session. Without a terminal, streams the session's output to
+        /// stdout until the run ends
         #[arg(long, conflicts_with = "takeover")]
         read_only: bool,
         /// Detach escape: `ctrl-backslash` (Ctrl-\ then d detaches; Ctrl-\ twice

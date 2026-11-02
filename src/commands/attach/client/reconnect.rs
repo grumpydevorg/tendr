@@ -380,12 +380,15 @@ impl Status {
     }
 
     /// The attach is leaving: erase the status, and turn off the modes the
-    /// session turned on.
+    /// session turned on, in a terminal. Without one, stdout gets nothing
+    /// but the session's output.
     pub(in crate::commands::attach) fn leave(&self, screen: &Screen) {
         let mut state = self.lock();
         let shown = screen.lock();
         let mut out = self.erase(&mut state, screen);
-        out.extend(shown.modes.reset());
+        if screen.is_terminal() {
+            out.extend(shown.modes.reset());
+        }
         screen.write_terminal(&out);
     }
 

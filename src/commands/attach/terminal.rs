@@ -13,8 +13,9 @@
 //! - [`Output`]: its screen and size, shared by the relay's threads, which
 //!   write only while holding the relay's screen lock.
 //!
-//! The layers: the user's Unix terminal ([`unix`]), and in debug builds a
-//! test terminal on piped stdio ([`pipe`]).
+//! The layers: the user's Unix terminal ([`unix`]), no terminal at all for a
+//! read-only attach whose stdin or stdout is not one ([`absent`]), and in
+//! debug builds a test terminal on piped stdio ([`pipe`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +65,11 @@ pub(super) trait Output: Send + Sync {
     /// The terminal's size; `None` if unknown or if either dimension is
     /// zero, which the session could not apply.
     fn size(&self) -> Option<Geometry>;
+
+    /// Whether this is a terminal: leaving turns off the modes the session
+    /// turned on in it. Without one, stdout carries the session's output
+    /// and nothing else.
+    fn is_terminal(&self) -> bool;
 }
 
 /// The terminal's state, taken before anything that may change it starts.
@@ -104,6 +110,24 @@ pub(super) fn open() -> anyhow::Result<Box<dyn Terminal>> {
     }
     require_terminal()?;
     Ok(Box::new(unix::UnixTerminal::open()?))
+}
+
+/// Whether a read-only attach runs with no terminal: its stdin or stdout is
+/// not one, and no test terminal is selected ([`pipe`]).
+///
+/// # Errors
+/// When `TENDR_TEST_ATTACH_TERMINAL` is set but malformed.
+pub(super) fn absent() -> anyhow::Result<bool> {
+    use std::io::IsTerminal;
+    Ok(pipe::from_env()?.is_none()
+        && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
+}
+
+/// No terminal, for a read-only attach ([`absent`]): stdin is never read,
+/// stdout gets the session's output and nothing else, and only the
+/// cancelling signals leave.
+pub(super) fn none() -> Box<dyn Terminal> {
+    Box::new(unix::Absent)
 }
 
 /// An attach drives the terminal on stdin.

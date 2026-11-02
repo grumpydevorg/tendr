@@ -30,8 +30,14 @@ pub fn cmd_attach(
     #[cfg(unix)]
     {
         // Fail before any side effect — a takeover included — if there is no
-        // terminal to drive.
-        let terminal = terminal::open()?;
+        // terminal to drive. A read-only attach needs none: without one it
+        // streams the session's output to stdout.
+        let no_terminal = read_only && terminal::absent()?;
+        let terminal = if no_terminal {
+            terminal::none()
+        } else {
+            terminal::open()?
+        };
         let mode = mode(takeover, read_only);
         // A local attach does not reconnect, so it has no use for offsets.
         let (stream, accept) = connect(session.path(), attach_proto::Version::V1, mode)?;
@@ -46,6 +52,7 @@ pub fn cmd_attach(
                 .as_ref()
                 .is_some_and(|control| control.taken_over_by().is_some())
         };
+        // A local relay's code is always 0: its failures are errors.
         client::relay(
             client::Link::socket(stream)?,
             None,
@@ -55,8 +62,55 @@ pub fn cmd_attach(
                 recorded_takeover: &recorded_takeover,
             },
             terminal,
-        )
-        .map(drop)
+        )?;
+        // Without a terminal nothing typed ends the attach: the session
+        // ended it, at the end of the run or by cutting this watcher off.
+        if no_terminal {
+            run_ended(&session, meta.run_id())?;
+        }
+        Ok(())
+    }
+}
+
+/// How long a no-terminal read-only attach whose connection the session
+/// closed waits for the run to record that it ended, while the session
+/// still publishes its attach socket, before counting the close as a
+/// cut-off.
+#[cfg(unix)]
+const RUN_END_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long it waits once the socket is gone: the sidecar removes it as the
+/// run ends, before the durable writes that record the end, which a busy
+/// disk can hold past [`RUN_END_GRACE`]. Beyond this the sidecar is taken to
+/// have died before recording it.
+#[cfg(unix)]
+const RUN_END_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// After the session closed a no-terminal read-only attach: `Ok` if the run
+/// `run_id` ended, waiting for it to say so ([`RUN_END_GRACE`],
+/// [`RUN_END_RECORD_GRACE`]); otherwise the attach was cut off (84), having
+/// fallen too far behind or been shut by the sidecar.
+#[cfg(unix)]
+fn run_ended(session: &SessionDir, run_id: tendr::model::ids::RunId) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let ended = session::read_meta(session).is_ok_and(|meta| {
+            meta.run_id() != run_id || !matches!(meta.status(), RunStatus::Running { .. })
+        });
+        if ended {
+            return Ok(());
+        }
+        let grace = if attach_proto::read_sock_path(session.path()).is_some() {
+            RUN_END_GRACE
+        } else {
+            RUN_END_RECORD_GRACE
+        };
+        if start.elapsed() >= grace {
+            return Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
+                "tendr: the session cut this read-only attach off while the run was still running"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

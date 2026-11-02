@@ -131,6 +131,70 @@ impl Output for UnixOutput {
             None
         }
     }
+
+    fn is_terminal(&self) -> bool {
+        true
+    }
+}
+
+/// No terminal, for a read-only attach whose stdin or stdout is not one:
+/// stdin is never read, so only the cancelling signals reach
+/// [`Raw::input`], and stdout is a plain stream of the session's output.
+pub(super) struct Absent;
+
+impl Terminal for Absent {
+    fn enter(self: Box<Self>) -> anyhow::Result<Box<dyn Raw>> {
+        let handlers = signals::Handlers::install()
+            .map_err(|e| anyhow::anyhow!("failed to install attach signal handlers: {e}"))?;
+        Ok(Box::new(AbsentRaw { handlers }))
+    }
+}
+
+/// [`Absent`] while attached; dropping it gives back the signal
+/// dispositions.
+struct AbsentRaw {
+    handlers: signals::Handlers,
+}
+
+impl Raw for AbsentRaw {
+    fn input(&mut self, _buf: &mut [u8], timeout: Duration) -> Input {
+        use rustix::event::{PollFd, PollFlags, poll};
+        let wake = self.handlers.wake();
+        let mut fds = [PollFd::new(&wake, PollFlags::IN)];
+        if !matches!(poll(&mut fds, Some(&poll_timespec(timeout))), Ok(n) if n > 0) {
+            return Input::Wake;
+        }
+        match self.handlers.take().cancel {
+            Some(cancel) => Input::Leave(Leave(cancel.name())),
+            // No size to follow.
+            None => Input::Wake,
+        }
+    }
+
+    fn output(&self) -> Arc<dyn Output> {
+        Arc::new(AbsentOutput)
+    }
+}
+
+/// stdout, which may not be a terminal (or not the one being typed at): no
+/// size, and modes turned off when leaving only if it is one.
+struct AbsentOutput;
+
+impl Output for AbsentOutput {
+    fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+        UnixOutput.write(bytes)
+    }
+
+    fn size(&self) -> Option<Geometry> {
+        None
+    }
+
+    /// A stdout that is a terminal (stdin piped) gets its modes turned off
+    /// when leaving; a pipe or file gets nothing but the session's output.
+    fn is_terminal(&self) -> bool {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal()
+    }
 }
 
 /// What woke the keyboard's poll.
