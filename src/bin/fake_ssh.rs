@@ -289,7 +289,8 @@ fn forward(argv: &[String]) -> ! {
 ///                of a `Frame` variant, such as `Repaint`) or the end of
 ///                its input: `await Repaint` waits until the client relays
 /// drain          read the client's frames until its input ends
-/// drop           exit 255 without an exit trailer: the link is lost
+/// drop           say what ssh says when its keepalives go unanswered, then
+///                exit 255 without an exit trailer: the link is lost
 /// exit <code>    exit with <code>, after the exit trailer
 /// ```
 ///
@@ -404,7 +405,10 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                 }
             }
             "drain" => while receive(&mut stdin, log.as_mut()).is_some() {},
-            "drop" => std::process::exit(255),
+            "drop" => {
+                eprint!("Timeout, server box not responding.\r\n");
+                std::process::exit(255)
+            }
             "exit" => exit(value.parse().unwrap()),
             other => panic!("fake ssh: unknown script step {other:?}"),
         }
