@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn attach_is_carried_and_checked() {
         let operation = decode(
-            br#"{"v":1,"op":"attach","params":{"session":"0x1F&b'$(id)","namespace":"9n|x","takeover":true,"escape":"none","protocol":2}}"#,
+            br#"{"v":1,"op":"attach","params":{"session":"0x1F&b'$(id)","namespace":"9n|x","takeover":true,"escape":"none","protocol":3}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -477,7 +477,7 @@ mod tests {
             other => panic!("not an attach: {other:?}"),
         };
         let sent = encode(&op(&["attach", "s"])).unwrap();
-        assert_eq!(version(read(&sent).unwrap()), Version::V2);
+        assert_eq!(version(read(&sent).unwrap()), Version::V3);
         let old = decode(
             br#"{"v":1,"op":"attach","params":{"session":"s","namespace":null,"takeover":false,"escape":"ctrl-backslash"}}"#,
         )

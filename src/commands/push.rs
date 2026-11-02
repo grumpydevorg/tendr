@@ -87,7 +87,7 @@ fn push_over_attach_socket(session_dir: &std::path::Path) -> anyhow::Result<()> 
     use tendr::attach_proto::{self, Frame, FrameError, Mode, read_frame, write_frame};
 
     // Both versions answer a push the same way.
-    let (mut stream, _accept) =
+    let (mut stream, _accept, _version) =
         super::attach::connect(session_dir, attach_proto::Version::V1, Mode::Push)?;
 
     let mut stdin = std::io::stdin().lock();

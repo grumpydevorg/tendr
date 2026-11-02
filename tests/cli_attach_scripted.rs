@@ -334,8 +334,10 @@ fn a_scripted_drop_resumes_where_the_screen_stopped() {
     let [resize, repaint] = greeting();
     assert_eq!(frames[1..], debug(&[resize, repaint, Frame::Detach]));
     assert!(
-        frames[0].starts_with("Resume(") && frames[0].contains("offset: 3 "),
-        "the resume asks for the offset past \"one\": {frames:?}"
+        frames[0].starts_with("Resume {")
+            && frames[0].contains("offset: 3 ")
+            && frames[0].ends_with("version: V2 }"),
+        "the resume, in version 2, asks for the offset past \"one\": {frames:?}"
     );
 }
 
@@ -422,8 +424,10 @@ fn a_scripted_watcher_resumes_with_a_watch_resume_and_never_sizes() {
     let frames = remote.frames();
     assert_eq!(frames[1..], debug(&[Frame::Detach]), "{frames:?}");
     assert!(
-        frames[0].starts_with("WatchResume(") && frames[0].contains("offset: 3 "),
-        "the watch resume asks for the offset past \"one\": {frames:?}"
+        frames[0].starts_with("WatchResume {")
+            && frames[0].contains("offset: 3 ")
+            && frames[0].ends_with("version: V2 }"),
+        "the watch resume, in version 2, asks for the offset past \"one\": {frames:?}"
     );
 }
 
@@ -497,5 +501,33 @@ fn a_scripted_watcher_without_a_terminal_keeps_stdout_to_the_output() {
                 && stderr.contains("the session no longer held 1 of them"),
             "{stderr}"
         );
+    }
+}
+
+/// The end of output ends a watcher's attach where the session closing it
+/// would, though the remote holds the connection open: the client stops
+/// reading, closes its side, and exits with the remote's verdict, never
+/// reconnecting. An end at another offset than the output reached is
+/// outside the protocol (80).
+#[test]
+fn a_scripted_end_of_output_ends_the_watch_at_its_offset() {
+    for (end, code, said) in [("end", 0, ""), ("end 1", 80, "ended at offset 4")] {
+        let root = TempDir::new().unwrap();
+        let remote = Remote::new(&format!(
+            "watch answer\n\
+             watch output one\n\
+             watch {end}\n\
+             watch drain"
+        ));
+        let mut client = remote.watch(&root, true);
+        assert_eq!(client.wait_exit(), code, "{end}: {}", client.stderr());
+        assert!(
+            client.screen().contains("one"),
+            "{end}: {}",
+            client.screen()
+        );
+        let stderr = client.stderr();
+        assert!(stderr.contains(said), "{end}: {stderr}");
+        assert!(!stderr.contains("reconnecting"), "{end}: {stderr}");
     }
 }

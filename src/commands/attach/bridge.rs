@@ -22,9 +22,10 @@ use tendr::model::ids::Namespace;
 ///
 /// `version` is the one the request agreed. The client's hello is always a
 /// version 1 hello, so that a remote tendr older than the agreement takes it
-/// too; this end speaks the agreed version to the sidecar, or version 1 to a
-/// sidecar started by a tendr that predates it ([`super::connect`]). The
-/// answer's type tells the client which.
+/// too; this end speaks the agreed version to the sidecar, or the newest a
+/// sidecar started by an older tendr speaks ([`super::connect`]). The
+/// answer's type tells the client which, up to version 2; version 3 only
+/// adds the end of output, which this end judges by.
 ///
 /// A request with `resume` is followed by the same resume frame in place of
 /// the hello, which this end passes on to the sidecar. It skips the
@@ -39,9 +40,17 @@ use tendr::model::ids::Namespace;
 /// ([`Frame::WatchResume`]), built from `resume`'s run and offset only: the
 /// epoch the request carries is ignored, and a plain resume frame after a
 /// read-only request is refused (80), so nothing a watcher sends can reach
-/// the control rule. When the session closes a watcher's connection, the
-/// run ended (0) or the session cut it off (84), as `meta.json` here says;
-/// the client has no other way to tell.
+/// the control rule. A resume speaks the agreed version too, or the newest
+/// the sidecar speaks, from version 2.
+///
+/// The session's end of output ([`Frame::OutputEnd`]) is passed on, and ends
+/// the bridge: the client has all of the run's output. When the session
+/// closes a watcher's connection without it, a sidecar speaking version 3
+/// cut it off (84), whatever the run did. A sidecar from before version 3
+/// sends none, so then `meta.json` here says which: the run ended (0), or
+/// the session cut it off (84). That reading takes a watcher cut off at the
+/// run's end, when the sidecar stops waiting for one slow to read, for one
+/// that had everything.
 ///
 /// Its exit code is that of a local attach: the checks' and the sidecar's
 /// refusals keep their codes, and a client taken over exits 81 (after the
@@ -71,7 +80,7 @@ pub fn cmd_attach_bridge(
     #[cfg(unix)]
     {
         use super::Point;
-        use tendr::attach_proto::{self, Frame, WatchPoint};
+        use tendr::attach_proto::{self, Frame, Version, WatchPoint};
         use tendr::pty_exit::PtyExitCode;
 
         let first = attach_proto::read_frame(&mut std::io::stdin().lock());
@@ -85,7 +94,7 @@ pub fn cmd_attach_bridge(
                 Point::Control(point)
             }
         });
-        let (stream, answer, epoch) = match resume {
+        let (stream, answer, epoch, version) = match resume {
             None => {
                 let mode = super::mode(takeover, read_only);
                 match first {
@@ -96,24 +105,28 @@ pub fn cmd_attach_bridge(
                         )));
                     }
                 }
-                let (stream, accept) = super::connect(session.path(), version, mode)?;
-                (stream, accept.frame(), accept.epoch())
+                let (stream, accept, version) = super::connect(session.path(), version, mode)?;
+                (stream, accept.frame(), accept.epoch(), version)
             }
             Some(point) => {
+                // The client's resume frame is version 2's, the only one a
+                // remote from before version 3 takes.
                 match first {
-                    Ok(asked) if asked == point.resume_frame() => {}
+                    Ok(asked) if asked == point.resume_frame(Version::V2) => {}
                     other => {
                         return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
                             "the resume request must be followed by its resume frame, not {other:?}"
                         )));
                     }
                 }
-                let (stream, resumed) = super::connect_resume(session.path(), point)?;
+                // Resuming is part of version 2.
+                let (stream, resumed, version) =
+                    super::connect_resume(session.path(), point, version.max(Version::V2))?;
                 let epoch = match point {
                     Point::Control(_) => Some(resumed.point().epoch),
                     Point::Watch(_) => None,
                 };
-                (stream, resumed.frame(), epoch)
+                (stream, resumed.frame(), epoch, version)
             }
         };
         // A resumed client's control is its new epoch: a later takeover of
@@ -127,9 +140,16 @@ pub fn cmd_attach_bridge(
             // The client has been told, and says so itself.
             unix::End::TakenOver => std::process::exit(PtyExitCode::Control.code()),
             // The session ends a watcher's connection only at the run's end
-            // or to cut it off; only this end can read which.
+            // or to cut it off. From version 3 it says which: the end of
+            // output, passed on, or nothing.
+            unix::End::Closed if read_only && version.reports_end() => {
+                Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
+                    "tendr: the session cut this read-only attach off before the end of the run's output"
+                )))
+            }
+            // Before it, only this end can read which.
             unix::End::Closed if read_only => super::run_ended(&session, meta.run_id()),
-            unix::End::Closed | unix::End::Left => Ok(()),
+            unix::End::Ended | unix::End::Closed | unix::End::Left => Ok(()),
         }
     }
 }
@@ -156,7 +176,11 @@ mod unix {
     pub(super) enum End {
         /// The client left: it detached, closed its input or hung up.
         Left,
-        /// The session closed the connection: its run ended.
+        /// The session said the run's output ended, and the client has
+        /// been passed that and everything before it.
+        Ended,
+        /// The session closed the connection: its run ended, or it cut the
+        /// client off.
         Closed,
         /// Another client took this one over, and this one has been told.
         TakenOver,
@@ -237,10 +261,12 @@ mod unix {
     /// Session → client, one whole frame at a time, so a client that stops
     /// reading stalls this direction and, behind it, the sidecar's queue for
     /// this viewer, exactly as a local client would. A frame the sidecar cut
-    /// off is not passed on. When the session ends the connection without
-    /// `MSG_RETIRED` because this client was taken over, the event log says
-    /// so, and the client is told as the sidecar would have told it. An end
-    /// after the client's own detach (`detached`) is the client leaving.
+    /// off is not passed on. The session's end of output, once passed on,
+    /// is the end: nothing follows it. When the session ends the connection
+    /// without `MSG_RETIRED` because this client was taken over, the event
+    /// log says so, and the client is told as the sidecar would have told
+    /// it. An end after the client's own detach (`detached`) is the client
+    /// leaving.
     fn forward_output(socket: UnixStream, control: Option<&Control>, detached: &AtomicBool) -> End {
         let mut socket = BufReader::new(socket);
         let mut retired = false;
@@ -250,6 +276,9 @@ mod unix {
                     retired |= matches!(frame, Frame::Retired(_));
                     if attach_proto::write_frame(&mut io::stdout().lock(), &frame).is_err() {
                         return End::Left;
+                    }
+                    if matches!(frame, Frame::OutputEnd(_)) {
+                        return End::Ended;
                     }
                 }
                 Err(FrameError::Malformed(_) | FrameError::Unknown(_)) => {}

@@ -287,6 +287,9 @@ fn forward(argv: &[String]) -> ! {
 ///                the same for these bytes, two hex digits each, which need
 ///                not be UTF-8
 /// retire         `Retired` at the next epoch: another client took over
+/// end [<n>]      the end of output (`OutputEnd`), as a version 3 bridge
+///                passes it on: at the offset the output has reached, or
+///                <n> bytes past it
 /// log <path>     from now on append the frames the client sent to <path>,
 ///                `{:?}` one per line, its first frame first
 /// request <path> write to <path> what the client sent ahead of its later
@@ -349,8 +352,8 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
         Frame::Hello {
             mode: Mode::Watch, ..
         } => ("watch", fresh),
-        Frame::Resume(asked) => ("resume", *asked),
-        Frame::WatchResume(asked) => (
+        Frame::Resume { point: asked, .. } => ("resume", *asked),
+        Frame::WatchResume { point: asked, .. } => (
             "watch-resume",
             ResumePoint {
                 run_id: asked.run_id,
@@ -417,6 +420,14 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                 send(Frame::Output { offset, bytes });
             }
             "retire" => send(Frame::Retired(next(point.epoch))),
+            "end" => {
+                let past: u64 = if value.is_empty() {
+                    0
+                } else {
+                    value.parse().expect("fake ssh: end [<n>]")
+                };
+                send(Frame::OutputEnd(point.offset + past));
+            }
             "log" => {
                 let mut file = std::fs::OpenOptions::new()
                     .create(true)

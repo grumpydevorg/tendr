@@ -99,7 +99,7 @@ flowchart LR
 ## The attach handshake
 
 - Every connection opens with a hello (`MSG_HELLO`, `[version, mode]`).
-  The sidecar speaks versions 1 and 2 (`attach_proto::Version`); any other
+  The sidecar speaks versions 1 to 3 (`attach_proto::Version`); any other
   version is refused with the protocol class.
 - Version 2 changes only what a viewer (an attach or takeover) receives. A
   push is answered the same in both versions.
@@ -116,18 +116,32 @@ flowchart LR
     last ended. The mode replay is not the run's output and still goes as
     plain `MSG_DATA`, unstamped.
   - A version 1 client never receives either new type.
-- A watch hello (`Mode::Watch`, mode byte 4, either version) asks for a
+- Version 3 adds only the end of a viewer's output. Its answers are version
+  2's, and so is its output.
+  - Once a viewer's sender has sent the run's last byte, it sends
+    `MSG_OUTPUT_END`, `[final offset u64]`, and nothing more. A viewer cut
+    off before then (evicted a ring behind, retired, or shut at the run's
+    end while still behind) never gets it.
+  - The viewer's output must have reached that offset; an end at any other
+    is a protocol failure (80).
+  - Only a version 3 hello or resume asks for it, so no client from before
+    it receives the type.
+  - A sidecar from before version 3 refuses a version 3 hello with the
+    protocol class. The client says it again one version lower, and goes
+    on stepping down to version 1 (an attach, takeover or push), or to
+    version 2 (a watch).
+- A watch hello (`Mode::Watch`, mode byte 4, any version) asks for a
   read-only viewer, a *watcher*
   ([Read-only viewers](#read-only-viewers)). The sidecar admits it with
   `MSG_WATCHING`: `[run id 16 bytes][head u64]`, big-endian, with no
   epoch, since a watcher holds no control. Version 1 then sends it plain
-  `MSG_DATA`, version 2 `MSG_OUTPUT`, as for a controller. One accept
-  serves both versions: only a client that sends a watch hello receives it,
-  and every such client knows it. A sidecar from before watchers decodes
-  `[1, 4]` and `[2, 4]` as an unsupported hello and refuses with the
-  protocol class; the client then exits 80 saying so, never retrying in
-  another version. A client refuses (80) a controller's accept to its watch
-  hello, so it never attaches with control it did not ask for.
+  `MSG_DATA`, version 2 `MSG_OUTPUT`, as for a controller, and version 3
+  also `MSG_OUTPUT_END`. One accept serves every version: only a client
+  that sends a watch hello receives it, and every such client knows it. A
+  sidecar from before watchers decodes `[2, 4]` as an unsupported hello and
+  refuses with the protocol class; the client then exits 80 saying so,
+  never trying version 1. A client refuses (80) a controller's accept to
+  its watch hello, so it never attaches with control it did not ask for.
 - Instead of a hello, a version 2 viewer whose connection was lost can send
   `MSG_RESUME` to regain its control and output
   ([Resuming a viewer](#resuming-a-viewer)).
@@ -201,14 +215,27 @@ flowchart LR
   waits only on the connection and the cancelling signals. stdout gets the
   mode replay and then the run's output bytes, and nothing else: no status
   line, and no mode resets when leaving unless stdout is a terminal. Every
-  notice goes to stderr. When the sidecar closes the connection, the client
-  reads `meta.json` for up to 2 s, or up to 30 s once the attach socket is
-  gone (the run is ending and recording it): the run ended (0), or the
-  watcher was cut off, evicted a ring behind or shut by the sidecar (84).
-  Over `--host` the remote tendr reads it and the client exits with its
-  verdict ([transport boundaries](06-transport-boundaries.md#the-attach-bridge)).
-  A write to stdout that fails (a pipeline's consumer gone) sends
-  `MSG_DETACH` and exits 1; a cancelling signal exits 1 as for any attach.
+  notice goes to stderr. A write to stdout that fails (a pipeline's consumer
+  gone) sends `MSG_DETACH` and exits 1; a cancelling signal exits 1 as for
+  any attach.
+- How a watcher's attach ends, when the session closes its connection:
+  - A local watcher speaks version 3 (see
+    [the handshake](#the-attach-handshake)). `MSG_OUTPUT_END` at the offset
+    its output reached means it has all of the run's output: exit 0.
+    Without it the session cut it off, at the run's end too, when the
+    session stopped waiting for it ([Output and viewers](#output-and-viewers)):
+    exit 84, saying on stderr how many bytes of the run's output it had.
+    This holds with a terminal as well.
+  - A session started before version 3 sends no end. A watcher without a
+    terminal then reads `meta.json` for up to 2 s, or up to 30 s once the
+    attach socket is gone (the run is ending and recording it): the run
+    ended (0), or the watcher was cut off, evicted a ring behind or shut by
+    the sidecar (84). That reading cannot see a watcher cut off at the
+    run's end: it exits 0, short. One with a terminal exits 0.
+  - Over `--host` the remote tendr, which knows the version its sidecar
+    speaks, decides the same way for every watcher, terminal or not, and
+    the client exits with its verdict
+    ([transport boundaries](06-transport-boundaries.md#the-attach-bridge)).
 - Accepted on an exe.dev VM over `--host` on 2026-11-03: eight watchers
   and a controller with a ninth refused, four stalled hellos, takeovers
   with watchers attached or stalled, a watcher's resume after a real drop,
@@ -256,6 +283,10 @@ bytes ([design](../design.md#a-resume-decides-control-and-output-on-one-connecti
     treats that as a protocol failure (80), since its own count is broken.
 - A sidecar that predates resuming refuses `MSG_RESUME` with the protocol
   class, as it refuses anything that is not a hello.
+- From version 3 a resume names its version: one byte after its point
+  (without it the resume is version 2). A sidecar from before version 3
+  refuses that with the protocol class, and the bridge says the resume
+  again in version 2.
 - A watcher resumes with its own frame, `MSG_WATCH_RESUME`: `[run id 16
   bytes][offset u64]`, the encoding of `MSG_WATCHING`, with no epoch
   ([design](../design.md#a-watch-resume-carries-no-epoch)). It takes a
@@ -284,7 +315,7 @@ for people.
   frame. A client never guesses at a refusal.
 - The set of classes is part of the protocol version. The hello carries the
   client's version, and a sidecar sends only the classes that version knows.
-  A new class requires a new version; versions 1 and 2 know the same four.
+  A new class requires a new version; versions 1 to 3 know the same four.
 - A refusal sent before the hello is read (another user's peer, no free
   slot) may use only classes every supported version knows.
 
@@ -411,19 +442,26 @@ tendr that bridges them to the session's socket
 
 - The handshake is the one above, and the request agrees its version
   ([transport boundaries](06-transport-boundaries.md#the-attach-bridge)):
-  the remote tendr speaks version 2 to the sidecar when both ends know it,
-  applies the 10 s reply deadline and classifies the reply, so refusals keep
-  their exit codes. On success it passes the sidecar's acceptance to the
-  client as it came.
+  the remote tendr speaks the newest version both the client and the
+  sidecar know, applies the 10 s reply deadline and classifies the reply,
+  so refusals keep their exit codes. On success it passes the sidecar's
+  acceptance to the client as it came.
 - On a version 2 attach, the client keeps the run, the offset just past the
   last output byte written to the terminal and, for a controller, the epoch;
-  a read-only attach is always version 2 over `--host`, and keeps the run
-  and offset. It moves the offset under the lock it writes the terminal
-  under, once the write has succeeded, so the offset never counts bytes the
-  terminal did not take. Stamped output that does not start at that offset,
-  or any stamped output on a version 1 attach, is a protocol failure: the
+  a read-only attach is always version 2 or later over `--host`, and keeps
+  the run and offset. It moves the offset under the lock it writes the
+  terminal under, once the write has succeeded, so the offset never counts
+  bytes the terminal did not take. Stamped output that does not start at
+  that offset, any stamped output on a version 1 attach, or an end of
+  output (`MSG_OUTPUT_END`) at any other offset, is a protocol failure: the
   client restores the terminal and exits 80. The local `attach` speaks
-  version 1: it does not reconnect, so it has no use for offsets.
+  version 1 for a controller, which does not reconnect, so has no use for
+  offsets, and version 3 for a watcher, which checks the end of output
+  against them.
+- The end of output, passed on by the bridge, ends the attach as the
+  session closing it does, never as a lost link: the client does not
+  reconnect, and exits with the remote's verdict
+  ([transport boundaries](06-transport-boundaries.md#the-attach-bridge)).
 - The sidecar keeps the controller epochs and the recording. The bridge only
   passes frames on; it decides nothing about control.
 - A client that stops reading backs up its output through ssh and the
@@ -449,8 +487,9 @@ tendr that bridges them to the session's socket
     resumes from that point over a new ssh with `BatchMode=yes`
     (`commands::attach::resume_host`): the request carries the point, and a
     `MSG_RESUME` takes the hello's place on ssh's stdin, which the bridge
-    passes on ([Resuming a viewer](#resuming-a-viewer)). A watcher's
-    request stays read-only, and its frame is `MSG_WATCH_RESUME`.
+    passes on in the version it speaks to the sidecar ([Resuming a
+    viewer](#resuming-a-viewer)). A watcher's request stays read-only, and
+    its frame is `MSG_WATCH_RESUME`.
   - A transport failure (255 without a trailer, ssh killed, the connect
     deadline) is tried again after 1 s, doubling to at most 30 s, with no
     limit on the number of attempts. Any remote verdict ends it: a refusal
@@ -584,9 +623,12 @@ tendr that bridges them to the session's socket
 - At the run's end, once capture has appended its last output, the sidecar
   finishes the ring and waits up to 2 s for every viewer's sender, the
   controller's and the watchers', to have sent everything up to the final
-  offset (`sidecar::flush_viewers`); only then does it shut the connections
-  down. Without it a viewer behind at the end lost the run's last bytes. A
-  viewer that is not reading is cut off at the 2 s, short of them.
+  offset (`sidecar::flush_viewers`), and a version 3 viewer's to have sent
+  `MSG_OUTPUT_END` after it; only then does it shut the connections down.
+  Without it a viewer behind at the end lost the run's last bytes. A viewer
+  that is not reading is cut off at the 2 s, short of them and with no end
+  of output, so a version 3 watcher knows it was cut off (84) rather than
+  taking the run's end for having had everything.
 - A version 2 viewer gets each byte's offset ([the attach
   handshake](#the-attach-handshake)); why offsets and not recording sequence
   numbers: [design](../design.md#viewers-count-output-in-bytes-and-agree-the-version-in-the-request).

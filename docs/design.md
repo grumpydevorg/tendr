@@ -333,6 +333,24 @@ the frame with 80 rather than reject the request with 2. Source: step 1 of
 the remote frame transport plan
 (`docs/plans/active/01_remote-frame-transport.md`) at `6612733`.
 
+### The end of a viewer's output is a frame, in a new version
+
+*2026-11-03.* A viewer cut off when the run ends (still behind when the
+sidecar stops waiting for it) and one that had everything both see the
+session close the connection after the run ended, so neither `meta.json`
+nor the remote's reading of it can tell them apart: a cut-off watcher
+exited 0, short. The sidecar now sends `MSG_OUTPUT_END`, with the final
+offset, once a viewer's sender has sent the run's last byte, and a watcher
+exits 0 only after it. The frame is attach protocol version 3, asked for in
+the hello or the resume, rather than sent to every watcher, so no client
+receives a type it never asked for. The cost is the step-down: a sidecar
+from before version 3 refuses the hello, and the client says it again in
+version 2, then goes by `meta.json` as before. Over `--host` the client
+cannot learn the version the bridge spoke to the sidecar (version 3's
+answers are version 2's), so the bridge, which can, judges: 84 without the
+end in version 3, `meta.json` before it. Source:
+`src/commands/attach/bridge.rs`, `src/sidecar.rs` (`run_viewer_sender`).
+
 ### Windows uses Job Objects and a hidden console
 
 *2026-03 to 2026-04.* Windows has no SIGTERM. The sidecar runs the child in a

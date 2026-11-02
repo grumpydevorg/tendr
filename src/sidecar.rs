@@ -82,8 +82,10 @@ struct ViewerStart {
 /// cursor or its connection closes, the ring evicts its cursor, or it has
 /// sent all of a finished ring's output. A version 2 viewer gets that output
 /// stamped with its offsets; the replay, which is not the run's output, is
-/// never stamped. However it ends, it closes its cursor, which tells the
-/// run's end ([`flush_viewers`]) that it is done.
+/// never stamped. A version 3 viewer that has been sent all of it is then
+/// told so ([`crate::attach_proto::Frame::OutputEnd`]), with the final
+/// offset; one cut off before then never is. However it ends, it closes its
+/// cursor, which tells the run's end ([`flush_viewers`]) that it is done.
 #[cfg(unix)]
 fn run_viewer_sender(
     viewer: ViewerStart,
@@ -99,13 +101,24 @@ fn run_viewer_sender(
     if !replay.is_empty() && write_frame(&mut *lock(conn), &Frame::Data(replay)).is_err() {
         return ring.close(&cursor);
     }
-    while let output_ring::Next::Bytes { offset, bytes } = ring.next(&cursor, PTY_READ_BYTES) {
-        let frame = match version {
-            Version::V1 => Frame::Data(bytes),
-            Version::V2 => Frame::Output { offset, bytes },
+    loop {
+        let frame = match ring.next(&cursor, PTY_READ_BYTES) {
+            output_ring::Next::Bytes { offset, bytes } => match version {
+                Version::V1 => Frame::Data(bytes),
+                Version::V2 | Version::V3 => Frame::Output { offset, bytes },
+            },
+            output_ring::Next::Ended(head) if version.reports_end() => {
+                let _ = write_frame(&mut *lock(conn), &Frame::OutputEnd(head));
+                break;
+            }
+            output_ring::Next::Ended(_)
+            | output_ring::Next::Evicted
+            | output_ring::Next::Closed => {
+                break;
+            }
         };
         if write_frame(&mut *lock(conn), &frame).is_err() {
-            return ring.close(&cursor);
+            break;
         }
     }
     ring.close(&cursor);
@@ -2729,11 +2742,12 @@ enum Ask {
     Resume(crate::attach_proto::ResumePoint),
 }
 
-/// One attach connection: a version 1 or 2 hello, or a resume; a claim,
+/// One attach connection: a hello of any version, or a resume; a claim,
 /// takeover or resume through the input writer; then relay input and
-/// resizes until detach, disconnect, or retirement. A version 2 viewer of
-/// the run `run_id` is told where its output starts and gets it stamped
-/// with offsets. A watch hello or a watch resume goes to
+/// resizes until detach, disconnect, or retirement. A viewer of the run
+/// `run_id` speaking version 2 or later is told where its output starts and
+/// gets it stamped with offsets, and from version 3 where it ends
+/// ([`run_viewer_sender`]). A watch hello or a watch resume goes to
 /// [`handle_watch_connection`] instead, and a push to
 /// [`handle_push_connection`].
 ///
@@ -2802,8 +2816,8 @@ fn handle_attach_connection(
         }
         // A watcher's resume: a watcher's slot, and never the input writer,
         // whose control rule its point has no epoch to reach. Resuming is
-        // part of version 2.
-        Ok(Frame::WatchResume(point)) => {
+        // part of version 2; a resume names a later version it speaks.
+        Ok(Frame::WatchResume { point, version }) => {
             let Some(_slot) = pools.watchers.take() else {
                 return reject_full(&mut stream);
             };
@@ -2819,7 +2833,7 @@ fn handle_attach_connection(
             return handle_watch_connection(
                 stream,
                 run_id,
-                Version::V2,
+                version,
                 Some(point.offset),
                 holder,
                 registry,
@@ -2834,8 +2848,9 @@ fn handle_attach_connection(
             version,
             mode: Mode::Takeover,
         }) => (version, Ask::Takeover),
-        // Resuming is part of version 2.
-        Ok(Frame::Resume(point)) => (Version::V2, Ask::Resume(point)),
+        // Resuming is part of version 2; a resume names a later version it
+        // speaks.
+        Ok(Frame::Resume { point, version }) => (version, Ask::Resume(point)),
         Err(FrameError::Malformed(e @ ProtocolError::UnsupportedHello)) => {
             return reject_connection(&mut stream, RejectClass::Protocol, &e.to_string());
         }
@@ -2931,7 +2946,8 @@ fn handle_attach_connection(
             oldest: span.oldest,
         },
         (Ask::Attach | Ask::Takeover, _, Version::V1) => Frame::Accepted(handle.epoch()),
-        (Ask::Attach | Ask::Takeover, _, Version::V2) => Frame::AcceptedV2(point),
+        // Version 3's answers are version 2's.
+        (Ask::Attach | Ask::Takeover, _, Version::V2 | Version::V3) => Frame::AcceptedV2(point),
     };
     let accepted = write_frame(&mut *reply_to, &reply);
     drop(reply_to);
@@ -2979,8 +2995,9 @@ fn handle_attach_connection(
 }
 
 /// One read-only viewer of the run `run_id`, registered as `holder`: told
-/// where its output starts, then sent that output (stamped for version 2)
-/// until it detaches, disconnects, falls a ring behind, or the run ends.
+/// where its output starts, then sent that output (stamped from version 2,
+/// and its end reported from version 3) until it detaches, disconnects,
+/// falls a ring behind, or the run ends.
 ///
 /// A fresh watcher is told [`crate::attach_proto::Frame::Watching`] and
 /// starts at the head with the mode replay. One resuming from the offset
