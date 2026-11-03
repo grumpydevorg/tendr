@@ -96,10 +96,8 @@ The JSON is the request under a version:
   `unrecognized subcommand '_remote'` (or `unexpected argument
   '--exit-trailer' found`, or, older still, the same for `--hello`). The
   client passes that on and adds that the remote tendr is too old for this
-  client and which version to upgrade it to. A remote tendr that has the
-  frame but not the attach bridge refuses `op: attach` with exit 2 and
-  `tendr _remote: invalid remote request: attach is not carried by the
-  remote frame: it runs over ssh -t`. Old clients still work against a new
+  client and to upgrade it to 0.5.0 or newer, the first release with both
+  the frame and the attach bridge. Old clients still work against a new
   remote tendr.
 
 ### The exit trailer
