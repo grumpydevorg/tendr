@@ -480,8 +480,8 @@ decides:
 |the terminal, or stdout, refused a write|end, detaching|
 |output outside the protocol|end, 80|
 |`MSG_OUTPUT_END` at the offset reached|end, the run's output complete|
-|stream closed, a resume point and no takeover|reconnect over `--host`; locally, end|
-|stream closed otherwise|end: the remote's code, 81 after a takeover, 84 for a watcher promised an end|
+|stream closed, a resume point and no takeover|reconnect over `--host`; locally, end: 0, or 84 for a watcher promised an end|
+|stream closed otherwise|end: the remote's code (0 locally), 81 after a takeover|
 
 A leave that arrived as the session's side ended wins over that end. A
 takeover is noted as the reader sees `MSG_RETIRED`, apart from its end,
@@ -494,7 +494,7 @@ says what happens to bytes it holds when something ends:
 |---|---|---|
 |the client's tty input queue|what the kernel has not handed over; on Unix read in 4 KiB from the descriptor polled|discarded when the terminal is restored|
 |the escape parser (`attach_escape.rs`)|a held prefix, an unfinished sequence (up to 64 bytes, forwarded after 20 ms), or a possible paste end (held until the next byte)|discarded|
-|the client's outbox|up to 1 MiB of keystrokes behind the controls; more are dropped and counted (`N typed bytes were dropped`)|the detach goes ahead of them, then the connection closes; while reconnecting there is no outbox, and keystrokes are discarded with a notice|
+|the client's outbox|up to 1 MiB of keystrokes behind the controls; more are dropped and counted (`N typed bytes were dropped`)|on a leave the detach goes ahead of them; then the connection closes, and what is still queued is never sent. While reconnecting there is no outbox, and keystrokes are discarded with a notice|
 |ssh, then the bridge's outbox (`--host` only)|the bridge stops reading ssh's stdin at 1 MiB, so the backlog waits in ssh|as the client's|
 |the sidecar's input queue (`pty_input.rs`)|32 writes; the connection's reader waits for room unless its client hung up|cancelled and recorded ([input arbitration](#input-arbitration))|
 |the PTY master|what the child has not read|kept for the child; once the PTY is closed (a write takes 0 bytes), that write and every later one end `Incomplete(Closed)`, unreported to an attach, since the run is ending|
