@@ -219,7 +219,7 @@ mod unix {
         });
 
         let end = wait_end(&ended);
-        // The session treats a closed connection as a detach.
+        // The session releases control as the connection closes.
         let _ = stream.shutdown(std::net::Shutdown::Both);
         outbox.close();
         end

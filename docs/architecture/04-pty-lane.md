@@ -349,7 +349,9 @@ A `push` to a pipe session that is not running exits 1.
   A controller that detaches has what it queued before the detach written
   first, for up to 1 s (`DETACH_WRITE_GRACE`), so keystrokes typed with the
   escape reach the child; a child not reading cannot keep it in control
-  longer than that. Whatever is still unwritten then is never written.
+  longer than that. Until it is released, the session still shows it in
+  control, and a plain `attach` is refused. Whatever is still unwritten
+  then is never written.
   Unwritten input is recorded as `pty.input_revoked`, after the
   `pty.control_changed` that ended its control. Bytes already written stay
   in the PTY's buffer for the child.

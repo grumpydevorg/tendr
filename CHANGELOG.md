@@ -8,8 +8,22 @@
   arrived in the same keyboard read as `Ctrl-\ d` was lost: the detach was
   sent ahead of it, and the session dropped any input it had not yet written
   as the attach left. The detach now goes after the keystrokes typed before
-  it, also through `--host`, and the session writes them before it lets go,
-  waiting at most a second for a program that is not reading.
+  it, and the session writes them before it lets go, waiting at most a
+  second for a program that is not reading. Over `--host` this needs the
+  remote `tendr`, and the session, to be this version too; an older one
+  still drops them.
+- **`prune` no longer hangs on a live attach socket with a full backlog.**
+  To tell an orphaned socket from a live one, `prune` connects to it, and on
+  Linux a blocking connect to a listener whose backlog is full waits until
+  the listener accepts, which a listener no session names may never do (for
+  example, a session directory removed by hand under a running sidecar).
+  The connect is now nonblocking: on Linux a full backlog counts as
+  listening, and the socket is kept. (macOS refuses a connect to a full
+  backlog, so there such a socket is still removed, as before.)
+- **A `push` taken over after its last frame reports at once.** It no
+  longer waits for its end of input to be served behind the new holder's
+  input, which a PTY the child is not reading could hold up indefinitely:
+  a superseded push has nothing left to release.
 
 ## v0.7.1 — attach fixes
 

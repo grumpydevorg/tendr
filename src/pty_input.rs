@@ -368,7 +368,8 @@ impl InputWriter {
     /// before, then release. A child not reading must not keep it in
     /// control, so if that takes longer than `within`, release then and
     /// cancel the rest, as [`InputWriter::disconnect`] does. Returns once
-    /// released. Consumes the handle.
+    /// released, or, when the queue had no room for its end marker by then,
+    /// once the disconnect is queued. Consumes the handle.
     pub fn detach(&self, handle: ControllerHandle, within: Duration) {
         let deadline = Instant::now() + within;
         let holder = handle.holder();

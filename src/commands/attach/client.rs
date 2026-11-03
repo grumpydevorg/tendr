@@ -194,7 +194,8 @@ impl Outgoing {
     }
 
     /// End the connection, which unblocks its sender and reader; the
-    /// session treats a closed connection as a detach. The reader, which
+    /// session then releases control, writing first only what came before
+    /// a detach it read. The reader, which
     /// may still be writing to the terminal, is not waited for.
     fn close(self) {
         (self.close)();
@@ -1000,7 +1001,8 @@ impl Outbox {
     /// with the escape reach the session first (#111), and wait up to
     /// `grace` for it to be written. Input that is backed up (a session
     /// not reading) keeps it waiting past `grace`; the caller then closes
-    /// the connection, which the session treats as a detach.
+    /// the connection, and the session releases control and drops what is
+    /// still queued.
     pub(super) fn detach(&self, grace: Duration) {
         let deadline = Instant::now() + grace;
         let mut state = self.lock();

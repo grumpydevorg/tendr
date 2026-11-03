@@ -185,8 +185,8 @@ fn mode(takeover: bool, read_only: bool) -> Mode {
 
 /// How long `attach --host` waits for ssh to end once the attach has ended
 /// on this side (a detach, or the keyboard closing) before stopping it. The
-/// remote side ends as soon as it reads the end of its input; the session
-/// treats a lost connection as a detach either way.
+/// remote side ends as soon as it reads the end of its input; a session
+/// whose connection is lost releases control either way.
 const SSH_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long `attach --host` waits for ssh to end, for its exit code, once
