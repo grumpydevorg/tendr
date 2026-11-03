@@ -302,8 +302,7 @@ fn kill_ends_a_pty_run_whose_terminal_is_held() {
         "ended_at {ended_at} is long after the kill at {killed_at}: {meta}"
     );
     let holder = read_pid(&holder).expect("holder pid");
-    // SAFETY: signal 0 only probes; the pid is the test's own holder.
-    let alive = unsafe { libc::kill(holder, 0) } == 0 && !is_zombie(holder);
+    let alive = harness::process_running(holder);
     assert!(!alive, "holder {holder} outlived the stop: {meta}");
     let warned = meta["warnings"].as_array().is_some_and(|w| {
         w.iter()
@@ -313,18 +312,6 @@ fn kill_ends_a_pty_run_whose_terminal_is_held() {
         !warned,
         "a holder warning after the stop ended the holder: {meta}"
     );
-}
-
-/// Whether `pid` is a zombie, per `ps`.
-fn is_zombie(pid: libc::pid_t) -> bool {
-    std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .is_ok_and(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .trim_start()
-                .starts_with('Z')
-        })
 }
 
 /// A holder that keeps writing to the terminal after the child has exited
