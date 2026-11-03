@@ -405,7 +405,9 @@ A `push` to a pipe session that is not running exits 1.
   screen and the signals belong to the terminal layer
   (`src/commands/attach/terminal.rs`). It takes the terminal's state before
   anything that may change it starts, ssh included, restores it on every way
-  out, and discards typed-ahead input. Debug builds accept
+  out, and discards typed-ahead input. On Unix the keyboard is read from the
+  descriptor it polls, never through `std::io::Stdin`, whose buffer would
+  hold bytes the poll cannot see. Debug builds accept
   `TENDR_TEST_ATTACH_TERMINAL=<rows>x<cols>`: a test terminal on piped stdio,
   which the scripted-remote tests (`tests/cli_attach_scripted.rs`) drive.
   With `TENDR_TEST_ATTACH_SCREEN_HOLD=<path>` too, it takes no writes while

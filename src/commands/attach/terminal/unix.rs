@@ -6,7 +6,8 @@
 //! the keyboard's poll through a self-pipe ([`signals`]); the previous
 //! dispositions are restored when the terminal is.
 
-use std::io::{Read, Write};
+use std::io::Write;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,7 +53,6 @@ impl Terminal for UnixTerminal {
         Ok(Box::new(UnixRaw {
             original: self.original,
             handlers,
-            stdin: std::io::stdin().lock(),
         }))
     }
 }
@@ -63,12 +63,12 @@ struct UnixRaw {
     original: libc::termios,
     /// Dropped after `Drop::drop` has restored the terminal.
     handlers: signals::Handlers,
-    stdin: std::io::StdinLock<'static>,
 }
 
 impl Raw for UnixRaw {
     fn input(&mut self, buf: &mut [u8], timeout: Duration) -> Input {
-        let ready = wait_ready(self.handlers.wake(), timeout);
+        let stdin = std::io::stdin();
+        let ready = wait_ready(stdin.as_fd(), self.handlers.wake(), timeout);
         if ready.signal {
             let received = self.handlers.take();
             if let Some(cancel) = received.cancel {
@@ -81,12 +81,7 @@ impl Raw for UnixRaw {
         if !ready.keyboard {
             return Input::Wake;
         }
-        match self.stdin.read(buf) {
-            Ok(0) => Input::Closed,
-            Ok(n) => Input::Bytes(n),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Input::Wake,
-            Err(_) => Input::Closed,
-        }
+        read_keyboard(stdin.as_fd(), buf)
     }
 
     fn output(&self) -> Arc<dyn Output> {
@@ -206,12 +201,11 @@ struct Ready {
     signal: bool,
 }
 
-/// Wait up to `timeout` for the keyboard or for a signal's wake-up byte.
-fn wait_ready(wake: std::os::fd::BorrowedFd<'_>, timeout: Duration) -> Ready {
+/// Wait up to `timeout` for the `keyboard` or for a signal's wake-up byte.
+fn wait_ready(keyboard: BorrowedFd<'_>, wake: BorrowedFd<'_>, timeout: Duration) -> Ready {
     use rustix::event::{PollFd, PollFlags, poll};
-    let stdin = std::io::stdin();
     let mut fds = [
-        PollFd::new(&stdin, PollFlags::IN),
+        PollFd::new(&keyboard, PollFlags::IN),
         PollFd::new(&wake, PollFlags::IN),
     ];
     let timespec = poll_timespec(timeout);
@@ -222,6 +216,19 @@ fn wait_ready(wake: std::os::fd::BorrowedFd<'_>, timeout: Duration) -> Ready {
         },
         // A timeout, or EINTR from a signal whose byte the next poll sees.
         _ => Ready::default(),
+    }
+}
+
+/// Read what the `keyboard` has, from the descriptor [`wait_ready`] polls.
+/// Never through `std::io::Stdin`: its 8 KiB buffer could take more than
+/// `buf` holds, and the rest would wait, unseen by the poll, for the next
+/// keystroke (issue #192, a paste cut at 4,096 bytes).
+fn read_keyboard(keyboard: BorrowedFd<'_>, buf: &mut [u8]) -> Input {
+    match rustix::io::read(keyboard, buf) {
+        Ok(0) => Input::Closed,
+        Ok(n) => Input::Bytes(n),
+        Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => Input::Wake,
+        Err(_) => Input::Closed,
     }
 }
 
@@ -453,6 +460,26 @@ mod signals {
 mod tests {
     use super::*;
 
+    /// Input bigger than one read is read in full: what a read leaves, the
+    /// next poll sees.
+    #[test]
+    fn a_read_leaves_nothing_the_poll_cannot_see() {
+        let (keyboard, typing) = rustix::pipe::pipe().unwrap();
+        let (wake, _wake_write) = rustix::pipe::pipe().unwrap();
+        // Over one 4 KiB read and under a pipe's buffer, so one write.
+        let typed: Vec<u8> = (0..6025u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(rustix::io::write(&typing, &typed).unwrap(), typed.len());
+        let mut buf = [0u8; 4096];
+        let mut got = Vec::new();
+        while wait_ready(keyboard.as_fd(), wake.as_fd(), Duration::ZERO).keyboard {
+            match read_keyboard(keyboard.as_fd(), &mut buf) {
+                Input::Bytes(n) => got.extend_from_slice(&buf[..n]),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(got, typed);
+    }
+
     fn disposition(signal: libc::c_int) -> libc::sighandler_t {
         // SAFETY: a null new action only queries the current one.
         let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -481,12 +508,13 @@ mod tests {
         // SAFETY: raise(3) delivers SIGWINCH to this thread, whose handler
         // is installed.
         unsafe { libc::raise(libc::SIGWINCH) };
-        let ready = wait_ready(handlers.wake(), Duration::from_secs(5));
+        let stdin = std::io::stdin();
+        let ready = wait_ready(stdin.as_fd(), handlers.wake(), Duration::from_secs(5));
         assert!(ready.signal, "SIGWINCH wakes the poll");
         let received = handlers.take();
         assert!(received.winch);
         assert_eq!(received.cancel, None);
-        let ready = wait_ready(handlers.wake(), Duration::ZERO);
+        let ready = wait_ready(stdin.as_fd(), handlers.wake(), Duration::ZERO);
         assert!(!ready.signal, "the wake pipe was drained");
 
         drop(handlers);
