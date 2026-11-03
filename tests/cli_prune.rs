@@ -657,6 +657,62 @@ fn prune_sweeps_orphaned_attach_sockets_only() {
     assert!(not_a_socket.exists(), "only sockets are swept");
 }
 
+/// prune keeps a live listener whose backlog is full, and does not wait for
+/// it: on Linux a blocking connect to one waits until it accepts, which a
+/// listener no session names may never do (#102).
+#[cfg(target_os = "linux")]
+#[test]
+fn prune_keeps_a_listener_with_a_full_backlog_without_waiting_on_it() {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let live = socket_dir(&root).join("dddddddddddd.sock");
+    let addr = SocketAddrUnix::new(&live).unwrap();
+    let socket = || {
+        rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap()
+    };
+    let listener = socket();
+    rustix::net::bind(&listener, &addr).unwrap();
+    rustix::net::listen(&listener, 0).unwrap();
+    // Connect, never accepting, until the backlog refuses more.
+    let mut queued = Vec::new();
+    loop {
+        let client = socket();
+        match rustix::net::connect(&client, &addr) {
+            Ok(()) => queued.push(client),
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(e) => panic!("connect: {e}"),
+        }
+        assert!(queued.len() < 64, "the backlog never filled");
+    }
+    backdate(&live);
+
+    // Killed at the deadline if it waits on the listener.
+    let out = tendr(&root)
+        .args(["prune", "--older-than", "1h"])
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .expect("run prune");
+    assert!(
+        out.status.success(),
+        "prune must not wait on a listener with a full backlog: {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines = parse_ndjson(&out.stdout);
+    let summary = lines.iter().find(|l| l["type"] == "summary").unwrap();
+    assert_eq!(summary["sockets_removed"], 0, "{summary}");
+    assert!(live.exists(), "a socket something listens on is kept");
+    drop((queued, listener));
+}
+
 /// Pruning a session whose sidecar died with it removes the session's socket
 /// in the same run: the breadcrumb that protected it is gone with the session.
 #[cfg(unix)]

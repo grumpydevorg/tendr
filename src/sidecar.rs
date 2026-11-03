@@ -2494,7 +2494,10 @@ fn handle_push_connection(
             Err(FrameError::Io(_)) => return gone(&stream, handle),
         }
     };
-    if let PushOutcome::Written { .. } = outcome {
+    // A revoked handle releases nothing, so a push taken over after its last
+    // frame must not wait for an end marker served behind its successor's
+    // input; nothing of its own is still queued either way.
+    if matches!(outcome, PushOutcome::Written { .. }) && !revoked.load(Ordering::SeqCst) {
         // The end marker releases control if it is still held.
         writer.end_of_input_and_wait(handle);
     } else {
@@ -4278,6 +4281,125 @@ mod tests {
             read_frame(&mut client).unwrap(),
             Frame::InputDone(PushOutcome::Written { bytes: 3 }),
             "every byte was written, so the push must not report revoked"
+        );
+        handler.join().unwrap();
+    }
+
+    /// A PTY that records what it accepts and, while `stalled`, accepts nothing.
+    #[derive(Clone, Default)]
+    struct StallablePty {
+        written: Arc<Mutex<Vec<u8>>>,
+        stalled: Arc<AtomicBool>,
+    }
+
+    impl crate::model::pty_control::PtyInputSink for StallablePty {
+        fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.stalled.load(Ordering::SeqCst) {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            lock(&self.written).extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    impl crate::pty_input::WritablePty for StallablePty {
+        fn wait_writable(&self, timeout: std::time::Duration) -> io::Result<bool> {
+            if self.stalled.load(Ordering::SeqCst) {
+                std::thread::sleep(timeout.min(std::time::Duration::from_millis(1)));
+                return Ok(false);
+            }
+            Ok(true)
+        }
+
+        fn resize(&self, _size: crate::recording::Geometry, _cause: crate::recording::ResizeCause) {
+        }
+    }
+
+    /// Hooks whose takeover flags the superseded push revoked but leaves its
+    /// connection open, as when the takeover lands after its Detach was read.
+    struct RevokingHooks(ConnectionRegistry);
+
+    impl crate::pty_input::ControlHooks for RevokingHooks {
+        fn human_control(
+            &mut self,
+            _trigger: crate::pty_input::Trigger,
+            _epoch: crate::model::pty_control::ControllerEpoch,
+        ) {
+        }
+        fn human_released(&mut self, _epoch: crate::model::pty_control::ControllerEpoch) {}
+        fn retire(
+            &mut self,
+            holder: crate::model::pty_control::HolderId,
+            _kind: crate::model::pty_control::ControllerKind,
+            _epoch: crate::model::pty_control::ControllerEpoch,
+        ) {
+            if let Some(Registered {
+                retirement: Retirement::Push { revoked },
+                ..
+            }) = self.0.remove_retirable(holder)
+            {
+                revoked.store(true, Ordering::SeqCst);
+            }
+        }
+        fn input_revoked(
+            &mut self,
+            _kind: crate::model::pty_control::ControllerKind,
+            _accepted: usize,
+            _total: usize,
+        ) {
+        }
+    }
+
+    /// A push revoked after its last frame was written reports at once: its
+    /// stale handle releases nothing, so it does not wait for an end marker
+    /// served behind its successor's stalled input (#102).
+    #[test]
+    fn a_revoked_push_reports_without_waiting_behind_its_successor() {
+        use crate::attach_proto::{Frame, PushOutcome, read_frame, write_frame};
+        use std::os::unix::net::UnixStream;
+
+        let pty = StallablePty::default();
+        let registry = ConnectionRegistry::default();
+        let writer = crate::pty_input::InputWriter::spawn(
+            RunId::new(),
+            pty.clone(),
+            RevokingHooks(registry.clone()),
+        );
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let handler = {
+            let (writer, registry) = (writer.clone(), registry.clone());
+            std::thread::spawn(move || handle_push_connection(server, &writer, &registry))
+        };
+        assert!(matches!(
+            read_frame(&mut client).unwrap(),
+            Frame::Accepted(_)
+        ));
+
+        write_frame(&mut client, &Frame::Data(b"abc".to_vec())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lock(&pty.written).len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the frame was never written"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The successor's input is queued ahead of the push's end and cannot
+        // be written while the PTY is stalled.
+        pty.stalled.store(true, Ordering::SeqCst);
+        let successor = writer.takeover(writer.next_holder()).unwrap().handle;
+        writer.write_nowait(&successor, b"xyz".to_vec());
+        write_frame(&mut client, &Frame::Detach).unwrap();
+
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let answer = read_frame(&mut client);
+        pty.stalled.store(false, Ordering::SeqCst);
+        assert_eq!(
+            answer.ok(),
+            Some(Frame::InputDone(PushOutcome::Written { bytes: 3 })),
+            "a revoked push must not wait behind its successor's input"
         );
         handler.join().unwrap();
     }
