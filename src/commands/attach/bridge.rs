@@ -219,7 +219,7 @@ mod unix {
         });
 
         let end = wait_end(&ended);
-        // The session treats a closed connection as a detach.
+        // The session releases control as the connection closes.
         let _ = stream.shutdown(std::net::Shutdown::Both);
         outbox.close();
         end
@@ -242,8 +242,7 @@ mod unix {
                 Ok(frame @ (Frame::Resize(_) | Frame::Repaint)) => outbox.push_control(frame),
                 Ok(Frame::Detach) => {
                     detached.store(true, Ordering::SeqCst);
-                    outbox.push_control(Frame::Detach);
-                    outbox.wait_controls_sent(DETACH_GRACE);
+                    outbox.detach(DETACH_GRACE);
                     return true;
                 }
                 // Frames a client does not send, and unknown or malformed

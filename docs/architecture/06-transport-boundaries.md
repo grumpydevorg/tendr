@@ -240,13 +240,15 @@ command line as the other operations, and keeps the terminal on the client
   that stops reading backs up only its output, and the sidecar's queue for it
   behind that; a frame the sidecar cut off is not passed on. Input goes
   through a queue in which controls go first: at most one resize waits (a
-  newer one replaces it), and a repaint or detach is sent once. Input data
-  waits behind them, bounded at 1 MiB, past which the bridge stops reading
-  ssh stdin. So a client that stops reading its output still has its resize
-  and detach reach the session, and a takeover by another client, which
-  arrives on its own connection, never waits for it. A detach that cannot
-  get past 1 MiB of backed-up input ends the connection instead (below),
-  which the session also treats as a detach.
+  newer one replaces it), and a repaint is sent once. Input data waits
+  behind them, bounded at 1 MiB, past which the bridge stops reading ssh
+  stdin. A detach goes after the input that came before it, so keystrokes
+  typed with the escape reach the session first. So a client that stops
+  reading its output still has its resize reach the session, and a
+  takeover by another client, which arrives on its own connection, never
+  waits for it. A detach that cannot get past backed-up input within
+  0.2 s ends the connection instead (below), and the session then releases
+  control and drops the input still queued, as for any lost connection.
 - A client taken over while it was not reading cannot read the
   `MSG_RETIRED` queued behind its output. When the session ends the
   connection without one, the remote tendr reads the run's event log as a
@@ -255,8 +257,8 @@ command line as the other operations, and keeps the terminal on the client
   reads it once it reads again, and exits 81.
 - When the client leaves, it closes ssh stdin, after a `MSG_DETACH` if the
   user detached; the remote tendr passes the detach on, closes the socket
-  and exits. The client waits at most 1 s for ssh to end, then stops it; the
-  session treats a lost connection as a detach either way. If the client
+  and exits. The client waits at most 1 s for ssh to end, then stops it; a
+  session whose connection is lost releases control either way. If the client
   hangs up while both directions are blocked, the remote tendr notices within
   0.2 s (ssh's stdin or stdout reports a hang-up), gives a detach just before
   it 0.2 s more to pass, and closes the socket.

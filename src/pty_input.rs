@@ -22,7 +22,7 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::model::ids::RunId;
 use crate::model::pty_control::{
@@ -118,6 +118,11 @@ enum Control {
     /// Release now and cancel everything the holder still has queued.
     Disconnect {
         handle: ControllerHandle,
+    },
+    /// The holder's detach ran out of time: serve its end marker now, as a
+    /// disconnect, if it has not been served.
+    Expire {
+        holder: HolderId,
     },
 }
 
@@ -359,6 +364,28 @@ impl InputWriter {
         self.push_control(Control::Disconnect { handle });
     }
 
+    /// The controller behind `handle` detached: write what it queued
+    /// before, then release. A child not reading must not keep it in
+    /// control, so if that takes longer than `within`, release then and
+    /// cancel the rest, as [`InputWriter::disconnect`] does. Returns once
+    /// released, or, when the queue had no room for its end marker by then,
+    /// once the disconnect is queued. Consumes the handle.
+    pub fn detach(&self, handle: ControllerHandle, within: Duration) {
+        let deadline = Instant::now() + within;
+        let holder = handle.holder();
+        let (done, rx) = sync_channel(1);
+        if let Err(handle) = self.push_end_until(handle, done, deadline) {
+            // The queue stayed full: nothing of it will be written in time.
+            self.disconnect(handle);
+            return;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if rx.recv_timeout(left).is_err() {
+            self.push_control(Control::Expire { holder });
+            let _ = rx.recv();
+        }
+    }
+
     /// Like [`InputWriter::end_of_input`], but wait until the end marker is
     /// served: every input queued before it is done, and the handle released
     /// if it still held control.
@@ -402,6 +429,35 @@ impl InputWriter {
         queues.inputs.push_back(item);
         drop(queues);
         self.shared.work.notify_one();
+    }
+
+    /// Queue `handle`'s end marker, waiting for queue space only until
+    /// `deadline`; the handle back if there was none by then.
+    fn push_end_until(
+        &self,
+        handle: ControllerHandle,
+        done: SyncSender<()>,
+        deadline: Instant,
+    ) -> Result<(), ControllerHandle> {
+        let mut queues = self.shared.lock();
+        while queues.inputs.len() >= INPUT_CAPACITY {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(handle);
+            };
+            queues = self
+                .shared
+                .space
+                .wait_timeout(queues, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        queues.inputs.push_back(InputItem::End {
+            handle,
+            done: Some(done),
+        });
+        drop(queues);
+        self.shared.work.notify_one();
+        Ok(())
     }
 }
 
@@ -447,8 +503,8 @@ fn writer_loop<P: WritablePty, H: ControlHooks>(
         }
 
         for control in controls {
-            if let Control::Disconnect { handle } = control {
-                disconnect(
+            match control {
+                Control::Disconnect { handle } => disconnect(
                     handle,
                     shared,
                     &mut arbiter,
@@ -456,9 +512,26 @@ fn writer_loop<P: WritablePty, H: ControlHooks>(
                     &mut hooks,
                     &mut current,
                     &mut next_end,
-                );
-            } else {
-                apply_control(control, &mut arbiter, &pty, &mut hooks, &mut repaint);
+                ),
+                Control::Expire { holder } => {
+                    let Some((handle, done)) = take_end(shared, holder, &mut next_end) else {
+                        // Served in time after all.
+                        continue;
+                    };
+                    disconnect(
+                        handle,
+                        shared,
+                        &mut arbiter,
+                        &mut pty,
+                        &mut hooks,
+                        &mut current,
+                        &mut next_end,
+                    );
+                    if let Some(done) = done {
+                        let _ = done.send(());
+                    }
+                }
+                control => apply_control(control, &mut arbiter, &pty, &mut hooks, &mut repaint),
             }
         }
 
@@ -498,6 +571,27 @@ fn writer_loop<P: WritablePty, H: ControlHooks>(
                 current = Some(writing);
             }
         }
+    }
+}
+
+/// Take `holder`'s end marker out of the writer's hands, staged or queued,
+/// if it is still waiting to be served.
+fn take_end(
+    shared: &Shared,
+    holder: HolderId,
+    next_end: &mut Option<InputItem>,
+) -> Option<(ControllerHandle, Option<SyncSender<()>>)> {
+    let is_theirs = |item: &InputItem| matches!(item, InputItem::End { handle, .. } if handle.holder() == holder);
+    let item = if next_end.as_ref().is_some_and(is_theirs) {
+        next_end.take()
+    } else {
+        let mut queues = shared.lock();
+        let at = queues.inputs.iter().position(is_theirs)?;
+        queues.inputs.remove(at)
+    };
+    match item? {
+        InputItem::End { handle, done } => Some((handle, done)),
+        InputItem::Write { .. } => None,
     }
 }
 
@@ -655,10 +749,10 @@ fn apply_control<P: WritablePty, H: ControlHooks>(
                 }
             }
         }
-        Control::Disconnect { .. } => {
+        Control::Disconnect { .. } | Control::Expire { .. } => {
             debug_assert!(
                 false,
-                "disconnect needs the queues; the writer loop serves it"
+                "disconnect and expire need the queues; the writer loop serves them"
             );
         }
     }
@@ -829,6 +923,100 @@ mod tests {
                 .is_ok(),
             "released once its input was written"
         );
+    }
+
+    /// A detach writes what its holder queued before it, then releases:
+    /// typing sent with the escape reaches the child (#111).
+    #[test]
+    fn a_detach_writes_what_was_queued_before_it_then_releases() {
+        let pty = SlowPty::default();
+        let hooks = Recorded::default();
+        let writer = InputWriter::spawn(RunId::new(), pty.clone(), hooks.clone());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+        writer.write_nowait(&human, b"typed-".to_vec());
+        writer.write_nowait(&human, b"before".to_vec());
+
+        writer.detach(human, Duration::from_secs(5));
+
+        assert_eq!(pty.0.lock().unwrap().as_slice(), b"typed-before");
+        assert!(
+            writer
+                .claim(writer.next_holder(), ControllerKind::Human)
+                .is_ok(),
+            "released once its input was written"
+        );
+        assert!(
+            !hooks.calls().iter().any(|c| c.starts_with("input_revoked")),
+            "{:?}",
+            hooks.calls()
+        );
+    }
+
+    /// A detach behind a PTY that never takes input releases at its bound
+    /// and revokes what it could not write, as a disconnect does.
+    #[test]
+    fn a_detach_behind_a_full_pty_releases_at_its_bound_and_revokes_the_rest() {
+        let hooks = Recorded::default();
+        let writer = InputWriter::spawn(RunId::new(), FullPty, hooks.clone());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+        writer.write_nowait(&human, vec![b'x'; 1024]);
+
+        let started = Instant::now();
+        writer.detach(human, Duration::from_millis(200));
+        let took = started.elapsed();
+
+        assert!(
+            took >= Duration::from_millis(200),
+            "returned early: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "held past its bound: {took:?}"
+        );
+        assert!(
+            writer
+                .claim(writer.next_holder(), ControllerKind::Human)
+                .is_ok(),
+            "released at the bound"
+        );
+        let calls = hooks.calls();
+        assert!(calls.contains(&"human_released".to_owned()), "{calls:?}");
+        assert!(
+            calls.contains(&"input_revoked:Human:0:1024".to_owned()),
+            "{calls:?}"
+        );
+    }
+
+    /// A detach whose end marker cannot even be queued, the input queue
+    /// full behind a PTY that never takes input, still releases at its
+    /// bound.
+    #[test]
+    fn a_detach_with_the_input_queue_full_releases_at_its_bound() {
+        let writer = InputWriter::spawn(RunId::new(), FullPty, Recorded::default());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+        // One is staged by the writer; the rest fill the queue.
+        for _ in 0..=INPUT_CAPACITY {
+            writer.write_nowait(&human, b"x".to_vec());
+        }
+
+        let started = Instant::now();
+        writer.detach(human, Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .is_err()
+        {
+            assert!(Instant::now() < deadline, "still held after the detach");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Records applied window sizes and their causes; starts at 24×80 and

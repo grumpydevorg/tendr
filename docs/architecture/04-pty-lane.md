@@ -344,11 +344,17 @@ A `push` to a pipe session that is not running exits 1.
 
 ## Input arbitration
 
-- Input queued by a controller that is superseded (a takeover) or leaves (a
-  detach or a lost connection), and not yet written to the PTY master, is
-  never written. It is recorded as `pty.input_revoked`, after the
-  `pty.control_changed` that ended its control. Bytes already written stay in
-  the PTY's buffer for the child.
+- Input queued by a controller that is superseded (a takeover) or that loses
+  its connection, and not yet written to the PTY master, is never written.
+  A controller that detaches has what it queued before the detach written
+  first, for up to 1 s (`DETACH_WRITE_GRACE`), so keystrokes typed with the
+  escape reach the child; a child not reading cannot keep it in control
+  longer than that. Until it is released, the session still shows it in
+  control, and a plain `attach` is refused. Whatever is still unwritten
+  then is never written.
+  Unwritten input is recorded as `pty.input_revoked`, after the
+  `pty.control_changed` that ended its control. Bytes already written stay
+  in the PTY's buffer for the child.
 - PTY `exec` frames arrive over the stdin FIFO. The FIFO forwarder is
   arbitrated the same way, but it cannot report an outcome:
   - It waits behind another agent's push.
@@ -397,7 +403,8 @@ A `push` to a pipe session that is not running exits 1.
 - The client keeps keyboard input, session writes and terminal output on
   separate paths:
   - The main thread polls the keyboard and terminal size and only queues
-    messages. Resize, repaint and detach go ahead of keystrokes.
+    messages. Resize and repaint go ahead of keystrokes; a detach goes
+    after the keystrokes queued before it (`Outbox::detach`).
   - A sender thread writes the queued messages.
   - A reader thread writes output to the terminal.
 - The client core (`src/commands/attach/client.rs`) touches no descriptor,
@@ -495,9 +502,9 @@ says what happens to bytes it holds when something ends:
 |---|---|---|
 |the client's tty input queue|what the kernel has not handed over; on Unix read in 4 KiB from the descriptor polled|discarded when the terminal is restored|
 |the escape parser (`attach_escape.rs`)|a held prefix, an unfinished sequence (up to 64 bytes, forwarded after 20 ms), or a possible paste end (held until the next byte)|discarded|
-|the client's outbox|up to 1 MiB of keystrokes behind the controls; more are dropped and counted (`N typed bytes were dropped`)|on a leave the detach goes ahead of them; then the connection closes, and what is still queued is never sent. While reconnecting there is no outbox, and keystrokes are discarded with a notice|
+|the client's outbox|up to 1 MiB of keystrokes behind the controls; more are dropped and counted (`N typed bytes were dropped`)|on a leave the detach goes after them, waiting up to 200 ms to be sent; then the connection closes, and what is still queued is never sent. While reconnecting there is no outbox, and keystrokes are discarded with a notice|
 |ssh, then the bridge's outbox (`--host` only)|the bridge stops reading ssh's stdin at 1 MiB, so the backlog waits in ssh|as the client's|
-|the sidecar's input queue (`pty_input.rs`)|32 writes; the connection's reader waits for room unless its client hung up|cancelled and recorded ([input arbitration](#input-arbitration))|
+|the sidecar's input queue (`pty_input.rs`)|32 writes; the connection's reader waits for room unless its client hung up|after a detach, written for up to 1 s first; otherwise, and after that, cancelled and recorded ([input arbitration](#input-arbitration))|
 |the PTY master|what the child has not read|kept for the child; once the PTY is closed (a write takes 0 bytes), that write and every later one end `Incomplete(Closed)`, unreported to an attach, since the run is ending|
 
 Output passes through these:

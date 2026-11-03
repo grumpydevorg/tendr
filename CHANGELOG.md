@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- **Keystrokes typed with the detach escape reach the session.** Text that
+  arrived in the same keyboard read as `Ctrl-\ d` was lost: the detach was
+  sent ahead of it, and the session dropped any input it had not yet written
+  as the attach left. The detach now goes after the keystrokes typed before
+  it, and the session writes them before it lets go, waiting at most a
+  second for a program that is not reading. Over `--host` this needs the
+  remote `tendr`, and the session, to be this version too; an older one
+  still drops them.
 - **`prune` no longer hangs on a live attach socket with a full backlog.**
   To tell an orphaned socket from a live one, `prune` connects to it, and on
   Linux a blocking connect to a listener whose backlog is full waits until

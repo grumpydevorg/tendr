@@ -194,7 +194,8 @@ impl Outgoing {
     }
 
     /// End the connection, which unblocks its sender and reader; the
-    /// session treats a closed connection as a detach. The reader, which
+    /// session then releases control, writing first only what came before
+    /// a detach it read. The reader, which
     /// may still be writing to the terminal, is not waited for.
     fn close(self) {
         (self.close)();
@@ -422,8 +423,7 @@ pub(super) fn relay(
                 ending,
                 Ending::Detached | Ending::Left(_) | Ending::OutputGone
             ) {
-                outgoing.outbox.push_control(Frame::Detach);
-                outgoing.outbox.wait_controls_sent(DETACH_GRACE);
+                outgoing.outbox.detach(DETACH_GRACE);
             }
             // Unblocks the sender and reader, which are not waited for.
             outgoing.close();
@@ -889,7 +889,8 @@ fn turn_off_modes(screen: &Arc<Screen>, status: &Arc<reconnect::Status>, grace: 
 /// Messages waiting for the sender thread. Controls go first, on a
 /// bounded path: at most one size waits (a newer one replaces it), and
 /// the others are sent once each. Input waits behind them, bounded by
-/// [`OUTBOX_DATA_LIMIT`].
+/// [`OUTBOX_DATA_LIMIT`]. A detach goes last, after the input queued
+/// before it ([`Outbox::detach`]).
 #[derive(Default)]
 pub(super) struct Outbox {
     state: Mutex<OutboxState>,
@@ -902,6 +903,8 @@ struct OutboxState {
     data: VecDeque<Vec<u8>>,
     data_bytes: usize,
     sending_control: bool,
+    /// A detach waits to be sent, once the input queued before it is.
+    detach: bool,
     closed: bool,
 }
 
@@ -962,7 +965,8 @@ impl Outbox {
         true
     }
 
-    /// The next message to send, controls first; `None` once closed.
+    /// The next message to send: controls first, then input, then a
+    /// detach; `None` once closed.
     fn next(&self) -> Option<Frame> {
         let mut state = self.lock();
         loop {
@@ -979,6 +983,11 @@ impl Outbox {
                 self.changed.notify_all();
                 return Some(Frame::Data(data));
             }
+            if state.detach {
+                state.detach = false;
+                state.sending_control = true;
+                return Some(Frame::Detach);
+            }
             state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -988,11 +997,23 @@ impl Outbox {
         self.changed.notify_all();
     }
 
-    /// Wait up to `grace` for queued controls to be written.
-    pub(super) fn wait_controls_sent(&self, grace: Duration) {
+    /// Send a detach after the input queued before it, so keystrokes typed
+    /// with the escape reach the session first (#111), and wait up to
+    /// `grace` for it to be written. Input that is backed up (a session
+    /// not reading) keeps it waiting past `grace`; the caller then closes
+    /// the connection, and the session releases control and drops what is
+    /// still queued.
+    pub(super) fn detach(&self, grace: Duration) {
         let deadline = Instant::now() + grace;
         let mut state = self.lock();
-        while !state.closed && (!state.controls.is_empty() || state.sending_control) {
+        state.detach = true;
+        self.changed.notify_all();
+        while !state.closed
+            && (state.detach
+                || !state.controls.is_empty()
+                || !state.data.is_empty()
+                || state.sending_control)
+        {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                 return;
             };
