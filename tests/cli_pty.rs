@@ -4490,3 +4490,50 @@ fn cli_push_to_a_finished_session_exits_81_for_a_pty_and_1_for_a_pipe() {
     let output = push_output(&root, "pipe-push-ended", b"too late\n");
     assert_exit(&output, 1, "push to a finished pipe session");
 }
+
+/// Keystrokes that arrive in the same read as the detach escape reach the
+/// child before the attach lets go (#111): the detach waits behind them on
+/// the wire, and the session writes them before releasing control.
+#[test]
+fn cli_keystrokes_typed_with_the_detach_reach_the_child() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-typed-detach");
+    let got = root.path().join("got.txt");
+    tendr(&root)
+        .args(["start", "pty-typed-detach", "--pty", "--"])
+        .args([
+            "sh",
+            "-c",
+            &format!(
+                "stty raw -echo; (while :; do printf READY; sleep 0.2; done) & exec cat > '{}'",
+                got.display()
+            ),
+        ])
+        .output()
+        .unwrap();
+    harness::wait_running(&root, "pty-typed-detach");
+    let mut wrapped = WrappedAttach::spawn(&root, "typed-detach", &["pty-typed-detach"]);
+    // Relayed output proves the CLI is in raw mode, so Ctrl-\ is not SIGQUIT.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !wrapped.cli.output().contains("READY") {
+        assert!(Instant::now() < deadline, "attach never relayed output");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    wrapped.cli.type_bytes(b"typed-before\x1cd");
+    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let received = std::fs::read_to_string(&got).unwrap_or_default();
+        if received.contains("typed-before") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never got the keystrokes typed with the detach: {received:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

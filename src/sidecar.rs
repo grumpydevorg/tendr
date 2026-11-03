@@ -2960,6 +2960,7 @@ fn handle_attach_connection(
         }
         installed
     });
+    let mut detached = false;
     if accepted.is_ok() {
         loop {
             match read_frame(&mut stream) {
@@ -2974,7 +2975,11 @@ fn handle_attach_connection(
                 }
                 Ok(Frame::Resize(size)) => writer.resize(&handle, size),
                 Ok(Frame::Repaint) => start_repaint(writer, attach_sink, &handle),
-                Ok(Frame::Detach) | Err(FrameError::Io(_)) => break,
+                Ok(Frame::Detach) => {
+                    detached = true;
+                    break;
+                }
+                Err(FrameError::Io(_)) => break,
                 // Other frames, unknown ones, and malformed ones such as a
                 // resize with a zero dimension, are ignored.
                 Ok(_) | Err(FrameError::Malformed(_) | FrameError::Unknown(_)) => {}
@@ -2982,17 +2987,28 @@ fn handle_attach_connection(
         }
     }
 
-    // Detach, disconnect, retirement, or a protocol violation such as an
-    // oversized frame: close the connection, release ahead of queued input,
-    // and cancel what this client still has queued.
     let _ = stream.shutdown(std::net::Shutdown::Both);
-    writer.disconnect(handle);
+    if detached {
+        // What the client typed before its detach is written first (#111),
+        // within a bound, so a child not reading cannot keep it in control.
+        writer.detach(handle, DETACH_WRITE_GRACE);
+    } else {
+        // A disconnect, retirement, or a protocol violation such as an
+        // oversized frame: release ahead of queued input, and cancel what
+        // this client still has queued.
+        writer.disconnect(handle);
+    }
     registry.remove(holder);
     lock(attach_sink).forget(holder);
     if let Some((ring, cursor)) = installed {
         ring.close(&cursor);
     }
 }
+
+/// How long a detaching controller's queued keystrokes may take to be
+/// written before the rest is revoked and control released.
+#[cfg(unix)]
+const DETACH_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One read-only viewer of the run `run_id`, registered as `holder`: told
 /// where its output starts, then sent that output (stamped from version 2,

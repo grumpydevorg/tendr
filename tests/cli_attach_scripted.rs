@@ -310,6 +310,34 @@ fn a_scripted_attach_greets_shows_output_types_and_detaches() {
     );
 }
 
+/// Keystrokes read together with the escape go out before the detach,
+/// never after it, where the session would no longer read them (#111).
+#[test]
+fn keystrokes_typed_with_the_escape_go_out_before_the_detach() {
+    let root = TempDir::new().unwrap();
+    let remote = Remote::new(
+        "hello log {log}\n\
+         hello answer\n\
+         hello output scripted-output\n\
+         hello drain",
+    );
+    let mut client = remote.attach(&root);
+    client.wait_screen(&["scripted-output"]);
+    let mut typed = b"typed-before".to_vec();
+    typed.extend_from_slice(DETACH);
+    client.type_bytes(&typed);
+    assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+
+    let frames = remote.frames();
+    assert!(
+        frames.ends_with(&debug(&[
+            Frame::Data(b"typed-before".to_vec()),
+            Frame::Detach
+        ])),
+        "{frames:?}"
+    );
+}
+
 /// Told another client took over, the client exits 81 and says so.
 #[test]
 fn a_scripted_takeover_exits_81() {

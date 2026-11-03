@@ -242,8 +242,7 @@ mod unix {
                 Ok(frame @ (Frame::Resize(_) | Frame::Repaint)) => outbox.push_control(frame),
                 Ok(Frame::Detach) => {
                     detached.store(true, Ordering::SeqCst);
-                    outbox.push_control(Frame::Detach);
-                    outbox.wait_controls_sent(DETACH_GRACE);
+                    outbox.detach(DETACH_GRACE);
                     return true;
                 }
                 // Frames a client does not send, and unknown or malformed

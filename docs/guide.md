@@ -275,10 +275,11 @@ concurrent `push` is refused, not interleaved.
 - `Ctrl-\` then `d` detaches; the session keeps running. `Ctrl-\` twice sends
   one `Ctrl-\`; `Ctrl-\` then any other key sends both. `--escape none` turns
   the escape off. `Enter ~ .` is the outer `ssh` escape, not tendr's.
-- Detaching, or losing the connection, drops any input you typed that tendr
-  had not yet written to the session's terminal, as `--takeover` does. Tendr
-  logs it as `pty.input_revoked`. Input already written stays for the program
-  to read.
+- Detaching first writes what you typed before the escape, waiting at most
+  about a second for a program that is not reading. Input still unwritten
+  then is dropped, and so is any you typed but tendr had not yet written when
+  you lose the connection or someone runs `--takeover`. Tendr logs it as
+  `pty.input_revoked`. Input already written stays for the program to read.
 - `Ctrl-C` goes to the session; it does not stop `attach`.
 - Window resizes follow your terminal, and your terminal settings are restored
   however the attach ends. The modes the session turned on, such as the

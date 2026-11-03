@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Keystrokes typed with the detach escape reach the session.** Text that
+  arrived in the same keyboard read as `Ctrl-\ d` was lost: the detach was
+  sent ahead of it, and the session dropped any input it had not yet written
+  as the attach left. The detach now goes after the keystrokes typed before
+  it, also through `--host`, and the session writes them before it lets go,
+  waiting at most a second for a program that is not reading.
+
 ## v0.7.1 — attach fixes
 
 No protocol change: works with 0.7.0, 0.6.0 and 0.5.0 exactly as 0.7.0 does.
