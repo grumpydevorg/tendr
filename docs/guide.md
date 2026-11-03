@@ -297,8 +297,9 @@ concurrent `push` is refused, not interleaved.
 - `attach --read-only` watches without control: it shows the session's
   output beside whoever holds the terminal, even while a human does, and up
   to eight can watch at once (a ninth is refused with 84). Your keystrokes
-  are dropped, with a note on the bottom line from the first one until the
-  attach ends, when it is erased; `Ctrl-\ d`
+  are dropped, with a note on the bottom line from the first one; leaving
+  erases that line (once output has scrolled the note up, the line erased is
+  the session's latest). `Ctrl-\ d`
   still detaches (0), so `--escape none` is refused with it. It sends no
   window size, so a full-screen program shows nothing new until it next
   redraws, and then at the controlling terminal's size. A takeover leaves

@@ -431,7 +431,7 @@ fn a_reconnect_dial_that_exits_1_is_tried_again_on_windows() {
         "tendr: connection lost, attempt 1 failed, next in 1 s",
         "two",
     ]);
-    assert!(!dial_dies.exists(), "the first dial never ran");
+    assert!(!dial_dies.exists(), "the reconnect's dial never ran");
     client.type_bytes(DETACH);
     assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
 }
@@ -484,7 +484,8 @@ fn a_controller_shows_all_output_before_the_remote_s_exit() {
     })
     .unwrap();
     client.type_bytes(b"k");
-    // Time for the client to find its write failed: it looks every 100 ms.
+    // Time for the failed write to end the attach early, as it would without
+    // the drain: the relay looks for a connection's end every 100 ms.
     std::thread::sleep(Duration::from_millis(500));
     std::fs::remove_file(&hold).unwrap();
     assert_eq!(client.wait_exit(), 3, "{}", client.stderr());

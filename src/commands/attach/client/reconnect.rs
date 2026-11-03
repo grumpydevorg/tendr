@@ -26,6 +26,9 @@
 //! status: drawn on the last row at the first keystroke, it stays while the
 //! attach does, gives its row to a reconnect's status while one runs, comes
 //! back once the attach has resumed, and is erased when the attach ends.
+//! Nothing tracks where it went after that: session output that scrolls
+//! the screen moves the note up, and leaving then erases the last row,
+//! where the session's latest line is.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -272,9 +275,10 @@ impl Status {
     /// Note, once, that a read-only attach drops typed input: on the last
     /// row, on a thread of its own, as [`Self::discard`] does. The note is
     /// part of the status: it stays while the attach does, and leaving
-    /// erases it. A reconnect's status takes its row while it runs, and the
-    /// note is drawn again once the attach has resumed. The session's output
-    /// may draw over it meanwhile; it is not redrawn for that.
+    /// erases its row. A reconnect's status takes that row while it runs,
+    /// and the note is drawn again once the attach has resumed. The
+    /// session's output may draw over the note or scroll it up meanwhile;
+    /// it is neither redrawn nor followed for that.
     pub(in crate::commands::attach) fn read_only(self: &Arc<Self>, screen: &Arc<Screen>) {
         if !self.read_only_said.swap(true, Ordering::SeqCst) {
             let (status, screen) = (Arc::clone(self), Arc::clone(screen));

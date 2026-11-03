@@ -215,8 +215,10 @@ flowchart LR
   the controller's size, not its own.
 - `attach --read-only` is the watcher client: it drops keystrokes, says so
   on the terminal's last row at the first one, and still detaches with the
-  escape. The note is part of the status line: it stays while attached
-  (the session's output may draw over it), and leaving erases it. With
+  escape. The note is part of the status line: it stays while attached,
+  and leaving erases the last row it was drawn on. Session output may draw
+  over it or scroll it up meanwhile; the client does not follow it, so then
+  the row erased holds the session's latest line. With
   `--host` the attach bridge passes it through, and it reconnects as a
   watcher ([Attaching over `--host`](#attaching-over---host)).
 - With no terminal (stdin or stdout is not one), `attach --read-only`

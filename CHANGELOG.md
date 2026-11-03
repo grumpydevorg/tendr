@@ -15,8 +15,9 @@
   takeover. The escape and the signals still leave at once.
 - **A watcher's read-only note no longer stays on screen after it leaves.**
   `tendr: read-only attach; typed input is dropped` is now part of the
-  status line: it stays while attached, comes back after a reconnect, and is
-  erased when the attach ends.
+  status line: it stays while attached, comes back after a reconnect, and
+  its row is erased when the attach ends. Output that scrolled the note up
+  is not followed: the row erased is then the session's latest line.
 
 ## v0.7.0 — read-only viewers, Windows console attach
 
