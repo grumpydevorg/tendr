@@ -1,0 +1,23 @@
+[package]
+name = "tendr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tendr = { path = ".." }
+
+# A workspace of its own: building or testing tendr never builds this.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "escape_paste"
+path = "fuzz_targets/escape_paste.rs"
+test = false
+doc = false
+bench = false
