@@ -779,8 +779,9 @@ mod tests {
         ]
     }
 
-    /// Up to 16 KiB of pasted text that holds no paste end, even one
-    /// completed by the wrapper's.
+    /// Up to 16 KiB of pasted text that holds no paste end. It may end in a
+    /// partial one: no end straddles the wrapper's, so that is held and the
+    /// wrapper's end still ends the paste.
     fn paste_body() -> impl Strategy<Value = Vec<u8>> {
         proptest::collection::vec(paste_piece(), 0..24).prop_map(|pieces| {
             let mut body = pieces.concat();
@@ -789,14 +790,11 @@ mod tests {
         })
     }
 
-    /// `body` with every paste end broken (its `~` dropped) and anything at
-    /// its end that could begin one trimmed.
+    /// `body` with every paste end broken (its `~` dropped), until none is
+    /// left: dropping one `~` can join the bytes around it into another.
     fn marker_safe(mut body: Vec<u8>) -> Vec<u8> {
         while let Some(at) = body.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
             body.remove(at + PASTE_END.len() - 1);
-        }
-        while (1..PASTE_END.len()).any(|n| body.ends_with(&PASTE_END[..n])) {
-            body.pop();
         }
         body
     }

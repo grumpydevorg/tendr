@@ -32,14 +32,11 @@ fuzz_target!(|data: &[u8]| {
     check(&input, &reads(&input, &cuts, PASTE_START.len()), true);
 });
 
-/// `body` with every paste end broken (its `~` dropped) and anything at its
-/// end that could begin one trimmed.
+/// `body` with every paste end broken (its `~` dropped), until none is left:
+/// dropping one `~` can join the bytes around it into another.
 fn marker_safe(mut body: Vec<u8>) -> Vec<u8> {
     while let Some(at) = body.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
         body.remove(at + PASTE_END.len() - 1);
-    }
-    while (1..PASTE_END.len()).any(|n| body.ends_with(&PASTE_END[..n])) {
-        body.pop();
     }
     body
 }
