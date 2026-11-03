@@ -482,6 +482,7 @@ decides:
 |`MSG_OUTPUT_END` at the offset reached|end, the run's output complete|
 |stream closed, a resume point and no takeover|reconnect over `--host`; locally, end: 0, or 84 for a watcher promised an end|
 |stream closed otherwise|end: the remote's code (0 locally), 81 after a takeover|
+|the reader panicked|the attach panics too (exit 101), its terminal restored: a bug, never a reason to reconnect|
 
 A leave that arrived as the session's side ended wins over that end. A
 takeover is noted as the reader sees `MSG_RETIRED`, apart from its end,

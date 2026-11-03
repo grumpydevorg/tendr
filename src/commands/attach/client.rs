@@ -123,17 +123,14 @@ pub(in crate::commands::attach) enum EndNotice {
     Unknown,
 }
 
-/// One connection's paths to the session: the sender, writing its
-/// outbox, and the reader.
+/// One connection's paths to the session: what goes out, and the reader.
 struct Connection {
-    outbox: Arc<Outbox>,
-    access: Access,
-    /// The reader, until its end is taken ([`Connection::end`]). A failed
-    /// write by the sender ends nothing by itself: the session's last
-    /// output may still be on its way to the terminal, and ends with the
-    /// reader.
-    reader: Option<std::thread::JoinHandle<ReaderEnd>>,
-    close: Box<dyn FnOnce() + Send>,
+    outgoing: Outgoing,
+    /// The reader thread, whose result is how the connection ended. A
+    /// failed write by the sender ends nothing by itself: the session's
+    /// last output may still be on its way to the terminal, and ends with
+    /// the reader.
+    reader: std::thread::JoinHandle<ReaderEnd>,
 }
 
 impl Connection {
@@ -142,24 +139,40 @@ impl Connection {
         spawn_sender(link.writer, Arc::clone(&outbox));
         let reader = spawn_reader(link.reader, Arc::clone(retired), Arc::clone(screen));
         Self {
-            outbox,
-            access,
-            reader: Some(reader),
-            close: link.close,
+            outgoing: Outgoing {
+                outbox,
+                access,
+                close: link.close,
+            },
+            reader,
         }
     }
 
-    /// How the connection ended, once its reader is done: every byte of
-    /// output it delivered is on the terminal, or never will be. Given
-    /// once; `None` before then, and after.
-    fn end(&mut self) -> Option<ReaderEnd> {
-        if !self.reader.as_ref()?.is_finished() {
-            return None;
+    /// How the connection ended, once its reader is done, with what still
+    /// goes out on it: every byte of output the reader delivered is on the
+    /// terminal, or never will be. The connection comes back while the
+    /// reader runs. A reader that panicked panics the relay too: a bug, not
+    /// an end to reconnect after. The terminal is restored as it unwinds.
+    fn end(self) -> Result<(ReaderEnd, Outgoing), Self> {
+        if !self.reader.is_finished() {
+            return Err(self);
         }
-        // A reader that panicked writes nothing more, as a closed one.
-        Some(self.reader.take()?.join().unwrap_or(ReaderEnd::Closed))
+        match self.reader.join() {
+            Ok(end) => Ok((end, self.outgoing)),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
+}
 
+/// What a connection sends the session: the outbox its sender thread
+/// writes, and how to end the connection.
+struct Outgoing {
+    outbox: Arc<Outbox>,
+    access: Access,
+    close: Box<dyn FnOnce() + Send>,
+}
+
+impl Outgoing {
     /// Send the terminal's size, then the repaint nudge: an attach at
     /// the session's size makes the child draw nothing, so the sidecar
     /// nudges it into redrawing, which only a resize lets apply. A
@@ -229,10 +242,14 @@ pub(super) fn relay(
 ) -> anyhow::Result<i32> {
     let (recorded_takeover, host) = match peer {
         Peer::Local { recorded_takeover } => (Some(recorded_takeover), None),
-        Peer::Host(end) => (None, Some(*end)),
+        Peer::Host(end) => (None, Some(end)),
     };
     // Only a version 2 attach knows where to resume from.
-    let resumable = resume.is_some();
+    let resumable = if resume.is_some() {
+        Resumable::Yes
+    } else {
+        Resumable::No
+    };
     // Set by a reader the session told of a takeover. Not part of its
     // end: the session closes the connection after telling, and a leave
     // in between still reports the takeover.
@@ -263,7 +280,7 @@ pub(super) fn relay(
 
     let mut size = screen.size();
     let connection = Connection::open(link, access, &retired, &screen);
-    connection.greet(size);
+    connection.outgoing.greet(size);
     let mut phase = Phase::Attached { connection, host };
 
     let size_poll = size_poll_interval();
@@ -271,53 +288,58 @@ pub(super) fn relay(
     let mut parser = EscapeParser::new(escape);
     let mut buf = [0u8; 4096];
     let mut dropped = 0usize;
-    let (ending, phase) = loop {
+    let (ending, held) = loop {
         phase = match phase {
-            Phase::Attached {
-                mut connection,
-                host,
-            } => match connection.end() {
-                None => Phase::Attached { connection, host },
-                Some(end) => match (
-                    after_reader(end, resumable, retired.load(Ordering::SeqCst)),
-                    host,
-                ) {
-                    (None, Some(host)) => {
-                        connection.close();
-                        Phase::Reconnecting(reconnect::Job::start(
-                            host,
-                            Arc::clone(&screen),
-                            Arc::clone(&status),
-                        ))
+            Phase::Attached { connection, host } => match connection.end() {
+                Err(connection) => Phase::Attached { connection, host },
+                Ok((end, outgoing)) => {
+                    let takeover = if retired.load(Ordering::SeqCst) {
+                        Takeover::Told
+                    } else {
+                        Takeover::None
+                    };
+                    match (after_reader(end, resumable, takeover), host) {
+                        (None, Some(host)) => {
+                            outgoing.close();
+                            Phase::Reconnecting(reconnect::Job::start(
+                                *host,
+                                Arc::clone(&screen),
+                                Arc::clone(&status),
+                            ))
+                        }
+                        // A local socket has no link to lose: its close is
+                        // the session's end.
+                        (None, None) => {
+                            let ending = settle(
+                                Ending::Session(SessionEnd::Closed),
+                                terminal.as_mut(),
+                                &mut buf,
+                            );
+                            break (
+                                ending,
+                                Held::Outgoing {
+                                    outgoing,
+                                    host: None,
+                                },
+                            );
+                        }
+                        (Some(ending), host) => {
+                            let ending = settle(ending, terminal.as_mut(), &mut buf);
+                            let host = host.map(|host| *host);
+                            break (ending, Held::Outgoing { outgoing, host });
+                        }
                     }
-                    // A local socket has no link to lose: its close is the
-                    // session's end.
-                    (None, None) => {
-                        let ending = settle(
-                            Ending::Session(SessionEnd::Closed),
-                            terminal.as_mut(),
-                            &mut buf,
-                        );
-                        break (
-                            ending,
-                            Phase::Attached {
-                                connection,
-                                host: None,
-                            },
-                        );
-                    }
-                    (Some(ending), host) => {
-                        let ending = settle(ending, terminal.as_mut(), &mut buf);
-                        break (ending, Phase::Attached { connection, host });
-                    }
-                },
+                }
             },
             Phase::Reconnecting(job) => match job.outcome() {
                 None => Phase::Reconnecting(job),
                 Some((host, reconnect::Outcome::Resumed(link))) => {
                     let connection = Connection::open(link, access, &retired, &screen);
-                    connection.greet(size);
-                    Phase::Attached { connection, host }
+                    connection.outgoing.greet(size);
+                    Phase::Attached {
+                        connection,
+                        host: host.map(Box::new),
+                    }
                 }
                 Some((host, reconnect::Outcome::Ended(verdict))) => {
                     let ending = settle(
@@ -325,11 +347,9 @@ pub(super) fn relay(
                         terminal.as_mut(),
                         &mut buf,
                     );
-                    break (ending, Phase::Ended { host });
+                    break (ending, Held::Host(host));
                 }
             },
-            // Entered only as the relay ends.
-            phase @ Phase::Ended { .. } => phase,
         };
         let mut timeout = size_due.saturating_duration_since(Instant::now()).min(POLL);
         if let Some(due) = parser.partial_deadline() {
@@ -339,8 +359,8 @@ pub(super) fn relay(
             Input::Bytes(n) => (Some(n), false),
             Input::SizeDue => (None, true),
             Input::Wake => (None, false),
-            Input::Leave(leave) => break (Ending::Left(leave), phase),
-            Input::Closed => break (Ending::KeyboardClosed, phase),
+            Input::Leave(leave) => break (Ending::Left(leave), phase.into()),
+            Input::Closed => break (Ending::KeyboardClosed, phase.into()),
         };
         if resized {
             // Size notices coalesce, so this only brings the check forward;
@@ -354,8 +374,8 @@ pub(super) fn relay(
                 size = now;
                 // While reconnecting, the size goes with the next
                 // connection's greeting.
-                if let (Some(connection), Some(size)) = (phase.connection(), now) {
-                    connection.resize(size);
+                if let (Some(outgoing), Some(size)) = (phase.outgoing(), now) {
+                    outgoing.resize(size);
                 }
             }
         }
@@ -371,7 +391,7 @@ pub(super) fn relay(
             let mut forward = Vec::new();
             parser.flush_expired(Instant::now(), &mut forward);
             send_keystrokes(
-                phase.connection(),
+                phase.outgoing(),
                 access,
                 &status,
                 &screen,
@@ -384,7 +404,7 @@ pub(super) fn relay(
         parser.set_bracketed_paste(screen.bracketed_paste.load(Ordering::SeqCst));
         let decision = parser.feed(&buf[..n], &mut forward);
         send_keystrokes(
-            phase.connection(),
+            phase.outgoing(),
             access,
             &status,
             &screen,
@@ -392,27 +412,27 @@ pub(super) fn relay(
             &mut dropped,
         );
         if decision == Escape::Detach {
-            break (Ending::Detached, phase);
+            break (Ending::Detached, phase.into());
         }
     };
 
-    let mut host = match phase {
-        Phase::Attached { connection, host } => {
+    let mut host = match held {
+        Held::Outgoing { outgoing, host } => {
             if matches!(
                 ending,
                 Ending::Detached | Ending::Left(_) | Ending::OutputGone
             ) {
-                connection.outbox.push_control(Frame::Detach);
-                connection.outbox.wait_controls_sent(DETACH_GRACE);
+                outgoing.outbox.push_control(Frame::Detach);
+                outgoing.outbox.wait_controls_sent(DETACH_GRACE);
             }
             // Unblocks the sender and reader, which are not waited for.
-            connection.close();
+            outgoing.close();
             host
         }
         // Leaving while reconnecting: stop it, and its ssh. A connection it
         // resumed just now ends as it is dropped, which closes ssh's stdin.
-        Phase::Reconnecting(job) => job.stop(RECONNECT_STOP_GRACE).and_then(|(host, _)| host),
-        Phase::Ended { host } => host,
+        Held::Reconnecting(job) => job.stop(RECONNECT_STOP_GRACE).and_then(|(host, _)| host),
+        Held::Host(host) => host,
     };
     turn_off_modes(
         &screen,
@@ -462,23 +482,150 @@ pub(super) fn relay(
             super::SSH_LEAVE_GRACE
         })
     });
+    let watched = (access == Access::ReadOnly).then(|| Watched {
+        end,
+        written: screen.written.load(Ordering::SeqCst),
+    });
+    let (code, note) = verdict(ending, taken_over, finished, watched);
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    code
+}
+
+/// Where the relay is: what it holds, and so what leaving must close.
+enum Phase {
+    /// Relaying over a connection. `host` is ssh's end for `attach --host`,
+    /// boxed: the phase is moved on every turn of the relay.
+    Attached {
+        connection: Connection,
+        host: Option<Box<super::HostEnd>>,
+    },
+    /// The link was lost; the reconnect holds ssh's end until it resumes
+    /// or ends. Keystrokes are discarded.
+    Reconnecting(reconnect::Job),
+}
+
+impl Phase {
+    /// Where keystrokes and sizes go, if anywhere.
+    fn outgoing(&self) -> Option<&Outgoing> {
+        match self {
+            Phase::Attached { connection, .. } => Some(&connection.outgoing),
+            Phase::Reconnecting(_) => None,
+        }
+    }
+}
+
+/// What the relay still holds as it ends, for leaving to close.
+enum Held {
+    /// A connection's way out, its reader done or left running, and
+    /// ssh's end.
+    Outgoing {
+        outgoing: Outgoing,
+        host: Option<super::HostEnd>,
+    },
+    /// A reconnect, still running.
+    Reconnecting(reconnect::Job),
+    /// Only ssh's end: a reconnect ended without resuming.
+    Host(Option<super::HostEnd>),
+}
+
+impl From<Phase> for Held {
+    /// The relay ends in `phase`. A connection's reader is left running,
+    /// not waited for.
+    fn from(phase: Phase) -> Self {
+        match phase {
+            Phase::Attached { connection, host } => Held::Outgoing {
+                outgoing: connection.outgoing,
+                host: host.map(|host| *host),
+            },
+            Phase::Reconnecting(job) => Held::Reconnecting(job),
+        }
+    }
+}
+
+/// Whether a closed connection can be resumed: only a version 2 attach
+/// knows the offset to resume from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resumable {
+    Yes,
+    No,
+}
+
+/// Whether the session told this attach another client took it over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Takeover {
+    None,
+    Told,
+}
+
+/// What a connection's end means for the relay: `None` to reconnect,
+/// which only a connection that closed where it can be resumed, without a
+/// takeover, may do. A complete run's output, a broken frame and a
+/// takeover are the session's word, and a terminal that refused output
+/// leaves nothing to reconnect for.
+fn after_reader(end: ReaderEnd, resumable: Resumable, takeover: Takeover) -> Option<Ending> {
+    match end {
+        ReaderEnd::TerminalGone => Some(Ending::OutputGone),
+        ReaderEnd::Broken(why) => Some(Ending::Broken(why)),
+        ReaderEnd::OutputComplete => Some(Ending::Session(SessionEnd::OutputComplete)),
+        ReaderEnd::Closed if resumable == Resumable::Yes && takeover == Takeover::None => None,
+        ReaderEnd::Closed => Some(Ending::Session(SessionEnd::Closed)),
+    }
+}
+
+/// A watcher's account at the end: whether its session promised to say
+/// where the run's output ends, and how many bytes of it were written.
+struct Watched {
+    end: EndNotice,
+    written: u64,
+}
+
+/// The attach's exit code, and a note for stderr, from how the relay
+/// ended, whether another client took this one over (never after a
+/// detach), ssh's end (`finished`, for `--host`) and, for a watcher, its
+/// account. The first that applies decides: output outside the protocol
+/// (80), a takeover (81), output that could not be written (1), the user's
+/// own end (0), then the session's: the remote's verdict, else ssh's, else
+/// 0. A watcher promised the end of the output that did not get it was cut
+/// off (84); one not promised it has the bytes it had reported when the
+/// session's code is 84.
+fn verdict(
+    ending: Ending,
+    taken_over: bool,
+    finished: Option<anyhow::Result<i32>>,
+    watched: Option<Watched>,
+) -> (anyhow::Result<i32>, Option<String>) {
+    debug_assert!(
+        !(taken_over && matches!(ending, Ending::Detached)),
+        "a detach is never a takeover"
+    );
     let session = match ending {
         Ending::Broken(why) => {
-            return Err(PtyExitCode::Protocol.error(anyhow::anyhow!("tendr: {why}")));
+            return (
+                Err(PtyExitCode::Protocol.error(anyhow::anyhow!("tendr: {why}"))),
+                None,
+            );
         }
         // This client lost control: a controller conflict, which a script
         // must be able to tell from a detach.
         _ if taken_over => {
-            return Err(PtyExitCode::Control.error(anyhow::anyhow!(
-                "tendr: another client took over this session"
-            )));
+            return (
+                Err(PtyExitCode::Control.error(anyhow::anyhow!(
+                    "tendr: another client took over this session"
+                ))),
+                None,
+            );
         }
         Ending::OutputGone => {
-            return Err(anyhow::anyhow!(
-                "tendr: the output closed; detached from the session"
-            ));
+            return (
+                Err(anyhow::anyhow!(
+                    "tendr: the output closed; detached from the session"
+                )),
+                None,
+            );
         }
-        Ending::Detached | Ending::KeyboardClosed | Ending::Left(_) => return Ok(0),
+        Ending::Detached | Ending::KeyboardClosed | Ending::Left(_) => return (Ok(0), None),
         Ending::Session(session) => session,
     };
     // The far side ended the connection: the remote's code, or ssh's
@@ -488,61 +635,23 @@ pub(super) fn relay(
         SessionEnd::Closed => (finished.unwrap_or(Ok(0)), false),
         SessionEnd::OutputComplete => (finished.unwrap_or(Ok(0)), true),
     };
-    if access == Access::ReadOnly && !complete {
-        let written = screen.written.load(Ordering::SeqCst);
-        match end {
-            EndNotice::Promised => {
-                return Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
-                    "tendr: the session cut this read-only attach off after {written} bytes of the run's output, before its end"
-                )));
-            }
-            EndNotice::Unknown if matches!(code, Ok(code) if code == PtyExitCode::Runtime.code()) =>
-            {
-                eprintln!("tendr: this read-only attach had {written} bytes of the run's output");
-            }
-            EndNotice::Unknown => {}
-        }
-    }
-    code
-}
-
-/// Where the relay is: what it holds, and so what leaving must close.
-enum Phase {
-    /// Relaying over a connection. `host` is ssh's end for `attach --host`.
-    Attached {
-        connection: Connection,
-        host: Option<super::HostEnd>,
-    },
-    /// The link was lost; the reconnect holds ssh's end until it resumes
-    /// or ends. Keystrokes are discarded.
-    Reconnecting(reconnect::Job),
-    /// A reconnect ended without resuming, leaving only ssh's end. The
-    /// relay ends as it enters this phase.
-    Ended { host: Option<super::HostEnd> },
-}
-
-impl Phase {
-    /// The connection keystrokes and sizes go to, if there is one.
-    fn connection(&self) -> Option<&Connection> {
-        match self {
-            Phase::Attached { connection, .. } => Some(connection),
-            Phase::Reconnecting(_) | Phase::Ended { .. } => None,
-        }
-    }
-}
-
-/// What a connection's end means for the relay: `None` to reconnect,
-/// which only a connection that closed where it can be resumed
-/// (`resumable`), without a takeover (`retired`), may do. A complete run's
-/// output, a broken frame and a takeover are the session's word, and a
-/// terminal that refused output leaves nothing to reconnect for.
-fn after_reader(end: ReaderEnd, resumable: bool, retired: bool) -> Option<Ending> {
+    let Some(Watched { end, written }) = watched.filter(|_| !complete) else {
+        return (code, None);
+    };
     match end {
-        ReaderEnd::TerminalGone => Some(Ending::OutputGone),
-        ReaderEnd::Broken(why) => Some(Ending::Broken(why)),
-        ReaderEnd::OutputComplete => Some(Ending::Session(SessionEnd::OutputComplete)),
-        ReaderEnd::Closed if resumable && !retired => None,
-        ReaderEnd::Closed => Some(Ending::Session(SessionEnd::Closed)),
+        EndNotice::Promised => (
+            Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
+                "tendr: the session cut this read-only attach off after {written} bytes of the run's output, before its end"
+            ))),
+            None,
+        ),
+        EndNotice::Unknown if matches!(code, Ok(code) if code == PtyExitCode::Runtime.code()) => (
+            code,
+            Some(format!(
+                "tendr: this read-only attach had {written} bytes of the run's output"
+            )),
+        ),
+        EndNotice::Unknown => (code, None),
     }
 }
 
@@ -561,7 +670,7 @@ fn settle(ending: Ending, terminal: &mut dyn Raw, buf: &mut [u8]) -> Ending {
 /// discarded: never sent late to a program that has moved on. A
 /// read-only attach drops them all, and says so once.
 fn send_keystrokes(
-    connection: Option<&Connection>,
+    outgoing: Option<&Outgoing>,
     access: Access,
     status: &Arc<reconnect::Status>,
     screen: &Arc<Screen>,
@@ -575,12 +684,12 @@ fn send_keystrokes(
         status.read_only(screen);
         return;
     }
-    let Some(connection) = connection else {
+    let Some(outgoing) = outgoing else {
         status.discard(screen);
         return;
     };
     let len = forward.len();
-    if !connection.outbox.push_data(forward) {
+    if !outgoing.outbox.push_data(forward) {
         *dropped += len;
     }
 }
@@ -632,7 +741,7 @@ enum SessionEnd {
 /// Why a connection's reader stopped. It is the reader thread's result,
 /// so the relay learns it only once the reader is done, with every byte
 /// it will write on the terminal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 enum ReaderEnd {
     /// The stream ended or failed: the session closed the connection, or
     /// the link was lost. Also how a reader stops as the relay leaves,
@@ -1145,9 +1254,9 @@ mod tests {
     /// else held.
     #[test]
     fn only_a_plain_close_with_a_resume_point_and_no_takeover_reconnects() {
-        for resumable in [false, true] {
-            for retired in [false, true] {
-                let next = |end| after_reader(end, resumable, retired);
+        for resumable in [Resumable::No, Resumable::Yes] {
+            for takeover in [Takeover::None, Takeover::Told] {
+                let next = |end| after_reader(end, resumable, takeover);
                 assert!(matches!(
                     next(ReaderEnd::TerminalGone),
                     Some(Ending::OutputGone)
@@ -1161,14 +1270,152 @@ mod tests {
                     Some(Ending::Session(SessionEnd::OutputComplete))
                 ));
                 let closed = next(ReaderEnd::Closed);
-                if resumable && !retired {
+                if resumable == Resumable::Yes && takeover == Takeover::None {
                     assert!(closed.is_none(), "{closed:?}");
                 } else {
                     assert!(
                         matches!(closed, Some(Ending::Session(SessionEnd::Closed))),
-                        "resumable {resumable}, retired {retired}: {closed:?}"
+                        "{resumable:?}, {takeover:?}: {closed:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The exit code's order of precedence: a broken protocol over a
+    /// takeover, a takeover over output that could not be written, the
+    /// user's own end next, then the session's, where the remote's verdict
+    /// wins over ssh's end. A watcher promised the end of the output exits
+    /// 84 short of it, whatever the session's code; one not promised it
+    /// keeps the code, with a note of its bytes only when that code is 84.
+    #[test]
+    fn the_exit_code_follows_the_ends_precedence() {
+        use tendr::pty_exit::exit_code;
+        struct Case {
+            name: &'static str,
+            ending: Ending,
+            taken_over: bool,
+            finished: Option<anyhow::Result<i32>>,
+            watched: Option<EndNotice>,
+            code: i32,
+            noted: bool,
+        }
+        let case = |name, ending, taken_over, finished, watched, code| Case {
+            name,
+            ending,
+            taken_over,
+            finished,
+            watched,
+            code,
+            noted: false,
+        };
+        let closed = || Ending::Session(SessionEnd::Closed);
+        let cases = [
+            case(
+                "broken over takeover",
+                Ending::Broken("why".into()),
+                true,
+                Some(Ok(0)),
+                None,
+                80,
+            ),
+            case(
+                "takeover over the session",
+                closed(),
+                true,
+                Some(Ok(7)),
+                None,
+                81,
+            ),
+            case(
+                "takeover over output gone",
+                Ending::OutputGone,
+                true,
+                None,
+                None,
+                81,
+            ),
+            case(
+                "output gone",
+                Ending::OutputGone,
+                false,
+                Some(Ok(7)),
+                None,
+                1,
+            ),
+            case("detach", Ending::Detached, false, Some(Ok(7)), None, 0),
+            case(
+                "keyboard closed",
+                Ending::KeyboardClosed,
+                false,
+                Some(Ok(7)),
+                None,
+                0,
+            ),
+            case("ssh's end", closed(), false, Some(Ok(7)), None, 7),
+            case("no ssh", closed(), false, None, None, 0),
+            case(
+                "the remote's verdict over ssh's end",
+                Ending::Session(SessionEnd::Remote(Ok(3))),
+                false,
+                Some(Ok(7)),
+                None,
+                3,
+            ),
+            case(
+                "a controller at 84",
+                closed(),
+                false,
+                Some(Ok(84)),
+                None,
+                84,
+            ),
+            case(
+                "a promised watcher cut off",
+                closed(),
+                false,
+                Some(Ok(0)),
+                Some(EndNotice::Promised),
+                84,
+            ),
+            case(
+                "a promised watcher with all of it",
+                Ending::Session(SessionEnd::OutputComplete),
+                false,
+                Some(Ok(0)),
+                Some(EndNotice::Promised),
+                0,
+            ),
+            case(
+                "an unpromised watcher",
+                closed(),
+                false,
+                Some(Ok(0)),
+                Some(EndNotice::Unknown),
+                0,
+            ),
+            Case {
+                noted: true,
+                ..case(
+                    "an unpromised watcher at 84",
+                    closed(),
+                    false,
+                    Some(Ok(84)),
+                    Some(EndNotice::Unknown),
+                    84,
+                )
+            },
+        ];
+        for c in cases {
+            let watched = c.watched.map(|end| Watched { end, written: 42 });
+            let (result, note) = verdict(c.ending, c.taken_over, c.finished, watched);
+            let message = result.as_ref().err().map(|e| format!("{e:#}"));
+            let code = result.unwrap_or_else(|e| exit_code(&e));
+            assert_eq!(code, c.code, "{}", c.name);
+            assert_eq!(note.is_some(), c.noted, "{}: {note:?}", c.name);
+            if c.code == 84 && c.watched == Some(EndNotice::Promised) {
+                let message = message.unwrap_or_default();
+                assert!(message.contains("after 42 bytes"), "{}: {message}", c.name);
             }
         }
     }
