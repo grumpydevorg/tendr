@@ -32,7 +32,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tendr::attach_escape::{Escape, EscapeMode, EscapeParser};
@@ -128,12 +128,11 @@ pub(in crate::commands::attach) enum EndNotice {
 struct Connection {
     outbox: Arc<Outbox>,
     access: Access,
-    /// Done once the connection has ended: at the end of the session's
-    /// output, or once the terminal refused it, the relay left, or the
-    /// output broke the protocol. A failed write by the sender ends
-    /// nothing by itself: the session's last output may still be on its
-    /// way to the terminal, and ends with the reader.
-    reader: std::thread::JoinHandle<()>,
+    /// The reader, until its end is taken ([`Connection::end`]). A failed
+    /// write by the sender ends nothing by itself: the session's last
+    /// output may still be on its way to the terminal, and ends with the
+    /// reader.
+    reader: Option<std::thread::JoinHandle<ReaderEnd>>,
     close: Box<dyn FnOnce() + Send>,
 }
 
@@ -145,15 +144,20 @@ impl Connection {
         Self {
             outbox,
             access,
-            reader,
+            reader: Some(reader),
             close: link.close,
         }
     }
 
-    /// Whether the connection has ended: its reader is done, so every byte
-    /// of output it delivered is on the terminal, or never will be.
-    fn ended(&self) -> bool {
-        self.reader.is_finished()
+    /// How the connection ended, once its reader is done: every byte of
+    /// output it delivered is on the terminal, or never will be. Given
+    /// once; `None` before then, and after.
+    fn end(&mut self) -> Option<ReaderEnd> {
+        if !self.reader.as_ref()?.is_finished() {
+            return None;
+        }
+        // A reader that panicked writes nothing more, as a closed one.
+        Some(self.reader.take()?.join().unwrap_or(ReaderEnd::Closed))
     }
 
     /// Send the terminal's size, then the repaint nudge: an attach at
@@ -192,10 +196,11 @@ impl Connection {
 /// attach's stamped output starts, a controller's or a watcher's; `None`
 /// for version 1.
 ///
-/// The far side's end of a connection counts once its reader is done, so
-/// whatever ends the attach, the session's last output reaches the terminal
-/// first. A failed write to the session only means that end is on its way;
-/// the keyboard stays live while the reader drains.
+/// The relay is in one [`Phase`] at a time. A connection's end counts once
+/// its reader is done ([`ReaderEnd`]), so whatever ends the attach, the
+/// session's last output reaches the terminal first; [`after_reader`]
+/// decides what that end means. A failed write to the session only means
+/// that end is on its way; the keyboard stays live while the reader drains.
 ///
 /// The session's end of output ([`Frame::OutputEnd`]) ends the relay as the
 /// session closing the connection does, never as a lost link, and must be
@@ -222,12 +227,15 @@ pub(super) fn relay(
     terminal: Box<dyn Terminal>,
     end: EndNotice,
 ) -> anyhow::Result<i32> {
-    let (recorded_takeover, mut host) = match peer {
+    let (recorded_takeover, host) = match peer {
         Peer::Local { recorded_takeover } => (Some(recorded_takeover), None),
         Peer::Host(end) => (None, Some(*end)),
     };
     // Only a version 2 attach knows where to resume from.
     let resumable = resume.is_some();
+    // Set by a reader the session told of a takeover. Not part of its
+    // end: the session closes the connection after telling, and a leave
+    // in between still reports the takeover.
     let retired = Arc::new(AtomicBool::new(false));
     let status = Arc::new(reconnect::Status::default());
 
@@ -241,9 +249,6 @@ pub(super) fn relay(
         }),
         done: AtomicBool::new(false),
         bracketed_paste: AtomicBool::new(false),
-        broken: OnceLock::new(),
-        terminal_gone: AtomicBool::new(false),
-        ended: AtomicBool::new(false),
         written: AtomicU64::new(0),
         output: terminal.output(),
     });
@@ -257,72 +262,75 @@ pub(super) fn relay(
     }
 
     let mut size = screen.size();
-    let mut connection = Some(Connection::open(link, access, &retired, &screen));
-    let mut reconnecting: Option<reconnect::Job> = None;
-    if let Some(connection) = &connection {
-        connection.greet(size);
-    }
-    // The remote's exit code, or its failure, when a reconnect ended the
-    // attach.
-    let mut verdict = None;
+    let connection = Connection::open(link, access, &retired, &screen);
+    connection.greet(size);
+    let mut phase = Phase::Attached { connection, host };
 
     let size_poll = size_poll_interval();
     let mut size_due = Instant::now() + size_poll;
     let mut parser = EscapeParser::new(escape);
     let mut buf = [0u8; 4096];
     let mut dropped = 0usize;
-    let ending = loop {
-        // Only once its reader is done: the session's last output reaches
-        // the terminal before anything ends the attach or reconnects, and
-        // the reader has seen any retirement, end of output or broken frame
-        // that decides which. A failed write meanwhile is the same end on
-        // its way. The keyboard stays live while the reader drains.
-        if connection.as_ref().is_some_and(Connection::ended) {
-            // The terminal, or stdout without one, refused the output (a
-            // pipeline's consumer gone): nothing to reconnect for, and the
-            // session is still there to tell.
-            if screen.terminal_gone.load(Ordering::SeqCst) {
-                break Ending::OutputGone;
-            }
-            // The end of the output is the session's end, not a lost link.
-            let lost = resumable
-                && !retired.load(Ordering::SeqCst)
-                && screen.broken.get().is_none()
-                && !screen.ended.load(Ordering::SeqCst);
-            match (host.take(), connection.take()) {
-                (Some(end), Some(old)) if lost => {
-                    old.close();
-                    reconnecting = Some(reconnect::Job::start(
-                        end,
-                        Arc::clone(&screen),
-                        Arc::clone(&status),
-                    ));
-                }
-                (end, old) => {
-                    (host, connection) = (end, old);
-                    break pending_leave(terminal.as_mut(), &mut buf)
-                        .map_or(Ending::SessionClosed, Ending::Left);
-                }
-            }
-        }
-        if let Some((end, outcome)) = reconnecting.as_ref().and_then(reconnect::Job::outcome) {
-            reconnecting = None;
-            host = end;
-            match outcome {
-                reconnect::Outcome::Resumed(link) => {
-                    let resumed = Connection::open(link, access, &retired, &screen);
-                    resumed.greet(size);
-                    connection = Some(resumed);
-                }
-                reconnect::Outcome::Ended(result) => {
-                    if let Some(leave) = pending_leave(terminal.as_mut(), &mut buf) {
-                        break Ending::Left(leave);
+    let (ending, phase) = loop {
+        phase = match phase {
+            Phase::Attached {
+                mut connection,
+                host,
+            } => match connection.end() {
+                None => Phase::Attached { connection, host },
+                Some(end) => match (
+                    after_reader(end, resumable, retired.load(Ordering::SeqCst)),
+                    host,
+                ) {
+                    (None, Some(host)) => {
+                        connection.close();
+                        Phase::Reconnecting(reconnect::Job::start(
+                            host,
+                            Arc::clone(&screen),
+                            Arc::clone(&status),
+                        ))
                     }
-                    verdict = Some(result);
-                    break Ending::SessionClosed;
+                    // A local socket has no link to lose: its close is the
+                    // session's end.
+                    (None, None) => {
+                        let ending = settle(
+                            Ending::Session(SessionEnd::Closed),
+                            terminal.as_mut(),
+                            &mut buf,
+                        );
+                        break (
+                            ending,
+                            Phase::Attached {
+                                connection,
+                                host: None,
+                            },
+                        );
+                    }
+                    (Some(ending), host) => {
+                        let ending = settle(ending, terminal.as_mut(), &mut buf);
+                        break (ending, Phase::Attached { connection, host });
+                    }
+                },
+            },
+            Phase::Reconnecting(job) => match job.outcome() {
+                None => Phase::Reconnecting(job),
+                Some((host, reconnect::Outcome::Resumed(link))) => {
+                    let connection = Connection::open(link, access, &retired, &screen);
+                    connection.greet(size);
+                    Phase::Attached { connection, host }
                 }
-            }
-        }
+                Some((host, reconnect::Outcome::Ended(verdict))) => {
+                    let ending = settle(
+                        Ending::Session(SessionEnd::Remote(verdict)),
+                        terminal.as_mut(),
+                        &mut buf,
+                    );
+                    break (ending, Phase::Ended { host });
+                }
+            },
+            // Entered only as the relay ends.
+            phase @ Phase::Ended { .. } => phase,
+        };
         let mut timeout = size_due.saturating_duration_since(Instant::now()).min(POLL);
         if let Some(due) = parser.partial_deadline() {
             timeout = timeout.min(due.saturating_duration_since(Instant::now()));
@@ -331,8 +339,8 @@ pub(super) fn relay(
             Input::Bytes(n) => (Some(n), false),
             Input::SizeDue => (None, true),
             Input::Wake => (None, false),
-            Input::Leave(leave) => break Ending::Left(leave),
-            Input::Closed => break Ending::KeyboardClosed,
+            Input::Leave(leave) => break (Ending::Left(leave), phase),
+            Input::Closed => break (Ending::KeyboardClosed, phase),
         };
         if resized {
             // Size notices coalesce, so this only brings the check forward;
@@ -346,7 +354,7 @@ pub(super) fn relay(
                 size = now;
                 // While reconnecting, the size goes with the next
                 // connection's greeting.
-                if let (Some(connection), Some(size)) = (&connection, now) {
+                if let (Some(connection), Some(size)) = (phase.connection(), now) {
                     connection.resize(size);
                 }
             }
@@ -363,7 +371,7 @@ pub(super) fn relay(
             let mut forward = Vec::new();
             parser.flush_expired(Instant::now(), &mut forward);
             send_keystrokes(
-                connection.as_ref(),
+                phase.connection(),
                 access,
                 &status,
                 &screen,
@@ -376,7 +384,7 @@ pub(super) fn relay(
         parser.set_bracketed_paste(screen.bracketed_paste.load(Ordering::SeqCst));
         let decision = parser.feed(&buf[..n], &mut forward);
         send_keystrokes(
-            connection.as_ref(),
+            phase.connection(),
             access,
             &status,
             &screen,
@@ -384,30 +392,28 @@ pub(super) fn relay(
             &mut dropped,
         );
         if decision == Escape::Detach {
-            break Ending::Detached;
+            break (Ending::Detached, phase);
         }
     };
 
-    if let Some(connection) = &connection {
-        if matches!(
-            ending,
-            Ending::Detached | Ending::Left(_) | Ending::OutputGone
-        ) {
-            connection.outbox.push_control(Frame::Detach);
-            connection.outbox.wait_controls_sent(DETACH_GRACE);
+    let mut host = match phase {
+        Phase::Attached { connection, host } => {
+            if matches!(
+                ending,
+                Ending::Detached | Ending::Left(_) | Ending::OutputGone
+            ) {
+                connection.outbox.push_control(Frame::Detach);
+                connection.outbox.wait_controls_sent(DETACH_GRACE);
+            }
+            // Unblocks the sender and reader, which are not waited for.
+            connection.close();
+            host
         }
-    }
-    // Unblocks the sender and reader, which are not waited for.
-    if let Some(connection) = connection {
-        connection.close();
-    }
-    // Leaving while reconnecting: stop it, and its ssh. A connection it
-    // resumed just now ends as it is dropped, which closes ssh's stdin.
-    if let Some(job) = reconnecting {
-        if let Some((end, _)) = job.stop(RECONNECT_STOP_GRACE) {
-            host = end;
-        }
-    }
+        // Leaving while reconnecting: stop it, and its ssh. A connection it
+        // resumed just now ends as it is dropped, which closes ssh's stdin.
+        Phase::Reconnecting(job) => job.stop(RECONNECT_STOP_GRACE).and_then(|(host, _)| host),
+        Phase::Ended { host } => host,
+    };
     turn_off_modes(
         &screen,
         &status,
@@ -423,16 +429,16 @@ pub(super) fn relay(
     // detach, whose terminal may be the thing that is blocked. A client
     // that was not reading when it was taken over never got the message,
     // so at the end of its connection the event log decides.
-    let taken_over = ending != Ending::Detached
+    let taken_over = !matches!(ending, Ending::Detached)
         && (retired.load(Ordering::SeqCst)
-            || (ending == Ending::SessionClosed && recorded_takeover.is_some_and(|f| f())));
+            || (ending.by_session() && recorded_takeover.is_some_and(|f| f())));
     // What the remote said on the reconnect's last attempt, such as why
     // it refused to resume, which the status line could only glimpse.
     let mut notes = status.take_lines();
-    if let Ending::Left(leave) = ending {
+    if let Ending::Left(leave) = &ending {
         notes.push(format!("tendr: attach ended by {}", leave.name()));
     }
-    if ending != Ending::Detached {
+    if !matches!(ending, Ending::Detached) {
         // Otherwise the takeover is the error returned below.
         if taken_over && matches!(ending, Ending::Left(_)) {
             notes.push("tendr: another client took over this session".to_owned());
@@ -450,36 +456,39 @@ pub(super) fn relay(
         eprintln!("{note}");
     }
     let finished = host.as_mut().and_then(|end| {
-        end.finish(if ending == Ending::SessionClosed {
+        end.finish(if ending.by_session() {
             super::SSH_CLOSE_GRACE
         } else {
             super::SSH_LEAVE_GRACE
         })
     });
-    if ending == Ending::SessionClosed {
-        if let Some(why) = screen.broken.get() {
+    let session = match ending {
+        Ending::Broken(why) => {
             return Err(PtyExitCode::Protocol.error(anyhow::anyhow!("tendr: {why}")));
         }
-    }
-    if taken_over {
         // This client lost control: a controller conflict, which a script
         // must be able to tell from a detach.
-        return Err(PtyExitCode::Control.error(anyhow::anyhow!(
-            "tendr: another client took over this session"
-        )));
-    }
-    if ending == Ending::OutputGone {
-        return Err(anyhow::anyhow!(
-            "tendr: the output closed; detached from the session"
-        ));
-    }
-    if ending != Ending::SessionClosed {
-        return Ok(0);
-    }
+        _ if taken_over => {
+            return Err(PtyExitCode::Control.error(anyhow::anyhow!(
+                "tendr: another client took over this session"
+            )));
+        }
+        Ending::OutputGone => {
+            return Err(anyhow::anyhow!(
+                "tendr: the output closed; detached from the session"
+            ));
+        }
+        Ending::Detached | Ending::KeyboardClosed | Ending::Left(_) => return Ok(0),
+        Ending::Session(session) => session,
+    };
     // The far side ended the connection: the remote's code, or ssh's
     // failure (a lost version 1 connection) when there is no code.
-    let code = verdict.or(finished).unwrap_or(Ok(0));
-    if access == Access::ReadOnly && !screen.ended.load(Ordering::SeqCst) {
+    let (code, complete) = match session {
+        SessionEnd::Remote(verdict) => (verdict, false),
+        SessionEnd::Closed => (finished.unwrap_or(Ok(0)), false),
+        SessionEnd::OutputComplete => (finished.unwrap_or(Ok(0)), true),
+    };
+    if access == Access::ReadOnly && !complete {
         let written = screen.written.load(Ordering::SeqCst);
         match end {
             EndNotice::Promised => {
@@ -495,6 +504,56 @@ pub(super) fn relay(
         }
     }
     code
+}
+
+/// Where the relay is: what it holds, and so what leaving must close.
+enum Phase {
+    /// Relaying over a connection. `host` is ssh's end for `attach --host`.
+    Attached {
+        connection: Connection,
+        host: Option<super::HostEnd>,
+    },
+    /// The link was lost; the reconnect holds ssh's end until it resumes
+    /// or ends. Keystrokes are discarded.
+    Reconnecting(reconnect::Job),
+    /// A reconnect ended without resuming, leaving only ssh's end. The
+    /// relay ends as it enters this phase.
+    Ended { host: Option<super::HostEnd> },
+}
+
+impl Phase {
+    /// The connection keystrokes and sizes go to, if there is one.
+    fn connection(&self) -> Option<&Connection> {
+        match self {
+            Phase::Attached { connection, .. } => Some(connection),
+            Phase::Reconnecting(_) | Phase::Ended { .. } => None,
+        }
+    }
+}
+
+/// What a connection's end means for the relay: `None` to reconnect,
+/// which only a connection that closed where it can be resumed
+/// (`resumable`), without a takeover (`retired`), may do. A complete run's
+/// output, a broken frame and a takeover are the session's word, and a
+/// terminal that refused output leaves nothing to reconnect for.
+fn after_reader(end: ReaderEnd, resumable: bool, retired: bool) -> Option<Ending> {
+    match end {
+        ReaderEnd::TerminalGone => Some(Ending::OutputGone),
+        ReaderEnd::Broken(why) => Some(Ending::Broken(why)),
+        ReaderEnd::OutputComplete => Some(Ending::Session(SessionEnd::OutputComplete)),
+        ReaderEnd::Closed if resumable && !retired => None,
+        ReaderEnd::Closed => Some(Ending::Session(SessionEnd::Closed)),
+    }
+}
+
+/// The relay's end, once a leave that arrived but was not yet read has
+/// had its say: the session's end may have been caused by it (the same
+/// signal can end ssh), and the user asked to leave.
+fn settle(ending: Ending, terminal: &mut dyn Raw, buf: &mut [u8]) -> Ending {
+    if !ending.by_session() {
+        return ending;
+    }
+    pending_leave(terminal, buf).map_or(ending, Ending::Left)
 }
 
 /// Send keystrokes to the session, counting them in `dropped` if the
@@ -537,15 +596,54 @@ fn pending_leave(terminal: &mut dyn Raw, buf: &mut [u8]) -> Option<Leave> {
 }
 
 /// How a relay ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum Ending {
     Detached,
-    SessionClosed,
     KeyboardClosed,
     /// The terminal, or stdout without one, refused the session's output.
     OutputGone,
     /// The user's side ended it from outside the keyboard.
     Left(Leave),
+    /// The session's output broke the protocol, with why (exit 80).
+    Broken(String),
+    /// The session's side ended it.
+    Session(SessionEnd),
+}
+
+impl Ending {
+    /// Whether the session's side ended the relay, not the user's.
+    fn by_session(&self) -> bool {
+        matches!(self, Ending::Broken(_) | Ending::Session(_))
+    }
+}
+
+/// How the session's side ended a relay.
+#[derive(Debug)]
+enum SessionEnd {
+    /// It closed the connection; over `--host`, ssh's end says why.
+    Closed,
+    /// It said the run's output ended where this attach's had reached
+    /// ([`Frame::OutputEnd`]): the attach has had all of it.
+    OutputComplete,
+    /// A reconnect ended it, with the remote's exit code, or its failure.
+    Remote(anyhow::Result<i32>),
+}
+
+/// Why a connection's reader stopped. It is the reader thread's result,
+/// so the relay learns it only once the reader is done, with every byte
+/// it will write on the terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReaderEnd {
+    /// The stream ended or failed: the session closed the connection, or
+    /// the link was lost. Also how a reader stops as the relay leaves,
+    /// which closes the connection.
+    Closed,
+    /// The session's end of output, at the offset this attach had reached.
+    OutputComplete,
+    /// Output outside the protocol, with why.
+    Broken(String),
+    /// The terminal, or stdout without one, refused a write.
+    TerminalGone,
 }
 
 /// Leave with exit code 1 after the user's side ended the attach
@@ -577,17 +675,6 @@ pub(super) struct Screen {
     /// The child has bracketed paste on. Read by the keyboard loop
     /// without taking `shown`, which a blocked write can hold.
     bracketed_paste: AtomicBool,
-    /// Why the reader stopped on output outside the protocol, if it did.
-    /// Set before it marks the connection closed.
-    broken: OnceLock<String>,
-    /// The terminal refused a write: the reader stopped for the
-    /// terminal's sake, not the connection's, so there is nothing to
-    /// reconnect for. Set before it marks the connection closed.
-    terminal_gone: AtomicBool,
-    /// The session said the run's output ended where this attach's had
-    /// reached ([`Frame::OutputEnd`]): it has had all of it. Set before the
-    /// reader marks the connection closed.
-    ended: AtomicBool,
     /// Bytes of the run's own output (stamped) written to the terminal,
     /// over every connection, for the report when a watcher is cut off.
     written: AtomicU64,
@@ -793,57 +880,55 @@ pub(super) fn spawn_sender(mut stream: impl Write + Send + 'static, outbox: Arc<
     });
 }
 
-/// Write the session's output to the terminal until it ends, on a thread
-/// whose end is the connection's ([`Connection::ended`]).
+/// Write the session's output to the terminal until the connection ends,
+/// on a thread whose result is how it ended ([`Connection::end`]).
 fn spawn_reader(
     mut stream: impl Read + Send + 'static,
     retired: Arc<AtomicBool>,
     screen: Arc<Screen>,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<ReaderEnd> {
     std::thread::spawn(move || {
         loop {
-            let shown = match attach_proto::read_frame(&mut stream) {
+            let step = match attach_proto::read_frame(&mut stream) {
                 Ok(Frame::Data(payload)) => show(&screen, None, &payload),
                 Ok(Frame::Output { offset, bytes }) => show(&screen, Some(offset), &bytes),
-                Ok(Frame::OutputEnd(offset)) => end_output(&screen, offset),
+                Ok(Frame::OutputEnd(offset)) => Err(end_output(&screen, offset)),
                 Ok(Frame::Retired(_)) => {
                     retired.store(true, Ordering::SeqCst);
-                    Ok(true)
+                    Ok(())
                 }
-                Ok(_) | Err(FrameError::Malformed(_) | FrameError::Unknown(_)) => Ok(true),
-                Err(FrameError::Io(_)) => Ok(false),
+                Ok(_) | Err(FrameError::Malformed(_) | FrameError::Unknown(_)) => Ok(()),
+                Err(FrameError::Io(_)) => Err(ReaderEnd::Closed),
             };
-            match shown {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(why) => {
-                    let _ = screen.broken.set(why);
-                    break;
-                }
+            if let Err(end) = step {
+                return end;
             }
         }
     })
 }
 
-/// Write the session's output to the terminal: `Ok(true)` to go on,
-/// `Ok(false)` once leaving or the terminal is gone. Stamped output
-/// (`offset`) must start exactly where the last ended, or it is refused
-/// unwritten, with why; it moves the resume point only once the terminal
-/// has taken all of it. Unstamped output, such as the mode replay, moves
-/// nothing.
-fn show(screen: &Screen, offset: Option<u64>, bytes: &[u8]) -> Result<bool, String> {
+/// Write the session's output to the terminal, or say why the reader
+/// stops. Stamped output (`offset`) must start exactly where the last
+/// ended, or it is refused unwritten, with why; it moves the resume point
+/// only once the terminal has taken all of it. Unstamped output, such as
+/// the mode replay, moves nothing.
+fn show(screen: &Screen, offset: Option<u64>, bytes: &[u8]) -> Result<(), ReaderEnd> {
     let mut shown = screen.shown.lock().unwrap_or_else(|e| e.into_inner());
     if screen.done.load(Ordering::SeqCst) {
-        return Ok(false);
+        return Err(ReaderEnd::Closed);
     }
     if let Some(offset) = offset {
         match &shown.resume {
-            None => return Err("the session sent offsets to a version 1 attach".to_owned()),
+            None => {
+                return Err(ReaderEnd::Broken(
+                    "the session sent offsets to a version 1 attach".to_owned(),
+                ));
+            }
             Some(point) if point.offset() != offset => {
-                return Err(format!(
+                return Err(ReaderEnd::Broken(format!(
                     "the session's output skipped from offset {} to {offset}",
                     point.offset()
-                ));
+                )));
             }
             Some(_) => {}
         }
@@ -855,8 +940,7 @@ fn show(screen: &Screen, offset: Option<u64>, bytes: &[u8]) -> Result<bool, Stri
         .bracketed_paste
         .store(shown.modes.bracketed_paste(), Ordering::SeqCst);
     if screen.output.write(bytes).is_err() {
-        screen.terminal_gone.store(true, Ordering::SeqCst);
-        return Ok(false);
+        return Err(ReaderEnd::TerminalGone);
     }
     if let (Some(_), Some(point)) = (offset, shown.resume.as_mut()) {
         point.advance(bytes.len() as u64);
@@ -864,25 +948,24 @@ fn show(screen: &Screen, offset: Option<u64>, bytes: &[u8]) -> Result<bool, Stri
             .written
             .fetch_add(bytes.len() as u64, Ordering::SeqCst);
     }
-    Ok(true)
+    Ok(())
 }
 
 /// The session's end of output, at `offset`: nothing more comes, so the
-/// reader stops (`Ok(false)`), the output complete. It must be where the
-/// stamped output has reached, or it is refused, with why: output the
-/// session never sent, or an end it claims before output it did send.
-fn end_output(screen: &Screen, offset: u64) -> Result<bool, String> {
+/// reader stops, the output complete. It must be where the stamped output
+/// has reached, or it is refused, with why: output the session never
+/// sent, or an end it claims before output it did send.
+fn end_output(screen: &Screen, offset: u64) -> ReaderEnd {
     let shown = screen.lock();
     match &shown.resume {
-        None => Err("the session sent an end of output to a version 1 attach".to_owned()),
-        Some(point) if point.offset() != offset => Err(format!(
+        None => {
+            ReaderEnd::Broken("the session sent an end of output to a version 1 attach".to_owned())
+        }
+        Some(point) if point.offset() != offset => ReaderEnd::Broken(format!(
             "the session's output ended at offset {offset}, but this attach has it up to {}",
             point.offset()
         )),
-        Some(_) => {
-            screen.ended.store(true, Ordering::SeqCst);
-            Ok(false)
-        }
+        Some(_) => ReaderEnd::OutputComplete,
     }
 }
 
@@ -1052,6 +1135,41 @@ mod tests {
                 "sizes sent out of order: {sent_sizes:?} from {sizes:?}"
             );
             prop_assert_eq!(sent_sizes.last(), sizes.last());
+        }
+    }
+
+    /// A finished reader's end decides the relay's next step: only a
+    /// connection that simply closed, with a point to resume from and no
+    /// takeover, reconnects. A complete run, a broken frame and a takeover
+    /// end the attach, and a terminal that refused output ends it whatever
+    /// else held.
+    #[test]
+    fn only_a_plain_close_with_a_resume_point_and_no_takeover_reconnects() {
+        for resumable in [false, true] {
+            for retired in [false, true] {
+                let next = |end| after_reader(end, resumable, retired);
+                assert!(matches!(
+                    next(ReaderEnd::TerminalGone),
+                    Some(Ending::OutputGone)
+                ));
+                assert!(matches!(
+                    next(ReaderEnd::Broken("why".to_owned())),
+                    Some(Ending::Broken(why)) if why == "why"
+                ));
+                assert!(matches!(
+                    next(ReaderEnd::OutputComplete),
+                    Some(Ending::Session(SessionEnd::OutputComplete))
+                ));
+                let closed = next(ReaderEnd::Closed);
+                if resumable && !retired {
+                    assert!(closed.is_none(), "{closed:?}");
+                } else {
+                    assert!(
+                        matches!(closed, Some(Ending::Session(SessionEnd::Closed))),
+                        "resumable {resumable}, retired {retired}: {closed:?}"
+                    );
+                }
+            }
         }
     }
 }
