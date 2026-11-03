@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.7.1 — attach fixes
+
+No protocol change: works with 0.7.0, 0.6.0 and 0.5.0 exactly as 0.7.0 does.
 
 ### Fixed
 
@@ -24,6 +26,11 @@
   keyboard through a buffer its wait for input could not see. It now reads
   the terminal directly. (A macOS terminal read returns at most about 1 KiB,
   so it never filled that buffer.)
+- **The Nix package builds on macOS again.** Building it runs the test
+  suite, which at 0.7.0 failed in the macOS sandbox: one test needed `lsof`,
+  which the sandbox lacked, and two judged whether a process was alive from
+  `ps`, which a `ps` without setuid answers there with no state. The package
+  now brings `lsof`, and the tests ask the kernel.
 
 ## v0.7.0 — read-only viewers, Windows console attach
 
