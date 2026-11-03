@@ -130,16 +130,8 @@ impl Drop for Kinds {
     }
 }
 
-/// Whether `pid` is a live process: present and not a zombie, per `ps`.
 fn running(pid: i32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .is_ok_and(|out| {
-            let stat = String::from_utf8_lossy(&out.stdout);
-            let stat = stat.trim();
-            !stat.is_empty() && !stat.starts_with('Z')
-        })
+    harness::process_running(pid)
 }
 
 /// A session's meta as it is on disk, if readable.

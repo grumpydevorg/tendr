@@ -72,10 +72,10 @@
           # test gate -- see checks.<system>.tendr.
           doCheck = true;
 
-          # Interpreters the TESTS spawn, not runtime dependencies of the binary:
+          # Tools the TESTS spawn, not runtime dependencies of the binary:
           # tendr resolves whatever it is asked to run from the caller's PATH.
-          # Neither test skips when its interpreter is missing, so both are
-          # required for the suite to mean anything in the sandbox.
+          # No test skips when its tool is missing, so each is required for the
+          # suite to mean anything in the sandbox.
           #
           #   python3  the PythonRepl lane -- cli_exec asserts variables survive
           #            between execs; without an interpreter five tests report
@@ -84,10 +84,13 @@
           #            flock from another process. The test picks perl precisely
           #            because it is present on stock macOS and Linux where a
           #            `flock` CLI is not -- which is not true of a Nix sandbox.
+          #   lsof     cli_inherited_fds lists a process's open files with it
+          #            off Linux (Linux reads /proc).
           nativeCheckInputs = [
             pkgs.python3
             pkgs.perl
-          ];
+          ]
+          ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.lsof;
 
           # The tests are built in DEBUG while the binary is built in release,
           # and that is load-bearing rather than a preference. The WAL-ordering

@@ -558,6 +558,44 @@ pub fn wait_pid_dead(pid: i32) {
         .unwrap_or_else(|e| panic!("waiting for pid {pid} to die: {e}"))
 }
 
+/// Whether `pid` is a live process: it exists and is not a zombie. Read from
+/// the kernel rather than `ps`: a `ps` without macOS's setuid bit (a Nix
+/// build's) prints no state letter, so its output cannot tell a live process
+/// from a gone one.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn process_running(pid: i32) -> bool {
+    // SAFETY: signal 0 only probes for existence.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // The state follows the parenthesised command, which may hold spaces.
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .is_some_and(|state| state != "Z")
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: proc_bsdinfo is plain data; proc_pidinfo writes at most
+        // `size` bytes into it and returns how many it wrote.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let wrote = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        };
+        // proc_pidinfo fails on a zombie, which kill(pid, 0) still finds.
+        wrote == size && info.pbi_status != libc::SZOMB
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        true
+    }
+}
+
 /// Whether the process with `pid` is still running.
 #[cfg(windows)]
 #[allow(dead_code)]
