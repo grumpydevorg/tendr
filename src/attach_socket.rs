@@ -426,11 +426,7 @@ pub fn sweep_orphans(state_root: &Path, dry_run: bool) -> io::Result<Vec<PathBuf
         if !meta.file_type().is_socket() || meta.uid() != euid || !old_enough {
             continue;
         }
-        let refused = matches!(
-            UnixStream::connect(&path),
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused
-        );
-        if !refused {
+        if !connect_refused(&path) {
             continue;
         }
         if dry_run || std::fs::remove_file(&path).is_ok() {
@@ -438,6 +434,48 @@ pub fn sweep_orphans(state_root: &Path, dry_run: bool) -> io::Result<Vec<PathBuf
         }
     }
     Ok(orphans)
+}
+
+/// Whether connecting to the socket at `path` is refused: nothing listens on it.
+///
+/// The connect is nonblocking. On Linux a blocking connect to a live listener
+/// whose backlog is full waits until the listener accepts, which a listener
+/// nobody names may never do; nonblocking it fails with `EAGAIN`, which counts
+/// as listening, as does a connect that succeeds or is in progress (#102). Any
+/// failure other than a refusal keeps the socket too.
+fn connect_refused(path: &Path) -> bool {
+    let Ok(addr) = rustix::net::SocketAddrUnix::new(path) else {
+        return false;
+    };
+    let Ok(socket) = nonblocking_stream_socket() else {
+        return false;
+    };
+    matches!(
+        rustix::net::connect(&socket, &addr),
+        Err(rustix::io::Errno::CONNREFUSED)
+    )
+}
+
+/// A nonblocking, close-on-exec Unix stream socket, not yet connected.
+fn nonblocking_stream_socket() -> io::Result<std::os::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketType};
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let socket = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        rustix::net::SocketFlags::NONBLOCK | rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )?;
+    // No SOCK_NONBLOCK or SOCK_CLOEXEC here: set both after creating it.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let socket = {
+        let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+        rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+        rustix::io::ioctl_fionbio(&socket, true)?;
+        socket
+    };
+    Ok(socket)
 }
 
 /// `<12 hex digits>.sock`, the shape [`socket_path`] gives a run's socket.
