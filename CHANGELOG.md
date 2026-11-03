@@ -7,10 +7,11 @@
 - **`prune` no longer hangs on a live attach socket with a full backlog.**
   To tell an orphaned socket from a live one, `prune` connects to it, and on
   Linux a blocking connect to a listener whose backlog is full waits until
-  the listener accepts, which one that no session names may never do (for
+  the listener accepts, which a listener no session names may never do (for
   example, a session directory removed by hand under a running sidecar).
-  The connect is now nonblocking: a full backlog counts as listening, and
-  the socket is kept.
+  The connect is now nonblocking: on Linux a full backlog counts as
+  listening, and the socket is kept. (macOS refuses a connect to a full
+  backlog, so there such a socket is still removed, as before.)
 - **A `push` taken over after its last frame reports at once.** It no
   longer waits for its end of input to be served behind the new holder's
   input, which a PTY the child is not reading could hold up indefinitely:

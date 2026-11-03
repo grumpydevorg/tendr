@@ -4402,6 +4402,13 @@ mod tests {
             "a revoked push must not wait behind its successor's input"
         );
         handler.join().unwrap();
+        // The disconnect cancelled nothing of the successor's: its input is
+        // written once the PTY takes input again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lock(&pty.written).len() < 6 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(lock(&pty.written).as_slice(), b"abcxyz");
     }
 
     /// Write a PTY-enabled meta.json (AgentControl by default) into `dir`.
