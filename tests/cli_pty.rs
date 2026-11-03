@@ -2085,6 +2085,83 @@ fn cli_session_end_restores_the_terminal() {
     wrapped.assert_terminal_restored();
 }
 
+/// A run that ends while the attach's terminal is not reading still shows
+/// its last output: the attach drains the connection before it ends, even
+/// once a keystroke has found the session's end of it closed. The test
+/// terminal (`TENDR_TEST_ATTACH_TERMINAL`) is held, so it takes no writes
+/// until the run has ended and the keystroke has failed.
+#[test]
+fn cli_session_end_shows_the_last_output_to_a_terminal_not_reading() {
+    use std::io::Read;
+
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let session = "pty-drain";
+    let _kill = harness::SessionGuard::new(&root, session);
+    let (go, hold) = (root.path().join("go"), root.path().join("hold"));
+    tendr(&root)
+        .args(["start", session, "--pty", "--", "sh", "-c"])
+        .arg(format!(
+            "while [ ! -f '{}' ]; do sleep 0.05; done; printf the-head; sleep 0.3; printf the-tail",
+            go.display()
+        ))
+        .output()
+        .unwrap();
+    harness::wait_running(&root, session);
+
+    std::fs::write(&hold, b"").unwrap();
+    let mut attach = std::process::Command::new(tendr_bin())
+        .args(["attach", session])
+        .env("HOME", root.path())
+        .env("TENDR_TEST_ATTACH_TERMINAL", "24x80")
+        .env("TENDR_TEST_ATTACH_SCREEN_HOLD", &hold)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_pty_control(&root, session, "HumanControl");
+    std::fs::write(&go, b"").unwrap();
+    drop(harness::wait_terminal_quiescent(&root, session));
+    // The session's end of the connection is closed, or soon will be: one
+    // of these keystrokes fails to reach it.
+    let mut keyboard = attach.stdin.take().unwrap();
+    for _ in 0..3 {
+        keyboard.write_all(b"k").unwrap();
+        keyboard.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::fs::remove_file(&hold).unwrap();
+
+    let status = poll_until(
+        Duration::from_secs(15),
+        Duration::from_millis(20),
+        || match attach.try_wait().unwrap() {
+            Some(status) => Observation::Ready(status),
+            None => Observation::Pending("attach still running".into()),
+        },
+    )
+    .unwrap_or_else(|e| {
+        let _ = attach.kill();
+        panic!("the attach never exited: {e}")
+    });
+    let (mut screen, mut stderr) = (String::new(), String::new());
+    attach
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut screen)
+        .unwrap();
+    attach
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "stderr: {stderr}");
+    assert!(screen.contains("the-headthe-tail"), "{screen:?}");
+}
+
 #[test]
 fn cli_detach_is_responsive_while_session_input_is_blocked() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

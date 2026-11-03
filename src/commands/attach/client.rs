@@ -19,7 +19,9 @@
 //!
 //! Leaving never joins a blocked thread: the connection is closed, the
 //! terminal is restored (without waiting for pending output to drain), and
-//! the process exits.
+//! the process exits. The session ending a connection is the opposite: the
+//! relay acts on it only once the reader is done, so the session's last
+//! output is on the terminal first.
 //!
 //! The terminal layer's [`Leave`] (on Unix SIGHUP, SIGTERM and SIGINT; on
 //! Windows the console's control events) ends the relay like a detach, and
@@ -126,35 +128,32 @@ pub(in crate::commands::attach) enum EndNotice {
 struct Connection {
     outbox: Arc<Outbox>,
     access: Access,
-    /// Set once the connection has ended: by the reader at the end of
-    /// the session's output, or by the sender on a failed write.
-    closed: Arc<AtomicBool>,
+    /// Done once the connection has ended: at the end of the session's
+    /// output, or once the terminal refused it, the relay left, or the
+    /// output broke the protocol. A failed write by the sender ends
+    /// nothing by itself: the session's last output may still be on its
+    /// way to the terminal, and ends with the reader.
     reader: std::thread::JoinHandle<()>,
     close: Box<dyn FnOnce() + Send>,
 }
 
 impl Connection {
     fn open(link: Link, access: Access, retired: &Arc<AtomicBool>, screen: &Arc<Screen>) -> Self {
-        let closed = Arc::new(AtomicBool::new(false));
         let outbox = Arc::new(Outbox::default());
-        spawn_sender(link.writer, Arc::clone(&outbox), Arc::clone(&closed));
-        let reader = spawn_reader(
-            link.reader,
-            Arc::clone(&closed),
-            Arc::clone(retired),
-            Arc::clone(screen),
-        );
+        spawn_sender(link.writer, Arc::clone(&outbox));
+        let reader = spawn_reader(link.reader, Arc::clone(retired), Arc::clone(screen));
         Self {
             outbox,
             access,
-            closed,
             reader,
             close: link.close,
         }
     }
 
-    fn closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+    /// Whether the connection has ended: its reader is done, so every byte
+    /// of output it delivered is on the terminal, or never will be.
+    fn ended(&self) -> bool {
+        self.reader.is_finished()
     }
 
     /// Send the terminal's size, then the repaint nudge: an attach at
@@ -178,12 +177,11 @@ impl Connection {
     }
 
     /// End the connection, which unblocks its sender and reader; the
-    /// session treats a closed connection as a detach. Returns the
-    /// reader, which may still be writing to the terminal.
-    fn close(self) -> std::thread::JoinHandle<()> {
+    /// session treats a closed connection as a detach. The reader, which
+    /// may still be writing to the terminal, is not waited for.
+    fn close(self) {
         (self.close)();
         self.outbox.close();
-        self.reader
     }
 }
 
@@ -194,6 +192,11 @@ impl Connection {
 /// attach's stamped output starts, a controller's or a watcher's; `None`
 /// for version 1.
 ///
+/// The far side's end of a connection counts once its reader is done, so
+/// whatever ends the attach, the session's last output reaches the terminal
+/// first. A failed write to the session only means that end is on its way;
+/// the keyboard stays live while the reader drains.
+///
 /// The session's end of output ([`Frame::OutputEnd`]) ends the relay as the
 /// session closing the connection does, never as a lost link, and must be
 /// at the offset the output has reached (else exit 80). A watcher whose
@@ -201,8 +204,8 @@ impl Connection {
 /// saying how many bytes of the run's output it had.
 ///
 /// A read-only attach ([`Access::ReadOnly`]) sends no size, resize or
-/// repaint, and drops keystrokes, saying so once in the status line; the
-/// escape and the signals still leave.
+/// repaint, and drops keystrokes, saying so in the status line from the
+/// first one on; the escape and the signals still leave.
 ///
 /// A version 2 `attach --host` whose connection the far side ends, without
 /// a takeover or a broken protocol, hands ssh's end to a
@@ -269,7 +272,12 @@ pub(super) fn relay(
     let mut buf = [0u8; 4096];
     let mut dropped = 0usize;
     let ending = loop {
-        if connection.as_ref().is_some_and(Connection::closed) {
+        // Only once its reader is done: the session's last output reaches
+        // the terminal before anything ends the attach or reconnects, and
+        // the reader has seen any retirement, end of output or broken frame
+        // that decides which. A failed write meanwhile is the same end on
+        // its way. The keyboard stays live while the reader drains.
+        if connection.as_ref().is_some_and(Connection::ended) {
             // The terminal, or stdout without one, refused the output (a
             // pipeline's consumer gone): nothing to reconnect for, and the
             // session is still there to tell.
@@ -283,9 +291,9 @@ pub(super) fn relay(
                 && !screen.ended.load(Ordering::SeqCst);
             match (host.take(), connection.take()) {
                 (Some(end), Some(old)) if lost => {
+                    old.close();
                     reconnecting = Some(reconnect::Job::start(
                         end,
-                        old.close(),
                         Arc::clone(&screen),
                         Arc::clone(&status),
                     ));
@@ -390,7 +398,9 @@ pub(super) fn relay(
         }
     }
     // Unblocks the sender and reader, which are not waited for.
-    drop(connection.map(Connection::close));
+    if let Some(connection) = connection {
+        connection.close();
+    }
     // Leaving while reconnecting: stop it, and its ssh. A connection it
     // resumed just now ends as it is dropped, which closes ssh's stdin.
     if let Some(job) = reconnecting {
@@ -768,19 +778,14 @@ impl Outbox {
 }
 
 /// Write the outbox's messages to `stream` until it closes. A failed
-/// write sets `closed` and closes the outbox. Dropping `stream` at the end
-/// closes it, which ends ssh's input for `attach --host`.
-pub(super) fn spawn_sender(
-    mut stream: impl Write + Send + 'static,
-    outbox: Arc<Outbox>,
-    closed: Arc<AtomicBool>,
-) {
+/// write closes the outbox. Dropping `stream` at the end closes it, which
+/// ends ssh's input for `attach --host`.
+pub(super) fn spawn_sender(mut stream: impl Write + Send + 'static, outbox: Arc<Outbox>) {
     std::thread::spawn(move || {
         while let Some(frame) = outbox.next() {
             let written = attach_proto::write_frame(&mut stream, &frame);
             outbox.sent();
             if written.is_err() {
-                closed.store(true, Ordering::SeqCst);
                 outbox.close();
                 return;
             }
@@ -788,9 +793,10 @@ pub(super) fn spawn_sender(
     });
 }
 
+/// Write the session's output to the terminal until it ends, on a thread
+/// whose end is the connection's ([`Connection::ended`]).
 fn spawn_reader(
     mut stream: impl Read + Send + 'static,
-    closed: Arc<AtomicBool>,
     retired: Arc<AtomicBool>,
     screen: Arc<Screen>,
 ) -> std::thread::JoinHandle<()> {
@@ -816,7 +822,6 @@ fn spawn_reader(
                 }
             }
         }
-        closed.store(true, Ordering::SeqCst);
     })
 }
 

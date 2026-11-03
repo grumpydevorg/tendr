@@ -200,11 +200,7 @@ mod unix {
         let outbox = Arc::new(Outbox::default());
         // A failed write to the socket means the session closed it: the
         // output direction reports that end, a takeover included.
-        spawn_sender(
-            BufWriter::new(to_session),
-            Arc::clone(&outbox),
-            Arc::new(AtomicBool::new(false)),
-        );
+        spawn_sender(BufWriter::new(to_session), Arc::clone(&outbox));
         // Set once the client has detached: the session then closes the
         // connection in answer, which is the client leaving, not the session
         // ending it, whichever direction reports first.

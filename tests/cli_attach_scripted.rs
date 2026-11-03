@@ -44,17 +44,25 @@ struct Client {
 
 impl Client {
     fn spawn(root: &TempDir, path: &std::ffi::OsStr, args: &[&str]) -> Self {
-        Self::spawn_on(root, path, args, true)
+        Self::spawn_on(root, path, args, true, None)
     }
 
     /// `tendr` with `args`, on the test terminal if `terminal`, or else with
-    /// no terminal at all: stdin closed, stdout a pipe.
-    fn spawn_on(root: &TempDir, path: &std::ffi::OsStr, args: &[&str], terminal: bool) -> Self {
+    /// no terminal at all: stdin closed, stdout a pipe. With a `hold`, the
+    /// test terminal takes no writes while that file exists.
+    fn spawn_on(
+        root: &TempDir,
+        path: &std::ffi::OsStr,
+        args: &[&str],
+        terminal: bool,
+        hold: Option<&Path>,
+    ) -> Self {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("tendr"));
         command
             .args(args)
             .env("HOME", root.path())
             .env("PATH", path)
+            .env_remove("TENDR_TEST_ATTACH_SCREEN_HOLD")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if terminal {
@@ -65,6 +73,9 @@ impl Client {
             command
                 .env_remove("TENDR_TEST_ATTACH_TERMINAL")
                 .stdin(Stdio::null());
+        }
+        if let Some(hold) = hold {
+            command.env("TENDR_TEST_ATTACH_SCREEN_HOLD", hold);
         }
         let mut child = command.spawn().unwrap();
         let mut collectors = Vec::new();
@@ -201,6 +212,18 @@ impl Remote {
         )
     }
 
+    /// [`Remote::attach`], on a screen that takes no writes while `hold`
+    /// exists.
+    fn attach_held(&self, root: &TempDir, hold: &Path) -> Client {
+        Client::spawn_on(
+            root,
+            &shim_path_env(&self.ssh),
+            &["--host", "box", "attach", "s"],
+            true,
+            Some(hold),
+        )
+    }
+
     /// `tendr --host box attach --read-only s` against this remote, on the
     /// test terminal if `terminal`.
     fn watch(&self, root: &TempDir, terminal: bool) -> Client {
@@ -209,6 +232,7 @@ impl Remote {
             &shim_path_env(&self.ssh),
             &["--host", "box", "attach", "--read-only", "s"],
             terminal,
+            None,
         )
     }
 
@@ -367,9 +391,120 @@ fn a_scripted_resume_that_is_gone_says_what_was_missed() {
     assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
 }
 
+/// A controller whose link drops, and whose reconnect's first dial then
+/// ends with exit 1 before the remote says hello, with no exit trailer: the
+/// remote, after `one`, waits for a typed `z`, then drops the link, and the
+/// next ssh dies at once. Returns the client and the file whose removal
+/// shows that dial ran.
+fn reconnect_dial_exits_1(root: &TempDir, dir: &TempDir) -> (Client, Remote, PathBuf) {
+    let dial_dies = dir.path().join("dial-dies");
+    let remote = Remote::after(
+        &format!("die-if {} 1", dial_dies.display()),
+        "hello answer\n\
+         hello await Repaint\n\
+         hello output one\n\
+         hello await-typed 7a\n\
+         hello drop\n\
+         resume answer\n\
+         resume output two\n\
+         resume drain",
+    );
+    let mut client = remote.attach(root);
+    client.wait_screen(&["one"]);
+    // Armed only now, so it is the reconnect's dial that dies.
+    std::fs::write(&dial_dies, b"").unwrap();
+    client.type_bytes(b"z");
+    (client, remote, dial_dies)
+}
+
+/// On a Windows client, ssh.exe's exit 1 without the remote's trailer on a
+/// reconnect's dial is ssh.exe's own end (`TerminateProcess` gives 1), as
+/// at a connection's end: a lost link, so the attempt fails and the next
+/// one resumes.
+#[cfg(windows)]
+#[test]
+fn a_reconnect_dial_that_exits_1_is_tried_again_on_windows() {
+    let (root, dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (mut client, _remote, dial_dies) = reconnect_dial_exits_1(&root, &dir);
+    client.wait_screen(&[
+        "one",
+        "tendr: connection lost, attempt 1 failed, next in 1 s",
+        "two",
+    ]);
+    assert!(!dial_dies.exists(), "the first dial never ran");
+    client.type_bytes(DETACH);
+    assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+}
+
+/// On a Unix client, ssh's own failures are 255 and a killed ssh has no
+/// code, so a reconnect's dial that exits 1 without a trailer gives the
+/// remote side's code, as the first dial does: it ends the attach with 1.
+#[cfg(not(windows))]
+#[test]
+fn a_reconnect_dial_that_exits_1_ends_the_attach_on_unix() {
+    let (root, dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (mut client, _remote, dial_dies) = reconnect_dial_exits_1(&root, &dir);
+    assert_eq!(client.wait_exit(), 1, "{}", client.stderr());
+    assert!(!dial_dies.exists(), "the reconnect never dialled");
+    let screen = client.screen();
+    assert!(
+        screen.contains("reconnecting (attempt 1)") && !screen.contains("two"),
+        "{screen:?}"
+    );
+}
+
+/// A remote that sends the last of its output and ends at once can end the
+/// connection while the terminal is still taking that output. Here the
+/// screen is held, the remote closes its input and exits 3 behind it, and
+/// the client's next write, a keystroke, fails. The attach still shows
+/// every byte the remote sent before it exits with the remote's code.
+#[test]
+fn a_controller_shows_all_output_before_the_remote_s_exit() {
+    let root = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let (hold, hung_up) = (dir.path().join("hold"), dir.path().join("hung-up"));
+    std::fs::write(&hold, b"").unwrap();
+    let remote = Remote::new(&format!(
+        "hello answer\n\
+         hello await Repaint\n\
+         hello output the-head\n\
+         hello output the-tail\n\
+         hello close-input\n\
+         hello touch {}\n\
+         hello exit 3",
+        hung_up.display()
+    ));
+    let mut client = remote.attach_held(&root, &hold);
+    poll_until(WAIT, Duration::from_millis(20), || {
+        if hung_up.exists() {
+            Observation::Ready(())
+        } else {
+            Observation::Pending("the remote has not closed its input".into())
+        }
+    })
+    .unwrap();
+    client.type_bytes(b"k");
+    // Time for the client to find its write failed: it looks every 100 ms.
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::remove_file(&hold).unwrap();
+    assert_eq!(client.wait_exit(), 3, "{}", client.stderr());
+    assert!(
+        client.screen().ends_with("the-headthe-tail"),
+        "{:?}",
+        client.screen()
+    );
+}
+
+/// The read-only note, drawn on the test terminal's last row.
+const READ_ONLY_ROW: &str =
+    "\x1b7\x1b[24;1H\x1b[0m\x1b[2Ktendr: read-only attach; typed input is dropped\x1b8";
+/// The test terminal's last row, erased.
+const LAST_ROW_ERASED: &str = "\x1b7\x1b[24;1H\x1b[0m\x1b[2K\x1b8";
+
 /// A read-only attach drops what is typed and says so once on the screen,
 /// through the terminal layer like every write, and sends the session
-/// nothing but its detach: no size, no repaint, no keystrokes.
+/// nothing but its detach: no size, no repaint, no keystrokes. The note
+/// stays while attached, and leaving erases it with the rest of the status.
 #[test]
 fn a_read_only_attach_says_typing_is_dropped() {
     let root = TempDir::new().unwrap();
@@ -382,9 +517,20 @@ fn a_read_only_attach_says_typing_is_dropped() {
     let mut client = remote.watch(&root, true);
     client.wait_screen(&["watched"]);
     client.type_bytes(b"x");
-    client.wait_screen(&["tendr: read-only attach; typed input is dropped"]);
+    client.wait_screen(&[READ_ONLY_ROW]);
+    client.type_bytes(b"y");
     client.type_bytes(DETACH);
     assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+    let screen = client.screen();
+    assert_eq!(
+        screen.matches("typed input is dropped").count(),
+        1,
+        "said once: {screen:?}"
+    );
+    assert!(
+        screen.ends_with(&format!("{READ_ONLY_ROW}{LAST_ROW_ERASED}")),
+        "the note is the last thing drawn, and leaving erases it: {screen:?}"
+    );
     assert_eq!(
         remote.frames(),
         debug(&[
@@ -394,6 +540,41 @@ fn a_read_only_attach_says_typing_is_dropped() {
             },
             Frame::Detach,
         ])
+    );
+}
+
+/// A reconnect's status takes the read-only note's row while it runs, and
+/// once the watcher has resumed the note is drawn again, since it is still
+/// attached and still drops typing. Leaving erases it.
+#[test]
+fn a_watcher_s_read_only_note_returns_after_a_reconnect() {
+    let root = TempDir::new().unwrap();
+    let remote = Remote::after(
+        "give-up-if {drop}",
+        "watch answer\n\
+         watch output one\n\
+         watch drain\n\
+         watch-resume answer\n\
+         watch-resume output two\n\
+         watch-resume drain",
+    );
+    let mut client = remote.watch(&root, true);
+    client.wait_screen(&["one"]);
+    client.type_bytes(b"x");
+    client.wait_screen(&[READ_ONLY_ROW]);
+    remote.drop_link();
+    client.wait_screen(&[
+        READ_ONLY_ROW,
+        "tendr: connection lost, reconnecting (attempt 1)",
+        READ_ONLY_ROW,
+        "two",
+    ]);
+    client.type_bytes(DETACH);
+    assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+    let screen = client.screen();
+    assert!(
+        screen.ends_with(&format!("two{LAST_ROW_ERASED}")),
+        "{screen:?}"
     );
 }
 

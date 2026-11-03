@@ -297,7 +297,8 @@ concurrent `push` is refused, not interleaved.
 - `attach --read-only` watches without control: it shows the session's
   output beside whoever holds the terminal, even while a human does, and up
   to eight can watch at once (a ninth is refused with 84). Your keystrokes
-  are dropped, with a note on the bottom line at the first one; `Ctrl-\ d`
+  are dropped, with a note on the bottom line from the first one until the
+  attach ends, when it is erased; `Ctrl-\ d`
   still detaches (0), so `--escape none` is refused with it. It sends no
   window size, so a full-screen program shows nothing new until it next
   redraws, and then at the controlling terminal's size. A takeover leaves
@@ -394,7 +395,9 @@ before, with ssh's exit.
   during a reconnect is not an end: it is tried again.
 - When a run ends, everything it wrote reaches every attached client before
   the session closes the connections, even one that was behind; a client
-  that has not taken it all within 2 s is cut off where it is.
+  that has not taken it all within 2 s is cut off where it is. A client
+  shows all it was sent before it exits, even if your terminal is slow to
+  take it.
 - On Windows, `ssh.exe` ended by Windows (an NTSTATUS exit such as
   `0xC000013A`, or a crash) or killed (Task Manager's exit 1) is a dropped
   connection too, and the attach reconnects: the remote `tendr` always

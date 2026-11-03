@@ -1,13 +1,14 @@
 //! Reconnecting a lost `attach --host` connection, on its own thread, while
 //! the relay's main thread keeps the keyboard.
 //!
-//! The far side ended the connection. ssh's end says whose doing that was:
-//! the remote's exit code is its verdict, and the attach ends with it. ssh
-//! failing (255 without an exit trailer), killed (by a signal on Unix; on
-//! Windows, an NTSTATUS exit or 1 without a trailer), or still running
+//! The far side ended the connection, and its reader is done: every byte it
+//! delivered is on the terminal, so the resume point is final. ssh's end
+//! says whose doing that was: the remote's exit code is its verdict, and the
+//! attach ends with it. ssh failing (255 without an exit trailer), killed
+//! (by a signal on Unix; on Windows, an NTSTATUS exit or 1 without a
+//! trailer), or still running
 //! [`SSH_CLOSE_GRACE`](super::super::SSH_CLOSE_GRACE) after its output ended
-//! is a lost link. Then the old reader is joined, so the resume
-//! point is final, and attempts follow, each a new ssh that never prompts,
+//! is a lost link. Then attempts follow, each a new ssh that never prompts,
 //! with a growing pause between failed ones, until one resumes, the remote
 //! refuses (its exit code ends the attach), or the user leaves.
 //!
@@ -20,6 +21,11 @@
 //! read-only attach streaming to stdout), stdout gets nothing but the
 //! session's output: the status and the notices go to stderr, a line each,
 //! and so does what ssh says.
+//!
+//! A read-only attach's note that it drops typed input is part of the same
+//! status: drawn on the last row at the first keystroke, it stays while the
+//! attach does, gives its row to a reconnect's status while one runs, comes
+//! back once the attach has resumed, and is erased when the attach ends.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +49,9 @@ const KEPT_LINE_BYTES: usize = 1024;
 
 /// How often a pause between attempts looks at the cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// What a read-only attach says, on the last row, once something is typed.
+const READ_ONLY_NOTE: &str = "tendr: read-only attach; typed input is dropped";
 
 /// What one attempt to resume got.
 pub(in crate::commands::attach) enum Attempt {
@@ -68,11 +77,10 @@ pub(in crate::commands::attach) struct Job {
 }
 
 impl Job {
-    /// Reconnect through `end` after its connection ended, once `reader`, the
-    /// old connection's reader, is done.
+    /// Reconnect through `end` after its connection ended, once that
+    /// connection's reader is done.
     pub(in crate::commands::attach) fn start(
         end: HostEnd,
-        reader: std::thread::JoinHandle<()>,
         screen: Arc<Screen>,
         status: Arc<Status>,
     ) -> Self {
@@ -80,7 +88,7 @@ impl Job {
         let (send, done) = mpsc::channel();
         std::thread::spawn(move || {
             let mut end = end;
-            let outcome = reconnect(&mut end, reader, &screen, &status);
+            let outcome = reconnect(&mut end, &screen, &status);
             let _ = send.send((end, outcome));
         });
         Self { done, cancel }
@@ -123,20 +131,12 @@ impl Job {
 }
 
 /// The reconnect's thread: `None` once cancelled.
-fn reconnect(
-    end: &mut HostEnd,
-    reader: std::thread::JoinHandle<()>,
-    screen: &Arc<Screen>,
-    status: &Arc<Status>,
-) -> Option<Outcome> {
+fn reconnect(end: &mut HostEnd, screen: &Arc<Screen>, status: &Arc<Status>) -> Option<Outcome> {
     match end.finish(SSH_CLOSE_GRACE) {
         Some(Ok(code)) => return Some(Outcome::Ended(Ok(code))),
         Some(Err(e)) if !lost_link(&e) => return Some(Outcome::Ended(Err(e))),
         _ => {}
     }
-    // Every byte the old connection delivered has been written once its
-    // reader is done, so the offset is final.
-    let _ = reader.join();
     let cancel = Arc::clone(&end.cancel);
     let cancelled = || cancel.load(Ordering::SeqCst);
     let asked = screen.lock().resume?;
@@ -234,7 +234,11 @@ pub(in crate::commands::attach) struct Status {
 struct State {
     /// A reconnect is under way and its status is on the terminal.
     active: bool,
-    /// How many of the last rows it has drawn on, to erase.
+    /// A read-only attach has said it drops typed input: the note is on the
+    /// last row whenever no reconnect's status is.
+    read_only: bool,
+    /// How many of the last rows the status or the note has drawn on, to
+    /// erase.
     drawn: u16,
     attempt: u32,
     /// After a failed attempt, the pause before the next.
@@ -266,23 +270,41 @@ impl Status {
     }
 
     /// Note, once, that a read-only attach drops typed input: on the last
-    /// row, on a thread of its own, as [`Self::discard`] does. The session's
-    /// output may draw over it; it is a notice, not a status kept on screen.
+    /// row, on a thread of its own, as [`Self::discard`] does. The note is
+    /// part of the status: it stays while the attach does, and leaving
+    /// erases it. A reconnect's status takes its row while it runs, and the
+    /// note is drawn again once the attach has resumed. The session's output
+    /// may draw over it meanwhile; it is not redrawn for that.
     pub(in crate::commands::attach) fn read_only(self: &Arc<Self>, screen: &Arc<Screen>) {
         if !self.read_only_said.swap(true, Ordering::SeqCst) {
             let (status, screen) = (Arc::clone(self), Arc::clone(screen));
             std::thread::spawn(move || {
-                let _state = status.lock();
+                let mut state = status.lock();
+                state.read_only = true;
+                if state.active {
+                    return;
+                }
                 let _shown = screen.lock();
                 if screen.done.load(Ordering::SeqCst) {
                     return;
                 }
-                if let Some(size) = screen.size() {
-                    let notice = ["tendr: read-only attach; typed input is dropped".to_owned()];
-                    screen.write_terminal(&status_rows(&notice, size.rows(), size.cols()));
-                }
+                let note = Self::note(&mut state, &screen);
+                screen.write_terminal(&note);
             });
         }
+    }
+
+    /// The bytes that draw the read-only note on the last row, once it has
+    /// been said and there is a terminal to draw it on, counted as drawn so
+    /// that the next erase takes it.
+    fn note(state: &mut State, screen: &Screen) -> Vec<u8> {
+        if !state.read_only {
+            return Vec::new();
+        }
+        screen.size().map_or_else(Vec::new, |size| {
+            state.drawn = state.drawn.max(1);
+            status_rows(&[READ_ONLY_NOTE.to_owned()], size.rows(), size.cols())
+        })
     }
 
     /// Attempt `attempt` begins.
@@ -368,7 +390,8 @@ impl Status {
     /// is the reset of the modes tracked so far (the replay that follows only
     /// turns modes on) and a notice of what was lost; without a terminal,
     /// the notice goes to stderr and stdout gets no reset, as when leaving.
-    /// Then the resume point becomes the new connection's.
+    /// A read-only attach's note, whose row the status took, is drawn
+    /// again. Then the resume point becomes the new connection's.
     fn resumed(&self, screen: &Screen, asked: Point, resumption: Resumption) {
         let mut state = self.lock();
         let mut shown = screen.lock();
@@ -391,13 +414,14 @@ impl Status {
             shown.modes = TermModes::default();
             screen.bracketed_paste.store(false, Ordering::SeqCst);
         }
+        out.extend(Self::note(&mut state, screen));
         shown.resume = Some(asked.resumed(resumption.point()));
         screen.write_terminal(&out);
     }
 
-    /// The attach is leaving: erase the status, and turn off the modes the
-    /// session turned on, in a terminal. Without one, stdout gets nothing
-    /// but the session's output.
+    /// The attach is leaving: erase the status, the read-only note
+    /// included, and turn off the modes the session turned on, in a
+    /// terminal. Without one, stdout gets nothing but the session's output.
     pub(in crate::commands::attach) fn leave(&self, screen: &Screen) {
         let mut state = self.lock();
         let shown = screen.lock();
@@ -408,8 +432,8 @@ impl Status {
         screen.write_terminal(&out);
     }
 
-    /// End the reconnect's display: the bytes that erase its rows, if
-    /// drawn.
+    /// End the reconnect's display: the bytes that erase the rows it, or
+    /// the read-only note, has drawn on.
     fn erase(&self, state: &mut State, screen: &Screen) -> Vec<u8> {
         self.discarded.store(false, Ordering::SeqCst);
         state.active = false;

@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **An attach shows all of a session's last output before it ends.** When
+  the session ended a connection, `attach` could end before the last of its
+  output reached the terminal, if a keystroke or resize found the session's
+  side already closed: a controlling `attach --host` whose remote answered
+  and exited at once lost the end of that output, and so could a local
+  attach whose run ended while the terminal was slow. Now the attach acts on
+  the session's end only once everything it was sent is on the terminal,
+  whether it then exits with the remote's code, reconnects, or reports a
+  takeover. The escape and the signals still leave at once.
+- **A watcher's read-only note no longer stays on screen after it leaves.**
+  `tendr: read-only attach; typed input is dropped` is now part of the
+  status line: it stays while attached, comes back after a reconnect, and is
+  erased when the attach ends.
+
 ## v0.7.0 — read-only viewers, Windows console attach
 
 Works with 0.6.0 and 0.5.0 in both directions over `--host` for everything

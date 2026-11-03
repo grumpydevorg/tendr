@@ -269,6 +269,16 @@ could be stale by the time the resume lands. The resume itself is the end
 signal: its refusal (the control rule, a run that has ended, a remote that
 cannot resume) carries the code to exit with.
 
+*2026-11-03.* That end counts only once the client has written everything
+the old connection delivered to the terminal. A failed write to the session
+(ssh's stdin already closed) is the same end arriving first, not the end
+itself: acting on it dropped a controller's last output when its remote
+answered and exited at once. The wait keeps the keyboard, so the escape and
+the signals still leave at once. A reconnect's dial is judged as the end of a
+connection is: on Windows, ssh.exe's 1 without a trailer is ssh.exe killed,
+and the attempt is tried again; on Unix it is the remote's code, and the
+attach ends with it.
+
 It retries without a limit on the number of attempts (Rick's decision),
 with pauses doubling from 1 s to at most 30 s, until it resumes, the remote
 refuses, or the user leaves with the escape or a signal. A laptop that

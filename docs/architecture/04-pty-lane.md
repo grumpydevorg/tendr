@@ -214,9 +214,11 @@ flowchart LR
   program, it shows nothing new until the program next redraws, and then at
   the controller's size, not its own.
 - `attach --read-only` is the watcher client: it drops keystrokes, says so
-  once on the status line at the first one, and still detaches with the
-  escape. With `--host` the attach bridge passes it through, and it
-  reconnects as a watcher ([Attaching over `--host`](#attaching-over---host)).
+  on the terminal's last row at the first one, and still detaches with the
+  escape. The note is part of the status line: it stays while attached
+  (the session's output may draw over it), and leaving erases it. With
+  `--host` the attach bridge passes it through, and it reconnects as a
+  watcher ([Attaching over `--host`](#attaching-over---host)).
 - With no terminal (stdin or stdout is not one), `attach --read-only`
   streams instead: the client's no-terminal layer never reads stdin and
   waits only on the connection and the cancelling signals. stdout gets the
@@ -404,6 +406,8 @@ A `push` to a pipe session that is not running exits 1.
   out, and discards typed-ahead input. Debug builds accept
   `TENDR_TEST_ATTACH_TERMINAL=<rows>x<cols>`: a test terminal on piped stdio,
   which the scripted-remote tests (`tests/cli_attach_scripted.rs`) drive.
+  With `TENDR_TEST_ATTACH_SCREEN_HOLD=<path>` too, it takes no writes while
+  that file exists, as a terminal that has stopped reading.
 - `Ctrl-\ d` detaches. `Ctrl-\` twice sends one `Ctrl-\`. `--escape none`
   disables the escape. Why this escape:
   [design](../design.md#detach-is-a-fixed-two-key-escape).
@@ -437,6 +441,13 @@ A `push` to a pipe session that is not running exits 1.
   draining output, and a signal's report gives up on a terminal that is not
   reading. A connection whose input is backed up is still released promptly
   when its client hangs up.
+- The session's end of a connection, by contrast, is drained: the client
+  acts on it only once the reader is done, so the session's last output is
+  on the terminal before the attach ends with its code, reconnects or
+  reports a takeover, however slowly the terminal takes it. A write the
+  sender could not make (the far end has closed) only means that end is on
+  its way. The keyboard stays live meanwhile, so the escape and the signals
+  still leave at once.
 
 ### Attaching over `--host`
 
@@ -483,20 +494,21 @@ tendr that bridges them to the session's socket
 - A version 2 client whose connection ends from the far side, without
   `MSG_RETIRED` and without output outside the protocol, hands ssh's end to
   a reconnect thread (`commands::attach::client::reconnect`;
-  [design](../design.md#a-dropped-attach---host-reconnects-by-itself-judged-by-sshs-exit)):
+  [design](../design.md#a-dropped-attach---host-reconnects-by-itself-judged-by-sshs-exit))
+  once the old connection's reader is done, so the offset is final and
+  every byte it got is on the terminal, whatever follows:
   - It waits up to 5 s for ssh's exit. The remote's exit code ends the
     attach with that code. ssh's 255 without an exit trailer, ssh killed
     (by a signal; on Windows, an exit below), or ssh still running then is
     a lost link. A leave the client has received but not yet read (a
     signal, a console control event) wins over an end it raced: the same
     signal or event can end ssh, which shares the terminal.
-  - It joins the old connection's reader, so the offset is final, and
-    resumes from that point over a new ssh with `BatchMode=yes`
-    (`commands::attach::resume_host`): the request carries the point, and a
-    `MSG_RESUME` takes the hello's place on ssh's stdin, which the bridge
-    passes on in the version it speaks to the sidecar ([Resuming a
-    viewer](#resuming-a-viewer)). A watcher's request stays read-only, and
-    its frame is `MSG_WATCH_RESUME`.
+  - A lost link is resumed from that point over a new ssh with
+    `BatchMode=yes` (`commands::attach::resume_host`): the request carries
+    the point, and a `MSG_RESUME` takes the hello's place on ssh's stdin,
+    which the bridge passes on in the version it speaks to the sidecar
+    ([Resuming a viewer](#resuming-a-viewer)). A watcher's request stays
+    read-only, and its frame is `MSG_WATCH_RESUME`.
   - A transport failure (255 without a trailer, ssh killed, the connect
     deadline) is tried again after 1 s, doubling to at most 30 s, with no
     limit on the number of attempts. Any remote verdict ends it: a refusal
@@ -513,7 +525,10 @@ tendr that bridges them to the session's socket
     (such as the `Timeout, server not responding.` the lost
     connection's ssh said as it gave up), as printable ASCII cut to the
     width. It is erased before the new connection's output is written.
-    While a connection is up its ssh stderr is kept off the screen too.
+    A watcher's read-only note gives its row to the status, and is drawn
+    again once the watcher has resumed; a reconnect that ends the attach
+    erases both. While a connection is up its ssh stderr is kept off the
+    screen too.
     What ssh said on the last attempt, or since the last connection came
     up, is printed once the terminal is restored, since it holds the
     remote's reason for a refusal.
@@ -569,7 +584,11 @@ tendr that bridges them to the session's socket
     ([the exit trailer](06-transport-boundaries.md#the-exit-trailer)); the
     first dial still keeps a 1, which a PowerShell login shell gives for a
     tendr too old to write a trailer. A Unix client keeps 1 as the remote's
-    code. The status line, its backoff, a resume, a gone answer and the
+    code. So a reconnect's dial that exits 1 with no trailer is a failed
+    attempt on Windows, tried again after the backoff, and on Unix ends the
+    attach with 1, as the first dial would; both are tested by the scripted
+    remote (`tests/cli_attach_scripted.rs`), each on its own platform. The
+    status line, its backoff, a resume, a gone answer and the
     escape mid-reconnect are tested under a pseudo console
     (`tests/windows_attach_console.rs`).
 
