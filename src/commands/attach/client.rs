@@ -151,16 +151,16 @@ impl Connection {
     /// How the connection ended, once its reader is done, with what still
     /// goes out on it: every byte of output the reader delivered is on the
     /// terminal, or never will be. The connection comes back while the
-    /// reader runs. A reader that panicked panics the relay too: a bug, not
-    /// an end to reconnect after. The terminal is restored as it unwinds.
+    /// reader runs. A reader that panicked ends it with its panic.
     fn end(self) -> Result<(ReaderEnd, Outgoing), Self> {
         if !self.reader.is_finished() {
             return Err(self);
         }
-        match self.reader.join() {
-            Ok(end) => Ok((end, self.outgoing)),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+        let end = self
+            .reader
+            .join()
+            .unwrap_or_else(|panic| ReaderEnd::Panicked(Panic(panic)));
+        Ok((end, self.outgoing))
     }
 }
 
@@ -566,6 +566,7 @@ enum Takeover {
 /// leaves nothing to reconnect for.
 fn after_reader(end: ReaderEnd, resumable: Resumable, takeover: Takeover) -> Option<Ending> {
     match end {
+        ReaderEnd::Panicked(panic) => Some(Ending::Panicked(panic)),
         ReaderEnd::TerminalGone => Some(Ending::OutputGone),
         ReaderEnd::Broken(why) => Some(Ending::Broken(why)),
         ReaderEnd::OutputComplete => Some(Ending::Session(SessionEnd::OutputComplete)),
@@ -584,12 +585,13 @@ struct Watched {
 /// The attach's exit code, and a note for stderr, from how the relay
 /// ended, whether another client took this one over (never after a
 /// detach), ssh's end (`finished`, for `--host`) and, for a watcher, its
-/// account. The first that applies decides: output outside the protocol
-/// (80), a takeover (81), output that could not be written (1), the user's
-/// own end (0), then the session's: the remote's verdict, else ssh's, else
-/// 0. A watcher promised the end of the output that did not get it was cut
-/// off (84); one not promised it has the bytes it had reported when the
-/// session's code is 84.
+/// account. The first that applies decides: a reader's panic, raised again
+/// now that the attach has cleaned up after it, then output outside the
+/// protocol (80), a takeover (81), output that could not be written (1),
+/// the user's own end (0), then the session's: the remote's verdict, else
+/// ssh's, else 0. A watcher promised the end of the output that did not get
+/// it was cut off (84); one not promised it has the bytes it had reported
+/// when the session's code is 84.
 fn verdict(
     ending: Ending,
     taken_over: bool,
@@ -601,6 +603,7 @@ fn verdict(
         "a detach is never a takeover"
     );
     let session = match ending {
+        Ending::Panicked(panic) => std::panic::resume_unwind(panic.0),
         Ending::Broken(why) => {
             return (
                 Err(PtyExitCode::Protocol.error(anyhow::anyhow!("tendr: {why}"))),
@@ -717,6 +720,10 @@ enum Ending {
     Broken(String),
     /// The session's side ended it.
     Session(SessionEnd),
+    /// The connection's reader panicked: a bug, never a reason to
+    /// reconnect. The attach leaves as on any end, the session's modes
+    /// turned off and ssh finished, and then panics with it (exit 101).
+    Panicked(Panic),
 }
 
 impl Ending {
@@ -753,6 +760,17 @@ enum ReaderEnd {
     Broken(String),
     /// The terminal, or stdout without one, refused a write.
     TerminalGone,
+    /// The reader panicked.
+    Panicked(Panic),
+}
+
+/// A thread's panic, carried until it is raised again.
+struct Panic(Box<dyn std::any::Any + Send>);
+
+impl std::fmt::Debug for Panic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Panic(..)")
+    }
 }
 
 /// Leave with exit code 1 after the user's side ended the attach
@@ -1269,6 +1287,10 @@ mod tests {
                     next(ReaderEnd::OutputComplete),
                     Some(Ending::Session(SessionEnd::OutputComplete))
                 ));
+                assert!(matches!(
+                    next(ReaderEnd::Panicked(Panic(Box::new("boom")))),
+                    Some(Ending::Panicked(_))
+                ));
                 let closed = next(ReaderEnd::Closed);
                 if resumable == Resumable::Yes && takeover == Takeover::None {
                     assert!(closed.is_none(), "{closed:?}");
@@ -1413,10 +1435,32 @@ mod tests {
             let code = result.unwrap_or_else(|e| exit_code(&e));
             assert_eq!(code, c.code, "{}", c.name);
             assert_eq!(note.is_some(), c.noted, "{}: {note:?}", c.name);
+            if let Some(note) = note {
+                assert!(note.contains("had 42 bytes"), "{}: {note}", c.name);
+            }
             if c.code == 84 && c.watched == Some(EndNotice::Promised) {
                 let message = message.unwrap_or_default();
                 assert!(message.contains("after 42 bytes"), "{}: {message}", c.name);
             }
         }
+    }
+
+    /// A reader's panic is raised again, after the cleanup, with the
+    /// reader's own payload, whatever else held.
+    #[test]
+    fn a_readers_panic_is_raised_again_as_it_was() {
+        let raised = std::panic::catch_unwind(|| {
+            verdict(
+                Ending::Panicked(Panic(Box::new("the reader's own"))),
+                true,
+                Some(Ok(7)),
+                Some(Watched {
+                    end: EndNotice::Promised,
+                    written: 0,
+                }),
+            )
+        });
+        let payload = raised.expect_err("the panic is raised again");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"the reader's own"));
     }
 }
