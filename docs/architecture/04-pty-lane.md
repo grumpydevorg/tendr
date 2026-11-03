@@ -454,6 +454,61 @@ A `push` to a pipe session that is not running exits 1.
   its way. The keyboard stays live meanwhile, so the escape and the signals
   still leave at once.
 
+### The relay's phases, and where the bytes are
+
+The client is in one phase at a time (`client::Phase`), and how it ends
+(`client::Ending`) decides the exit code:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Attached
+    Attached --> Reconnecting: reader closed, resumable over --host, no takeover
+    Reconnecting --> Attached: resumed
+    Reconnecting --> [*]: the remote's verdict
+    Attached --> [*]: reader ended otherwise
+    Attached --> [*]: escape, signal, keyboard closed
+    Reconnecting --> [*]: escape, signal, keyboard closed
+```
+
+A connection's reader thread returns why it stopped (`client::ReaderEnd`).
+The relay reads that only once the thread is done, so every byte the
+reader will write is on the terminal first. Then `client::after_reader`
+decides:
+
+|Reader end|Next|
+|---|---|
+|the terminal, or stdout, refused a write|end, detaching|
+|output outside the protocol|end, 80|
+|`MSG_OUTPUT_END` at the offset reached|end, the run's output complete|
+|stream closed, a resume point and no takeover|reconnect over `--host`; locally, end|
+|stream closed otherwise|end: the remote's code, 81 after a takeover, 84 for a watcher promised an end|
+
+A leave that arrived as the session's side ended wins over that end. A
+takeover is noted as the reader sees `MSG_RETIRED`, apart from its end,
+because a leave before the connection closes still reports it.
+
+Keystrokes pass through these places on their way to the child. Each one
+says what happens to bytes it holds when something ends:
+
+|Hop|Holds|On a leave, takeover or lost link|
+|---|---|---|
+|the client's tty input queue|what the kernel has not handed over; on Unix read in 4 KiB from the descriptor polled|discarded when the terminal is restored|
+|the escape parser (`attach_escape.rs`)|a held prefix, an unfinished sequence (up to 64 bytes, forwarded after 20 ms), or a possible paste end (held until the next byte)|discarded|
+|the client's outbox|up to 1 MiB of keystrokes behind the controls; more are dropped and counted (`N typed bytes were dropped`)|the detach goes ahead of them, then the connection closes; while reconnecting there is no outbox, and keystrokes are discarded with a notice|
+|ssh, then the bridge's outbox (`--host` only)|the bridge stops reading ssh's stdin at 1 MiB, so the backlog waits in ssh|as the client's|
+|the sidecar's input queue (`pty_input.rs`)|32 writes; the connection's reader waits for room unless its client hung up|cancelled and recorded ([input arbitration](#input-arbitration))|
+|the PTY master|what the child has not read|kept for the child; once the PTY is closed (a write takes 0 bytes), that write and every later one end `Incomplete(Closed)`, unreported to an attach, since the run is ending|
+
+Output passes through these:
+
+|Hop|Holds|On an end|
+|---|---|---|
+|the output ring|the run's latest 32 MiB, by offset|a viewer more than a ring behind is disconnected; a controller loses control, and a watcher promised an end exits 84|
+|the viewer's sender|one frame of up to 4 KiB|at the run's end it sends the rest and `MSG_OUTPUT_END` (version 3), within 2 s|
+|the bridge (`--host` only)|one whole frame, flushed as it is written|a frame the sidecar cut off is not passed on|
+|the client's reader|one frame, checked against the offset reached|written in full before the relay acts on the end; on a leave, it writes nothing more|
+|the terminal|what it has not yet drawn|restored without waiting for it|
+
 ### Attaching over `--host`
 
 `attach --host` runs this same client on the laptop, Unix or Windows: raw
