@@ -18,11 +18,12 @@
   status line: it stays while attached, comes back after a reconnect, and
   its row is erased when the attach ends. Output that scrolled the note up
   is not followed: the row erased is then the session's latest line.
-- **A paste over 4 KiB reaches the session whole.** On macOS and Linux, a
-  paste that arrived faster than `attach` read it could stop after its first
-  4,096 bytes, with the rest held until the next keystroke: the client read
-  the keyboard through a buffer its wait for input could not see. It now
-  reads the terminal directly.
+- **A paste over 4 KiB reaches the session whole.** On Linux, a paste that
+  arrived faster than `attach` read it could stop after its first 4,096
+  bytes, with the rest held until the next keystroke: the client read the
+  keyboard through a buffer its wait for input could not see. It now reads
+  the terminal directly. (A macOS terminal read returns at most about 1 KiB,
+  so it never filled that buffer.)
 
 ## v0.7.0 — read-only viewers, Windows console attach
 
