@@ -166,7 +166,9 @@ What it showed beyond the tests:
   instead of closing the window or opening its menu. `ssh -t` in conhost does
   the same: it is the console's virtual terminal input, which tendr needs. The
   close button still works, and Windows Terminal keeps both keys.
-- The read-only note stays on the window's last row after the watcher leaves.
+- The read-only note stayed on the window's last row after the watcher left
+  (fixed in #189: leaving now erases that row, unless output has scrolled
+  the note up, when the row erased is the session's latest line).
 - A reconnect erases the rows its status took, and a shell does not redraw
   them: the line of earlier output there stays blank.
 

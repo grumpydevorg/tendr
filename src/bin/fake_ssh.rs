@@ -44,6 +44,10 @@
 //! give-up-if <path> from now on, once <path> exists: remove it, write
 //!                   `Timeout, server box not responding.` to stderr and
 //!                   exit 255, as ssh does when its keepalives go unanswered
+//! die-if <path> <code>
+//!                   if <path> exists: remove it and exit <code> at once,
+//!                   with no hello and no exit trailer, as an ssh killed
+//!                   while it dials does
 //! forward           act as the remote login shell: see `forward`
 //! pump              act as the remote login shell, as real ssh does (Unix
 //!                   only): see `pump`
@@ -184,6 +188,14 @@ fn main() {
                 );
             }
             "give-up-if" => give_up_if(value.to_owned()),
+            "die-if" => {
+                let (path, code) = value
+                    .rsplit_once(' ')
+                    .expect("fake ssh: die-if <path> <code>");
+                if std::fs::remove_file(path).is_ok() {
+                    std::process::exit(code.parse().expect("fake ssh: die-if <code>"));
+                }
+            }
             "forward" => forward(&argv),
             "pump" => pump(&argv),
             "script" => play(&argv, lines.collect()),
@@ -303,6 +315,9 @@ fn forward(argv: &[String]) -> ! {
 ///                since this step began hold these bytes (two hex digits
 ///                each), or its input ends
 /// drain          read the client's frames until its input ends
+/// close-input    close our stdin, as a remote that has ended does: the
+///                client's next write to it fails
+/// touch <path>   create an empty file at <path>
 /// say <text>     write <text> and a newline to stderr, as the remote
 ///                tendr's own message
 /// drop [<code>]  say what ssh says when its keepalives go unanswered, then
@@ -465,6 +480,8 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                 }
             }
             "drain" => while receive(&mut stdin, log.as_mut()).is_some() {},
+            "close-input" => close_stdin(),
+            "touch" => std::fs::write(value, "").unwrap(),
             "drop" => {
                 eprint!("Timeout, server box not responding.\r\n");
                 let code = if value.is_empty() {
@@ -629,6 +646,13 @@ fn close_stderr() {
     unsafe { libc::close(2) };
 }
 
+#[cfg(unix)]
+fn close_stdin() {
+    // SAFETY: closing fd 0 only; nothing in this process reads stdin
+    // afterwards.
+    unsafe { libc::close(0) };
+}
+
 #[cfg(windows)]
 fn close_stderr() {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -636,6 +660,15 @@ fn close_stderr() {
     // SAFETY: closes this process's own stderr handle; nothing in this
     // process writes to stderr afterwards.
     unsafe { CloseHandle(GetStdHandle(STD_ERROR_HANDLE)) };
+}
+
+#[cfg(windows)]
+fn close_stdin() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+    // SAFETY: closes this process's own stdin handle; nothing in this
+    // process reads stdin afterwards.
+    unsafe { CloseHandle(GetStdHandle(STD_INPUT_HANDLE)) };
 }
 
 /// Keep our own stdin, stdout and stderr from being inherited by what we

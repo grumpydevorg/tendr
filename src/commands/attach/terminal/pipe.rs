@@ -3,9 +3,12 @@
 //! `TENDR_TEST_ATTACH_TERMINAL=<rows>x<cols>`, in place of the user's
 //! terminal, which then need not exist; release builds ignore it. There is
 //! no raw mode to enter or restore, and nothing leaves but the keyboard
-//! closing or the escape.
+//! closing or the escape. With `TENDR_TEST_ATTACH_SCREEN_HOLD=<path>` too,
+//! the screen takes no writes while `<path>` exists: a terminal that has
+//! stopped reading, whatever the size of the pipe behind it.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -15,6 +18,10 @@ use tendr::recording::Geometry;
 use super::{Input, Output, Raw, Terminal};
 
 const ENV: &str = "TENDR_TEST_ATTACH_TERMINAL";
+const HOLD_ENV: &str = "TENDR_TEST_ATTACH_SCREEN_HOLD";
+
+/// How often a held screen looks for its hold to be gone.
+const HOLD_POLL: Duration = Duration::from_millis(10);
 
 /// The test terminal, if this is a debug build and [`ENV`] selects it.
 ///
@@ -32,12 +39,16 @@ pub(super) fn from_env() -> anyhow::Result<Option<Pipe>> {
         .and_then(|v| v.split_once('x'))
         .and_then(|(rows, cols)| Geometry::new(rows.parse().ok()?, cols.parse().ok()?))
         .ok_or_else(|| anyhow::anyhow!("{ENV} must be <rows>x<cols>, not {value:?}"))?;
-    Ok(Some(Pipe { size }))
+    Ok(Some(Pipe {
+        size,
+        hold: std::env::var_os(HOLD_ENV).map(PathBuf::from),
+    }))
 }
 
 /// The test terminal before the attach.
 pub(super) struct Pipe {
     size: Geometry,
+    hold: Option<PathBuf>,
 }
 
 impl Terminal for Pipe {
@@ -45,7 +56,10 @@ impl Terminal for Pipe {
         Ok(Box::new(PipeRaw {
             keyboard: keyboard(),
             typed: Vec::new(),
-            output: Arc::new(PipeOutput { size: self.size }),
+            output: Arc::new(PipeOutput {
+                size: self.size,
+                hold: self.hold,
+            }),
         }))
     }
 }
@@ -103,10 +117,15 @@ impl Raw for PipeRaw {
 /// stdout, at the size [`ENV`] gave.
 struct PipeOutput {
     size: Geometry,
+    /// While this file exists, writes wait ([`HOLD_ENV`]).
+    hold: Option<PathBuf>,
 }
 
 impl Output for PipeOutput {
     fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+        while self.hold.as_ref().is_some_and(|hold| hold.exists()) {
+            std::thread::sleep(HOLD_POLL);
+        }
         let mut stdout = std::io::stdout().lock();
         stdout.write_all(bytes).and_then(|()| stdout.flush())
     }
