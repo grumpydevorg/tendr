@@ -2379,10 +2379,11 @@ fn takeover_revokes_queued_agent_input() {
     let _kill = harness::SessionGuard::new(&root, "pty-revoke");
     let go = root.path().join("go");
 
-    // The child consumes exactly 1 KiB of agent input, reports READY, then stops
-    // reading until the go file exists. Everything the agent pushes after that
-    // stays queued behind a full PTY input buffer.
-    let script = "stty raw -echo; head -c 1024 >/dev/null; printf READY; \
+    // The child reports RAW once its terminal is raw, consumes exactly 1 KiB of
+    // agent input, reports READY, then stops reading until the go file exists.
+    // Everything the agent pushes after that stays queued behind a full PTY
+    // input buffer.
+    let script = "stty raw -echo; printf RAW; head -c 1024 >/dev/null; printf READY; \
                   while [ ! -f \"$GO\" ]; do sleep 0.05; done; exec cat";
     tendr(&root)
         .args(["start", "pty-revoke", "--pty", "--stdin"])
@@ -2393,6 +2394,10 @@ fn takeover_revokes_queued_agent_input() {
         .unwrap();
     harness::wait_running(&root, "pty-revoke");
     let sock_path = wait_for_attach_socket(&root, "pty-revoke");
+    // A PTY starts in canonical mode, which discards an over-long line without
+    // blocking the writer, so a push sent before `stty raw` could be swallowed
+    // whole and finish before READY.
+    wait_log_contains(&root, "pty-revoke", "RAW");
 
     let mut payload = vec![b'a'; 2 << 20];
     payload.extend_from_slice(b"AGENT-TAIL\n");
@@ -3794,9 +3799,10 @@ fn fifo_input_waits_behind_an_agent_push() {
     let _kill = harness::SessionGuard::new(&root, "pty-fifo");
     let go = root.path().join("go");
 
-    // Consumes 1 KiB, reports READY, then stops reading until the go file
-    // exists, so the push below stays in flight holding the input.
-    let script = "stty raw -echo; head -c 1024 >/dev/null; printf READY; \
+    // Reports RAW once its terminal is raw, consumes 1 KiB, reports READY, then
+    // stops reading until the go file exists, so the push below stays in flight
+    // holding the input.
+    let script = "stty raw -echo; printf RAW; head -c 1024 >/dev/null; printf READY; \
                   while [ ! -f \"$GO\" ]; do sleep 0.05; done; exec cat";
     tendr(&root)
         .args(["start", "pty-fifo", "--pty", "--stdin"])
@@ -3806,6 +3812,10 @@ fn fifo_input_waits_behind_an_agent_push() {
         .output()
         .unwrap();
     harness::wait_running(&root, "pty-fifo");
+    // A PTY starts in canonical mode, which discards an over-long line without
+    // blocking the writer, so a push sent before `stty raw` could be swallowed
+    // whole and finish before READY.
+    wait_log_contains(&root, "pty-fifo", "RAW");
 
     let mut payload = vec![b'a'; 1 << 20];
     payload.extend_from_slice(b"\nPUSH-TAIL\n");
