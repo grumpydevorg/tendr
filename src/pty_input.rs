@@ -690,6 +690,7 @@ fn release<H: ControlHooks>(arbiter: &mut InputArbiter, handle: ControllerHandle
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::time::Instant;
 
     /// A PTY whose input buffer is permanently full: the child never reads.
@@ -1095,5 +1096,182 @@ mod tests {
             ]
         );
         writer.disconnect(resumed.handle);
+    }
+
+    /// One answer of [`ScriptedPty`] to a write attempt.
+    #[derive(Debug, Clone, Copy)]
+    enum Answer {
+        /// Take up to this many bytes (at least one).
+        Take(usize),
+        WouldBlock,
+        Interrupted,
+    }
+
+    /// A PTY that answers write attempts from a script, cycled, and records
+    /// what it took. It never answers `Ok(0)` or a terminal error.
+    #[derive(Clone)]
+    struct ScriptedPty {
+        script: Arc<[Answer]>,
+        next: usize,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl PtyInputSink for ScriptedPty {
+        fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let answer = self.script[self.next % self.script.len()];
+            self.next += 1;
+            match answer {
+                Answer::Take(n) => {
+                    let n = n.min(bytes.len());
+                    self.written.lock().unwrap().extend_from_slice(&bytes[..n]);
+                    Ok(n)
+                }
+                Answer::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
+                Answer::Interrupted => Err(io::ErrorKind::Interrupted.into()),
+            }
+        }
+    }
+
+    impl WritablePty for ScriptedPty {
+        fn wait_writable(&self, _timeout: Duration) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn resize(&self, _size: Geometry, _cause: ResizeCause) {}
+    }
+
+    /// Byte `k` of the input stream: not periodic, so a chunk written twice,
+    /// skipped or out of order cannot line up with the expected stream.
+    fn stream_byte(k: usize) -> u8 {
+        ((k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Whatever mix of partial writes, `WouldBlock` and `Interrupted` the
+        /// PTY answers with, one controller's writes reach it whole, in
+        /// order and once, and each waited-for write is accepted in full.
+        /// Writes go through both the waited path and the attach
+        /// connection's queue-and-go path.
+        #[test]
+        fn a_controllers_writes_arrive_whole_in_order_and_once(
+            mut script in proptest::collection::vec(
+                prop_oneof![
+                    3 => (1..4096usize).prop_map(Answer::Take),
+                    1 => Just(Answer::WouldBlock),
+                    1 => Just(Answer::Interrupted),
+                ],
+                0..16,
+            ),
+            last_take in 1..4096usize,
+            writes in proptest::collection::vec((1..16384usize, any::<bool>()), 1..12),
+        ) {
+            script.push(Answer::Take(last_take)); // so every cycle makes progress
+            let pty = ScriptedPty {
+                script: script.into(),
+                next: 0,
+                written: Arc::default(),
+            };
+            let written = Arc::clone(&pty.written);
+            let writer = InputWriter::spawn(RunId::new(), pty, Recorded::default());
+            let human = writer.claim(writer.next_holder(), ControllerKind::Human).unwrap();
+
+            let mut sent = 0;
+            let mut waited = Vec::new();
+            for &(len, wait) in &writes {
+                let bytes: Vec<u8> = (sent..sent + len).map(stream_byte).collect();
+                sent += len;
+                if wait {
+                    waited.push((len, writer.submit(&human, bytes).unwrap()));
+                } else {
+                    prop_assert!(writer.write_nowait_unless(&human, bytes, || false));
+                }
+            }
+            for (len, outcome) in waited {
+                let outcome = outcome.recv().unwrap();
+                prop_assert!(
+                    matches!(outcome, InputOutcome::Accepted { bytes, .. } if bytes == len),
+                    "{outcome:?} for {len} bytes"
+                );
+            }
+            writer.end_of_input_and_wait(human);
+
+            let expected: Vec<u8> = (0..sent).map(stream_byte).collect();
+            prop_assert!(*written.lock().unwrap() == expected, "the PTY got other bytes");
+        }
+    }
+
+    /// A PTY that takes `limit` bytes in all, three at a time, then answers
+    /// every attempt with `Ok(0)`.
+    #[derive(Clone)]
+    struct ClosesAfter {
+        limit: usize,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl PtyInputSink for ClosesAfter {
+        fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut written = self.written.lock().unwrap();
+            let n = (self.limit - written.len()).min(bytes.len()).min(3);
+            written.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+    }
+
+    impl WritablePty for ClosesAfter {
+        fn wait_writable(&self, _timeout: Duration) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn resize(&self, _size: Geometry, _cause: ResizeCause) {}
+    }
+
+    /// `Ok(0)` for a non-empty write means the PTY is closed: the write it
+    /// interrupts ends `Incomplete(Closed)` with what was taken, and every
+    /// later write ends the same way with nothing taken. The controller
+    /// keeps control, and nothing is reported to the hooks: the run's exit
+    /// is what ends it.
+    #[test]
+    fn a_pty_that_takes_nothing_ends_each_write_as_closed() {
+        let hooks = Recorded::default();
+        let pty = ClosesAfter {
+            limit: 7,
+            written: Arc::default(),
+        };
+        let writer = InputWriter::spawn(RunId::new(), pty.clone(), hooks.clone());
+        let human = writer
+            .claim(writer.next_holder(), ControllerKind::Human)
+            .unwrap();
+
+        let outcomes: Vec<_> = [&b"hello"[..], b"world!", b"again"]
+            .into_iter()
+            .map(|bytes| writer.write(&human, bytes.to_vec()).unwrap())
+            .map(|outcome| match outcome {
+                InputOutcome::Accepted { bytes, .. } => (bytes, bytes, None),
+                InputOutcome::Incomplete {
+                    accepted,
+                    total,
+                    reason,
+                    ..
+                } => (accepted, total, Some(reason)),
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                (5, 5, None),
+                (2, 6, Some(IncompleteReason::Closed)),
+                (0, 5, Some(IncompleteReason::Closed)),
+            ]
+        );
+        assert_eq!(pty.written.lock().unwrap().as_slice(), b"hellowo");
+        assert!(
+            writer
+                .claim(writer.next_holder(), ControllerKind::Agent)
+                .is_err(),
+            "the human still holds control"
+        );
+        assert_eq!(hooks.calls(), ["human_control:Attach".to_owned()]);
     }
 }

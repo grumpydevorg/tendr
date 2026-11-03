@@ -689,7 +689,7 @@ mod tests {
     }
 
     /// What feeding some chunks forwarded, and what the parser still holds.
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct Outcome {
         forward: Vec<u8>,
         escape: Escape,
@@ -701,6 +701,14 @@ mod tests {
     }
 
     fn run_state(chunks: &[&[u8]]) -> Outcome {
+        feed_reads(chunks, false)
+    }
+
+    /// Feed `chunks` with bracketed paste on. With `idle`, after each read
+    /// the client's read times out long after any deadline, as when the user
+    /// stops typing, so it forwards whatever [`EscapeParser::flush_expired`]
+    /// lets go.
+    fn feed_reads(chunks: &[&[u8]], idle: bool) -> Outcome {
         let mut parser = EscapeParser::new(EscapeMode::CtrlBackslash);
         parser.set_bracketed_paste(true);
         let mut forward = Vec::new();
@@ -709,6 +717,9 @@ mod tests {
             escape = parser.feed(chunk, &mut forward);
             if escape == Escape::Detach {
                 break;
+            }
+            if idle {
+                parser.flush_expired(Instant::now() + Duration::from_secs(3600), &mut forward);
             }
         }
         Outcome {
@@ -719,6 +730,19 @@ mod tests {
             between_kept: parser.between_kept,
             partial: parser.partial,
             pasting: parser.pasting,
+        }
+    }
+
+    /// Every byte of `input` forwarded, no detach, and nothing held.
+    fn forwarded_whole(input: &[u8]) -> Outcome {
+        Outcome {
+            forward: input.to_vec(),
+            escape: Escape::Continue,
+            prefix: None,
+            between: Vec::new(),
+            between_kept: Vec::new(),
+            partial: Vec::new(),
+            pasting: false,
         }
     }
 
@@ -736,6 +760,80 @@ mod tests {
             2 => any::<u8>().prop_map(|b| vec![b]),
         ];
         proptest::collection::vec(piece, 0..24).prop_map(|pieces| pieces.concat())
+    }
+
+    /// One piece of pasted text: the escape in every encoding, its halves,
+    /// sequence fragments (paste-end ones included), runs long enough to
+    /// cross a 4 KiB read, and arbitrary bytes.
+    fn paste_piece() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            3 => proptest::sample::select(CTRL_BACKSLASH.to_vec()).prop_map(<[u8]>::to_vec),
+            3 => proptest::sample::select(DETACH.to_vec()).prop_map(<[u8]>::to_vec),
+            3 => proptest::sample::select(vec![
+                &b"\x1cd"[..], b"\x1c", b"\x1c\x1c", b"\x1b", b"\x1b[", b"\x1b[2", b"\x1b[20",
+                b"\x1b[201", b"\x1b[201;", b"\x1b[200~", b"\x1b[92;5", b"\x1b[27;5;", b"\x1b[A",
+                b"\x1bO", b"~",
+            ]).prop_map(<[u8]>::to_vec),
+            3 => (any::<u8>(), 1..4096usize).prop_map(|(byte, n)| vec![byte; n]),
+            2 => proptest::collection::vec(any::<u8>(), 1..64),
+        ]
+    }
+
+    /// Up to 16 KiB of pasted text that holds no paste end, even one
+    /// completed by the wrapper's.
+    fn paste_body() -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(paste_piece(), 0..24).prop_map(|pieces| {
+            let mut body = pieces.concat();
+            body.truncate(16 << 10);
+            marker_safe(body)
+        })
+    }
+
+    /// `body` with every paste end broken (its `~` dropped) and anything at
+    /// its end that could begin one trimmed.
+    fn marker_safe(mut body: Vec<u8>) -> Vec<u8> {
+        while let Some(at) = body.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
+            body.remove(at + PASTE_END.len() - 1);
+        }
+        while (1..PASTE_END.len()).any(|n| body.ends_with(&PASTE_END[..n])) {
+            body.pop();
+        }
+        body
+    }
+
+    /// Typing after a paste that cannot start the escape: no prefix byte and
+    /// no escape sequence.
+    fn plain_typing() -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(
+            any::<u8>().prop_filter("not the prefix or ESC", |b| *b != PREFIX && *b != ESC),
+            0..16,
+        )
+    }
+
+    /// `bytes` cut into reads at `cuts`, at each multiple of the client's
+    /// 4 KiB read buffer, and `skews` bytes either side of each multiple;
+    /// never inside the first `whole` bytes.
+    fn reads<'a>(
+        bytes: &'a [u8],
+        whole: usize,
+        cuts: &[proptest::sample::Index],
+        skews: &[i8],
+    ) -> Vec<&'a [u8]> {
+        const READ: usize = 4096;
+        let mut at: Vec<usize> = cuts.iter().map(|c| c.index(bytes.len() + 1)).collect();
+        for boundary in (READ..bytes.len()).step_by(READ) {
+            at.push(boundary);
+            at.extend(
+                skews
+                    .iter()
+                    .filter_map(|&s| boundary.checked_add_signed(s.into())),
+            );
+        }
+        at.retain(|&a| a >= whole && a <= bytes.len());
+        at.extend([0, bytes.len()]);
+        at.sort_unstable();
+        at.dedup();
+        at.windows(2).map(|w| &bytes[w[0]..w[1]]).collect()
     }
 
     /// Complete keys and events that never start the escape.
@@ -1240,6 +1338,88 @@ mod tests {
             at.sort_unstable();
             let chunks: Vec<&[u8]> = at.windows(2).map(|w| &bytes[w[0]..w[1]]).collect();
             prop_assert_eq!(run(EscapeMode::CtrlBackslash, &chunks), (bytes.clone(), Escape::Continue));
+        }
+    }
+
+    #[test]
+    fn the_paste_from_issue_192_is_forwarded_whole_across_4096_byte_reads() {
+        let paste = cat(&[
+            PASTE_START,
+            &[b'A'; 3000],
+            b"\x1cd",
+            &[b'B'; 3000],
+            PASTE_END,
+            b"BPASTE-END\n",
+        ]);
+        // The issue says 6,020; the test's paste is 6 + 3000 + 2 + 3000 + 6 + 11.
+        assert_eq!(paste.len(), 6025);
+        let (first, second) = paste.split_at(4096);
+        for idle in [false, true] {
+            assert_eq!(feed_reads(&[first, second], idle), forwarded_whole(&paste));
+        }
+    }
+
+    /// Why the idle runs below never cut a paste's start: a start marker
+    /// split across reads is held like any unfinished sequence, and once it
+    /// has waited past its deadline it is forwarded as typed, so what follows
+    /// is typing. A terminal writes the marker at once, so only a read
+    /// boundary inside it and a 20 ms stall together can do this.
+    #[test]
+    fn a_paste_start_held_past_its_deadline_is_typed() {
+        let outcome = feed_reads(&[b"\x1b[20", b"0~x\x1cd"], true);
+        assert_eq!(outcome.escape, Escape::Detach);
+        assert_eq!(outcome.forward, b"\x1b[200~x");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// A paste is forwarded byte for byte however the reads cut it, a
+        /// pasted escape never detaches, and nothing is left held after it.
+        /// The same holds when every read is followed by an idle timeout
+        /// that forwards expired sequences, as the client's loop does.
+        #[test]
+        fn a_paste_is_forwarded_whole_however_the_reads_cut_it(
+            body in paste_body(),
+            after in plain_typing(),
+            cuts in proptest::collection::vec(any::<proptest::sample::Index>(), 0..8),
+            skews in proptest::collection::vec(-8i8..=8, 0..3),
+        ) {
+            let input = cat(&[PASTE_START, &body, PASTE_END, &after]);
+            prop_assert_eq!(
+                feed_reads(&reads(&input, 0, &cuts, &skews), false),
+                forwarded_whole(&input)
+            );
+            prop_assert_eq!(
+                feed_reads(&reads(&input, PASTE_START.len(), &cuts, &skews), true),
+                forwarded_whole(&input)
+            );
+        }
+
+        /// A paste end inside what was pasted ends the paste there: the
+        /// result is the paste up to and including that end, then what
+        /// follows typed into a parser that has never seen a paste (the end
+        /// leaves nothing held, so the state is a fresh one's).
+        #[test]
+        fn an_early_paste_end_ends_the_paste_and_the_rest_is_typed(
+            body in paste_body(),
+            rest in proptest::collection::vec(
+                prop_oneof![4 => paste_piece(), 1 => Just(PASTE_END.to_vec())],
+                0..12,
+            ),
+            after in extended_stream(),
+            cuts in proptest::collection::vec(any::<proptest::sample::Index>(), 0..8),
+            skews in proptest::collection::vec(-8i8..=8, 0..3),
+        ) {
+            let pasted = cat(&[PASTE_START, &body, PASTE_END]);
+            let after_end = cat(&[&rest.concat(), PASTE_END, &after]);
+            let input = cat(&[&pasted, &after_end]);
+            let typed = run_state(&[&after_end]);
+            let expected = Outcome {
+                forward: cat(&[&pasted, &typed.forward]),
+                ..typed
+            };
+            prop_assert_eq!(feed_reads(&reads(&input, 0, &cuts, &skews), false), expected);
         }
     }
 }

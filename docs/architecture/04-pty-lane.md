@@ -427,7 +427,8 @@ A `push` to a pipe session that is not running exits 1.
   `ESC [ 201 ~`) is forwarded as text, so pasted `Ctrl-\` bytes neither start
   the escape nor detach. A read that ends inside a possible paste end holds
   it until the next byte, with no deadline. Turning bracketed paste off ends
-  a paste.
+  a paste. A fuzz target checks a paste is forwarded whole however reads cut
+  it: `cargo +nightly fuzz run escape_paste` (the `fuzz/` crate, not in CI).
 - The terminal size is checked every 100 ms and changes are forwarded.
   SIGWINCH (on Windows, `WINDOW_BUFFER_SIZE_EVENT`) only brings that check
   forward, because such notices coalesce.

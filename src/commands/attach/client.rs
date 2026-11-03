@@ -901,3 +901,157 @@ fn size_poll_interval() -> Duration {
     }
     SIZE_POLL
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use tendr::recording::Geometry;
+
+    /// What the keyboard side puts in the outbox.
+    #[derive(Debug, Clone)]
+    enum Push {
+        /// Keystrokes of this length.
+        Data(usize),
+        /// A size, with this many rows.
+        Resize(u16),
+        Repaint,
+    }
+
+    /// Chunk `i` of those pushed: its index, then one byte repeated. Each
+    /// chunk differs from the others, so one sent twice, skipped or out of
+    /// order cannot match the expected list.
+    fn chunk(i: usize, len: usize) -> Vec<u8> {
+        let mut bytes = vec![(i as u8).wrapping_mul(97); len];
+        let index = (i as u64).to_le_bytes();
+        let n = index.len().min(len);
+        bytes[..n].copy_from_slice(&index[..n]);
+        bytes
+    }
+
+    /// Nothing, a yield, or a short sleep, so the two threads interleave
+    /// differently from case to case.
+    fn pause(kind: u8) {
+        match kind % 4 {
+            0 => {}
+            1 => std::thread::yield_now(),
+            2 => std::thread::sleep(Duration::from_micros(50)),
+            _ => std::thread::sleep(Duration::from_micros(500)),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// With the sender draining concurrently, the Data frames it gets
+        /// are exactly the accepted chunks, in order and once; every refused
+        /// byte is counted as dropped; a chunk is refused only when it could
+        /// not fit; and sizes queued in between neither reorder nor lose
+        /// input, and the latest size is always sent.
+        #[test]
+        fn the_sender_gets_every_accepted_chunk_in_order_and_once(
+            pushes in proptest::collection::vec(
+                prop_oneof![
+                    6 => (1..4096usize).prop_map(Push::Data),
+                    2 => ((256usize << 10)..(1200 << 10)).prop_map(Push::Data),
+                    2 => (1..100u16).prop_map(Push::Resize),
+                    1 => Just(Push::Repaint),
+                ],
+                0..24,
+            ),
+            producer_pauses in proptest::collection::vec(any::<u8>(), 1..8),
+            consumer_pauses in proptest::collection::vec(any::<u8>(), 1..8),
+        ) {
+            // Built ahead, so pushes come as fast as reads and fill the queue.
+            let mut chunks = Vec::new();
+            for push in &pushes {
+                if let Push::Data(len) = *push {
+                    chunks.push(chunk(chunks.len(), len));
+                }
+            }
+            let pushed: usize = chunks.iter().map(Vec::len).sum();
+            let mut chunks = chunks.into_iter();
+
+            let outbox = Arc::new(Outbox::default());
+            let sender = {
+                let outbox = Arc::clone(&outbox);
+                std::thread::spawn(move || {
+                    let mut frames = Vec::new();
+                    while let Some(frame) = outbox.next() {
+                        pause(consumer_pauses[frames.len() % consumer_pauses.len()]);
+                        frames.push(frame);
+                        outbox.sent();
+                    }
+                    frames
+                })
+            };
+
+            let mut accepted: Vec<Vec<u8>> = Vec::new();
+            let mut accepted_bytes = 0;
+            let mut dropped = 0;
+            let mut sizes = Vec::new();
+            let mut repaints = 0;
+            for (i, push) in pushes.iter().enumerate() {
+                pause(producer_pauses[i % producer_pauses.len()]);
+                match *push {
+                    Push::Data(len) => {
+                        let bytes = chunks.next().unwrap();
+                        // As `send_keystrokes` counts them.
+                        if outbox.push_data(bytes.clone()) {
+                            accepted_bytes += len;
+                            accepted.push(bytes);
+                        } else {
+                            // Queued bytes are at most the accepted ones.
+                            prop_assert!(
+                                accepted_bytes + len > OUTBOX_DATA_LIMIT,
+                                "{len} bytes refused with {accepted_bytes} accepted so far"
+                            );
+                            dropped += len;
+                        }
+                    }
+                    Push::Resize(rows) => {
+                        let size = Geometry::new(rows, 80).unwrap();
+                        sizes.push(size);
+                        outbox.push_control(Frame::Resize(size));
+                    }
+                    Push::Repaint => {
+                        repaints += 1;
+                        outbox.push_control(Frame::Repaint);
+                    }
+                }
+            }
+            // Once the queues are empty every frame is in the sender's hands.
+            loop {
+                let state = outbox.lock();
+                if state.data.is_empty() && state.controls.is_empty() {
+                    break;
+                }
+                drop(state);
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            outbox.close();
+            let frames = sender.join().unwrap();
+
+            let mut data = Vec::new();
+            let mut sent_sizes = Vec::new();
+            let mut sent_repaints = 0;
+            for frame in frames {
+                match frame {
+                    Frame::Data(bytes) => data.push(bytes),
+                    Frame::Resize(size) => sent_sizes.push(size),
+                    Frame::Repaint => sent_repaints += 1,
+                    other => prop_assert!(false, "unexpected {other:?}"),
+                }
+            }
+            prop_assert!(data == accepted, "the sender got other chunks");
+            prop_assert_eq!(data.iter().map(Vec::len).sum::<usize>() + dropped, pushed);
+            prop_assert_eq!(sent_repaints, repaints);
+            let mut later = sizes.iter();
+            prop_assert!(
+                sent_sizes.iter().all(|sent| later.any(|size| size == sent)),
+                "sizes sent out of order: {sent_sizes:?} from {sizes:?}"
+            );
+            prop_assert_eq!(sent_sizes.last(), sizes.last());
+        }
+    }
+}
