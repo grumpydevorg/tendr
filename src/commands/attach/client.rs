@@ -468,6 +468,14 @@ pub(super) fn relay(
                 "tendr: {dropped} typed bytes were dropped while the session was not accepting input"
             ));
         }
+        // The reader's own report went to a raw terminal, and an alternate
+        // screen took it away as the modes were turned off.
+        if let Ending::Panicked(panic) = &ending {
+            notes.push(format!(
+                "tendr: the attach's output reader panicked: {}",
+                panic.message()
+            ));
+        }
     }
     if matches!(ending, Ending::Left(_)) {
         exit_left(notes);
@@ -770,6 +778,17 @@ struct Panic(Box<dyn std::any::Any + Send>);
 impl std::fmt::Debug for Panic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Panic(..)")
+    }
+}
+
+impl Panic {
+    /// The panic's message, when it has one.
+    fn message(&self) -> &str {
+        self.0
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| self.0.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("(no message)")
     }
 }
 
