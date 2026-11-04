@@ -256,6 +256,13 @@ Notes:
   `DependencyFailed`. If the sidecar does not act within 8 s, `kill` fails
   (exit 1). If no sidecar holds the session, `kill` records `SidecarLost`
   at once, stopping any child in the `child_pid` breadcrumb.
+- A sidecar holds the session before it writes `meta.json`, which it does
+  once the child is spawned (or at `Starting`, for a run with `--after`). A
+  session with the lock held and no `meta.json` is starting. `kill` and
+  `start --replace` say so, wait up to 11 s for the record, and then proceed
+  as for a recorded run; past that, they fail with "still starting". A
+  second `start` and `status` fail with "session … is starting" and leave
+  the session alone; the orphan-directory cleanup never removes it.
 
 ## `attach` (local and remote)
 

@@ -69,7 +69,7 @@ flags:
 |`--record-input`, `--no-record`|With `--pty`: also record what is typed, or record nothing ([PTY details](#pty-details); `start` only).|
 |`--namespace <ns>`|Put the session in a namespace.|
 |`--exec-target <target>`|Set the exec target instead of inferring it (`start` only).|
-|`--replace`|Kill an existing session of the same name and start a new run.|
+|`--replace`|Kill an existing session of the same name and start a new run. A run still starting is waited for first, as `kill` does.|
 |`--timeout <sec>`|Stop the child after this many seconds, as `kill` does.|
 |`--cwd <dir>`, `--env KEY=VALUE`|Set the child's working directory or an environment variable.|
 |`--unset-env NAME`|Remove an inherited variable from the child's environment. Repeatable; `--env` of the same name still sets it.|
@@ -571,6 +571,14 @@ has exited. A stop ends such processes too.
 `kill` succeeds only when the run has ended. If the sidecar has not recorded
 the end after about 20 s, `kill` exits 1. If the sidecar is gone, `kill` stops
 the child and records the run as `SidecarLost`.
+
+A run whose sidecar has not recorded it yet is still starting; this
+happens when its `start` or `run` was interrupted while it waited for the
+run to start. `kill` and `start --replace` say `<name> is starting; waiting
+for its sidecar to record the run` on stderr, wait up to 11 s for the
+record, and then stop or replace the run. If it is still not recorded, they
+exit 1 with `<name> is still starting after 11 s`. A second `start` and
+`status` exit 1 with `session <name> is starting` and leave the run alone.
 
 `wait` and `kill` return once the sidecar has released the session, so a
 `prune` or `start --replace` straight after them finds the session free. If the

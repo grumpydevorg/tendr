@@ -214,9 +214,13 @@ fn handle_replace(
         .join(namespace.as_str())
         .join(session_name.as_str());
     if session_path.exists() {
+        // A starting run is replaced like any other, once it is recorded.
+        if let Ok(dir) = session::open_raw(root, namespace, session_name) {
+            super::kill::await_record(&dir, session_name.as_str(), "start --replace")?;
+        }
         if !session_path.join("meta.json").exists() {
             // Orphan dir -- just clean up, no generation to read
-            super::status::cleanup_orphan_dir(&session_path);
+            super::status::cleanup_orphan_dir(root, namespace, session_name)?;
         } else if let Some(existing) = session::open(root, namespace, session_name)? {
             let existing_meta = session::read_meta(&existing)?;
             let prev_generation = existing_meta.generation();
@@ -284,9 +288,10 @@ fn try_idempotent_start(
         .join(session_name.as_str());
     let name = session_name.as_str();
 
-    // Orphan dir check: no meta.json means sidecar crashed before writing state
+    // Orphan dir check: no meta.json means sidecar crashed before writing
+    // state, unless one still holds the session (starting: an error).
     if !session_path.join("meta.json").exists() {
-        super::status::cleanup_orphan_dir(&session_path);
+        super::status::cleanup_orphan_dir(root, namespace, session_name)?;
         let session = session::create(root, namespace, session_name)?;
         return Ok(Some(session));
     }
@@ -327,7 +332,7 @@ fn try_idempotent_start(
             }
         } else {
             // Starting + unlocked = orphan
-            super::status::cleanup_orphan_dir(&session_path);
+            super::status::cleanup_orphan_dir(root, namespace, session_name)?;
             let session = session::create(root, namespace, session_name)?;
             Ok(Some(session))
         }

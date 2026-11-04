@@ -16,7 +16,7 @@ pub fn cmd_status(name: &str, namespace: &Namespace) -> anyhow::Result<()> {
                 .join(namespace.as_str())
                 .join(session_name.as_str());
             if orphan_dir.exists() {
-                cleanup_orphan_dir(&orphan_dir);
+                cleanup_orphan_dir(&root, namespace, &session_name)?;
                 anyhow::bail!("session {name} was orphaned (cleaned up)");
             }
             anyhow::bail!("session not found: {name}");
@@ -40,12 +40,27 @@ pub fn cmd_status(name: &str, namespace: &Namespace) -> anyhow::Result<()> {
 /// The child_pid breadcrumb contains a JSON-serialized ProcessIdentity; the
 /// child is killed only by the shared identity-verified rule
 /// ([`tendr::reconcile::kill_verified_orphan`]), never on a bare PID.
-pub(crate) fn cleanup_orphan_dir(dir: &std::path::Path) {
-    let child_pid_path = dir.join("child_pid");
+///
+/// # Errors
+/// A sidecar holds the session: it is starting, not orphaned (see
+/// [`super::kill::is_unrecorded`]), and is left alone.
+pub(crate) fn cleanup_orphan_dir(
+    root: &SessionRoot,
+    namespace: &Namespace,
+    name: &SessionName,
+) -> anyhow::Result<()> {
+    let Ok(dir) = session::open_raw(root, namespace, name) else {
+        return Ok(());
+    };
+    if super::kill::is_unrecorded(&dir) {
+        return Err(super::kill::starting_error(name.as_str()));
+    }
+    let child_pid_path = dir.path().join("child_pid");
     if let Ok(content) = std::fs::read_to_string(&child_pid_path) {
         if let Ok(identity) = serde_json::from_str::<ProcessIdentity>(&content) {
             let _ = tendr::reconcile::kill_verified_orphan(&identity);
         }
     }
-    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(dir.path());
+    Ok(())
 }

@@ -106,9 +106,9 @@ impl Home {
     }
 
     /// Force-kill `namespace/name` unless it is terminal, then wait until no
-    /// sidecar holds it. Returns the last observation if it is still held
-    /// after [`HANG`].
-    fn release(&self, root: &SessionRoot, namespace: &str, name: &str) -> Result<(), WaitTimeout> {
+    /// sidecar holds it. Returns what it saw (the kill's outcome, the
+    /// session's state) if it is still held after [`HANG`].
+    fn release(&self, root: &SessionRoot, namespace: &str, name: &str) -> Result<(), String> {
         let (Ok(ns), Ok(session_name)) = (Namespace::new(namespace), SessionName::new(name)) else {
             return Ok(());
         };
@@ -119,11 +119,23 @@ impl Home {
         // Decided by meta, not by the lock: the kill also reconciles a
         // Running session whose sidecar crashed, killing the child it left.
         // Its result is ignored; the lock decides whether the sidecar is gone.
+        let mut kill = "not sent: meta.json is terminal".to_owned();
         if !session::read_meta(&dir).is_ok_and(|meta| meta.status().is_terminal()) {
-            let _ = tendr(self)
+            // Load must not end the kill's waits (for a starting run's record,
+            // then for its sidecar) early; each ends as soon as it is met.
+            kill = match tendr(self)
+                .env("TENDR_TEST_KILL_WAIT_MS", HANG.as_millis().to_string())
                 .args(["kill", "--force", "--namespace", namespace, name])
-                .timeout(HANG)
-                .output();
+                .timeout(3 * HANG)
+                .output()
+            {
+                Ok(out) => format!(
+                    "{}; stderr: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => format!("did not run: {e}"),
+            };
         }
         poll_until(HANG, Duration::from_millis(10), || {
             match LockGuard::try_acquire(&dir) {
@@ -134,7 +146,36 @@ impl Home {
                 _ => Observation::Ready(()),
             }
         })
+        .map_err(|e| format!("{e}\n  kill --force: {kill}\n  {}", describe_session(&dir)))
     }
+}
+
+/// What a held session looks like on disk, for [`Home`]'s failure message:
+/// its recorded status, whether its sidecar and child are alive, its files.
+fn describe_session(dir: &session::SessionDir) -> String {
+    use tendr::platform::{Current, Platform};
+    let mut files: Vec<String> = std::fs::read_dir(dir.path())
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    let alive = |id: &tendr::model::ids::ProcessIdentity| {
+        format!("{} {:?}", id.pid, Current::process_status(id))
+    };
+    let state = match session::read_meta(dir) {
+        Ok(meta) => format!(
+            "meta: {:?}; sidecar {}; child {}",
+            meta.status(),
+            alive(meta.sidecar()),
+            meta.status().child().map_or("none".to_owned(), alive),
+        ),
+        Err(e) => format!("meta: {e}"),
+    };
+    format!("{state}\n  files: {}", files.join(" "))
 }
 
 impl Drop for Home {

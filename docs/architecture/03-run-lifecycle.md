@@ -388,7 +388,12 @@ since only the sidecar holds the kill-on-close Job Object.
   failure, before any meta was written. The orphan-directory cleanup in
   `status` and `start` handles this. It kills the breadcrumb's child by the
   same identity rule and removes the directory without a record. The only
-  copy of the failure record is then the lost+found one.
+  copy of the failure record is then the lost+found one. A directory whose
+  lock a sidecar holds (or whose lock cannot be probed) is not an orphan:
+  the run is starting (see [`kill`](05-key-flows.md#kill)), and the cleanup
+  refuses it. A sidecar that has been spawned but has not taken the lock
+  yet leaves a directory that still looks orphaned; nothing tells it apart,
+  so the cleanup can still remove it under that sidecar.
 - **Descriptors opened while `start` lists them.** `close_range` exists from
   Linux 5.9, and its `CLOSE_RANGE_CLOEXEC` flag from 5.11. Where the call or
   the flag is missing (macOS, older Linux) or seccomp denies it, `start` lists
