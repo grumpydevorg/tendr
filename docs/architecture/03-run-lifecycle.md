@@ -269,8 +269,15 @@ The outcome is recorded:
 - child already gone: nothing
 
 On Windows the child is in a kill-on-close Job Object that only the sidecar
-holds. The kernel kills the process tree when the sidecar dies, so
-reconciliation only records the loss.
+holds, from before its first instruction: the child starts suspended and is
+resumed once assigned. The kernel kills the process tree when the sidecar
+dies, so reconciliation only records the loss. A `kill` past a sidecar that
+is stuck, not dead, opens the job by its name (the child's PID and creation
+time), sends CTRL_BREAK from a helper attached to the child's console, waits
+up to 5 s and ends the job. Where the name cannot be opened (another logon
+session), it walks the child's process tree instead, holding each process
+open as it finds it and leaving other sessions' sidecars alone
+(`src/platform/windows/orphan.rs`).
 
 If the sidecar's durable `run.sidecar_failed` event exists but its meta write
 failed, reconciliation heals meta from that event. This also works on the
@@ -344,9 +351,14 @@ How the search finds the run:
   it signals the child, and every later search also takes whatever of that
   list is still running with the same start time.
 
-On Windows the child's Job Object holds the whole tree. A forced stop ends
-it; after a graceful one the rest of the tree ends when the sidecar exits,
-since only the sidecar holds the kill-on-close Job Object.
+On Windows the child's Job Object holds the whole tree: the child is
+created suspended and resumed only once it is in the job. A forced stop ends
+the job; after a graceful one the rest of the tree ends when the sidecar
+exits, since only the sidecar holds the kill-on-close Job Object. The job
+allows no breakaway: Cygwin and MSYS programs (Git Bash's `sh`) start every
+child asking to leave a job that allows it. So a session started inside
+the run stays in the run's job and ends with it, unlike on Unix, and over
+SSH such a start is refused ([design](../design.md#windows-uses-job-objects-and-a-hidden-console)).
 
 ## Limits
 
@@ -396,6 +408,13 @@ since only the sidecar holds the kill-on-close Job Object.
     child is found. What escapes is a child whose parent exits on its own in
     that moment, if the child has also left the run's session: the first
     case above.
+  - On Windows, it cannot reach a process that left the Job Object by
+    asking to (`CREATE_BREAKAWAY_FROM_JOB`), nor one started through a
+    service or another manager. A `kill` past a stuck sidecar from another
+    Terminal Services session (an SSH login, for a desktop's run), which
+    cannot open the job by its `Local\` name, walks the child's
+    process tree, so it also misses a process whose parent had exited
+    before the walk.
 - **A terminal holder outlives a PTY child that exits on its own.** A
   process outside the child's session may still hold the terminal after the
   child has exited. Capture then reads what that process writes for at most

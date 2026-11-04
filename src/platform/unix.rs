@@ -78,7 +78,9 @@ impl Platform for UnixPlatform {
         tendr_bin: &Path,
         session_dir: &Path,
         ready_write_fd: &File,
+        _lifetime: super::SessionLifetime,
     ) -> io::Result<u32> {
+        // A new session (setsid) outlives its caller either way.
         spawn_sidecar(tendr_bin, session_dir, ready_write_fd)
     }
 

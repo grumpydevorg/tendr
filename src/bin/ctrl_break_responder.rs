@@ -3,6 +3,11 @@
 //! Used by tests/windows_child.rs to verify that graceful kill via
 //! GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) works without escalating
 //! to TerminateJobObject.
+//!
+//! With `--child` it first starts a second responder, its child in the same
+//! console and process group, and prints `CHILD <pid>` once that child is
+//! ready: a process that starts a descendant as soon as it runs
+//! (tests/windows_stop_tree.rs).
 
 #[cfg(windows)]
 fn main() {
@@ -35,6 +40,25 @@ fn main() {
         );
         std::process::exit(1);
     }
+    // With `--child`, start the second responder before anything else, and
+    // wait for it to prove its own handler installed.
+    let child_line = std::env::args().nth(1).filter(|a| a == "--child").map(|_| {
+        use std::io::BufRead;
+        let exe = std::env::current_exe().expect("own path");
+        // Not waited for: it runs until its own CTRL_BREAK, as this one does.
+        #[allow(clippy::zombie_processes)]
+        let mut child = std::process::Command::new(exe)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the child responder");
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("child stdout"))
+            .read_line(&mut ready)
+            .expect("read the child's READY");
+        assert_eq!(ready.trim(), "READY", "child responder");
+        format!("CHILD {}", child.id())
+    });
 
     // Readiness handshake: the handler is now proven installed, so any CTRL_BREAK
     // from this point on is caught. The test waits for this line before signalling,
@@ -43,6 +67,9 @@ fn main() {
     {
         use std::io::Write;
         let mut out = std::io::stdout();
+        if let Some(line) = child_line {
+            let _ = writeln!(out, "{line}");
+        }
         let _ = writeln!(out, "READY");
         let _ = out.flush();
     }

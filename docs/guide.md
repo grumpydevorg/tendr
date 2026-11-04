@@ -658,13 +658,29 @@ tool shells that Claude Code starts in sessions of their own. `kill` and
 `--timeout` send each SIGTERM and give it up to 1 s to exit; then, and at
 once for `kill --force`, each one left is stopped and killed. The run's end
 is recorded after that, so `kill` returns with them gone. A session you start
-with `tendr start` from inside the run is left running. A stop cannot reach
-processes started through another manager, such as `systemd-run --user`,
-`at` or an already running `tmux` server, nor end a setuid program; a run
+with `tendr start` from inside the run is left running (not on Windows, see
+below). A stop cannot reach processes started through another manager,
+such as `systemd-run --user`, `at` or an already running `tmux` server,
+nor end a setuid program; a run
 warning names what it could not end. On macOS, where orphans go to launchd,
 it also misses a process that left the session, lost its parent and holds
 no terminal descriptor, such as `(setsid cmd >/dev/null 2>&1 &)` (run
 lifecycle, [Limits](architecture/03-run-lifecycle.md#limits)).
+
+**On Windows** the child starts suspended, is put in a Job Object, and only
+then runs, so whatever it starts, at once or later, is in the job. `kill`
+and `--timeout` send CTRL_BREAK to the child's process group and end the
+job after 5 s; `kill --force` ends it at once. No process can leave the
+job: Cygwin and MSYS programs such as Git Bash's `sh` would otherwise let
+their children escape it. So, unlike on Unix, a session started with
+`tendr start` from inside the run is in the run's job too and ends with the
+run; start it from outside the run to keep it. When the
+sidecar is gone or does not answer, `kill` finds the run by its Job Object,
+or, from another Windows session, by the child's process tree: the job's
+name is per Terminal Services session, and every SSH login runs in session
+0, apart from a desktop's sign-in. It sends CTRL_BREAK, waits up to 5 s,
+then ends what is left. A PID that now names another process is never
+stopped.
 
 A PTY run ends with its child, even if a process the child started still holds
 the terminal, such as a `setsid` job. Once the child has exited, tendr captures
@@ -839,6 +855,26 @@ Values are carried exactly, not translated, so a Windows session takes
 Windows commands and paths. If you wrap a local-only command in `ssh`
 yourself, quote for the remote shell, for example with
 `powershell -NoProfile -Command`.
+
+A session started over SSH on a Windows host outlives the connection: its
+sidecar leaves the job Windows OpenSSH runs the connection's processes in,
+which can end with the connection. CI checks, against a real Windows
+OpenSSH server on x64 and ARM64, that a session is still running after the
+connection that started it has closed. If the job does not let its
+processes leave (no `JOB_OBJECT_LIMIT_BREAKAWAY_OK`), `start` (and
+`run --detach`) exits 1 and says the session could not outlive this SSH
+connection, rather than start one that may die with it. tendr knows it
+runs for SSH by `SSH_CONNECTION`, which every process started from an SSH
+login inherits, so a `tendr start` in a program you launched from an SSH
+shell is checked too, and one with the variable removed is not. A
+foreground `tendr run` is never refused: it lasts as long as its caller
+anyway. A `tendr start` inside a tendr run on Windows is in the run's job,
+which nothing leaves; inside a run started over SSH (whose processes have
+`SSH_CONNECTION`) it is refused, and the message says the session would
+end with the run. Locally, a session started inside such a job (Cargo's,
+an IDE's, a run's) stays in it and lasts as long as the job, as one in a
+cgroup does on Linux. A remote `tendr` older than 0.8.0 starts the session
+inside such a job over SSH too.
 
 **Connect deadline.** Every `--host` command must authenticate and start the
 remote `tendr` within 30 s, or tendr stops `ssh` and exits 82, naming the

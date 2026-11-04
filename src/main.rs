@@ -628,6 +628,11 @@ enum Commands {
     /// Internal: run one `--host` request read from stdin (not for direct use)
     #[command(name = "_remote", hide = true)]
     Remote,
+    /// Internal (Windows): send CTRL_BREAK to a stopped session's child from
+    /// its console, for a stop without the sidecar (not for direct use)
+    #[cfg(windows)]
+    #[command(name = "_ctrl-break", hide = true)]
+    CtrlBreak { pid: u32, start_time_ns: u64 },
 }
 
 /// Subcommands of `tendr skill`.
@@ -1306,6 +1311,10 @@ fn main() {
         },
         Commands::Sidecar { session_dir } => commands::cmd_sidecar(session_dir),
         Commands::Remote => remote_frame::serve(),
+        #[cfg(windows)]
+        Commands::CtrlBreak { pid, start_time_ns } => std::process::exit(
+            tendr::platform::windows::ctrl_break_helper(pid, start_time_ns),
+        ),
         // The remote-capable commands run through the same typed layer as
         // `--host`. Named, not a catch-all, so a new command must be classified.
         remote @ (Commands::Start { .. }
