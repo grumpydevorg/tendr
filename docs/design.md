@@ -453,6 +453,11 @@ frame ends at the remote tendr CLI, which runs the command as if typed there:
 no network listener, no RPC layer. Values cross verbatim, and tendr does not
 translate workload syntax between shells.
 
+An older remote ignores a request field it does not know, so a new option
+would be dropped without a word (*2026-11-04*). A request that uses one goes
+in frame version 2, which a remote from before it refuses as too old; every
+other request stays version 1, so older remotes keep working for it.
+
 ### No automatic restart
 
 *2026-03.* Tendr never restarts a child that exits (rules 1 and 7). Restarting
@@ -483,6 +488,30 @@ screen replays the recording through a terminal of its own. Source:
 `docs/plans/specs/ecosystem-landscape.md`, and the cloud PTY plan at
 `95dcf1d`, which designed an optional `tendr-screen` extension that was
 dropped on 2026-10-31.
+
+### Replay plays a recording through the user's terminal
+
+*2026-11-04.* With no screen engine, the way to see what a past PTY session
+looked like is to play its recorded output through a real terminal, so
+`tendr replay` does that and nothing more: it never connects to a live
+session or writes to a child. Core cannot resize the user's window and does
+not rely on `CSI 8 ; rows ; cols t`, which many terminals ignore, so matching
+the size is the user's: replay asks once, before playback. By default a later
+mismatch is reported once, after playback, because a notice drawn during it
+would damage the picture; `--strict-geometry` pauses at each size change for
+an exact one. Repaint nudges are tendr's own resizes, not the user's, so they
+never prompt. The whole recording is decoded before anything is shown, so a
+damaged one plays nothing: the format leaves salvaging a valid prefix to an
+explicit tool. Source: the pty-replay plan at `7d73421`.
+
+### Recordings expire only when asked
+
+*2026-11-04.* A recording is the exact record of a run, so tendr deletes none
+on its own: no age limit and no total cap by default, where the pty-replay
+plan had proposed seven days and 10 GiB. `tendr prune --recordings-older-than`
+and `--recordings-max` delete finished runs' recordings when the user asks,
+report each one, and never touch a run that may still be going. The session
+and its `meta.json` stay, marked with when the recording went.
 
 ### Detach is a fixed two-key escape
 

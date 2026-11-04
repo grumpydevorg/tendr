@@ -54,6 +54,183 @@ pub fn cmd_prune_named(
     Ok(())
 }
 
+/// A finished run's recording that `--recordings-…` may delete.
+struct Recording {
+    ns: Namespace,
+    name: SessionName,
+    session_dir: session::SessionDir,
+    /// Relative to the session directory, as `meta.json` names it.
+    dir: String,
+    ended_at: u64,
+    bytes: u64,
+}
+
+/// Delete the PTY recordings of finished runs, never their sessions: first
+/// those of runs that ended more than `older_than` ago, then, while all
+/// recordings together take more than `max` bytes, those of the runs that
+/// ended first. A recording whose run may still be going (its session is
+/// locked, or not in a terminal state) is never deleted; it counts toward
+/// the total. `meta.json` keeps the recording's entry, with `deleted_at`.
+/// Prints one NDJSON line per recording deleted or kept running, and a
+/// summary line.
+pub fn cmd_prune_recordings(
+    older_than: Option<Duration>,
+    max: Option<u64>,
+    namespace: Option<&Namespace>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let root = SessionRoot::default_path()?;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut finished = Vec::new();
+    let mut total: u64 = 0;
+    let mut kept_running: u64 = 0;
+    for (ns, name) in session::list(&root, namespace)? {
+        let Ok(session_dir) = session::open_raw(&root, &ns, &name) else {
+            continue;
+        };
+        let Ok(meta) = session::read_meta(&session_dir) else {
+            continue;
+        };
+        let Some(recording) = meta.pty().and_then(|pty| pty.recording.as_ref()) else {
+            continue;
+        };
+        if recording.deleted_at.is_some() {
+            continue;
+        }
+        let Some(bytes) = dir_size_bytes(&session_dir.path().join(&recording.dir)) else {
+            continue; // nothing on disk
+        };
+        total += bytes;
+        let live =
+            !matches!(session::is_locked(&session_dir), Ok(false)) || !meta.status().is_terminal();
+        match meta.status().ended_at().filter(|_| !live) {
+            Some(ended_at) => finished.push(Recording {
+                ns,
+                name,
+                session_dir,
+                dir: recording.dir.clone(),
+                ended_at: ended_at.as_secs(),
+                bytes,
+            }),
+            None => {
+                kept_running += 1;
+                emit_recording(&ns, &name, "skip", &recording.dir, None, bytes, None, None);
+            }
+        }
+    }
+
+    // Oldest first, so a cap deletes the runs that ended first.
+    finished.sort_by_key(|r| r.ended_at);
+    let mut deleted: u64 = 0;
+    let mut failed: u64 = 0;
+    let mut bytes_reclaimed: u64 = 0;
+    for recording in finished {
+        let expired =
+            older_than.is_some_and(|d| now_secs.saturating_sub(recording.ended_at) >= d.as_secs());
+        let over_cap = max.is_some_and(|max| total > max);
+        if !expired && !over_cap {
+            continue;
+        }
+        let reason = if expired { "older_than" } else { "over_max" };
+        let result = if dry_run {
+            Ok(())
+        } else {
+            delete_recording(&recording)
+        };
+        match result {
+            Ok(()) => {
+                deleted += 1;
+                bytes_reclaimed += recording.bytes;
+                total -= recording.bytes;
+                emit_recording(
+                    &recording.ns,
+                    &recording.name,
+                    "delete",
+                    &recording.dir,
+                    Some(recording.ended_at),
+                    recording.bytes,
+                    Some(reason),
+                    None,
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                emit_recording(
+                    &recording.ns,
+                    &recording.name,
+                    "error",
+                    &recording.dir,
+                    Some(recording.ended_at),
+                    recording.bytes,
+                    Some(reason),
+                    Some(&e.to_string()),
+                );
+            }
+        }
+    }
+
+    let summary = PruneOutput::RecordingSummary {
+        recordings_deleted: deleted,
+        recordings_running: kept_running,
+        failed,
+        bytes_reclaimed,
+        bytes_kept: total,
+        dry_run,
+        namespace: namespace.map(|ns| ns.as_str().to_owned()),
+    };
+    outln!("{}", serde_json::to_string(&summary).unwrap());
+    Ok(())
+}
+
+/// Delete a finished run's segments and mark its entry in `meta.json`,
+/// holding the session's lock, so no sidecar or `start --replace` acts on the
+/// session meanwhile. A session taken since it was listed, or holding
+/// another run by now, keeps its recording.
+fn delete_recording(recording: &Recording) -> anyhow::Result<()> {
+    let kept = || anyhow::anyhow!("the session changed while pruning; its recording is kept");
+    let _lock = session::LockGuard::try_acquire(&recording.session_dir).map_err(|_| kept())?;
+    let mut meta = session::read_meta(&recording.session_dir)?;
+    let mut entry = meta
+        .pty()
+        .and_then(|pty| pty.recording.clone())
+        .filter(|entry| entry.dir == recording.dir && meta.status().is_terminal())
+        .ok_or_else(kept)?;
+    fs::remove_dir_all(recording.session_dir.path().join(&recording.dir))?;
+    entry.deleted_at = Some(tendr::model::ids::EpochTimestamp::now());
+    meta.set_pty_recording(entry);
+    session::write_meta_atomic(&recording.session_dir, &meta)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // one NDJSON line's fields
+fn emit_recording(
+    ns: &Namespace,
+    name: &SessionName,
+    action: &'static str,
+    dir: &str,
+    ended_at: Option<u64>,
+    bytes: u64,
+    reason: Option<&str>,
+    error: Option<&str>,
+) {
+    let line = PruneOutput::Recording {
+        action,
+        namespace: ns.as_str().to_owned(),
+        session: name.as_str().to_owned(),
+        dir: dir.to_owned(),
+        ended_at,
+        bytes,
+        reason: reason.map(str::to_owned),
+        skip_reason: (action == "skip").then(|| "running".to_owned()),
+        error: error.map(str::to_owned),
+    };
+    outln!("{}", serde_json::to_string(&line).unwrap());
+}
+
 /// Apply prune's checks to each session, delete the eligible ones (unless
 /// `dry_run`), print one NDJSON line per session and a summary line, and return
 /// the names that did not exist. With `older_than`, also sweep lost+found
@@ -426,6 +603,36 @@ enum PruneOutput {
         lost_found_removed: u64,
         /// `--on-exit` result files removed (only with `--older-than`).
         callbacks_removed: u64,
+        dry_run: bool,
+        namespace: Option<String>,
+    },
+    /// A recording `--recordings-…` deleted (`delete`), failed to delete
+    /// (`error`), or kept because its run may still be going (`skip`).
+    Recording {
+        action: &'static str,
+        namespace: String,
+        session: String,
+        /// Relative to the session directory.
+        dir: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ended_at: Option<u64>,
+        bytes: u64,
+        /// `older_than` or `over_max`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skip_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    RecordingSummary {
+        recordings_deleted: u64,
+        /// Recordings kept because their run may still be going.
+        recordings_running: u64,
+        failed: u64,
+        bytes_reclaimed: u64,
+        /// What every recording left, running ones included, takes.
+        bytes_kept: u64,
         dry_run: bool,
         namespace: Option<String>,
     },

@@ -7,9 +7,12 @@
 //!                                                    | attach only: attach protocol frames
 //! ```
 //!
-//! The JSON is `{"v": 1, "op": <operation>, "params": {…}}`: the request
-//! types of [`crate::remote_op`] under a version. Unknown fields are ignored;
-//! an unknown version or operation is refused.
+//! The JSON is `{"v": <version>, "op": <operation>, "params": {…}}`: the
+//! request types of [`crate::remote_op`] under a version. Unknown fields are
+//! ignored; an unknown version or operation is refused. The client sends the
+//! lowest version that carries everything the request asks for
+//! ([`min_frame_version`]), so a remote that would drop an option it does not
+//! know refuses the request instead.
 //!
 //! [`serve`] (`tendr _remote`) reads the frame, checks everything it can
 //! before anything runs, then dispatches the request as if typed on this
@@ -28,8 +31,21 @@ use tendr::model::ids::{Namespace, SessionName};
 use crate::commands::{check_unset_env_name, parse_env_entry};
 use crate::remote_op::{self, RemoteOperation, StartRequest};
 
-/// The frame version this binary reads and writes.
-pub const FRAME_VERSION: u32 = 1;
+/// The newest frame version this binary reads and writes. Version 2 is
+/// version 1 with options a 0.7 remote would ignore ([`min_frame_version`]);
+/// this binary reads both.
+pub const FRAME_VERSION: u32 = 2;
+
+/// The lowest frame version that carries `operation` faithfully: 1, unless
+/// it uses an option that a remote speaking only version 1 (0.7 and older)
+/// would drop without a word. Such a remote refuses version 2 with
+/// [`FrameError::Version`] instead.
+fn min_frame_version(operation: &RemoteOperation) -> u32 {
+    match operation {
+        RemoteOperation::Start(r) if r.record_input || r.no_record => 2,
+        _ => 1,
+    }
+}
 
 /// The largest JSON header accepted, in bytes.
 pub const MAX_HEADER_LEN: usize = 1 << 20;
@@ -98,7 +114,7 @@ pub fn encode(operation: &RemoteOperation) -> Result<Vec<u8>, EncodeError> {
         }
     }
     let header = serde_json::to_vec(&RemoteFrame {
-        v: FRAME_VERSION,
+        v: min_frame_version(operation),
         operation,
     })?;
     if header.len() > MAX_HEADER_LEN {
@@ -165,8 +181,13 @@ fn read_exact(input: &mut impl Read, buf: &mut [u8], what: &'static str) -> Resu
 
 /// Decode and check a JSON header.
 fn decode(header: &[u8]) -> Result<RemoteOperation, FrameError> {
+    decode_speaking(header, FRAME_VERSION)
+}
+
+/// [`decode`] by a tendr whose newest frame version is `newest`.
+fn decode_speaking(header: &[u8], newest: u32) -> Result<RemoteOperation, FrameError> {
     let head: Head = serde_json::from_slice(header)?;
-    if head.v != FRAME_VERSION {
+    if !(1..=newest).contains(&head.v) {
         return Err(FrameError::Version(head.v));
     }
     if let Some(op) = head.op.filter(|op| !remote_op::is_operation(op)) {
@@ -239,6 +260,12 @@ fn validate_start(r: &StartRequest) -> Result<(), String> {
             .to_string()
             .parse::<Boundary>()
             .map_err(|e| e.to_string())?;
+    }
+    if !r.pty && (r.record_input || r.no_record) {
+        return Err("--record-input and --no-record need --pty".to_owned());
+    }
+    if r.record_input && r.no_record {
+        return Err("--record-input cannot be used with --no-record".to_owned());
     }
     Ok(())
 }
@@ -417,10 +444,13 @@ mod tests {
 
     #[test]
     fn unknown_versions_and_operations_are_refused() {
-        assert!(matches!(
-            decode(br#"{"v":2,"op":"list","params":{"namespace":null}}"#),
-            Err(FrameError::Version(2))
-        ));
+        for v in [0, FRAME_VERSION + 1] {
+            let header = format!(r#"{{"v":{v},"op":"list","params":{{"namespace":null}}}}"#);
+            assert!(
+                matches!(decode(header.as_bytes()), Err(FrameError::Version(got)) if got == v),
+                "{v}"
+            );
+        }
         assert!(matches!(
             decode(br#"{"v":1,"op":"explode","params":{}}"#),
             Err(FrameError::UnknownOperation(op)) if op == "explode"
@@ -429,6 +459,55 @@ mod tests {
             decode(br#"{"op":"list"}"#),
             Err(FrameError::Parse(_))
         ));
+    }
+
+    /// A request that uses no version 2 option goes as version 1, which every
+    /// remote reads. One that does goes as version 2: a remote that speaks
+    /// only version 1, and would drop the option, refuses it, and this tendr
+    /// reads it.
+    #[test]
+    fn a_request_goes_in_the_lowest_version_that_carries_it() {
+        let version = |frame: &[u8]| -> u64 {
+            serde_json::from_slice::<serde_json::Value>(&frame[4..]).unwrap()["v"]
+                .as_u64()
+                .unwrap()
+        };
+        let plain = encode(&op(&["start", "--pty", "s", "x"])).unwrap();
+        assert_eq!(version(&plain), 1);
+        assert!(decode_speaking(&plain[4..], 1).is_ok());
+
+        for flag in ["--record-input", "--no-record"] {
+            let original = op(&["start", "--pty", flag, "s", "x"]);
+            let frame = encode(&original).unwrap();
+            assert_eq!(version(&frame), 2, "{flag}");
+            assert!(
+                matches!(decode_speaking(&frame[4..], 1), Err(FrameError::Version(2))),
+                "{flag}"
+            );
+            assert_eq!(read(&frame).unwrap(), original, "{flag}");
+        }
+    }
+
+    /// The recording flags need `--pty` and exclude each other, as on the
+    /// command line.
+    #[test]
+    fn recording_flags_are_checked() {
+        for (params, why) in [
+            (r#""pty":false,"record_input":true"#, "need --pty"),
+            (r#""pty":false,"no_record":true"#, "need --pty"),
+            (
+                r#""pty":true,"record_input":true,"no_record":true"#,
+                "cannot be used with",
+            ),
+        ] {
+            let header = format!(
+                r#"{{"v":2,"op":"start","params":{{"session":"s","namespace":null,"argv":["x"],"cwd":null,"env":[],"unset_env":[],"stdin":false,"timeout":null,"exec_target":null,"replace":false,"on_exit":[],"after":[],"any_exit":false,"boundary":null,"boundary_parent":[],{params}}}}}"#
+            );
+            assert!(
+                matches!(decode(header.as_bytes()), Err(FrameError::Invalid(msg)) if msg.contains(why)),
+                "{params}"
+            );
+        }
     }
 
     #[test]

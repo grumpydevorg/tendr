@@ -26,6 +26,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("boundary", "--boundary"),
     ("cgroup", "Cap a session's memory"),
     ("herdr", "inside herdr"),
+    ("replay", "Replay a recording"),
 ];
 
 pub fn cmd_guide(topic: Option<&str>) -> anyhow::Result<()> {

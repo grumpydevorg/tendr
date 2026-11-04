@@ -14,7 +14,7 @@
 //! workflow builds only `--bin tendr`.
 
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
@@ -58,7 +58,8 @@ fn run() -> Result<()> {
         };
         dump(&recording, &mut out)?;
     } else {
-        let runs = runs(&path)?;
+        let runs = DirectoryStore::runs(&path)
+            .with_context(|| format!("listing recordings at {}", path.display()))?;
         if runs.is_empty() {
             bail!("no recording segments at or under {}", path.display());
         }
@@ -80,40 +81,4 @@ fn run() -> Result<()> {
     }
     out.flush()?;
     Ok(())
-}
-
-/// The recording directories at `path`, each with its segments in order:
-/// `path` itself if it holds segments, otherwise every subdirectory of
-/// `path/recording` (or of `path`) that does, in name order. Run ids are
-/// UUIDv7, so name order is start order.
-fn runs(path: &Path) -> Result<Vec<(PathBuf, Vec<PathBuf>)>> {
-    let list = |dir: &Path| {
-        DirectoryStore::segments(dir).with_context(|| format!("listing {}", dir.display()))
-    };
-    let segments = list(path)?;
-    if !segments.is_empty() {
-        return Ok(vec![(path.to_path_buf(), segments)]);
-    }
-    let nested = path.join("recording");
-    let root = if nested.is_dir() {
-        nested
-    } else {
-        path.to_path_buf()
-    };
-    let mut dirs = Vec::new();
-    for entry in std::fs::read_dir(&root).with_context(|| format!("listing {}", root.display()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            dirs.push(entry.path());
-        }
-    }
-    dirs.sort();
-    let mut runs = Vec::new();
-    for dir in dirs {
-        let segments = list(&dir)?;
-        if !segments.is_empty() {
-            runs.push((dir, segments));
-        }
-    }
-    Ok(runs)
 }

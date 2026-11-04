@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Context;
 use tendr::model::boundary::BoundaryContext;
 use tendr::model::ids::{Namespace, SessionName};
-use tendr::model::spec::{ExecTarget, IoMode, LaunchSpec, StdinMode};
+use tendr::model::spec::{ExecTarget, IoMode, LaunchSpec, RecordingPolicy, StdinMode};
 use tendr::platform::{Current, Platform};
 use tendr::session::{self, SessionRoot};
 
@@ -24,6 +24,7 @@ pub fn cmd_start(
     pty: bool,
     exec_target: Option<ExecTarget>,
     boundary: Option<BoundaryContext>,
+    recording: RecordingPolicy,
 ) -> anyhow::Result<()> {
     let (meta, _session) = launch_session(
         name,
@@ -41,6 +42,7 @@ pub fn cmd_start(
         pty,
         exec_target,
         boundary,
+        recording,
     )?;
 
     let json = serde_json::to_string_pretty(&meta)?;
@@ -84,6 +86,7 @@ pub(crate) fn launch_session(
     pty: bool,
     exec_target: Option<ExecTarget>,
     boundary: Option<BoundaryContext>,
+    recording: RecordingPolicy,
 ) -> anyhow::Result<(tendr::model::meta::Meta, session::SessionDir)> {
     let session_name = SessionName::new(name)?;
     let root = SessionRoot::default_path()?;
@@ -115,6 +118,7 @@ pub(crate) fn launch_session(
     }
     launch_spec.on_exit = on_exit.to_vec();
     launch_spec.boundary = boundary;
+    launch_spec.recording = recording;
     if pty {
         launch_spec.io_mode = IoMode::Pty;
     }

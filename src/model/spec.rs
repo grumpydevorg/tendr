@@ -29,6 +29,27 @@ pub enum IoMode {
     Pty,
 }
 
+/// What a PTY run's exact recording holds
+/// (`docs/architecture/08-pty-recording-format.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingPolicy {
+    /// Output bytes and applied window sizes.
+    #[default]
+    Output,
+    /// Output, window sizes, and the input bytes written to the terminal
+    /// (`start --record-input`).
+    OutputAndInput,
+    /// No recording (`start --no-record`).
+    Off,
+}
+
+impl RecordingPolicy {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// What exec protocol the session speaks. Determined at start time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecTarget {
@@ -88,6 +109,10 @@ pub struct LaunchSpec {
     /// without a boundary hash identically to pre-feature specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boundary: Option<BoundaryContext>,
+    /// What a PTY run records. Omitted at the default so specs that record
+    /// output only hash identically to pre-feature specs.
+    #[serde(default, skip_serializing_if = "RecordingPolicy::is_default")]
+    pub recording: RecordingPolicy,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +138,7 @@ impl LaunchSpec {
             io_mode: IoMode::Pipe,
             exec_target: ExecTarget::None,
             boundary: None,
+            recording: RecordingPolicy::Output,
         })
     }
 
@@ -155,6 +181,8 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             exec_target: ExecTarget,
             #[serde(default)]
             boundary: Option<BoundaryContext>,
+            #[serde(default)]
+            recording: RecordingPolicy,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -175,6 +203,7 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             io_mode: raw.io_mode,
             exec_target: raw.exec_target,
             boundary: raw.boundary,
+            recording: raw.recording,
         })
     }
 }

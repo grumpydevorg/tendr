@@ -66,6 +66,7 @@ flags:
 |---|---|
 |`--stdin`|Make a pipe session, so `exec` and `push` can write to it. Use it for shells and REPLs.|
 |`--pty`|Make a PTY session, for programs you want to `attach` to (`start` only).|
+|`--record-input`, `--no-record`|With `--pty`: also record what is typed, or record nothing ([PTY details](#pty-details); `start` only).|
 |`--namespace <ns>`|Put the session in a namespace.|
 |`--exec-target <target>`|Set the exec target instead of inferring it (`start` only).|
 |`--replace`|Kill an existing session of the same name and start a new run.|
@@ -430,15 +431,21 @@ Otherwise a paste is typing, and the escape applies to it.
 ### PTY details
 
 A PTY session starts at 24×80. Tendr records its output and every window size
-under `recording/<run_id>/` in the session directory, but not typed input.
-`tendr status` shows the recording under `pty.recording`. If recording stops
-(size limit, disk failure, or storage falling behind), the session keeps
-running. `status` then shows `Stopped` with the last recorded sequence, Tendr
-logs a `recording.stopped` event, and the run ends with a warning that later
-output was not recorded. If the sidecar itself is lost, the recording shows
-`Stopped` with reason `sidecar_lost`. If the sidecar died after the run ended
-but before writing the recording's end, it shows reason `end_unrecorded`;
-the recording on disk is complete.
+under `recording/<run_id>/` in the session directory. `--record-input` also
+records what is typed: every byte written to the terminal, from an attach or
+a `push`, stored in clear. That includes passwords, tokens and anything else
+typed or pushed, and `replay --export asciicast` writes it out as `i` events;
+use it only where that is acceptable. `--no-record` records nothing, and
+`status` then shows no `pty.recording`. Otherwise `tendr status` shows the
+recording there. If
+recording stops (size limit, disk failure, or storage falling behind), the
+session keeps running. `status` then shows `Stopped` with the last recorded
+sequence, Tendr logs a `recording.stopped` event, and the run ends with a
+warning that later output was not recorded. If the sidecar itself is lost,
+the recording shows `Stopped` with reason `sidecar_lost`. If the sidecar died
+after the run ended but before writing the recording's end, it shows reason
+`end_unrecorded`; the recording on disk is complete. Recordings are kept
+until you delete them ([Pruning](#lifecycle-batches-and-hooks)).
 
 The child gets `TERM=xterm-256color` when `TERM` was missing, empty, `dumb`,
 or removed with `--unset-env TERM` for the `tendr start` that launched it, as
@@ -448,6 +455,49 @@ in an agent's tool shell or `ssh -T`. Otherwise `TERM` passes through, and
 shell exports `CI=true` and `NO_COLOR=1`, and Claude Code turns colour off for
 any `CI` value, even an empty one, so `--env CI=` cannot undo it. Remove them
 with `--unset-env CI --unset-env NO_COLOR`.
+
+### Replay a recording
+
+```bash
+tendr replay ~/.tendr/sessions/default/dev          # play it in this terminal
+tendr replay --speed 4 <path>                       # four times as fast; --no-delay skips the pauses
+tendr replay --export asciicast <path> > dev.cast   # asciicast v2, for asciinema and other players
+```
+
+`<path>` is a session directory, its `recording/<run_id>/` directory, or one
+segment file (`seg-00000000.tndrrec`). Replay writes the recorded output to
+your terminal at the recorded pace, and nothing else: it never connects to a
+session, and typed input in a recording is not played. Watch it in a real
+terminal such as Ghostty; tendr has no screen of its own.
+
+- Replay cannot resize your window. Before it plays, it shows the size the
+  recording starts at and its largest size, and asks you to size the window
+  and press a key, unless the window already matches. The bytes are always
+  played exactly; if the window did not match the recording, replay says so
+  once, after it ends, since the picture may differ. `--strict-geometry`
+  instead pauses at each recorded size change, with a note on the bottom
+  line, until the window matches. The resizes tendr makes itself so a
+  program redraws on attach never ask anything.
+- The terminal is in raw mode while replay runs. What it sends back, such as
+  answers to the queries in the recording, is read and dropped, and so is
+  every key but Ctrl-C, which stops replay (0). SIGHUP, SIGTERM and SIGINT
+  stop it too (1), and on Windows so do Ctrl-Break and closing the console.
+  However it ends, the modes the recording turned on are turned off and the
+  terminal is restored.
+- A damaged recording plays nothing: replay exits 1 naming the file and byte
+  offset. A recording cut off inside its last record, as a running session's
+  can be, plays to its last complete record, and replay says where it was
+  cut.
+- `--export asciicast` writes asciicast v2 to stdout: output as `o` events,
+  recorded input (passwords and tokens included) as `i` events, and every
+  window size change as an `r` event, with times since the recording
+  started. A character split between records
+  is joined. A recording whose output or input is not valid UTF-8 is refused
+  (1), naming the record; the recording itself stays the exact copy.
+- Replay is local-only. Copy a recording from another host first, such as
+  `scp -r box:.tendr/sessions/default/dev/recording ./dev-rec`, then
+  `tendr replay ./dev-rec`. On Windows it plays in Windows Terminal or a
+  conhost window on Windows 10 1809 or later, as `attach` does.
 
 ## Observe long-running work
 
@@ -481,6 +531,7 @@ tendr watch --namespace nightly --events --logs
 tendr kill  dev                  # stop a session
 tendr prune dev                  # delete one finished session
 tendr prune --older-than 7d      # delete finished sessions older than 7 days; --all for all
+tendr prune --recordings-older-than 7d --recordings-max 10GiB   # delete old PTY recordings only
 tendr run --detach ./job.sh      # run a script as a session
 ```
 
@@ -529,6 +580,21 @@ line counts them as `lost_found_removed` and `callbacks_removed`, and their
 bytes in `bytes_reclaimed`. A session's event log starts a new segment file
 every 64 MiB and keeps them all until the session is pruned
 ([session storage](architecture/02-session-storage.md#limits)).
+
+PTY recordings are never deleted on their own. `prune
+--recordings-older-than <duration>` deletes the recordings of runs that ended
+longer ago than that, and `--recordings-max <size>` (`B`, `KiB`, `MiB`, `GiB`
+or `TiB`) then deletes those of the runs that ended first until all
+recordings together take at most that much. Give either or both, with
+`--namespace` and `--dry-run` if you like; they cannot be combined with
+session names, `--older-than` or `--all`. The sessions stay: `status` shows
+the recording with `deleted_at`. A run still going keeps its recording, which
+counts toward the total. Each recording deleted is a `"type":"recording"`
+line with `"action":"delete"`, its session, `dir`, `bytes` and `reason`
+(`older_than` or `over_max`); one that could not be deleted is the same line
+with `"action":"error"` and an `error`; each one kept because its run is
+going is a line with `"skip_reason":"running"`; and a `recording_summary`
+line ends the output. Only pruning sessions sweeps stale attach sockets.
 
 **Hooks.** `--on-exit` splits its command into argv like a shell would, but
 runs no shell: no variable expansion, pipes or `&&`. Put that logic in a
@@ -596,11 +662,11 @@ Start work under `--host`, disconnect, and come back later to `log`, `status`,
 |`start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `exec`|Run on the remote host. The request travels as data on the SSH stdin, so no remote shell parses it. Through a POSIX login shell, output and exit codes are byte for byte those of the command run there.|
 |`attach`|The request travels the same way, from macOS, Linux or Windows, and your terminal stays local ([Answer prompts and attach](#answer-prompts-and-attach)).|
 |`run`, `wrap`, `prune`, `query`, `guide`, `skill`|Refused with exit 2 and a ready-to-paste fallback for a POSIX shell, such as `try (POSIX shell):  ssh data-box 'tendr run deploy.sh'`.|
-|`events`, `emit`|Refused with exit 1.|
+|`events`, `emit`, `replay`|Refused with exit 1.|
 
 **Versions.** The remote `tendr` must be 0.5.0 or newer for every command,
 `exec` included. An older one fails at once, and tendr says to upgrade it.
-These features need more:
+Some features need more:
 
 - Reconnecting a dropped `attach --host` needs 0.6.0 or newer on the remote
   host, and a session started by 0.6.0 or newer. Otherwise the attach ends
@@ -618,6 +684,10 @@ These features need more:
 - Saying how much of what you typed before a drop reached the session needs
   0.8.0 or newer on both hosts, and a session started by 0.8.0 or newer.
   Otherwise the attach reconnects as before and says nothing of it.
+- `start --record-input` and `start --no-record` need 0.8.0 or newer on the
+  remote host. An older one would ignore them, so tendr sends such a request
+  in a form it refuses instead (exit 2, `unsupported remote request
+  version 2`).
 
 An older client still works against a newer remote.
 
@@ -826,7 +896,7 @@ or an I/O error.
 |---|---|---|
 |any|2|Usage error from argument parsing|
 |any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request (1 when the remote login shell is PowerShell)|
-|`events`, `emit` with `--host`|1|Not supported over SSH|
+|`events`, `emit`, `replay` with `--host`|1|Not supported over SSH|
 |any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 without one from the remote is `ssh` failing to connect (`attach` reconnects instead, once it is attached)|
 |any, with `--host`|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s); while `attach --host` reconnects, it tries again instead|
 |`start`|2, 5|The child failed to spawn; the sidecar failed|

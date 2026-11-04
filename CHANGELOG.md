@@ -4,6 +4,33 @@
 
 ### Added
 
+- **`tendr replay` plays a PTY recording in your terminal.** Give it a
+  session directory, a run's `recording/<run_id>/` or a segment file, and it
+  writes the recorded output at the recorded pace (`--speed`, `--no-delay`),
+  so you can see what a past session looked like in a real terminal such as
+  Ghostty. It asks once for the window size the recording starts at;
+  `--strict-geometry` also pauses at each later size change until the
+  window matches, and the repaint resizes tendr makes on attach never ask.
+  Replies the terminal sends to the recording's queries are dropped, Ctrl-C
+  stops it, and the terminal is restored however it ends. A damaged
+  recording plays nothing and names the file and byte offset; a running
+  session's recording plays to its last complete record. Local-only, and it
+  works in a Windows console too.
+- **`tendr replay --export asciicast` writes a recording as asciicast v2**,
+  for asciinema and other players and for agents that cannot watch a
+  terminal: characters split between records are joined, every window size
+  change is an `r` event, and output that is not UTF-8 is refused rather
+  than altered.
+- **`tendr start --pty --record-input` records typed input too, and
+  `--no-record` records nothing.** Input written to the terminal, by an
+  attach or a `push`, becomes `INPUT` records ahead of the echo it causes.
+  Over `--host` both need the remote `tendr` to be 0.8.0 or newer; an older
+  one refuses the request (exit 2) instead of ignoring the option.
+- **`tendr prune --recordings-older-than <duration>` and
+  `--recordings-max <size>` delete old PTY recordings.** Only finished
+  runs' recordings go, oldest first for the cap, and each one deleted is
+  reported; the sessions stay, and `status` shows when the recording was
+  deleted. Nothing expires unless you run it.
 - **Event logs start a new segment every 64 MiB.** A session's
   `events/*.jsonl` grew in one file for as long as the session existed. Once
   the newest segment reaches 64 MiB, the next append starts a new one that

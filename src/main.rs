@@ -143,6 +143,13 @@ enum Commands {
             requires = "boundary"
         )]
         boundary_parent: Vec<tendr::model::boundary::Boundary>,
+        /// Also record the input written to the terminal, in clear: anything
+        /// typed or pushed, passwords and tokens included (needs --pty)
+        #[arg(long, requires = "pty", conflicts_with = "no_record")]
+        record_input: bool,
+        /// Record nothing for this run (needs --pty)
+        #[arg(long, requires = "pty")]
+        no_record: bool,
         /// Command and arguments
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
@@ -424,17 +431,19 @@ enum Commands {
         #[arg(long = "best-effort")]
         best_effort: bool,
     },
-    /// Delete terminal sessions: by name, older than a threshold, or all
+    /// Delete terminal sessions (by name, older than a threshold, or all),
+    /// or only the PTY recordings of finished runs
     ///
-    /// Also removes attach sockets that sidecars killed outright left in
-    /// ~/.tendr/sockets (counted as `sockets_removed`): only sockets no session
-    /// names, nothing listens on, and older than a minute. With --older-than it
-    /// also removes ~/.tendr/lost+found events and ~/.tendr/callbacks results
-    /// older than DURATION (`lost_found_removed`, `callbacks_removed`).
+    /// When pruning sessions, also removes attach sockets that sidecars killed
+    /// outright left in ~/.tendr/sockets (counted as `sockets_removed`): only
+    /// sockets no session names, nothing listens on, and older than a minute.
+    /// With --older-than it also removes ~/.tendr/lost+found events and
+    /// ~/.tendr/callbacks results older than DURATION (`lost_found_removed`,
+    /// `callbacks_removed`). `--recordings-…` sweeps none of these.
     Prune {
         /// Sessions to delete, by name. They resolve in --namespace, or in
         /// `default`; a name that doesn't exist is reported and fails the command
-        #[arg(conflicts_with_all = ["older_than", "all"])]
+        #[arg(conflicts_with_all = ["older_than", "all", "recordings_older_than", "recordings_max"])]
         names: Vec<String>,
         /// Delete sessions ended more than DURATION ago (e.g. 7d, 24h, 30m),
         /// and lost+found events and --on-exit results older than DURATION
@@ -443,6 +452,25 @@ enum Commands {
         /// Delete all terminal sessions regardless of age
         #[arg(long, conflicts_with = "older_than")]
         all: bool,
+        /// Delete only the PTY recordings of runs that ended more than
+        /// DURATION ago (e.g. 7d); the sessions stay
+        #[arg(
+            long,
+            value_name = "DURATION",
+            value_parser = parse_duration,
+            conflicts_with_all = ["older_than", "all"]
+        )]
+        recordings_older_than: Option<Duration>,
+        /// Delete the PTY recordings of the runs that ended first until all
+        /// recordings together take at most SIZE (e.g. 10GiB, 500MiB); the
+        /// sessions stay
+        #[arg(
+            long,
+            value_name = "SIZE",
+            value_parser = parse_size,
+            conflicts_with_all = ["older_than", "all"]
+        )]
+        recordings_max: Option<u64>,
         /// Namespace to prune. Without names, every namespace if omitted; with
         /// names, the namespace they are in (`default` if omitted)
         #[arg(long)]
@@ -450,6 +478,34 @@ enum Commands {
         /// Show what would be deleted without deleting
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Play a PTY recording in this terminal at the recorded pace, or export it
+    ///
+    /// PATH is a segment file, a run's recording directory
+    /// (<session>/recording/<run_id>) or a session directory. Ctrl-C stops.
+    /// Local-only: copy a remote recording here first.
+    Replay {
+        /// The recording to play
+        path: PathBuf,
+        /// Pause at each recorded window size change until this window
+        /// matches it
+        #[arg(long, conflicts_with = "export")]
+        strict_geometry: bool,
+        /// Play FACTOR times as fast as recorded (e.g. 2, or 0.5)
+        #[arg(
+            long,
+            value_name = "FACTOR",
+            value_parser = parse_speed,
+            default_value_t = 1.0,
+            conflicts_with_all = ["no_delay", "export"]
+        )]
+        speed: f64,
+        /// Play without the recorded pauses
+        #[arg(long, conflicts_with = "export")]
+        no_delay: bool,
+        /// Write the recording to stdout in FORMAT instead of playing it
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        export: Option<commands::ExportFormat>,
     },
     /// Attach to a PTY session's terminal
     Attach {
@@ -623,6 +679,8 @@ impl Commands {
                 names,
                 older_than,
                 all,
+                recordings_older_than,
+                recordings_max,
                 namespace,
                 dry_run,
             } => {
@@ -636,6 +694,15 @@ impl Commands {
                 }
                 if *all {
                     args.push("--all".to_string());
+                }
+                if let Some(d) = recordings_older_than {
+                    args.extend([
+                        "--recordings-older-than".to_string(),
+                        humantime::format_duration(*d).to_string(),
+                    ]);
+                }
+                if let Some(max) = recordings_max {
+                    args.extend(["--recordings-max".to_string(), max.to_string()]);
                 }
                 if let Some(ns) = namespace {
                     args.extend(["--namespace".to_string(), ns.clone()]);
@@ -719,6 +786,43 @@ fn resolve_namespace(namespace: Option<String>) -> anyhow::Result<Namespace> {
         .transpose()
         .map(|opt| opt.unwrap_or_else(Namespace::default_namespace))
         .map_err(Into::into)
+}
+
+/// Parse a size in bytes: a whole number, optionally followed by `B`,
+/// `KiB`, `MiB`, `GiB` or `TiB` (or `K`, `M`, `G`, `T`, the same binary
+/// units), e.g. `10GiB`.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (number, unit) = s.split_at(digits);
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("expected a size such as 10GiB or 500MiB, got {s:?}"))?;
+    let shift = match unit.trim() {
+        "" | "B" => 0,
+        "K" | "KiB" => 10,
+        "M" | "MiB" => 20,
+        "G" | "GiB" => 30,
+        "T" | "TiB" => 40,
+        other => {
+            return Err(format!(
+                "unknown size unit {other:?}: use B, KiB, MiB, GiB or TiB"
+            ));
+        }
+    };
+    number
+        .checked_mul(1 << shift)
+        .ok_or_else(|| format!("{s} is too large"))
+}
+
+/// Parse a playback speed: a finite number above zero.
+fn parse_speed(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(speed) if speed.is_finite() && speed > 0.0 => Ok(speed),
+        _ => Err(format!(
+            "expected a number above 0, such as 2 or 0.5, got {s:?}"
+        )),
+    }
 }
 
 /// Parse an optional namespace string without defaulting.
@@ -1048,10 +1152,21 @@ fn main() {
             names,
             older_than,
             all,
+            recordings_older_than,
+            recordings_max,
             namespace,
             dry_run,
         } => {
-            if names.is_empty() {
+            if recordings_older_than.is_some() || recordings_max.is_some() {
+                parse_optional_namespace(namespace).and_then(|ns| {
+                    commands::cmd_prune_recordings(
+                        recordings_older_than,
+                        recordings_max,
+                        ns.as_ref(),
+                        dry_run,
+                    )
+                })
+            } else if names.is_empty() {
                 parse_optional_namespace(namespace)
                     .and_then(|ns| commands::cmd_prune(older_than, all, ns.as_ref(), dry_run))
             } else {
@@ -1059,6 +1174,19 @@ fn main() {
                     .and_then(|ns| commands::cmd_prune_named(&names, &ns, dry_run))
             }
         }
+        Commands::Replay {
+            path,
+            strict_geometry,
+            speed,
+            no_delay,
+            export,
+        } => commands::cmd_replay(&commands::ReplayOptions {
+            path,
+            strict_geometry,
+            speed,
+            no_delay,
+            export,
+        }),
         Commands::Wrap {
             session,
             namespace,

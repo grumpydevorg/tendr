@@ -3511,6 +3511,114 @@ fn an_applied_resize_is_recorded_between_the_output_around_it() {
     assert!(contains(&after, b"two"), "after: {after:?}");
 }
 
+/// `--record-input` records the input written to the terminal, before the
+/// echo it causes, and says so in the recording's header and in metadata.
+#[test]
+fn record_input_records_the_input_written_before_its_echo() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    tendr(&root)
+        .args([
+            "start",
+            "pty-rec-input",
+            "--pty",
+            "--record-input",
+            "--",
+            "cat",
+        ])
+        .output()
+        .unwrap();
+    harness::wait_running(&root, "pty-rec-input");
+    wait_for_attach_socket(&root, "pty-rec-input");
+    push(&root, "pty-rec-input", b"typed-line\n");
+    wait_log_contains(&root, "pty-rec-input", "typed-line");
+    tendr(&root)
+        .args(["kill", "pty-rec-input", "--force"])
+        .output()
+        .unwrap();
+    harness::wait_terminal(&root, "pty-rec-input");
+
+    let recording = decode_session_recording(&root, "pty-rec-input");
+    assert!(recording.header.input_recorded);
+    let inputs: Vec<usize> = recording
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches!(r.kind, tendr::recording::RecordKind::Input(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let typed: Vec<u8> = inputs
+        .iter()
+        .flat_map(|&i| match &recording.records[i].kind {
+            tendr::recording::RecordKind::Input(bytes) => bytes.clone(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(typed, b"typed-line\n", "{:?}", recording.records);
+    let before = recorded_output(&recording.records[..inputs[0]]);
+    assert!(
+        !contains(&before, b"typed-line"),
+        "echo before input: {before:?}"
+    );
+    let after = recorded_output(&recording.records[inputs[0]..]);
+    assert!(contains(&after, b"typed-line"), "after: {after:?}");
+    assert_eq!(
+        session_meta(&root, "pty-rec-input")["pty"]["recording"]["input_recorded"],
+        true
+    );
+}
+
+/// `--no-record` records nothing, while `output.log` still captures.
+#[test]
+fn no_record_records_nothing() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    tendr(&root)
+        .args([
+            "start",
+            "pty-no-rec",
+            "--pty",
+            "--no-record",
+            "--",
+            "sh",
+            "-c",
+            "printf unrecorded",
+        ])
+        .output()
+        .unwrap();
+    harness::wait_terminal(&root, "pty-no-rec");
+    wait_log_contains(&root, "pty-no-rec", "unrecorded");
+    let meta = session_meta(&root, "pty-no-rec");
+    assert!(meta["pty"]["recording"].is_null(), "{meta}");
+    assert!(
+        !root
+            .path()
+            .join(".tendr/sessions/default/pty-no-rec/recording")
+            .exists()
+    );
+}
+
+#[test]
+fn recording_flags_need_pty_and_exclude_each_other() {
+    let root = Home::new();
+    for args in [
+        &["start", "s", "--record-input", "--", "true"][..],
+        &["start", "s", "--no-record", "--", "true"],
+        &[
+            "start",
+            "s",
+            "--pty",
+            "--record-input",
+            "--no-record",
+            "--",
+            "true",
+        ],
+    ] {
+        let out = tendr(&root).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+}
+
 #[test]
 fn a_resize_with_a_zero_dimension_is_ignored() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -4385,24 +4493,35 @@ fn cli_push_to_an_older_sidecar_exits_80() {
 /// machine cannot fail an attach or push. The deadline a session that may
 /// predate the hello still gets (see `reply_deadline`'s unit test) is
 /// shortened here to well under the time the fake takes to answer, so the
-/// answer is taken only because none applies to this session.
+/// answer is taken only because none applies to this session: one that
+/// records, and one started with `--no-record`, which has no recording.
 #[test]
 fn a_late_answer_to_the_hello_is_waited_for() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = Home::new();
-    start_cat(&root, "pty-late-answer");
-    // A control refusal (81), told apart from the deadline's protocol
-    // failure (80).
-    let refusal = frame_bytes(MSG_REJECTED, b"\x02held");
-    fake_sidecar(&root, "pty-late-answer", "late", FakeReply::Late, refusal);
-    let output = tendr(&root)
-        .args(["push", "pty-late-answer"])
-        .env("TENDR_TEST_PRE_HELLO_REPLY_MS", "100")
-        .write_stdin(b"never-written\n".to_vec())
-        .timeout(HANG)
-        .output()
-        .expect("push returns");
-    assert_exit(&output, 81, "a late answer from a sidecar with a hello");
+    for (session, flags) in [
+        ("pty-late-answer", &[][..]),
+        ("pty-late-no-rec", &["--no-record"][..]),
+    ] {
+        let root = Home::new();
+        let mut args = vec!["start", session, "--pty", "--stdin"];
+        args.extend_from_slice(flags);
+        args.extend(["--", "cat"]);
+        tendr(&root).args(&args).output().unwrap();
+        harness::wait_running(&root, session);
+        wait_for_attach_socket(&root, session);
+        // A control refusal (81), told apart from the deadline's protocol
+        // failure (80).
+        let refusal = frame_bytes(MSG_REJECTED, b"\x02held");
+        fake_sidecar(&root, session, "late", FakeReply::Late, refusal);
+        let output = tendr(&root)
+            .args(["push", session])
+            .env("TENDR_TEST_PRE_HELLO_REPLY_MS", "100")
+            .write_stdin(b"never-written\n".to_vec())
+            .timeout(HANG)
+            .output()
+            .expect("push returns");
+        assert_exit(&output, 81, &format!("a late answer to {session}"));
+    }
 }
 
 #[test]

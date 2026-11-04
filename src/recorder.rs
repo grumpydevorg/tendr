@@ -177,6 +177,45 @@ impl DirectoryStore {
         Ok(segments)
     }
 
+    /// The recordings at `path`, each a run's directory with its segments in
+    /// order: `path` itself if it holds segments, otherwise every
+    /// subdirectory of `path/recording` (or of `path`) that does, in name
+    /// order. Run ids are UUIDv7, so name order is start order. So `path`
+    /// may be a run's recording directory, a session's `recording/`, or the
+    /// session directory itself.
+    ///
+    /// # Errors
+    ///
+    /// Reading a directory.
+    pub fn runs(path: &Path) -> io::Result<Vec<(PathBuf, Vec<PathBuf>)>> {
+        let segments = Self::segments(path)?;
+        if !segments.is_empty() {
+            return Ok(vec![(path.to_path_buf(), segments)]);
+        }
+        let nested = path.join("recording");
+        let root = if nested.is_dir() {
+            nested
+        } else {
+            path.to_path_buf()
+        };
+        let mut dirs = Vec::new();
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+        dirs.sort();
+        let mut runs = Vec::new();
+        for dir in dirs {
+            let segments = Self::segments(&dir)?;
+            if !segments.is_empty() {
+                runs.push((dir, segments));
+            }
+        }
+        Ok(runs)
+    }
+
     fn create_dirs(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -490,6 +529,30 @@ impl Recorder {
         self.shared
             .enqueue(&mut state, RecordKind::Resize { geometry, cause });
         Ok(())
+    }
+
+    /// Write input with `write` and record the bytes it accepted, the first
+    /// `n` of `bytes` for its `Ok(n)`. As with [`Self::resize_applied`], no
+    /// output is sequenced while `write` runs, so the child's echo is always
+    /// recorded after the input it answers. Only for a recording whose header
+    /// has `input_recorded` set: in another, the writer stops the recording
+    /// at the first input record.
+    ///
+    /// # Errors
+    ///
+    /// `write`'s error; nothing is recorded.
+    pub fn input_written(
+        &self,
+        bytes: &[u8],
+        write: impl FnOnce(&[u8]) -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        let mut state = self.shared.lock();
+        let n = write(bytes)?;
+        for chunk in bytes[..n.min(bytes.len())].chunks(crate::recording::MAX_PAYLOAD) {
+            self.shared
+                .enqueue(&mut state, RecordKind::Input(chunk.to_vec()));
+        }
+        Ok(n)
     }
 
     /// The stop, once recording has stopped.
@@ -881,6 +944,45 @@ mod tests {
         let recording = store.decoded();
         assert_eq!(recording.records.len(), 1);
         assert_eq!(recording.records[0].kind, RecordKind::Output(b"x".to_vec()));
+    }
+
+    /// Only the bytes the terminal accepted are recorded, before any output
+    /// the child produces once it has them (here: offered during the write).
+    #[test]
+    fn accepted_input_is_recorded_before_the_echo_it_causes() {
+        let store = MemoryStore::default();
+        let header = SegmentHeader {
+            input_recorded: true,
+            ..header()
+        };
+        let thread =
+            RecorderThread::start(header, store.clone(), RecorderLimits::default(), |_| {
+                panic!("no stop expected")
+            });
+        let recorder = thread.recorder();
+        let mut echo = None;
+        let accepted = recorder
+            .input_written(b"ls\r", |bytes| {
+                assert_eq!(bytes, b"ls\r");
+                let producer = recorder.clone();
+                echo = Some(std::thread::spawn(move || producer.output(b"ls")));
+                Ok(2)
+            })
+            .unwrap();
+        assert_eq!(accepted, 2);
+        echo.unwrap().join().unwrap();
+        let _ = thread.finish();
+
+        let recording = store.decoded();
+        assert!(recording.header.input_recorded);
+        let kinds: Vec<_> = recording.records.into_iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                RecordKind::Input(b"ls".to_vec()),
+                RecordKind::Output(b"ls".to_vec())
+            ]
+        );
     }
 
     #[test]

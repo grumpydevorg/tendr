@@ -40,7 +40,7 @@ use tendr::attach_proto::{self, Frame, FrameError};
 use tendr::pty_exit::PtyExitCode;
 use tendr::term_modes::TermModes;
 
-use super::terminal::{Input, Leave, Output, Raw, Terminal};
+use crate::commands::terminal::{Input, Leave, Output, Raw, Terminal};
 
 mod reconnect;
 
