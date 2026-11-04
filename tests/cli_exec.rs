@@ -1114,10 +1114,12 @@ fn exec_duckdb_mixed_success_reports_error() {
 
 /// A DuckDB error logged after the sentinel still fails the exec. The
 /// sidecar logs stdout and stderr from separate threads, so DuckDB's error,
-/// written before the sentinel, can reach the log after it. This stand-in
-/// for DuckDB writes the error and the stderr end marker only once the test
-/// has seen the sentinel logged, the latest order the sidecar can produce:
-/// the exec must wait for the marker, not for a while.
+/// written before the sentinel, can reach the log after it, however much
+/// later a starved reader makes it. This stand-in for DuckDB writes the
+/// error and the stderr end marker only once the test has seen the sentinel
+/// logged and then waited well past the exec's one-second grace for a
+/// missing marker (shortened here to 50 ms): the exec must wait for the
+/// marker, not for a while.
 #[cfg(unix)]
 #[test]
 fn exec_duckdb_error_logged_after_the_sentinel_fails_the_exec() {
@@ -1147,8 +1149,25 @@ done"#,
     let _session = harness::SessionGuard::new(&root, "db");
     harness::wait_running(&root, "db");
 
-    let exec = spawn_exec(&root, "db", "SELECT * FROM late;");
+    let exec = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        .env("HOME", root.path())
+        .env("TENDR_TEST_ERR_MARKER_GRACE_MS", "50")
+        .args([
+            "exec",
+            "db",
+            "--timeout",
+            EXEC_TIMEOUT,
+            "--",
+            "SELECT * FROM late;",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
     harness::wait_log_tail(&root, "db", "__TENDR_EXEC__");
+    // Holds stderr back past the grace. Load can only shorten what this
+    // proves (an exec starved past it too), never fail it.
+    std::thread::sleep(std::time::Duration::from_secs(1));
     std::fs::write(&gate, b"").unwrap();
     let output = finish_exec(exec);
 
