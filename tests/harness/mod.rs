@@ -89,9 +89,9 @@ pub fn assert_within(cmd: &mut Command, deadline: Duration) -> Assert {
 /// nothing that can reach them (#87), and a sidecar that finishes afterwards
 /// recreates its session directory, or salvages its exit record into
 /// `.tendr/lost+found`, under the deleted path, so every such test leaked a
-/// directory into the system temp dir. Every helper that runs `tendr` takes a
-/// `Home`, and a `Home` is declared before anything that uses it, so it drops
-/// last, after the test's followers, gates and locks.
+/// directory into the system temp dir. Tests take their HOME from a `Home`,
+/// declared before anything that uses it, so it drops last, after the
+/// test's followers, gates and locks.
 #[allow(dead_code)]
 pub struct Home(TempDir);
 
@@ -105,33 +105,34 @@ impl Home {
         self.0.path()
     }
 
-    /// Wait until no sidecar holds `namespace/name`, force-killing it first
-    /// if one does. Returns the last observation if it is still held after
-    /// [`HANG`].
+    /// Force-kill `namespace/name` unless it is terminal, then wait until no
+    /// sidecar holds it. Returns the last observation if it is still held
+    /// after [`HANG`].
     fn release(&self, root: &SessionRoot, namespace: &str, name: &str) -> Result<(), WaitTimeout> {
         let (Ok(ns), Ok(session_name)) = (Namespace::new(namespace), SessionName::new(name)) else {
             return Ok(());
         };
-        let Ok(Some(dir)) = session::open(root, &ns, &session_name) else {
+        // Not `open`: a sidecar holds the lock before it writes meta.json.
+        let Ok(dir) = session::open_raw(root, &ns, &session_name) else {
             return Ok(());
         };
-        let mut killed = false;
+        // Decided by meta, not by the lock: the kill also reconciles a
+        // Running session whose sidecar crashed, killing the child it left.
+        // Its result is ignored; the lock decides whether the sidecar is gone.
+        if !session::read_meta(&dir).is_ok_and(|meta| meta.status().is_terminal()) {
+            let _ = tendr(self)
+                .args(["kill", "--force", "--namespace", namespace, name])
+                .timeout(HANG)
+                .output();
+        }
         poll_until(HANG, Duration::from_millis(10), || {
             match LockGuard::try_acquire(&dir) {
-                Err(session::SessionError::Locked(_)) => {}
+                Err(session::SessionError::Locked(_)) => {
+                    Observation::Pending(format!("{namespace}/{name} is still held by its sidecar"))
+                }
                 // Free, or no longer a session a sidecar could hold.
-                _ => return Observation::Ready(()),
+                _ => Observation::Ready(()),
             }
-            if !killed {
-                killed = true;
-                // Ignored: the session may already be terminal, with its
-                // sidecar finishing; the lock decides either way.
-                let _ = tendr(self)
-                    .args(["kill", "--force", "--namespace", namespace, name])
-                    .timeout(HANG)
-                    .output();
-            }
-            Observation::Pending(format!("{namespace}/{name} is still held by its sidecar"))
         })
     }
 }
