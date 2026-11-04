@@ -4,14 +4,14 @@
 #![cfg(unix)]
 
 mod harness;
+use harness::Home;
 
 use std::path::{Path, PathBuf};
-use tempfile::TempDir;
 
 /// An fd number nothing in the test or tendr opens by itself.
 const LEAKED_FD: i32 = 47;
 
-fn meta(root: &TempDir, session: &str) -> serde_json::Value {
+fn meta(root: &Home, session: &str) -> serde_json::Value {
     let path = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/meta.json"));
@@ -41,7 +41,7 @@ fn open_paths(pid: u64) -> Vec<PathBuf> {
 
 /// Start a run from a shell that holds a non-CLOEXEC fd on `marker` open, as
 /// exe-init does with its terminals.
-fn start_with_leaked_fd(root: &TempDir, session: &str, pty: bool, marker: &Path) {
+fn start_with_leaked_fd(root: &Home, session: &str, pty: bool, marker: &Path) {
     let mode = if pty { "--pty" } else { "" };
     // The child never ends by itself: it must still be there to inspect.
     let script = format!(
@@ -61,7 +61,7 @@ fn start_with_leaked_fd(root: &TempDir, session: &str, pty: bool, marker: &Path)
 }
 
 fn assert_fd_not_inherited(pty: bool) {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let session = if pty { "fd-pty" } else { "fd-pipe" };
     // Canonical, so it matches what /proc and lsof report (macOS's /var is a
     // symlink to /private/var).
@@ -70,7 +70,6 @@ fn assert_fd_not_inherited(pty: bool) {
     let marker = marker.canonicalize().unwrap();
 
     start_with_leaked_fd(&root, session, pty, &marker);
-    let _guard = harness::SessionGuard::new(&root, session);
     harness::wait_running(&root, session);
 
     let meta = meta(&root, session);

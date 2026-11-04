@@ -1,4 +1,5 @@
 mod harness;
+use harness::Home;
 
 use std::sync::Mutex;
 
@@ -25,7 +26,7 @@ fn until_exists(gate: &std::path::Path) -> [String; 5] {
 #[test]
 fn after_bind_captures_run_id() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start job1 (short-lived)
     harness::tendr(&root)
@@ -60,7 +61,7 @@ fn after_bind_captures_run_id() {
 #[test]
 fn after_nonexistent_session_fails_at_bind() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job2", "--after", "nonexistent", "--", "true"])
@@ -75,14 +76,13 @@ fn after_nonexistent_session_fails_at_bind() {
 #[test]
 fn after_idempotent_on_running() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start job1 (never ends by itself)
     harness::tendr(&root)
         .args(["start", "job1", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session_job1 = harness::SessionGuard::new(&root, "job1");
     harness::wait_running(&root, "job1");
 
     // Start job2 --after job1 (stays in Starting, waiting for job1)
@@ -90,7 +90,6 @@ fn after_idempotent_on_running() {
         .args(["start", "job2", "--after", "job1", "--", "sleep", "30"])
         .assert()
         .success();
-    let _session_job2 = harness::SessionGuard::new(&root, "job2");
 
     // No sleep: start returning proves the first scan completed — job2's metadata
     // is Starting and the sidecar holds the session lock.
@@ -106,14 +105,13 @@ fn after_idempotent_on_running() {
 #[test]
 fn after_idempotent_on_starting() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start job1 (never ends by itself, so job2 stays in Starting)
     harness::tendr(&root)
         .args(["start", "job1", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session_job1 = harness::SessionGuard::new(&root, "job1");
     harness::wait_running(&root, "job1");
 
     // Start job2 --after job1 (enters Starting, waits)
@@ -121,7 +119,6 @@ fn after_idempotent_on_starting() {
         .args(["start", "job2", "--after", "job1", "--", "echo", "done"])
         .assert()
         .success();
-    let _session_job2 = harness::SessionGuard::new(&root, "job2");
 
     // No sleep: start returning proves the first scan completed — job2's metadata
     // is Starting and the sidecar holds the session lock.
@@ -137,14 +134,13 @@ fn after_idempotent_on_starting() {
 #[test]
 fn kill_during_dependency_wait() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start job1 (never ends by itself)
     harness::tendr(&root)
         .args(["start", "job1", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "job1");
     harness::wait_running(&root, "job1");
 
     // Start job2 --after job1 (enters wait loop)
@@ -177,7 +173,7 @@ fn kill_during_dependency_wait() {
 #[test]
 fn after_dependency_exits_nonzero() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job1", "--", "false"])
@@ -201,7 +197,7 @@ fn after_dependency_exits_nonzero() {
 #[test]
 fn start_after_already_failed_dep_returns_dependency_failed_snapshot() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job1", "--", "false"])
@@ -230,7 +226,7 @@ fn start_after_already_failed_dep_returns_dependency_failed_snapshot() {
 #[test]
 fn after_any_exit_proceeds_on_failure() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job1", "--", "false"])
@@ -260,14 +256,13 @@ fn after_any_exit_proceeds_on_failure() {
 #[test]
 fn after_run_id_mismatch_fails() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job1", "--", "sleep", "3600"])
         .assert()
         .success();
     // Never ends by itself: only the replace below ends this run.
-    let _session = harness::SessionGuard::new(&root, "job1");
     harness::wait_running(&root, "job1");
 
     // Start job2 --after job1 (captures run_id)
@@ -298,14 +293,13 @@ fn after_run_id_mismatch_fails() {
 #[test]
 fn after_timeout_during_wait() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job1", "--", "sleep", "3600"])
         .assert()
         .success();
     // Never ends by itself: job2's dependency timeout is its only way out.
-    let _session = harness::SessionGuard::new(&root, "job1");
     harness::wait_running(&root, "job1");
 
     harness::tendr(&root)
@@ -331,7 +325,7 @@ fn after_timeout_during_wait() {
 #[test]
 fn after_multiple_dependencies() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job1", "--", "true"])
@@ -360,18 +354,16 @@ fn after_multiple_dependencies() {
 #[test]
 fn after_idempotent_different_deps_conflicts() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job1", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session_job1 = harness::SessionGuard::new(&root, "job1");
     harness::tendr(&root)
         .args(["start", "job3", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session_job3 = harness::SessionGuard::new(&root, "job3");
     harness::wait_running(&root, "job1");
     harness::wait_running(&root, "job3");
 
@@ -379,7 +371,6 @@ fn after_idempotent_different_deps_conflicts() {
         .args(["start", "job2", "--after", "job1", "--", "sleep", "30"])
         .assert()
         .success();
-    let _session_job2 = harness::SessionGuard::new(&root, "job2");
 
     // Different dep → conflict. start returned ⇒ first scan completed, job2's
     // metadata is Starting, and the sidecar holds the session lock.
@@ -394,7 +385,7 @@ fn after_idempotent_different_deps_conflicts() {
 #[test]
 fn wait_dependency_failed_exits_4() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job1", "--", "false"])
@@ -418,7 +409,7 @@ fn wait_dependency_failed_exits_4() {
 #[test]
 fn after_waits_for_running_dependency() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start job1, which runs until the test opens its gate.
     let gate = root.path().join("job1-gate");
@@ -427,7 +418,6 @@ fn after_waits_for_running_dependency() {
         .args(until_exists(&gate))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "job1");
     harness::wait_running(&root, "job1");
 
     // Start job2 --after job1
@@ -454,13 +444,12 @@ fn after_waits_for_running_dependency() {
 #[test]
 fn kill_force_during_dependency_wait() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "job1", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "job1");
     harness::wait_running(&root, "job1");
 
     harness::tendr(&root)
@@ -488,14 +477,13 @@ fn kill_force_during_dependency_wait() {
 #[test]
 fn after_satisfied_dep_not_invalidated_by_replace() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     // job1 exits quickly, job3 runs until the test opens its gate
     harness::tendr(&root)
         .args(["start", "job1", "--", "true"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "job1");
     harness::wait_terminal(&root, "job1");
 
     let gate = root.path().join("job3-gate");
@@ -504,7 +492,6 @@ fn after_satisfied_dep_not_invalidated_by_replace() {
         .args(until_exists(&gate))
         .assert()
         .success();
-    let _session_job3 = harness::SessionGuard::new(&root, "job3");
     harness::wait_running(&root, "job3");
 
     // job2 depends on both: job1 (already terminal) and job3 (still running)

@@ -2,6 +2,7 @@
 //! files (spec §5.2, slice 2 plan scope items 3–4, 6).
 
 mod harness;
+use harness::Home;
 
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -9,7 +10,6 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use harness::{tendr, wait_running, wait_terminal};
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -21,12 +21,12 @@ fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn events_dir(root: &TempDir, session: &str) -> std::path::PathBuf {
+fn events_dir(root: &Home, session: &str) -> std::path::PathBuf {
     root.path()
         .join(format!(".tendr/sessions/default/{session}/events"))
 }
 
-fn segments(root: &TempDir, session: &str) -> Vec<std::path::PathBuf> {
+fn segments(root: &Home, session: &str) -> Vec<std::path::PathBuf> {
     let mut segs: Vec<_> = std::fs::read_dir(events_dir(root, session))
         .unwrap()
         .filter_map(Result::ok)
@@ -40,7 +40,7 @@ fn segments(root: &TempDir, session: &str) -> Vec<std::path::PathBuf> {
 /// Split the session's single segment after `keep` lines: the tail moves to
 /// a new, lexicographically-later segment (tendr does not rotate segments yet,
 /// but multi-segment logs are legal — names are permanent identities).
-fn split_segment(root: &TempDir, session: &str, keep: usize) {
+fn split_segment(root: &Home, session: &str, keep: usize) {
     let segs = segments(root, session);
     assert_eq!(segs.len(), 1, "expected a single segment to split");
     let content = std::fs::read_to_string(&segs[0]).unwrap();
@@ -75,7 +75,7 @@ fn ids(records: &[serde_json::Value]) -> Vec<String> {
 #[test]
 fn batch_mode_emits_final_bookmark_and_resume_is_empty_then_exact() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "hi"])
         .assert()
@@ -137,7 +137,7 @@ fn batch_mode_emits_final_bookmark_and_resume_is_empty_then_exact() {
 #[test]
 fn mid_stream_bookmark_resumes_remainder_exactly_across_segments() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "hi"])
         .assert()
@@ -210,14 +210,13 @@ fn mid_stream_bookmark_resumes_remainder_exactly_across_segments() {
 #[test]
 fn follow_cursors_bookmarks_within_5s_of_idle() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "idle", "--", "sleep", "3600"])
         .assert()
         .success();
     // The session never ends by itself, so nothing but the idle timer can
     // put a record on the follower's stream.
-    let _session = harness::SessionGuard::new(&root, "idle");
     wait_running(&root, "idle");
 
     let bin = assert_cmd::cargo::cargo_bin("tendr");
@@ -276,7 +275,7 @@ fn follow_cursors_bookmarks_within_5s_of_idle() {
 #[test]
 fn cursor_gone_exits_44_with_structured_stderr() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "hi"])
         .assert()
@@ -321,7 +320,7 @@ fn cursor_gone_exits_44_with_structured_stderr() {
 #[test]
 fn unparseable_or_future_version_tokens_are_cursor_gone() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     for token in [
         "definitely-not-a-cursor",
@@ -344,7 +343,7 @@ fn unparseable_or_future_version_tokens_are_cursor_gone() {
 #[test]
 fn cursors_never_cover_output_log() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "logged-line"])
         .assert()

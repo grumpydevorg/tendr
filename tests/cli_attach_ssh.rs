@@ -22,13 +22,13 @@
 #![cfg(unix)]
 
 mod harness;
+use harness::Home;
 
 use harness::terminal::{WrappedAttach, tendr_bin};
 use harness::{HANG, Observation, poll_until};
 use std::process::Output;
 use std::sync::Mutex;
 use std::time::Duration;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -211,7 +211,7 @@ fn without_ssh_note(output: &str) -> &str {
 
 /// Attach through `ssh -t` and wait until the remote client is relaying: it
 /// replays the modes only after it has put its terminal in raw mode.
-fn attach(root: &TempDir, remote: &Remote, label: &str, session: &str) -> WrappedAttach {
+fn attach(root: &Home, remote: &Remote, label: &str, session: &str) -> WrappedAttach {
     let wrapped = WrappedAttach::spawn_argv(root, label, &remote.attach_argv(session, &[]));
     wrapped.wait_output_contains(MODES_ON);
     remote.wait_control(session, "HumanControl");
@@ -226,7 +226,7 @@ fn ssh_detach_restores_the_terminal_and_turns_the_modes_off() {
     else {
         return;
     };
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     remote.start_modes_cat("ssh-detach");
 
     let mut wrapped = attach(&root, &remote, "detach", "ssh-detach");
@@ -248,7 +248,7 @@ fn ssh_ctrl_right_bracket_passes_through() {
     let Some(mut remote) = Remote::connect("ssh_ctrl_right_bracket_passes_through") else {
         return;
     };
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     remote.start_modes_cat("ssh-ctrl-bracket");
 
     let mut wrapped = attach(&root, &remote, "ctrl-bracket", "ssh-ctrl-bracket");
@@ -268,7 +268,7 @@ fn ssh_paste_with_prefixes_reaches_the_child() {
     let Some(mut remote) = Remote::connect("ssh_paste_with_prefixes_reaches_the_child") else {
         return;
     };
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     remote.start_modes_cat("ssh-paste");
     let mut wrapped = attach(&root, &remote, "paste", "ssh-paste");
 
@@ -297,7 +297,7 @@ fn ssh_takeover_over_a_stopped_first_client() {
     let Some(mut remote) = Remote::connect("ssh_takeover_over_a_stopped_first_client") else {
         return;
     };
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     remote.start_modes_cat("ssh-takeover");
 
     let first = attach(&root, &remote, "take-1", "ssh-takeover");

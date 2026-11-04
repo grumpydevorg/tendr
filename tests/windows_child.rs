@@ -227,7 +227,7 @@ fn windows_kill_graceful_cooperative() {
 /// state under `USERPROFILE`.
 #[test]
 fn state_lives_under_userprofile_when_home_is_unset() {
-    let profile = tempfile::TempDir::new().unwrap();
+    let profile = harness::Home::new();
     harness::tendr(&profile)
         .env_remove("HOME")
         .env("USERPROFILE", profile.path())

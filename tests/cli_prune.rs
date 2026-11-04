@@ -1,13 +1,13 @@
 mod harness;
+use harness::Home;
 
 use harness::{tendr, wait_running};
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Start a session that exits immediately, wait for terminal state.
-fn create_terminal_session(root: &TempDir, name: &str, namespace: &str) {
+fn create_terminal_session(root: &Home, name: &str, namespace: &str) {
     let out = tendr(root)
         .args([
             "start",
@@ -41,7 +41,7 @@ fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
 }
 
 /// Backdate ended_at in a session's meta.json by rewriting the file.
-fn backdate_ended_at(root: &TempDir, namespace: &str, session: &str, age_secs: u64) {
+fn backdate_ended_at(root: &Home, namespace: &str, session: &str, age_secs: u64) {
     let meta_path = root
         .path()
         .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
@@ -61,7 +61,7 @@ fn backdate_ended_at(root: &TempDir, namespace: &str, session: &str, age_secs: u
 #[test]
 fn prune_deletes_terminal_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     create_terminal_session(&root, "prune-del", "default");
 
@@ -98,14 +98,13 @@ fn prune_deletes_terminal_session() {
 #[test]
 fn prune_skips_running_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .args(["start", "prune-running", "--", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(out.status.success());
-    let _session = harness::SessionGuard::new(&root, "prune-running");
     wait_running(&root, "prune-running");
 
     let out = tendr(&root).args(["prune", "--all"]).output().unwrap();
@@ -128,7 +127,7 @@ fn prune_skips_running_session() {
 #[test]
 fn prune_respects_older_than() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     create_terminal_session(&root, "prune-old", "default");
     create_terminal_session(&root, "prune-recent", "default");
@@ -171,7 +170,7 @@ fn prune_respects_older_than() {
 #[test]
 fn prune_dry_run_preserves_sessions() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     create_terminal_session(&root, "prune-dry", "default");
 
@@ -200,7 +199,7 @@ fn prune_dry_run_preserves_sessions() {
 #[test]
 fn prune_without_filter_fails() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root).args(["prune"]).output().unwrap();
     assert!(!out.status.success(), "prune without filter should fail");
@@ -209,7 +208,7 @@ fn prune_without_filter_fails() {
 #[test]
 fn prune_skips_corrupt_meta() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Create a session dir with garbage meta.json
     let session_dir = root.path().join(".tendr/sessions/default/prune-corrupt");
@@ -233,7 +232,7 @@ fn prune_skips_corrupt_meta() {
 #[test]
 fn prune_skips_missing_meta() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Create a session dir with no meta.json
     let session_dir = root.path().join(".tendr/sessions/default/prune-nometa");
@@ -256,7 +255,7 @@ fn prune_skips_missing_meta() {
 #[test]
 fn prune_respects_namespace() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     create_terminal_session(&root, "prune-ns", "ns-a");
     create_terminal_session(&root, "prune-ns", "ns-b");
@@ -281,7 +280,7 @@ fn prune_respects_namespace() {
 #[test]
 fn prune_output_format() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     create_terminal_session(&root, "prune-fmt", "default");
 
@@ -315,7 +314,7 @@ fn prune_output_format() {
 #[test]
 fn prune_summary_counts_match_mixed_outcomes() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // 1. Deletable terminal session
     create_terminal_session(&root, "prune-mix-ok", "default");
@@ -326,7 +325,6 @@ fn prune_summary_counts_match_mixed_outcomes() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    let _session = harness::SessionGuard::new(&root, "prune-mix-run");
     wait_running(&root, "prune-mix-run");
 
     // 3. Corrupt meta session (will be skipped)
@@ -362,7 +360,7 @@ fn prune_delete_failure_reports_error_and_continues() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Create two deletable terminal sessions
     create_terminal_session(&root, "prune-err-a", "default");
@@ -400,13 +398,13 @@ fn prune_delete_failure_reports_error_and_continues() {
         "error line should have error message"
     );
 
-    // Cleanup: restore permissions so TempDir can clean up
+    // Cleanup: restore permissions so the Home can clean up
     std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 // ── prune by name (#70) ─────────────────────────────────────────────────
 
-fn session_dir(root: &TempDir, namespace: &str, name: &str) -> std::path::PathBuf {
+fn session_dir(root: &Home, namespace: &str, name: &str) -> std::path::PathBuf {
     root.path()
         .join(format!(".tendr/sessions/{namespace}/{name}"))
 }
@@ -414,7 +412,7 @@ fn session_dir(root: &TempDir, namespace: &str, name: &str) -> std::path::PathBu
 #[test]
 fn prune_by_name_deletes_only_that_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     create_terminal_session(&root, "prune-one", "default");
     create_terminal_session(&root, "prune-other", "default");
@@ -446,13 +444,12 @@ fn prune_by_name_deletes_only_that_session() {
 #[test]
 fn prune_by_name_skips_a_running_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "prune-live", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "prune-live");
     wait_running(&root, "prune-live");
 
     let out = tendr(&root).args(["prune", "prune-live"]).output().unwrap();
@@ -468,7 +465,7 @@ fn prune_by_name_skips_a_running_session() {
 #[test]
 fn prune_by_name_reports_an_unknown_name_and_fails() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     create_terminal_session(&root, "prune-real", "default");
 
@@ -499,7 +496,7 @@ fn prune_by_name_reports_an_unknown_name_and_fails() {
 #[test]
 fn prune_by_name_dry_run_removes_nothing() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     create_terminal_session(&root, "prune-dry-one", "default");
 
@@ -518,7 +515,7 @@ fn prune_by_name_dry_run_removes_nothing() {
 #[test]
 fn prune_by_name_resolves_in_the_given_namespace() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     create_terminal_session(&root, "prune-same", "ns-a");
     create_terminal_session(&root, "prune-same", "ns-b");
@@ -534,7 +531,7 @@ fn prune_by_name_resolves_in_the_given_namespace() {
 
 #[test]
 fn prune_names_conflict_with_all_and_older_than() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     for flag in [&["--all"][..], &["--older-than", "1d"][..]] {
         let mut args = vec!["prune", "some-session"];
         args.extend_from_slice(flag);
@@ -585,7 +582,7 @@ fn backdate(path: &std::path::Path) {
 }
 
 #[cfg(unix)]
-fn socket_dir(root: &TempDir) -> std::path::PathBuf {
+fn socket_dir(root: &Home) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = root.path().join(".tendr/sockets");
     std::fs::create_dir_all(&dir).unwrap();
@@ -601,7 +598,7 @@ fn socket_dir(root: &TempDir) -> std::path::PathBuf {
 #[test]
 fn prune_sweeps_orphaned_attach_sockets_only() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let sockets = socket_dir(&root);
 
     // A session prune keeps (too recent), whose breadcrumb names a dead socket.
@@ -672,7 +669,7 @@ fn prune_keeps_a_listener_with_a_full_backlog_without_waiting_on_it() {
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let live = socket_dir(&root).join("dddddddddddd.sock");
     let addr = SocketAddrUnix::new(&live).unwrap();
     let socket = || {
@@ -726,7 +723,7 @@ fn prune_keeps_a_listener_with_a_full_backlog_without_waiting_on_it() {
 #[test]
 fn prune_removes_a_pruned_sessions_dead_socket() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let sockets = socket_dir(&root);
 
     create_terminal_session(&root, "crashed", "default");

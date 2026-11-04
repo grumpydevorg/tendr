@@ -7,9 +7,10 @@
 #![cfg(unix)]
 
 mod harness;
+use harness::Home;
 
 use harness::terminal::{WrappedAttach, tendr_bin};
-use harness::{HANG, Observation, SessionGuard, fake_ssh, poll_until, shim_path_env, tendr};
+use harness::{HANG, Observation, fake_ssh, poll_until, shim_path_env, tendr};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -87,7 +88,7 @@ impl Remote {
     }
 
     /// `tendr --host box attach <args>` in a fresh terminal.
-    fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
+    fn attach(&self, root: &Home, label: &str, args: &[&str]) -> WrappedAttach {
         attach_through(&self.ssh, CONNECTS, root, label, args, &[])
     }
 }
@@ -97,7 +98,7 @@ impl Remote {
 fn attach_through(
     ssh: &TempDir,
     deadline: &str,
-    root: &TempDir,
+    root: &Home,
     label: &str,
     args: &[&str],
     env: &[(&str, &str)],
@@ -130,7 +131,7 @@ impl Remote {
     }
 }
 
-fn start_pty(root: &TempDir, session: &str, argv: &[&str]) {
+fn start_pty(root: &Home, session: &str, argv: &[&str]) {
     let output = tendr(root)
         .args(["start", session, "--pty", "--stdin", "--"])
         .args(argv)
@@ -140,7 +141,7 @@ fn start_pty(root: &TempDir, session: &str, argv: &[&str]) {
     harness::wait_running(root, session);
 }
 
-fn control(root: &TempDir, session: &str) -> Option<String> {
+fn control(root: &Home, session: &str) -> Option<String> {
     let meta = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/meta.json"));
@@ -148,7 +149,7 @@ fn control(root: &TempDir, session: &str) -> Option<String> {
     meta["pty"]["control"].as_str().map(str::to_owned)
 }
 
-fn wait_control(root: &TempDir, session: &str, expected: &str) {
+fn wait_control(root: &Home, session: &str, expected: &str) {
     poll_until(HANG, Duration::from_millis(50), || {
         match control(root, session) {
             Some(c) if c == expected => Observation::Ready(()),
@@ -164,7 +165,7 @@ fn wait_control(root: &TempDir, session: &str, expected: &str) {
 /// ssh's pipe, the remote side's socket) and waits in the sidecar's ring,
 /// so the sidecar's write to this client is blocked. Waiting on the bytes,
 /// not a time, keeps that true however slowly the flood runs.
-fn wait_recorded_past(root: &TempDir, session: &str, bytes: u64) {
+fn wait_recorded_past(root: &Home, session: &str, bytes: u64) {
     let log = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/output.log"));
@@ -194,8 +195,7 @@ const BACKLOG: u64 = 2 << 20;
 #[test]
 fn host_attach_types_sees_output_resizes_and_detaches() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, HOSTILE_NAME);
+    let root = Home::new();
     start_pty(&root, HOSTILE_NAME, &["sh"]);
     let remote = Remote::new();
 
@@ -237,8 +237,7 @@ const PACED_FLOOD: &str = "stty raw -echo; line=$(printf '%01000d' 0); \
 #[test]
 fn host_detach_is_not_held_up_by_unread_output() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-stall-detach");
+    let root = Home::new();
     start_pty(&root, "host-stall-detach", &["sh", "-c", PACED_FLOOD]);
     let remote = Remote::new();
 
@@ -269,8 +268,7 @@ fn host_detach_is_not_held_up_by_unread_output() {
 #[test]
 fn host_takeover_while_the_first_client_is_stalled() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-take");
+    let root = Home::new();
     // The paced flood in the background, and an echo of what is typed.
     let child = format!("({PACED_FLOOD}) & exec cat -v");
     start_pty(&root, "host-take", &["sh", "-c", &child]);
@@ -320,7 +318,7 @@ enum FakeReply {
 
 /// Point `session`'s breadcrumb at a fake sidecar in `root` that answers
 /// every connection with `reply`.
-fn fake_sidecar(root: &TempDir, session: &str, label: &str, when: FakeReply, reply: Vec<u8>) {
+fn fake_sidecar(root: &Home, session: &str, label: &str, when: FakeReply, reply: Vec<u8>) {
     use std::io::Write;
     let sock = root.path().join(format!("{label}.sock"));
     let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
@@ -339,7 +337,7 @@ fn fake_sidecar(root: &TempDir, session: &str, label: &str, when: FakeReply, rep
     point_breadcrumb_at(root, session, &sock);
 }
 
-fn point_breadcrumb_at(root: &TempDir, session: &str, sock: &std::path::Path) {
+fn point_breadcrumb_at(root: &Home, session: &str, sock: &std::path::Path) {
     let dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}"));
@@ -350,7 +348,7 @@ fn point_breadcrumb_at(root: &TempDir, session: &str, sock: &std::path::Path) {
 
 /// Attach to `args` through the bridge and return its exit code and what its
 /// terminal showed; the terminal is checked restored.
-fn host_attach_exit(root: &TempDir, remote: &Remote, label: &str, args: &[&str]) -> (i32, String) {
+fn host_attach_exit(root: &Home, remote: &Remote, label: &str, args: &[&str]) -> (i32, String) {
     let wrapped = remote.attach(root, label, args);
     let code = wrapped.wait_exit();
     wrapped.assert_terminal_restored();
@@ -363,7 +361,7 @@ fn host_attach_exit(root: &TempDir, remote: &Remote, label: &str, args: &[&str])
 #[test]
 fn host_attach_keeps_the_exit_codes() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::new();
 
     let (code, out) = host_attach_exit(&root, &remote, "missing", &["no-such"]);
@@ -371,7 +369,6 @@ fn host_attach_keeps_the_exit_codes() {
     assert!(out.contains("session not found"), "{out}");
     remote.assert_constant_argv();
 
-    let _pipe = SessionGuard::new(&root, "host-pipe");
     tendr(&root)
         .args(["start", "host-pipe", "--", "sleep", "3600"])
         .output()
@@ -381,7 +378,6 @@ fn host_attach_keeps_the_exit_codes() {
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("not PTY-enabled"), "{out}");
 
-    let _ended = SessionGuard::new(&root, "host-ended");
     tendr(&root)
         .args(["start", "host-ended", "--pty", "--", "true"])
         .output()
@@ -391,7 +387,6 @@ fn host_attach_keeps_the_exit_codes() {
     assert_eq!(code, 81, "{out}");
 
     // Held by a human: the remote check refuses a plain attach.
-    let _held = SessionGuard::new(&root, "host-held");
     start_pty(&root, "host-held", &["cat"]);
     let holder = remote.attach(&root, "holder", &["host-held"]);
     wait_control(&root, "host-held", "HumanControl");
@@ -405,7 +400,6 @@ fn host_attach_keeps_the_exit_codes() {
     wait_control(&root, "host-held", "AgentControl");
 
     // A breadcrumb naming a socket nobody listens on.
-    let _dead = SessionGuard::new(&root, "host-dead");
     start_pty(&root, "host-dead", &["cat"]);
     let dead = root.path().join("dead.sock");
     drop(std::os::unix::net::UnixListener::bind(&dead).unwrap());
@@ -414,7 +408,6 @@ fn host_attach_keeps_the_exit_codes() {
     assert_eq!(code, 84, "{out}");
 
     // A sidecar that speaks another protocol, and one that refuses the peer.
-    let _fake = SessionGuard::new(&root, "host-fake");
     start_pty(&root, "host-fake", &["cat"]);
     let mut unknown = Vec::new();
     tendr::attach_proto::write_msg(&mut unknown, 0x7f, b"from the future").unwrap();
@@ -449,8 +442,7 @@ fn host_attach_keeps_the_exit_codes() {
 fn remote_attach_requires_its_hello() {
     use tendr::attach_proto::{Frame, Mode, Version, write_frame};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-hello");
+    let root = Home::new();
     start_pty(&root, "host-hello", &["cat"]);
 
     let json = br#"{"v":1,"op":"attach","params":{"session":"host-hello","namespace":null,"takeover":false,"escape":"ctrl-backslash"}}"#;
@@ -493,7 +485,7 @@ fn remote_attach_requires_its_hello() {
 #[test]
 fn host_attach_ssh_failures_keep_their_codes() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // The fake ssh never says hello by itself: only the deadline ends it.
     let silent = fake_ssh("sleep 3600");
@@ -515,8 +507,7 @@ fn host_attach_ssh_failures_keep_their_codes() {
 #[test]
 fn host_attach_client_killed_gives_control_back() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-killed");
+    let root = Home::new();
     start_pty(&root, "host-killed", &["cat"]);
     let remote = Remote::new();
 
@@ -535,7 +526,7 @@ type Hellos = std::sync::Arc<Mutex<Vec<Vec<u8>>>>;
 /// Point `session`'s breadcrumb at a socket in `root` whose every connection,
 /// after its hello (recorded in the returned list), goes to `serve`.
 fn fake_listener(
-    root: &TempDir,
+    root: &Home,
     session: &str,
     label: &str,
     serve: impl Fn(std::os::unix::net::UnixStream, &[u8]) + Send + 'static,
@@ -563,7 +554,7 @@ fn fake_listener(
 /// any hello but `[1, mode]` with the protocol class and the message 0.5.0
 /// sends, and serves a version 1 hello as the real sidecar at `real` does,
 /// by passing the connection through to it.
-fn v1_only_sidecar(root: &TempDir, session: &str) -> Hellos {
+fn v1_only_sidecar(root: &Home, session: &str) -> Hellos {
     use std::io::Write;
     use tendr::attach_proto::{Frame, RejectClass, write_frame};
     let real = tendr::attach_proto::read_sock_path(
@@ -606,8 +597,7 @@ fn v1_only_sidecar(root: &TempDir, session: &str) -> Hellos {
 #[test]
 fn host_attach_falls_back_to_v1_for_an_old_sidecar() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-old-sidecar");
+    let root = Home::new();
     start_pty(&root, "host-old-sidecar", &["sh"]);
     let hellos = v1_only_sidecar(&root, "host-old-sidecar");
     let remote = Remote::new();
@@ -637,8 +627,7 @@ fn host_attach_falls_back_to_v1_for_an_old_sidecar() {
 fn host_attach_tracks_offsets_and_refuses_output_that_skips() {
     use tendr::attach_proto::{Frame, ResumePoint, write_frame};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-skip");
+    let root = Home::new();
     start_pty(&root, "host-skip", &["cat"]);
     let hellos = fake_listener(&root, "host-skip", "skip", |mut client, _| {
         let accept = Frame::AcceptedV2(ResumePoint {
@@ -683,7 +672,7 @@ struct FrameClient {
 }
 
 impl FrameClient {
-    fn start(root: &TempDir, json: &str) -> Self {
+    fn start(root: &Home, json: &str) -> Self {
         use tendr::attach_proto::{Frame, Mode, Version};
         Self::start_with(
             root,
@@ -699,7 +688,7 @@ impl FrameClient {
     /// watcher's remote that goes by `meta.json` waits for the run's end
     /// longer than load can delay it ([`RECORDED_END`]); no test here
     /// cuts a watcher off through this client.
-    fn start_with(root: &TempDir, json: &str, first: &tendr::attach_proto::Frame) -> Self {
+    fn start_with(root: &Home, json: &str, first: &tendr::attach_proto::Frame) -> Self {
         use std::io::Write;
         use std::process::Stdio;
         let mut child = std::process::Command::new(tendr_bin())
@@ -743,7 +732,7 @@ impl FrameClient {
 }
 
 /// A PTY session that prints `marker` once `go` exists, then waits.
-fn start_marker(root: &TempDir, session: &str, go: &std::path::Path, marker: &str) {
+fn start_marker(root: &Home, session: &str, go: &std::path::Path, marker: &str) {
     let script =
         format!("while [ ! -f \"$GO\" ]; do sleep 0.05; done; printf {marker}; sleep 3600");
     let output = tendr(root)
@@ -763,8 +752,7 @@ fn start_marker(root: &TempDir, session: &str, go: &std::path::Path, marker: &st
 fn remote_attach_passes_v2_through() {
     use tendr::attach_proto::{MSG_ACCEPTED_V2, MSG_OUTPUT};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-v2");
+    let root = Home::new();
     let go = root.path().join("go");
     start_marker(&root, "host-v2", &go, "v2-marker");
 
@@ -811,8 +799,7 @@ fn remote_attach_passes_v2_through() {
 fn remote_attach_answers_an_old_client_in_v1() {
     use tendr::attach_proto::{MSG_ACCEPTED, MSG_DATA};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-v1");
+    let root = Home::new();
     let go = root.path().join("go");
     start_marker(&root, "host-v1", &go, "v1-marker");
 
@@ -842,7 +829,7 @@ fn remote_attach_answers_an_old_client_in_v1() {
 #[test]
 fn host_attach_sends_what_an_old_remote_reads() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let sent = root.path().join("sent");
     let pid = root.path().join("ssh-pid");
     let ssh = fake_ssh(&format!(
@@ -944,7 +931,7 @@ fn attach_json(session: &str, resume: Option<tendr::attach_proto::ResumePoint>) 
 }
 
 /// A version 2 attach through `_remote`, and the point it was accepted at.
-fn attach_v2(root: &TempDir, session: &str) -> (FrameClient, tendr::attach_proto::ResumePoint) {
+fn attach_v2(root: &Home, session: &str) -> (FrameClient, tendr::attach_proto::ResumePoint) {
     let mut client = FrameClient::start(root, &attach_json(session, None));
     match client.frame() {
         tendr::attach_proto::Frame::AcceptedV2(point) => (client, point),
@@ -961,8 +948,7 @@ fn remote_resume_is_not_refused_by_the_human_control_check() {
     use tendr::attach_proto::{Frame, ResumePoint, Version};
     use tendr::model::pty_control::ControllerEpoch;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-resume");
+    let root = Home::new();
     start_pty(&root, "host-resume", &["cat"]);
 
     let (mut lost, accepted) = attach_v2(&root, "host-resume");
@@ -997,8 +983,7 @@ fn remote_resume_is_not_refused_by_the_human_control_check() {
 fn remote_resume_with_a_sidecar_that_cannot_resume_is_refused() {
     use tendr::attach_proto::{Frame, RejectClass, ResumePoint, Version, write_frame};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-old-resume");
+    let root = Home::new();
     start_pty(&root, "host-old-resume", &["cat"]);
     let seen = fake_listener(&root, "host-old-resume", "pre-resume", |mut client, _| {
         let refusal = Frame::Rejected {
@@ -1074,7 +1059,7 @@ impl Flaky {
     }
 
     /// `tendr --host box attach <args>` in a fresh terminal.
-    fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
+    fn attach(&self, root: &Home, label: &str, args: &[&str]) -> WrappedAttach {
         self.attach_with_deadline(CONNECTS, root, label, args)
     }
 
@@ -1083,7 +1068,7 @@ impl Flaky {
     fn attach_with_deadline(
         &self,
         deadline: &str,
-        root: &TempDir,
+        root: &Home,
         label: &str,
         args: &[&str],
     ) -> WrappedAttach {
@@ -1172,7 +1157,7 @@ impl Flaky {
 /// Start a PTY session running `script` under `sh -c`. Each of `files` is
 /// set in its environment to that name's path in `root`, for the script to
 /// wait on; `env` goes to the sidecar.
-fn start_script(root: &TempDir, session: &str, script: &str, files: &[&str], env: &[(&str, &str)]) {
+fn start_script(root: &Home, session: &str, script: &str, files: &[&str], env: &[(&str, &str)]) {
     let mut start = tendr(root);
     for (key, value) in env {
         start.env(key, value);
@@ -1188,12 +1173,12 @@ fn start_script(root: &TempDir, session: &str, script: &str, files: &[&str], env
     harness::wait_running(root, session);
 }
 
-fn touch(root: &TempDir, name: &str) {
+fn touch(root: &Home, name: &str) {
     std::fs::write(root.path().join(name), b"").unwrap();
 }
 
 /// Wait until the run has granted control to `n` resumes.
-fn wait_resumes(root: &TempDir, session: &str, n: usize) {
+fn wait_resumes(root: &Home, session: &str, n: usize) {
     poll_until(HANG, Duration::from_millis(50), || {
         let resumes = harness::read_events(root, session)
             .into_iter()
@@ -1237,8 +1222,7 @@ const NUMBERED_FLOOD: &str = "while [ ! -f \"$GO\" ]; do sleep 0.05; done; i=0; 
 #[test]
 fn host_attach_reconnects_when_ssh_dies_mid_flood_with_no_gap_or_duplicate() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-cut");
+    let root = Home::new();
     start_script(
         &root,
         "host-cut",
@@ -1310,8 +1294,7 @@ fn host_attach_reconnects_when_ssh_dies_mid_flood_with_no_gap_or_duplicate() {
 #[test]
 fn host_attach_keeps_what_ssh_says_off_the_sessions_screen() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-quiet");
+    let root = Home::new();
     start_script(
         &root,
         "host-quiet",
@@ -1358,8 +1341,7 @@ fn host_attach_keeps_what_ssh_says_off_the_sessions_screen() {
 #[test]
 fn host_reconnect_fails_fast_backs_off_and_discards_typing() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-backoff");
+    let root = Home::new();
     start_pty(&root, "host-backoff", &["cat"]);
     let link = Flaky::new();
 
@@ -1417,8 +1399,7 @@ fn hold_in_reconnect(link: &Flaky) {
 #[test]
 fn host_reconnect_after_a_takeover_in_the_gap_exits_81() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-gap-take");
+    let root = Home::new();
     start_pty(&root, "host-gap-take", &["cat"]);
     let link = Flaky::new();
 
@@ -1449,8 +1430,7 @@ fn host_reconnect_after_a_takeover_in_the_gap_exits_81() {
 #[test]
 fn host_reconnect_after_the_run_ended_exits_81() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-gap-end");
+    let root = Home::new();
     start_pty(&root, "host-gap-end", &["cat"]);
     let link = Flaky::new();
 
@@ -1478,8 +1458,7 @@ fn host_reconnect_after_the_run_ended_exits_81() {
 #[test]
 fn host_escape_or_signal_while_reconnecting_leaves_and_stops_ssh() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-gap-leave");
+    let root = Home::new();
     start_pty(&root, "host-gap-leave", &["cat"]);
     let link = Flaky::new();
     // Leaving waits for the reconnect to stop its ssh
@@ -1536,8 +1515,7 @@ fn host_escape_or_signal_while_reconnecting_leaves_and_stops_ssh() {
 #[test]
 fn host_reconnect_past_the_ring_resets_the_modes_and_says_what_was_missed() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-gone");
+    let root = Home::new();
     // About 2 MB of `x` lines, far past a 64 KiB ring, then markers. Capture
     // logs a chunk just before it adds it to the ring, so only the last
     // chunk logged can lag the ring: FLOOD-END is written only once
@@ -1620,8 +1598,7 @@ fn host_reconnect_past_the_ring_resets_the_modes_and_says_what_was_missed() {
 #[test]
 fn host_reconnected_attach_taken_over_while_stalled_exits_81() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-resume-take");
+    let root = Home::new();
     let child = format!("({PACED_FLOOD}) & exec cat -v");
     start_pty(&root, "host-resume-take", &["sh", "-c", &child]);
     let link = Flaky::new();
@@ -1659,7 +1636,7 @@ fn host_reconnected_attach_taken_over_while_stalled_exits_81() {
 
 /// The `pty.control_changed` events of `session` so far, as `(trigger,
 /// epoch)`.
-fn control_changes(root: &TempDir, session: &str) -> Vec<(String, u64)> {
+fn control_changes(root: &Home, session: &str) -> Vec<(String, u64)> {
     harness::read_events(root, session)
         .into_iter()
         .filter(|e| e["kind"] == "pty.control_changed")
@@ -1681,8 +1658,7 @@ fn control_changes(root: &TempDir, session: &str) -> Vec<(String, u64)> {
 #[test]
 fn host_read_only_attach_resumes_beside_a_controller_with_no_gap_or_duplicate() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-cut");
+    let root = Home::new();
     start_script(
         &root,
         "host-ro-cut",
@@ -1765,7 +1741,7 @@ fn watch_json(session: &str, resume: Option<tendr::attach_proto::WatchPoint>) ->
 /// `_remote` run for a watcher's resume from `point`, with `first` in place
 /// of the hello.
 fn watch_resume(
-    root: &TempDir,
+    root: &Home,
     session: &str,
     point: tendr::attach_proto::WatchPoint,
     first: &tendr::attach_proto::Frame,
@@ -1784,8 +1760,7 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
     use tendr::attach_proto::{Frame, Mode, ResumePoint, Version, WatchPoint};
     use tendr::model::pty_control::ControllerEpoch;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-resume");
+    let root = Home::new();
     // The flood passes the 4 KiB ring in 1200-byte steps (ONLCR). Each step
     // is let out only once the controller has been sent the one before, so
     // it is never a whole ring behind and never evicted, however slowly
@@ -1931,8 +1906,7 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
 fn remote_watch_resume_in_version_3_is_told_where_the_output_ends() {
     use tendr::attach_proto::{Frame, Mode, Version, WatchPoint};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-end");
+    let root = Home::new();
     start_script(
         &root,
         "host-ro-end",
@@ -2003,7 +1977,7 @@ fn remote_watch_resume_in_version_3_is_told_where_the_output_ends() {
 /// added (the fake ssh passes it on to the remote tendr).
 fn watch_without_terminal(
     ssh: &TempDir,
-    root: &TempDir,
+    root: &Home,
     session: &str,
     env: &[(&str, &str)],
 ) -> std::process::Child {
@@ -2074,8 +2048,7 @@ fn ticking_then(then: &str) -> String {
 fn host_read_only_without_a_terminal_writes_the_runs_output_and_exits_0() {
     use std::io::Read;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-out");
+    let root = Home::new();
     start_script(
         &root,
         "host-ro-out",
@@ -2112,8 +2085,7 @@ fn host_read_only_without_a_terminal_writes_the_runs_output_and_exits_0() {
 fn host_read_only_without_a_terminal_cut_off_exits_84() {
     use std::io::Read;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-cutoff");
+    let root = Home::new();
     let line = "0123456789abcdef".repeat(62);
     start_script(
         &root,
@@ -2161,8 +2133,7 @@ fn host_read_only_without_a_terminal_cut_off_exits_84() {
 fn host_read_only_gets_the_runs_last_bytes_at_its_end() {
     use std::io::Read;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-flush");
+    let root = Home::new();
     start_script(
         &root,
         "host-ro-flush",
@@ -2208,8 +2179,7 @@ fn host_read_only_gets_the_runs_last_bytes_at_its_end() {
 fn host_read_only_gets_a_burst_as_the_run_ends_through_its_marker() {
     use std::io::Read;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-burst");
+    let root = Home::new();
     start_script(
         &root,
         "host-ro-burst",
@@ -2247,8 +2217,7 @@ fn host_read_only_gets_a_burst_as_the_run_ends_through_its_marker() {
 fn host_read_only_stalled_past_the_run_end_flush_exits_84() {
     use std::io::Read;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-stall");
+    let root = Home::new();
     start_script(
         &root,
         "host-ro-stall",
@@ -2289,8 +2258,7 @@ fn host_read_only_with_a_sidecar_from_before_the_end_of_output_exits_0() {
     use std::io::Read;
     use tendr::attach_proto::MSG_HELLO;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-old-end");
+    let root = Home::new();
     start_script(
         &root,
         "host-ro-old-end",
@@ -2334,7 +2302,7 @@ type FirstFrames = std::sync::Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
 /// one would; any other is refused with the protocol class, as the old
 /// decoder refuses it.
 fn old_sidecar(
-    root: &TempDir,
+    root: &Home,
     session: &str,
     label: &str,
     decodes: fn(u8, &[u8]) -> bool,
@@ -2428,8 +2396,7 @@ fn decoded_before_output_end(msg_type: u8, payload: &[u8]) -> bool {
 fn host_watch_resume_to_a_sidecar_from_before_the_end_of_output_says_it_in_version_2() {
     use tendr::attach_proto::{MSG_HELLO, MSG_WATCH_RESUME};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-old-end-resume");
+    let root = Home::new();
     start_script(
         &root,
         "host-ro-old-end-resume",
@@ -2484,8 +2451,7 @@ fn host_watch_resume_to_a_sidecar_from_before_the_end_of_output_says_it_in_versi
 fn host_watch_hello_to_a_sidecar_from_before_watchers_exits_80() {
     use tendr::attach_proto::MSG_HELLO;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-old");
+    let root = Home::new();
     start_pty(&root, "host-ro-old", &["cat"]);
     let mut controller = WrappedAttach::spawn(&root, "old-controller", &["host-ro-old"]);
     wait_control(&root, "host-ro-old", "HumanControl");
@@ -2518,8 +2484,7 @@ fn host_watch_hello_to_a_sidecar_from_before_watchers_exits_80() {
 fn host_watch_resume_to_a_sidecar_from_before_it_exits_80() {
     use tendr::attach_proto::{MSG_HELLO, MSG_WATCH_RESUME};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "host-ro-old-resume");
+    let root = Home::new();
     start_pty(
         &root,
         "host-ro-old-resume",
@@ -2611,7 +2576,7 @@ fn old_remote(sent: &[u8], human_control: bool, before_this: bool) -> Option<i32
 #[test]
 fn a_watch_hello_and_watch_resume_are_refused_by_an_old_remote() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let files = TempDir::new().unwrap();
     let path = |name: &str| files.path().join(name);
     let ssh = fake_ssh(&format!(

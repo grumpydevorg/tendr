@@ -5,14 +5,14 @@
 #![cfg(unix)]
 
 mod harness;
+use harness::Home;
 
 use harness::{tendr, wait_terminal};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
-use tempfile::TempDir;
 
 /// Run `tendr <args>` with stdout a pipe whose reader has already closed.
-fn run_into_closed_pipe(root: &TempDir, args: &[&str]) -> std::process::Output {
+fn run_into_closed_pipe(root: &Home, args: &[&str]) -> std::process::Output {
     let mut fds = [0; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
@@ -29,7 +29,7 @@ fn run_into_closed_pipe(root: &TempDir, args: &[&str]) -> std::process::Output {
 
 #[test]
 fn read_commands_survive_a_reader_that_exits_early() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s", "--", "sh", "-c", "seq 1 2000"])
         .assert()

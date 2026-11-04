@@ -6,14 +6,14 @@
 //! the available topics.
 
 mod harness;
+use harness::Home;
 
 use harness::tendr;
 use predicates::prelude::*;
-use tempfile::TempDir;
 
 #[test]
 fn version_reports_package_version() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let expected = format!("tendr {}\n", env!("CARGO_PKG_VERSION"));
 
     tendr(&root)
@@ -25,7 +25,7 @@ fn version_reports_package_version() {
 
 #[test]
 fn guide_prints_the_whole_guide() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // The top-level title and a section from the far end both appear only when
     // the entire document is emitted.
@@ -40,7 +40,7 @@ fn guide_prints_the_whole_guide() {
 
 #[test]
 fn guide_exec_prints_only_the_exec_section() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // The exec section carries its own argv rule; it must NOT bleed into the
     // remote or REPL sections that follow it.
@@ -57,7 +57,7 @@ fn guide_exec_prints_only_the_exec_section() {
 
 #[test]
 fn guide_remote_includes_the_frame_subsection() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // The remote section runs to the next top-level heading, so its nested
     // frame-from-stdin subsection rides along.
@@ -73,7 +73,7 @@ fn guide_remote_includes_the_frame_subsection() {
 
 #[test]
 fn guide_python_section_is_relevant() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["guide", "python"])
@@ -86,7 +86,7 @@ fn guide_python_section_is_relevant() {
 
 #[test]
 fn guide_duckdb_section_is_relevant() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["guide", "duckdb"])
@@ -98,7 +98,7 @@ fn guide_duckdb_section_is_relevant() {
 
 #[test]
 fn guide_ndjson_section_is_relevant() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["guide", "ndjson"])
@@ -111,7 +111,7 @@ fn guide_ndjson_section_is_relevant() {
 
 #[test]
 fn guide_install_section_is_relevant() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["guide", "install"])
@@ -124,7 +124,7 @@ fn guide_install_section_is_relevant() {
 
 #[test]
 fn guide_boundary_section_is_relevant() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["guide", "boundary"])
@@ -136,7 +136,7 @@ fn guide_boundary_section_is_relevant() {
 
 #[test]
 fn guide_cgroup_section_is_relevant() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["guide", "cgroup"])
@@ -148,7 +148,7 @@ fn guide_cgroup_section_is_relevant() {
 
 #[test]
 fn guide_herdr_section_is_relevant() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["guide", "herdr"])
@@ -160,7 +160,7 @@ fn guide_herdr_section_is_relevant() {
 
 #[test]
 fn guide_topic_is_case_insensitive() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["guide", "EXEC"])
@@ -171,7 +171,7 @@ fn guide_topic_is_case_insensitive() {
 
 #[test]
 fn guide_unknown_topic_exits_2_and_lists_topics() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["guide", "bogus"])

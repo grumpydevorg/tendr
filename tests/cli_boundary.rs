@@ -3,10 +3,10 @@
 //! See docs/guide.md ("Record where a session runs").
 
 mod harness;
+use harness::Home;
 
 use harness::{read_events, tendr, wait_terminal};
 use serde_json::Value;
-use tempfile::TempDir;
 
 /// The `data` payload of the first event of the given kind, if any.
 fn event_data<'a>(events: &'a [Value], kind: &str) -> Option<&'a Value> {
@@ -18,7 +18,7 @@ fn event_data<'a>(events: &'a [Value], kind: &str) -> Option<&'a Value> {
 
 /// Run `start` with the given extra args after the session name and return the
 /// parsed meta JSON it prints to stdout on success.
-fn start_ok(root: &TempDir, session: &str, extra: &[&str]) -> Value {
+fn start_ok(root: &Home, session: &str, extra: &[&str]) -> Value {
     let mut args = vec!["start", session];
     args.extend_from_slice(extra);
     args.extend_from_slice(&["--", "echo", "hi"]);
@@ -29,7 +29,7 @@ fn start_ok(root: &TempDir, session: &str, extra: &[&str]) -> Value {
 
 #[test]
 fn start_records_boundary_on_launch_spec() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let meta = start_ok(&root, "job", &["--boundary", "host:data-box"]);
     let b = &meta["launch_spec"]["boundary"];
     assert_eq!(b["current"]["kind"], "host");
@@ -44,7 +44,7 @@ fn start_records_boundary_on_launch_spec() {
 
 #[test]
 fn boundary_parent_builds_ancestry() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let meta = start_ok(
         &root,
         "dev",
@@ -65,7 +65,7 @@ fn boundary_parent_builds_ancestry() {
 
 #[test]
 fn start_without_boundary_omits_it() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let meta = start_ok(&root, "plain", &[]);
     assert!(
         meta["launch_spec"].get("boundary").is_none(),
@@ -75,7 +75,7 @@ fn start_without_boundary_omits_it() {
 
 #[test]
 fn status_surfaces_boundary() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     start_ok(&root, "job", &["--boundary", "vm:builder-1"]);
     wait_terminal(&root, "job");
 
@@ -91,7 +91,7 @@ fn status_surfaces_boundary() {
 
 #[test]
 fn invalid_boundary_is_rejected() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "bad", "--boundary", "host", "--", "echo", "hi"])
         .assert()
@@ -100,7 +100,7 @@ fn invalid_boundary_is_rejected() {
 
 #[test]
 fn boundary_parent_requires_boundary() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args([
             "start",
@@ -119,7 +119,7 @@ fn boundary_parent_requires_boundary() {
 
 #[test]
 fn run_starting_and_started_carry_boundary_snapshot() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     start_ok(&root, "job", &["--boundary", "container:img:latest"]);
     wait_terminal(&root, "job");
     let events = read_events(&root, "job");
@@ -136,7 +136,7 @@ fn run_starting_and_started_carry_boundary_snapshot() {
 
 #[test]
 fn terminal_events_do_not_carry_boundary_snapshot() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     start_ok(&root, "job", &["--boundary", "host:data-box"]);
     wait_terminal(&root, "job");
     let events = read_events(&root, "job");
@@ -150,7 +150,7 @@ fn terminal_events_do_not_carry_boundary_snapshot() {
 
 #[test]
 fn no_declared_boundary_means_no_snapshot() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     start_ok(&root, "plain", &[]);
     wait_terminal(&root, "plain");
     let events = read_events(&root, "plain");

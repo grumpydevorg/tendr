@@ -1,21 +1,17 @@
 mod harness;
+use harness::Home;
 
 use harness::{tendr, wait_running_ns, wait_terminal};
 // Command/Stdio remain only for the cfg(unix) SIGTERM test below.
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Start a session that runs a `sleep` that never ends by itself, wait for
-/// Running state. The returned guard force-kills the session on drop.
-fn create_running_session<'a>(
-    root: &'a TempDir,
-    name: &str,
-    namespace: &str,
-) -> harness::SessionGuard<'a> {
+/// Running state.
+fn create_running_session(root: &Home, name: &str, namespace: &str) {
     let out = tendr(root)
         .args([
             "start",
@@ -33,13 +29,11 @@ fn create_running_session<'a>(
         "start failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let guard = harness::SessionGuard::new_ns(root, namespace, name);
     wait_running_ns(root, namespace, name);
-    guard
 }
 
 /// Read the run_id from a session's meta.json.
-fn read_run_id(root: &TempDir, namespace: &str, session: &str) -> String {
+fn read_run_id(root: &Home, namespace: &str, session: &str) -> String {
     let path = root
         .path()
         .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
@@ -49,7 +43,7 @@ fn read_run_id(root: &TempDir, namespace: &str, session: &str) -> String {
 }
 
 /// Read output.log and return annotation payloads.
-fn read_annotation_lines(root: &TempDir, namespace: &str, session: &str) -> Vec<serde_json::Value> {
+fn read_annotation_lines(root: &Home, namespace: &str, session: &str) -> Vec<serde_json::Value> {
     let path = root
         .path()
         .join(format!(".tendr/sessions/{namespace}/{session}/output.log"));
@@ -70,7 +64,7 @@ fn read_annotation_lines(root: &TempDir, namespace: &str, session: &str) -> Vec<
 #[test]
 fn wrap_child_inherits_tendr_env() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start a session that prints its env
     let out = tendr(&root)
@@ -109,9 +103,9 @@ fn wrap_child_inherits_tendr_env() {
 #[test]
 fn wrap_preserves_child_exit_code() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-exit", "default");
+    create_running_session(&root, "wrap-exit", "default");
     let run_id = read_run_id(&root, "default", "wrap-exit");
 
     let out = tendr(&root)
@@ -149,9 +143,9 @@ fn wrap_preserves_child_exit_code() {
 #[test]
 fn wrap_captures_and_replays_stdout() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-stdout", "default");
+    create_running_session(&root, "wrap-stdout", "default");
     let run_id = read_run_id(&root, "default", "wrap-stdout");
 
     let out = tendr(&root)
@@ -196,9 +190,9 @@ fn wrap_captures_and_replays_stdout() {
 #[test]
 fn wrap_writes_annotation_line() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-ann", "default");
+    create_running_session(&root, "wrap-ann", "default");
     let run_id = read_run_id(&root, "default", "wrap-ann");
 
     let out = tendr(&root)
@@ -239,7 +233,7 @@ fn wrap_writes_annotation_line() {
 #[test]
 fn wrap_fails_without_run_id() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Don't set TENDR_RUN_ID
     let out = tendr(&root)
@@ -273,7 +267,7 @@ fn wrap_fails_without_run_id() {
 #[test]
 fn wrap_fails_for_nonexistent_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .env("TENDR_RUN_ID", "fake-run-id")
@@ -301,7 +295,7 @@ fn wrap_fails_for_nonexistent_session() {
 #[test]
 fn source_rejects_tendr_prefix() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .env("TENDR_RUN_ID", "fake-run-id")
@@ -331,9 +325,9 @@ fn source_rejects_tendr_prefix() {
 #[test]
 fn wrap_defaults_session_from_env() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-env-default", "myns");
+    create_running_session(&root, "wrap-env-default", "myns");
     let run_id = read_run_id(&root, "myns", "wrap-env-default");
 
     // Don't pass --session or --namespace, rely on env vars
@@ -374,9 +368,9 @@ fn wrap_defaults_session_from_env() {
 #[test]
 fn wrap_truncates_large_payload() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-trunc", "default");
+    create_running_session(&root, "wrap-trunc", "default");
     let run_id = read_run_id(&root, "default", "wrap-trunc");
 
     // Generate a large stdin payload (>4096 bytes)
@@ -429,9 +423,9 @@ fn wrap_truncates_large_payload() {
 #[test]
 fn wrap_passes_stdin_to_child() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-stdin", "default");
+    create_running_session(&root, "wrap-stdin", "default");
     let run_id = read_run_id(&root, "default", "wrap-stdin");
 
     let input = r#"{"tool":"bash","input":"ls"}"#;
@@ -478,9 +472,9 @@ fn wrap_passes_stdin_to_child() {
 #[test]
 fn wrap_annotation_visible_in_watch() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-watch", "default");
+    create_running_session(&root, "wrap-watch", "default");
     let run_id = read_run_id(&root, "default", "wrap-watch");
 
     // Wait for the watcher's baseline before mutating, then read until the exact
@@ -530,9 +524,9 @@ fn wrap_annotation_visible_in_watch() {
 #[test]
 fn wrap_forwards_sigterm_and_writes_annotation() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-sigterm", "default");
+    create_running_session(&root, "wrap-sigterm", "default");
     let run_id = read_run_id(&root, "default", "wrap-sigterm");
 
     // The shell installs its TERM trap and *then* publishes an out-of-band
@@ -613,9 +607,9 @@ fn wrap_forwards_sigterm_and_writes_annotation() {
 #[test]
 fn wrap_dual_writes_event_and_linked_aline() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-dual", "default");
+    create_running_session(&root, "wrap-dual", "default");
     let run_id = read_run_id(&root, "default", "wrap-dual");
 
     let out = tendr(&root)
@@ -673,9 +667,9 @@ fn wrap_dual_writes_event_and_linked_aline() {
 #[test]
 fn wrap_sets_child_env_chain() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-env", "default");
+    create_running_session(&root, "wrap-env", "default");
     let run_id = read_run_id(&root, "default", "wrap-env");
 
     let out = tendr(&root)
@@ -727,9 +721,9 @@ fn wrap_sets_child_env_chain() {
 #[test]
 fn wrap_child_emit_chains_to_hook_event() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-chain", "default");
+    create_running_session(&root, "wrap-chain", "default");
     let run_id = read_run_id(&root, "default", "wrap-chain");
 
     let tendr_bin = assert_cmd::cargo::cargo_bin("tendr");
@@ -787,9 +781,9 @@ fn wrap_child_emit_chains_to_hook_event() {
 #[test]
 fn wrap_reserved_event_exits_6_without_side_effects() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-res", "default");
+    create_running_session(&root, "wrap-res", "default");
     let run_id = read_run_id(&root, "default", "wrap-res");
 
     let marker = root.path().join("side-effect-marker");
@@ -833,9 +827,9 @@ fn wrap_reserved_event_exits_6_without_side_effects() {
 #[test]
 fn wrap_legacy_dotless_event_keeps_aline_only() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-legacy", "default");
+    create_running_session(&root, "wrap-legacy", "default");
     let run_id = read_run_id(&root, "default", "wrap-legacy");
 
     let out = tendr(&root)
@@ -892,9 +886,9 @@ fn wrap_legacy_dotless_event_keeps_aline_only() {
 #[test]
 fn wrap_chains_parent_from_ambient_env() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-outer", "default");
+    create_running_session(&root, "wrap-outer", "default");
     let run_id = read_run_id(&root, "default", "wrap-outer");
 
     let outer = uuid::Uuid::now_v7().to_string();
@@ -935,9 +929,9 @@ fn wrap_event_append_failure_is_best_effort() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = create_running_session(&root, "wrap-ro", "default");
+    create_running_session(&root, "wrap-ro", "default");
     let run_id = read_run_id(&root, "default", "wrap-ro");
 
     let events_dir = root.path().join(".tendr/sessions/default/wrap-ro/events");

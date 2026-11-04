@@ -2,12 +2,12 @@
 //! O/E lines as derived events (spec §5.1, slice 2 plan scope item 5).
 
 mod harness;
+use harness::Home;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use harness::{tendr, wait_terminal};
-use tempfile::TempDir;
 
 fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
     String::from_utf8_lossy(stdout)
@@ -17,7 +17,7 @@ fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn segment_bytes(root: &TempDir, session: &str) -> BTreeMap<PathBuf, Vec<u8>> {
+fn segment_bytes(root: &Home, session: &str) -> BTreeMap<PathBuf, Vec<u8>> {
     let events_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/events"));
@@ -35,7 +35,7 @@ fn segment_bytes(root: &TempDir, session: &str) -> BTreeMap<PathBuf, Vec<u8>> {
 
 #[test]
 fn include_logs_interleaves_derived_records_in_timestamp_order() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args([
             "start",
@@ -97,7 +97,7 @@ fn include_logs_interleaves_derived_records_in_timestamp_order() {
 
 #[test]
 fn include_logs_respects_kind_prefix_filter() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "only-line"])
         .assert()
@@ -121,7 +121,7 @@ fn include_logs_respects_kind_prefix_filter() {
 
 #[test]
 fn logs_are_not_projected_without_the_flag() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "quiet"])
         .assert()
@@ -141,7 +141,7 @@ fn logs_are_not_projected_without_the_flag() {
 
 #[test]
 fn include_logs_with_last_counts_the_merged_stream() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "tail-me"])
         .assert()

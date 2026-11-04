@@ -1,9 +1,9 @@
 mod harness;
+use harness::Home;
 
-use harness::{HANG, SessionGuard, tendr, wait_running, wait_terminal};
+use harness::{HANG, tendr, wait_running, wait_terminal};
 use predicates::prelude::*;
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -17,13 +17,12 @@ fn kill_wait_ms() -> String {
 #[test]
 fn kill_running_process() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "kill-job", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "kill-job");
     wait_running(&root, "kill-job");
 
     tendr(&root)
@@ -38,13 +37,12 @@ fn kill_running_process() {
 #[test]
 fn kill_force() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "force-job", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "force-job");
     wait_running(&root, "force-job");
 
     tendr(&root)
@@ -60,7 +58,7 @@ fn kill_force() {
 #[test]
 fn kill_already_dead_is_idempotent() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "dead-job", "true"])
@@ -79,7 +77,7 @@ fn kill_already_dead_is_idempotent() {
 #[test]
 fn kill_nonexistent_session_is_idempotent() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["kill", "nope"])
@@ -91,7 +89,7 @@ fn kill_nonexistent_session_is_idempotent() {
 #[test]
 fn kill_preserves_child_identity() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let start_out = tendr(&root)
         .args(["start", "preserve-kill", "sleep", "3600"])
@@ -100,7 +98,6 @@ fn kill_preserves_child_identity() {
     let start_meta: serde_json::Value =
         serde_json::from_slice(&start_out.stdout).expect("not JSON");
     let start_pid = start_meta["child"]["pid"].as_u64().unwrap();
-    let _session = SessionGuard::new(&root, "preserve-kill");
     wait_running(&root, "preserve-kill");
 
     let kill_out = tendr(&root)
@@ -117,13 +114,12 @@ fn kill_preserves_child_identity() {
 #[test]
 fn status_shows_killed_after_kill() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "status-kill", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "status-kill");
     wait_running(&root, "status-kill");
 
     tendr(&root)
@@ -142,7 +138,7 @@ fn status_shows_killed_after_kill() {
 
 /// Start `sleep 3600` as `name` and return the pids of its sidecar and child.
 #[cfg(unix)]
-fn start_sleeper(root: &TempDir, name: &str) -> (libc::pid_t, libc::pid_t) {
+fn start_sleeper(root: &Home, name: &str) -> (libc::pid_t, libc::pid_t) {
     let out = tendr(root)
         .args(["start", name, "sleep", "3600"])
         .output()
@@ -173,9 +169,8 @@ impl Drop for ResumeOnDrop {
 #[test]
 fn kill_fails_when_the_run_does_not_end() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let (sidecar, _) = start_sleeper(&root, "stuck-kill");
-    let _session = SessionGuard::new(&root, "stuck-kill");
     // SAFETY: the pid is the test's own sidecar.
     unsafe { libc::kill(sidecar, libc::SIGSTOP) };
     let _resume = ResumeOnDrop(sidecar);
@@ -198,9 +193,8 @@ fn kill_fails_when_the_run_does_not_end() {
 #[test]
 fn kill_records_the_end_of_a_run_whose_sidecar_is_gone() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let (sidecar, child) = start_sleeper(&root, "lost-kill");
-    let _session = SessionGuard::new(&root, "lost-kill");
     // SAFETY: the pid is the test's own sidecar.
     unsafe { libc::kill(sidecar, libc::SIGKILL) };
     harness::wait_pid_dead(sidecar);
@@ -223,9 +217,8 @@ fn kill_records_the_end_of_a_run_whose_sidecar_is_gone() {
 #[test]
 fn kill_records_the_end_of_a_starting_run_whose_sidecar_is_gone() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     start_sleeper(&root, "lost-dep");
-    let _dep = SessionGuard::new(&root, "lost-dep");
     tendr(&root)
         .args([
             "start",
@@ -237,7 +230,6 @@ fn kill_records_the_end_of_a_starting_run_whose_sidecar_is_gone() {
         ])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "lost-starting");
     let meta_path = root
         .path()
         .join(".tendr/sessions/default/lost-starting/meta.json");

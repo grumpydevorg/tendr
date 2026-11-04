@@ -1,11 +1,11 @@
 //! `tendr events` — replay-only read surface (spec §5.1, slice 1 scope).
 
 mod harness;
+use harness::Home;
 
 use harness::{tendr, wait_terminal, wait_terminal_ns};
-use tempfile::TempDir;
 
-fn finished_session(root: &TempDir, name: &str) {
+fn finished_session(root: &Home, name: &str) {
     tendr(root)
         .args(["start", name, "--", "echo", "hi"])
         .assert()
@@ -23,7 +23,7 @@ fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
 
 #[test]
 fn events_replays_session_lifecycle_as_ndjson() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     let output = tendr(&root)
@@ -43,7 +43,7 @@ fn events_replays_session_lifecycle_as_ndjson() {
 
 #[test]
 fn events_merges_all_sessions_by_timestamp() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "a");
     finished_session(&root, "b");
 
@@ -75,7 +75,7 @@ fn events_merges_all_sessions_by_timestamp() {
 
 #[test]
 fn events_kind_prefix_filter() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
     tendr(&root)
         .args(["emit", "--kind", "hook.post_tool_use", "--session", "s1"])
@@ -104,7 +104,7 @@ fn events_kind_prefix_filter() {
 
 #[test]
 fn events_source_prefix_filter() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
     tendr(&root)
         .args([
@@ -130,7 +130,7 @@ fn events_source_prefix_filter() {
 
 #[test]
 fn events_namespace_filter() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
     tendr(&root)
         .args(["start", "s2", "--namespace", "other", "--", "echo", "hi"])
@@ -149,7 +149,7 @@ fn events_namespace_filter() {
 
 #[test]
 fn events_session_filter_is_repeatable() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "a");
     finished_session(&root, "b");
     finished_session(&root, "c");
@@ -168,7 +168,7 @@ fn events_session_filter_is_repeatable() {
 
 #[test]
 fn events_strict_exits_65_on_parse_skips() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     // Corrupt the log with a torn line.
@@ -200,7 +200,7 @@ fn events_strict_exits_65_on_parse_skips() {
 
 #[test]
 fn events_empty_log_succeeds_with_no_output() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let output = tendr(&root).args(["events"]).output().unwrap();
     assert!(output.status.success());
     assert!(output.stdout.is_empty());

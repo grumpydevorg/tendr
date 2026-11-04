@@ -81,9 +81,94 @@ pub fn assert_within(cmd: &mut Command, deadline: Duration) -> Assert {
         .assert()
 }
 
+/// A test's HOME: a temp directory that, when dropped, force-kills every
+/// session in it and waits for each sidecar to let go of its session before
+/// deleting the directory.
+///
+/// Removing the directory under a live sidecar loses the test's sessions to
+/// nothing that can reach them (#87), and a sidecar that finishes afterwards
+/// recreates its session directory, or salvages its exit record into
+/// `.tendr/lost+found`, under the deleted path, so every such test leaked a
+/// directory into the system temp dir. Tests take their HOME from a `Home`,
+/// declared before anything that uses it, so it drops last, after the
+/// test's followers, gates and locks.
+#[allow(dead_code)]
+pub struct Home(TempDir);
+
+#[allow(dead_code)]
+impl Home {
+    pub fn new() -> Self {
+        Self(TempDir::new().expect("create a temp HOME"))
+    }
+
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    /// Force-kill `namespace/name` unless it is terminal, then wait until no
+    /// sidecar holds it. Returns the last observation if it is still held
+    /// after [`HANG`].
+    fn release(&self, root: &SessionRoot, namespace: &str, name: &str) -> Result<(), WaitTimeout> {
+        let (Ok(ns), Ok(session_name)) = (Namespace::new(namespace), SessionName::new(name)) else {
+            return Ok(());
+        };
+        // Not `open`: a sidecar holds the lock before it writes meta.json.
+        let Ok(dir) = session::open_raw(root, &ns, &session_name) else {
+            return Ok(());
+        };
+        // Decided by meta, not by the lock: the kill also reconciles a
+        // Running session whose sidecar crashed, killing the child it left.
+        // Its result is ignored; the lock decides whether the sidecar is gone.
+        if !session::read_meta(&dir).is_ok_and(|meta| meta.status().is_terminal()) {
+            let _ = tendr(self)
+                .args(["kill", "--force", "--namespace", namespace, name])
+                .timeout(HANG)
+                .output();
+        }
+        poll_until(HANG, Duration::from_millis(10), || {
+            match LockGuard::try_acquire(&dir) {
+                Err(session::SessionError::Locked(_)) => {
+                    Observation::Pending(format!("{namespace}/{name} is still held by its sidecar"))
+                }
+                // Free, or no longer a session a sidecar could hold.
+                _ => Observation::Ready(()),
+            }
+        })
+    }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        let sessions = self.path().join(".tendr/sessions");
+        let root = SessionRoot::new(sessions.clone());
+        let Ok(namespaces) = std::fs::read_dir(&sessions) else {
+            return;
+        };
+        for namespace in namespaces.flatten() {
+            let Ok(names) = std::fs::read_dir(namespace.path()) else {
+                continue;
+            };
+            let namespace = namespace.file_name().to_string_lossy().into_owned();
+            for name in names.flatten() {
+                let name = name.file_name().to_string_lossy().into_owned();
+                if let Err(e) = self.release(&root, &namespace, &name) {
+                    let message =
+                        format!("test HOME: sidecar of {namespace}/{name} outlived the test: {e}");
+                    // A second panic while unwinding would abort the binary.
+                    if std::thread::panicking() {
+                        eprintln!("{message}");
+                    } else {
+                        panic!("{message}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Create a `tendr` command rooted in a temp HOME.
 #[allow(dead_code)]
-pub fn tendr(root: &TempDir) -> Command {
+pub fn tendr(root: &Home) -> Command {
     let mut cmd = Command::cargo_bin("tendr").expect("tendr binary not found");
     cmd.env("HOME", root.path());
     // On Windows, ensure Git-for-Windows coreutils (echo, sleep, true, cat)
@@ -97,53 +182,6 @@ pub fn tendr(root: &TempDir) -> Command {
         }
     }
     cmd
-}
-
-/// Force-kills a session when dropped, whether the test passed or panicked.
-///
-/// A test that stops its session only on its last line leaks a live sidecar
-/// whenever an earlier assertion panics. The `TempDir` is then removed while
-/// unwinding, and nothing can reach the orphan (#87). Create the guard right
-/// after `start`, and after the `TempDir`: locals drop in reverse order, so the
-/// sidecar is stopped before its state directory disappears.
-#[allow(dead_code)]
-pub struct SessionGuard<'a> {
-    root: &'a TempDir,
-    namespace: String,
-    name: String,
-}
-
-#[allow(dead_code)]
-impl<'a> SessionGuard<'a> {
-    pub fn new(root: &'a TempDir, name: &str) -> Self {
-        Self::new_ns(root, "default", name)
-    }
-
-    /// [`new`](Self::new) for a session in `namespace`.
-    pub fn new_ns(root: &'a TempDir, namespace: &str, name: &str) -> Self {
-        Self {
-            root,
-            namespace: namespace.to_owned(),
-            name: name.to_owned(),
-        }
-    }
-}
-
-impl Drop for SessionGuard<'_> {
-    fn drop(&mut self) {
-        // The result is ignored: the session may already be terminal, and a
-        // panic here while unwinding would abort the whole test binary.
-        let _ = tendr(self.root)
-            .args([
-                "kill",
-                "--force",
-                "--namespace",
-                &self.namespace,
-                &self.name,
-            ])
-            .timeout(HANG)
-            .output();
-    }
 }
 
 /// Creates the gate file a test's child or sidecar waits on, when dropped,
@@ -228,7 +266,7 @@ pub fn shim_path_env(tmp: &TempDir) -> std::ffi::OsString {
 /// Read all stored events for a default-namespace session, merged by
 /// (ts, writer, seq) — the spec §4 merge rule.
 #[allow(dead_code)]
-pub fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
+pub fn read_events(root: &Home, session: &str) -> Vec<serde_json::Value> {
     let events_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/events"));
@@ -262,7 +300,7 @@ pub fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
 /// recording holds it. Read it once the run has ended, so the recording is
 /// complete.
 #[allow(dead_code)]
-pub fn recorded_output(root: &TempDir, session: &str) -> Vec<u8> {
+pub fn recorded_output(root: &Home, session: &str) -> Vec<u8> {
     let session_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}"));
@@ -319,7 +357,7 @@ pub fn assert_prefix_of_the_burst(recording: &[u8], out: &[u8]) {
 /// mid-line. Joining the lines recovers such text, at the cost of the output's
 /// own line breaks.
 #[allow(dead_code)]
-pub fn logged_output(root: &TempDir, session: &str) -> String {
+pub fn logged_output(root: &Home, session: &str) -> String {
     let output = tendr(root)
         .args(["log", session, "--raw"])
         .output()
@@ -336,7 +374,7 @@ pub fn logged_output(root: &TempDir, session: &str) -> String {
 /// log's lines follow capture's reads, so they are joined. Reads only the
 /// tail, so a large log costs nothing more.
 #[allow(dead_code)]
-pub fn wait_log_tail(root: &TempDir, session: &str, marker: &str) {
+pub fn wait_log_tail(root: &Home, session: &str, marker: &str) {
     let log = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/output.log"));
@@ -470,7 +508,7 @@ pub fn poll_until<T>(
 
 /// Wait for a session event of `kind`, returning the observed record.
 #[allow(dead_code)]
-pub fn wait_event_kind(root: &TempDir, session: &str, kind: &str) -> serde_json::Value {
+pub fn wait_event_kind(root: &Home, session: &str, kind: &str) -> serde_json::Value {
     poll_until(HANG, Duration::from_millis(10), || {
         match read_events(root, session)
             .into_iter()
@@ -494,13 +532,13 @@ fn meta_status(session_meta: &Path) -> Option<String> {
 
 /// Wait for meta.json to show Running state on disk.
 #[allow(dead_code)]
-pub fn wait_running(root: &TempDir, session: &str) {
+pub fn wait_running(root: &Home, session: &str) {
     wait_running_ns(root, "default", session)
 }
 
 /// [`wait_running`] for a session in `namespace`.
 #[allow(dead_code)]
-pub fn wait_running_ns(root: &TempDir, namespace: &str, session: &str) {
+pub fn wait_running_ns(root: &Home, namespace: &str, session: &str) {
     let path = root
         .path()
         .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
@@ -515,13 +553,13 @@ pub fn wait_running_ns(root: &TempDir, namespace: &str, session: &str) {
 
 /// Wait for meta.json to reach any terminal state on disk.
 #[allow(dead_code)]
-pub fn wait_terminal(root: &TempDir, session: &str) -> serde_json::Value {
+pub fn wait_terminal(root: &Home, session: &str) -> serde_json::Value {
     wait_terminal_ns(root, "default", session)
 }
 
 /// [`wait_terminal`] for a session in `namespace`.
 #[allow(dead_code)]
-pub fn wait_terminal_ns(root: &TempDir, namespace: &str, session: &str) -> serde_json::Value {
+pub fn wait_terminal_ns(root: &Home, namespace: &str, session: &str) -> serde_json::Value {
     poll_terminal_ns(root, namespace, session)
         .unwrap_or_else(|e| panic!("waiting for terminal state in {namespace}/{session}: {e}"))
 }
@@ -529,7 +567,7 @@ pub fn wait_terminal_ns(root: &TempDir, namespace: &str, session: &str) -> serde
 /// [`wait_terminal_ns`] that returns the timeout instead of panicking.
 #[allow(dead_code)]
 pub fn poll_terminal_ns(
-    root: &TempDir,
+    root: &Home,
     namespace: &str,
     session: &str,
 ) -> Result<serde_json::Value, WaitTimeout> {
@@ -682,14 +720,14 @@ pub struct QuiescentTerminal {
 /// sidecar writes its final state immediately before releasing the lock. This
 /// condition handshake acquires the lock instead of relying on a timing gap.
 #[allow(dead_code)]
-pub fn wait_terminal_quiescent(root: &TempDir, session_name: &str) -> QuiescentTerminal {
+pub fn wait_terminal_quiescent(root: &Home, session_name: &str) -> QuiescentTerminal {
     wait_terminal_quiescent_ns(root, "default", session_name)
 }
 
 /// [`wait_terminal_quiescent`] for a session in `namespace`.
 #[allow(dead_code)]
 pub fn wait_terminal_quiescent_ns(
-    root: &TempDir,
+    root: &Home,
     namespace: &str,
     session_name: &str,
 ) -> QuiescentTerminal {
@@ -740,7 +778,7 @@ pub struct OrphanedRunning {
 /// terminal-plus-acquired-lock is a stable contradiction for this injected crash
 /// point, not a transient state worth polling further.
 #[allow(dead_code)]
-pub fn wait_orphaned_running(root: &TempDir, session_name: &str) -> OrphanedRunning {
+pub fn wait_orphaned_running(root: &Home, session_name: &str) -> OrphanedRunning {
     let session_root = SessionRoot::new(root.path().join(".tendr/sessions"));
     let namespace = Namespace::new("default").expect("default namespace is valid");
     let session_name = SessionName::new(session_name).expect("test session name is valid");
@@ -849,7 +887,7 @@ impl ReadyFollower {
     /// the follower signals readiness. Panics — after killing/reaping the child
     /// — if the follower exits before readiness or [`HANG`] elapses,
     /// surfacing the follower's captured stderr rather than a bare timeout.
-    pub fn spawn(root: &TempDir, subcommand: &str, args: &[&str]) -> Self {
+    pub fn spawn(root: &Home, subcommand: &str, args: &[&str]) -> Self {
         let bin = assert_cmd::cargo::cargo_bin("tendr");
         let seq = FOLLOWER_SEQ.fetch_add(1, Ordering::Relaxed);
         let ready_path = root.path().join(format!("follower-ready-{seq}"));
