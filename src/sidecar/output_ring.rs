@@ -38,7 +38,6 @@ struct RingState {
     retaining: bool,
     /// Set once the run's output has all been appended: a cursor at the
     /// head has nothing more to wait for.
-    #[cfg(unix)]
     finished: bool,
 }
 
@@ -73,7 +72,6 @@ impl Cursor {
 }
 
 /// What [`OutputRing::next`] found at a cursor.
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Next {
     /// The bytes from the cursor on, which start at `offset`; the cursor now
@@ -117,7 +115,6 @@ impl OutputRing {
                 capacity,
                 head: 0,
                 retaining: false,
-                #[cfg(unix)]
                 finished: false,
             }),
             ready: Condvar::new(),
@@ -153,14 +150,12 @@ impl OutputRing {
 
     /// What the ring holds now. Under the attach sink's lock, which capture
     /// holds while it appends, it stays so until that lock is released.
-    #[cfg(unix)]
     pub(super) fn span(&self) -> Span {
         lock(&self.state).span()
     }
 
     /// A cursor at `offset`, which must be one the ring holds or its head;
     /// otherwise the ring's span. The ring keeps output from now on.
-    #[cfg(unix)]
     pub(super) fn cursor_at(&self, offset: u64) -> Result<std::sync::Arc<Cursor>, Span> {
         let mut state = lock(&self.state);
         let span = state.span();
@@ -177,7 +172,6 @@ impl OutputRing {
     /// Wait for output at `cursor`, then take up to `max` bytes of it and
     /// move the cursor past them; [`Next::Ended`] once it has had all of a
     /// finished ring's output.
-    #[cfg(unix)]
     pub(super) fn next(&self, cursor: &Cursor, max: usize) -> Next {
         let mut state = lock(&self.state);
         loop {
@@ -217,7 +211,6 @@ impl OutputRing {
     }
 
     /// Close `cursor`, waking its sender if it waits for output.
-    #[cfg(unix)]
     pub(super) fn close(&self, cursor: &Cursor) {
         cursor.closed.store(true, Ordering::SeqCst);
         // Taking the lock orders the store before a waiting sender's check,
@@ -228,7 +221,6 @@ impl OutputRing {
 
     /// The run's output has all been appended: wake every sender waiting at
     /// the head, which then ends ([`Next::Ended`]).
-    #[cfg(unix)]
     pub(super) fn finish(&self) {
         lock(&self.state).finished = true;
         self.ready.notify_all();
@@ -236,7 +228,6 @@ impl OutputRing {
 
     /// Wait until every one of `cursors` is closed, or `until`; whether
     /// they all were.
-    #[cfg(unix)]
     pub(super) fn wait_closed(
         &self,
         cursors: &[std::sync::Arc<Cursor>],

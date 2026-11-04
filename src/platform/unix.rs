@@ -78,7 +78,9 @@ impl Platform for UnixPlatform {
         tendr_bin: &Path,
         session_dir: &Path,
         ready_write_fd: &File,
+        _lifetime: super::SessionLifetime,
     ) -> io::Result<u32> {
+        // A new session (setsid) outlives its caller either way.
         spawn_sidecar(tendr_bin, session_dir, ready_write_fd)
     }
 
@@ -340,11 +342,12 @@ impl Platform for UnixPlatform {
         }
     }
 
-    fn pty_resize_fd(child: &SupervisedChild) -> Option<File> {
+    fn pty_resizer(child: &SupervisedChild) -> Option<PtyResize> {
         child
             .pty_master_write
             .as_ref()
             .and_then(|f| f.try_clone().ok())
+            .map(PtyResize)
     }
 
     fn child_kill_handle(child: &SupervisedChild) -> ChildKillHandle {
@@ -1937,6 +1940,47 @@ impl Write for PtyWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Sets and reads a PTY's window size, through a duplicate of its master.
+pub struct PtyResize(File);
+
+impl PtyResize {
+    /// Apply `size` (`TIOCSWINSZ`); the kernel then sends the child SIGWINCH.
+    ///
+    /// # Errors
+    ///
+    /// The ioctl's error.
+    pub fn apply(&self, size: crate::recording::Geometry) -> io::Result<()> {
+        let ws = libc::winsize {
+            ws_row: size.rows(),
+            ws_col: size.cols(),
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: the fd is a valid PTY master fd. TIOCSWINSZ with a valid
+        // winsize pointer is safe on any terminal fd.
+        if unsafe { libc::ioctl(self.0.as_raw_fd(), libc::TIOCSWINSZ, &ws) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The PTY's window size (`TIOCGWINSZ`), if it can be read.
+    #[must_use]
+    pub fn size(&self) -> Option<crate::recording::Geometry> {
+        let mut ws = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: the fd is a valid PTY master fd; TIOCGWINSZ fills a winsize.
+        if unsafe { libc::ioctl(self.0.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) } == -1 {
+            return None;
+        }
+        crate::recording::Geometry::new(ws.ws_row, ws.ws_col)
     }
 }
 

@@ -1,17 +1,24 @@
 //! Windows implementation of the Platform trait.
 //!
-//! All Platform methods are implemented: process lifecycle (spawn, kill,
-//! identity, status), sidecar spawn with STARTUPINFOEXW handle whitelisting,
+//! All Platform methods are implemented: process lifecycle (spawn suspended
+//! into a Job Object, kill, identity, status), PTY children on a
+//! pseudoconsole, sidecar spawn with STARTUPINFOEXW handle whitelisting,
 //! readiness channel (CreatePipe), and stdin transport (named pipes).
+
+mod conpty;
+mod launch;
+mod orphan;
+
+pub use conpty::{PtyResize, PtyWriter};
+pub use orphan::ctrl_break_helper;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::Arc;
 
 use crate::model::ids::ProcessIdentity;
@@ -33,12 +40,16 @@ impl WindowsPlatform {
     /// # Errors
     /// Terminating the Job Object failed.
     pub fn stop_gracefully(handle: &ChildKillHandle, grace: std::time::Duration) -> io::Result<()> {
-        // Best-effort CTRL_BREAK, then wait via WaitForSingleObject, then
-        // escalate. Uses a real waitable handle instead of process_status
-        // because Windows keeps the process object alive while any handle is
-        // open (e.g. SupervisedChild's std::process::Child), making PID-based
-        // liveness checks unreliable.
-        send_ctrl_break(handle.identity.pid.get());
+        // A PTY child's console closes, as a terminal window would: everything
+        // attached gets CTRL_CLOSE_EVENT. Any other child gets a best-effort
+        // CTRL_BREAK. Then wait via WaitForSingleObject, then escalate. Uses a
+        // real waitable handle instead of process_status because Windows keeps
+        // the process object alive while any handle is open (e.g.
+        // SupervisedChild's own), making PID-based liveness checks unreliable.
+        match &handle.console {
+            Some(console) => console.close_for_stop(),
+            None => send_ctrl_break(handle.identity.pid.get()),
+        }
 
         let grace_ms = u32::try_from(grace.as_millis()).unwrap_or(u32::MAX - 1);
         if wait_for_process_exit(handle.identity.pid.get(), grace_ms) {
@@ -50,22 +61,41 @@ impl WindowsPlatform {
     }
 }
 
-/// Opaque supervised-child state for Windows.
-/// Wraps a `std::process::Child` with its verified `ProcessIdentity`
-/// and an Arc'd Job Object for tree kill.
+/// Opaque supervised-child state for Windows: the process, its verified
+/// `ProcessIdentity`, an Arc'd Job Object for tree kill, and the parent
+/// ends of its standard streams until they are taken. A PTY child's
+/// output is held by its pseudoconsole until taken, and its input is
+/// `pty_writer`.
 pub struct SupervisedChild {
-    child: std::process::Child,
+    process: OwnedHandle,
     identity: ProcessIdentity,
     job_object: Arc<OwnedHandle>,
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
+    /// A PTY child's pseudoconsole. None for pipe sessions.
+    console: Option<Arc<conpty::PseudoConsole>>,
+    /// A PTY child's input, until taken. None for pipe sessions.
+    pty_writer: Option<PtyWriter>,
+}
+
+impl SupervisedChild {
+    /// Take the pseudoconsole's input for the sidecar's single input
+    /// writer. `None` for pipe sessions or once taken.
+    pub fn take_pty_writer(&mut self) -> Option<PtyWriter> {
+        self.pty_writer.take()
+    }
 }
 
 /// Lightweight kill handle for Windows.
-/// Carries an Arc'd Job Object HANDLE for tree kill and ProcessIdentity
-/// for status checks and GenerateConsoleCtrlEvent targeting.
+/// Carries an Arc'd Job Object HANDLE for tree kill, ProcessIdentity
+/// for status checks and GenerateConsoleCtrlEvent targeting, and a PTY
+/// child's pseudoconsole, which a graceful stop closes.
 #[derive(Clone)]
 pub struct ChildKillHandle {
     identity: ProcessIdentity,
     job_object: Arc<OwnedHandle>,
+    console: Option<Arc<conpty::PseudoConsole>>,
 }
 
 /// Stdin transport for Windows.
@@ -92,11 +122,16 @@ impl Platform for WindowsPlatform {
     type ReadyReader = File;
     type ReadyWriter = File;
 
-    fn spawn_sidecar(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) -> io::Result<u32> {
+    fn spawn_sidecar(
+        tendr_bin: &Path,
+        session_dir: &Path,
+        ready_writer: &File,
+        lifetime: super::SessionLifetime,
+    ) -> io::Result<u32> {
         // Raw CreateProcessW with STARTUPINFOEXW + PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
         // This is the only way to inherit exactly one handle (the ready pipe)
         // without leaking every other inheritable handle from the parent.
-        spawn_sidecar_raw(tendr_bin, session_dir, ready_writer)
+        spawn_sidecar_raw(tendr_bin, session_dir, ready_writer, lifetime)
     }
 
     fn ready_channel() -> io::Result<(File, File)> {
@@ -149,75 +184,85 @@ impl Platform for WindowsPlatform {
         env_remove: &BTreeSet<String>,
         env: &BTreeMap<String, String>,
     ) -> io::Result<SupervisedChild> {
-        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
-
-        let mut cmd = Command::new(&argv[0]);
-        if argv.len() > 1 {
-            cmd.args(&argv[1..]);
-        }
-        if stdin_piped {
-            cmd.stdin(std::process::Stdio::piped());
+        let (stdin_child, stdin) = if stdin_piped {
+            let (read, write) = pipe()?;
+            (read, Some(write))
         } else {
-            cmd.stdin(std::process::Stdio::null());
+            (null_device()?, None)
+        };
+        let (stdout, stdout_child) = pipe()?;
+        let (stderr, stderr_child) = pipe()?;
+        let child_ends = [&stdin_child, &stdout_child, &stderr_child];
+        for end in child_ends {
+            set_handle_inheritable(end.as_raw_handle().cast(), true)?;
         }
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
-        for name in env_remove {
-            cmd.env_remove(name);
-        }
-        if !env.is_empty() {
-            cmd.envs(env);
-        }
-        if let Some(module_path) = windows_powershell_module_path(&argv[0], env_remove, env) {
-            cmd.env(PS_MODULE_PATH, module_path);
-        }
-
-        // CREATE_NEW_PROCESS_GROUP: required for GenerateConsoleCtrlEvent targeting.
-        // No CREATE_SUSPENDED — std::process::Child doesn't expose the thread
-        // handle needed for ResumeThread, so the child can run briefly before
-        // the Job Object assignment below. Accepted for now; the fix (raw
-        // CreateProcessW, CREATE_SUSPENDED) is in
-        // docs/plans/backlog/windows-parity.md, "Windows child containment".
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-        let mut child = cmd.spawn()?;
-
-        let job = create_job_object()?;
-
-        // Assign child to Job Object immediately after spawn.
-        // Race window: the child may briefly run before assignment (see above).
-        if let Err(e) = assign_process_to_job(
-            job.as_raw_handle() as *mut _,
-            child.as_raw_handle() as *mut _,
-        ) {
-            // Kill the child so it doesn't run unsupervised outside the job.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
-
-        let pid = child.id();
-        let identity = process_identity(pid)?;
-
+        let handles = child_ends.map(|end| end.as_raw_handle().cast());
+        let (process, identity, job) = start_contained(
+            argv,
+            cwd,
+            env_remove,
+            env,
+            &launch::Streams::Handles(handles),
+        )?;
+        // The child's ends are the child's now; ours must close, so that
+        // stdout reads end when the child's tree closes its copies.
+        drop((stdin_child, stdout_child, stderr_child));
         Ok(SupervisedChild {
-            child,
+            process,
             identity,
             job_object: Arc::new(job),
+            stdin,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            console: None,
+            pty_writer: None,
         })
     }
 
+    /// The child runs on a new pseudoconsole of the initial size. Its
+    /// output ends once it has exited: a watcher closes the pseudoconsole
+    /// then (see [`conpty`]).
     fn spawn_child_pty(
-        _argv: &[String],
-        _cwd: Option<&Path>,
-        _env_remove: &BTreeSet<String>,
-        _env: &BTreeMap<String, String>,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env_remove: &BTreeSet<String>,
+        env: &BTreeMap<String, String>,
     ) -> io::Result<SupervisedChild> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "PTY not supported on Windows yet",
-        ))
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+        let size =
+            crate::recording::Geometry::new(super::INITIAL_PTY_ROWS, super::INITIAL_PTY_COLS)
+                .ok_or_else(|| io::Error::other("initial PTY size is zero"))?;
+        let (console, input) = conpty::PseudoConsole::create(size)?;
+        let hpc = console
+            .handle()
+            .ok_or_else(|| io::Error::other("pseudoconsole closed before spawn"))?;
+        // The sidecar ignores Ctrl+C (it was started in a new process group),
+        // and a child inherits that: it would ignore the Ctrl+C typed into
+        // its terminal. Handle it for the spawn only.
+        // SAFETY: a null handler with FALSE only clears the ignore flag.
+        unsafe { SetConsoleCtrlHandler(None, 0) };
+        let started = start_contained(
+            argv,
+            cwd,
+            env_remove,
+            env,
+            &launch::Streams::PseudoConsole(hpc),
+        );
+        // SAFETY: as above, setting the flag back.
+        unsafe { SetConsoleCtrlHandler(None, 1) };
+        let (process, identity, job) = started?;
+        conpty::close_on_exit(process.try_clone()?, Arc::clone(&console))?;
+        Ok(SupervisedChild {
+            process,
+            identity,
+            job_object: Arc::new(job),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            console: Some(console),
+            pty_writer: Some(PtyWriter::spawn(input)?),
+        })
     }
 
     fn child_identity(child: &SupervisedChild) -> ProcessIdentity {
@@ -225,45 +270,64 @@ impl Platform for WindowsPlatform {
     }
 
     fn child_wait(child: &mut SupervisedChild) -> io::Result<ExitStatus> {
-        child.child.wait()
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+        // SAFETY: the process handle is valid and has SYNCHRONIZE access.
+        if unsafe { WaitForSingleObject(child.process.as_raw_handle().cast(), INFINITE) }
+            != WAIT_OBJECT_0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        exit_status(&child.process)
     }
 
     fn child_try_wait(child: &mut SupervisedChild) -> io::Result<Option<ExitStatus>> {
-        child.child.try_wait()
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: the process handle is valid; a zero timeout only polls.
+        match unsafe { WaitForSingleObject(child.process.as_raw_handle().cast(), 0) } {
+            WAIT_OBJECT_0 => exit_status(&child.process).map(Some),
+            WAIT_TIMEOUT => Ok(None),
+            _ => Err(io::Error::last_os_error()),
+        }
     }
 
     fn child_stdout(child: &mut SupervisedChild) -> Option<Box<dyn io::Read + Send>> {
+        // A PTY child's output is its pseudoconsole's, which keeps it until
+        // taken (see `PseudoConsole::close`).
         child
-            .child
             .stdout
             .take()
+            .or_else(|| child.console.as_ref()?.take_output())
             .map(|s| Box::new(s) as Box<dyn io::Read + Send>)
     }
 
     fn child_stderr(child: &mut SupervisedChild) -> Option<Box<dyn io::Read + Send>> {
         child
-            .child
             .stderr
             .take()
             .map(|s| Box::new(s) as Box<dyn io::Read + Send>)
     }
 
     fn child_stdin(child: &mut SupervisedChild) -> Option<Box<dyn io::Write + Send>> {
+        if let Some(writer) = child.pty_writer.take() {
+            return Some(Box::new(writer));
+        }
         child
-            .child
             .stdin
             .take()
             .map(|s| Box::new(s) as Box<dyn io::Write + Send>)
     }
 
-    fn pty_resize_fd(_child: &SupervisedChild) -> Option<File> {
-        None // No PTY support on Windows in slice one
+    fn pty_resizer(child: &SupervisedChild) -> Option<PtyResize> {
+        child.console.as_ref().map(|c| PtyResize(Arc::clone(c)))
     }
 
     fn child_kill_handle(child: &SupervisedChild) -> ChildKillHandle {
         ChildKillHandle {
             identity: child.identity,
             job_object: child.job_object.clone(),
+            console: child.console.clone(),
         }
     }
 
@@ -289,30 +353,12 @@ impl Platform for WindowsPlatform {
         Self::kill_child(handle, force)
     }
 
-    fn kill_orphan(id: &ProcessIdentity, _force: bool) -> io::Result<()> {
-        // Without a Job Object handle (sidecar crashed or CLI-initiated kill),
-        // we can only kill the individual process by PID — no descendant tree
-        // kill. This is a known degradation on Windows; orphan kill is a
-        // recovery path, not the normal lifecycle.
-        //
-        // force=false degrades to force on Windows because there is no
-        // reliable way to send a graceful stop signal to an orphaned process
-        // without a shared console (which we don't have for orphans).
-        match process_status(id) {
-            ProcessStatus::Missing => return Ok(()),
-            ProcessStatus::IdentityMismatch => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "PID was recycled — refusing to kill wrong process",
-                ));
-            }
-            ProcessStatus::OsError(kind) => {
-                return Err(io::Error::new(kind, "failed to probe process status"));
-            }
-            ProcessStatus::AliveVerified | ProcessStatus::Inaccessible => {}
-        }
-
-        terminate_process_by_pid(id.pid.get())
+    /// Without the sidecar's Job Object handle: see [`orphan`]. The tree is
+    /// found by the run's named job, or else by parent links from the
+    /// child; unless `force`, it gets CTRL_BREAK and [`orphan::GRACE`]
+    /// first. A PID that no longer names the child is refused.
+    fn kill_orphan(id: &ProcessIdentity, force: bool) -> io::Result<()> {
+        orphan::kill_orphan(id, force)
     }
 
     fn self_identity() -> io::Result<ProcessIdentity> {
@@ -555,21 +601,28 @@ pub(super) fn std_handles_not_inheritable() {
 
 // --- Sidecar spawn (raw CreateProcessW) ---
 
-/// Whether the calling process's job (if any) permits child breakaway.
-///
-/// Returns true when:
-/// - The calling process is not in a job at all (breakaway flag is a no-op).
-/// - The calling process is in a job whose limits include
-///   `JOB_OBJECT_LIMIT_BREAKAWAY_OK`.
-///
-/// Returns false when the parent's job exists but forbids breakaway, or when
-/// the kernel queries fail. False is the safe default: the sidecar will
-/// inherit the parent's job (and lifetime) — a degradation, but better than
-/// failing the spawn outright with ERROR_ACCESS_DENIED.
-fn parent_job_allows_breakaway() -> bool {
+/// How the sidecar leaves the job tendr runs in, if any, so that it
+/// outlives its caller: an SSH session's processes, for one, are in a job
+/// that is closed, killing them, when the connection ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Breakaway {
+    /// Not in a job, or in one whose children leave it by themselves
+    /// (`JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`): nothing to do.
+    NotNeeded,
+    /// Ask for it with `CREATE_BREAKAWAY_FROM_JOB`: the job allows it
+    /// (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`), or it could not be asked.
+    Request,
+    /// The job allows neither: the sidecar stays in it and lasts as long as
+    /// the job lets it.
+    Forbidden,
+}
+
+/// Whether, and how, the sidecar must break away from this process's job.
+fn breakaway() -> Breakaway {
     use windows_sys::Win32::System::JobObjects::{
-        IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -580,19 +633,20 @@ fn parent_job_allows_breakaway() -> bool {
     // to a valid stack i32.
     let ok = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) };
     if ok == 0 {
-        return false;
+        return Breakaway::Request;
     }
     if in_job == 0 {
-        return true; // not in any job — breakaway flag is a no-op, harmless
+        return Breakaway::NotNeeded;
     }
 
     // SAFETY: zeroed JOBOBJECT_EXTENDED_LIMIT_INFORMATION is the documented
     // initialization pattern before passing as an out-buffer.
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     let mut returned: u32 = 0;
-    // SAFETY: null hJob = "the job associated with the calling process";
-    // the info pointer + advertised size match the JobObjectExtendedLimitInformation
-    // class; the returned-bytes out param is a valid stack u32.
+    // SAFETY: null hJob = "the job associated with the calling process" (the
+    // innermost, when jobs are nested); the info pointer + advertised size
+    // match the JobObjectExtendedLimitInformation class; the returned-bytes
+    // out param is a valid stack u32.
     let ok = unsafe {
         QueryInformationJobObject(
             std::ptr::null_mut(),
@@ -603,9 +657,46 @@ fn parent_job_allows_breakaway() -> bool {
         )
     };
     if ok == 0 {
-        return false;
+        return Breakaway::Request;
     }
-    (info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK) != 0
+    let flags = info.BasicLimitInformation.LimitFlags;
+    if flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != 0 {
+        Breakaway::NotNeeded
+    } else if flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK != 0 {
+        Breakaway::Request
+    } else {
+        Breakaway::Forbidden
+    }
+}
+
+/// Whether tendr runs for an SSH connection, whose job Windows OpenSSH (or
+/// another server) may close when the connection ends. Known by
+/// `SSH_CONNECTION`, which every process started from an SSH login
+/// inherits. Outside one, a job that keeps its processes is its owner's
+/// choice (an IDE, a CI runner), as a cgroup is on Linux, and the session
+/// lives as long as it.
+fn over_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+}
+
+/// The error `start` fails with over SSH when the session could not
+/// outlive the connection. Kept rather than starting a session that dies
+/// with the connection's job. Inside a tendr run (`TENDR_RUN_ID`, which a
+/// run gives its child, is set) the job is most likely the run's, which no
+/// process leaves: the message says so, since the SSH connection is then
+/// not what the session would end with.
+fn breakaway_forbidden() -> io::Error {
+    let message = if std::env::var_os("TENDR_RUN_ID").is_some() {
+        "the session could not outlive the tendr run it is started from: on \
+         Windows a session started inside a run stays in the run's job, \
+         which no process leaves, and ends with the run; start it from \
+         outside the run"
+    } else {
+        "the session could not outlive this SSH connection: tendr runs in a \
+         Windows job that does not let its processes break away, so the \
+         session would end with the connection"
+    };
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
 /// Spawn the sidecar with explicit handle whitelisting.
@@ -624,8 +715,13 @@ fn parent_job_allows_breakaway() -> bool {
 /// readiness read that waits for that process too, never a lost failure.
 ///
 /// Requires Windows 7+ (PROC_THREAD_ATTRIBUTE_HANDLE_LIST support).
-fn spawn_sidecar_raw(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) -> io::Result<u32> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+fn spawn_sidecar_raw(
+    tendr_bin: &Path,
+    session_dir: &Path,
+    ready_writer: &File,
+    lifetime: super::SessionLifetime,
+) -> io::Result<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE};
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
         CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
@@ -634,13 +730,27 @@ fn spawn_sidecar_raw(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) 
         UpdateProcThreadAttribute,
     };
 
+    // CREATE_BREAKAWAY_FROM_JOB lets the sidecar escape any job object the
+    // parent (e.g. OpenSSH-Server's per-session job with KILL_ON_JOB_CLOSE)
+    // assigned us to. Without it, DETACHED_PROCESS only severs the *console*,
+    // not the *job*, and the sidecar dies on parent disconnect. Over SSH, a
+    // job that forbids it fails a detached start instead: a session that
+    // may die with the connection is not one tendr reports as started.
+    // Elsewhere, and for a foreground run, which lasts only as long as its
+    // caller anyway, the sidecar stays in the job.
+    let breakaway = breakaway();
+    let refuse = over_ssh() && lifetime == super::SessionLifetime::Detached;
+    if breakaway == Breakaway::Forbidden && refuse {
+        return Err(breakaway_forbidden());
+    }
+
     let ready_dup = inheritable_duplicate(ready_writer)?;
     let ready_handle: HANDLE = ready_dup.as_raw_handle() as *mut _;
 
     // --- Build command line ---
     // CreateProcessW wants a single mutable wide string for the command line.
     let cmdline = format!(
-        "\"{}\" _sidecar --session-dir \"{}\"",
+        "\"{}\" {SIDECAR_ARG} --session-dir \"{}\"",
         tendr_bin.display(),
         session_dir.display(),
     );
@@ -707,45 +817,48 @@ fn spawn_sidecar_raw(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) 
     si_ex.lpAttributeList = attr_list;
 
     // --- Create process ---
-    // CREATE_BREAKAWAY_FROM_JOB lets the sidecar escape any job object the
-    // parent (e.g. OpenSSH-Server's per-session job with KILL_ON_JOB_CLOSE)
-    // assigned us to. Without it, DETACHED_PROCESS only severs the *console*,
-    // not the *job* — and the sidecar dies on parent disconnect.
-    //
-    // Detect-then-spawn: ask the kernel whether the parent job allows
-    // breakaway. If we set CREATE_BREAKAWAY_FROM_JOB on a job that doesn't
-    // permit it, CreateProcessW fails with ERROR_ACCESS_DENIED — and we'd
-    // have to retry with a buffer that CreateProcessW may have mutated
-    // in-place. Detecting upfront avoids that.
-    let mut creation_flags = CREATE_NEW_PROCESS_GROUP
+    let creation_flags = CREATE_NEW_PROCESS_GROUP
         | DETACHED_PROCESS
         | EXTENDED_STARTUPINFO_PRESENT
         | CREATE_UNICODE_ENVIRONMENT;
-    if parent_job_allows_breakaway() {
-        creation_flags |= CREATE_BREAKAWAY_FROM_JOB;
-    }
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-
-    let ret = unsafe {
+    let mut create = |flags| unsafe {
         CreateProcessW(
             std::ptr::null(),          // lpApplicationName (use cmdline)
             cmdline_wide.as_mut_ptr(), // lpCommandLine
             std::ptr::null(),          // lpProcessAttributes
             std::ptr::null(),          // lpThreadAttributes
             1,                         // bInheritHandles = TRUE
-            creation_flags,            // dwCreationFlags
+            flags,                     // dwCreationFlags
             env_block.as_ptr().cast(), // lpEnvironment
             std::ptr::null(),          // lpCurrentDirectory (inherit)
             &si_ex.StartupInfo,        // lpStartupInfo
             &mut pi,                   // lpProcessInformation
         )
     };
+    let access_denied =
+        || io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+
+    let mut result = if breakaway == Breakaway::Request {
+        create(creation_flags | CREATE_BREAKAWAY_FROM_JOB)
+    } else {
+        create(creation_flags)
+    };
+    // An outer job of nested ones can forbid what the inner allows.
+    let outer_forbids = result == 0 && breakaway == Breakaway::Request && access_denied();
+    if outer_forbids && !refuse {
+        result = create(creation_flags);
+    }
+    let err = io::Error::last_os_error();
 
     unsafe { DeleteProcThreadAttributeList(attr_list) };
 
-    if ret == 0 {
-        return Err(io::Error::last_os_error());
+    if result == 0 {
+        if outer_forbids && refuse {
+            return Err(breakaway_forbidden());
+        }
+        return Err(err);
     }
 
     let pid = pi.dwProcessId;
@@ -762,23 +875,92 @@ fn spawn_sidecar_raw(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) 
 
 // --- Job Object helpers ---
 
-/// Create a Job Object with KILL_ON_JOB_CLOSE (safety net for crashes).
-fn create_job_object() -> io::Result<OwnedHandle> {
+/// Start `argv` suspended, put it in a new kill-on-close Job Object named
+/// for it ([`orphan::job_name`]), then let it run: every process it starts
+/// is in the job from its first instruction. Returns the process, its
+/// identity and the job. On failure nothing is left running.
+fn start_contained(
+    argv: &[String],
+    cwd: Option<&Path>,
+    env_remove: &BTreeSet<String>,
+    env: &BTreeMap<String, String>,
+    streams: &launch::Streams,
+) -> io::Result<(OwnedHandle, ProcessIdentity, OwnedHandle)> {
+    use windows_sys::Win32::System::Threading::{ResumeThread, TerminateProcess};
+
+    let mut environment = launch::Environment::inherited(env_remove, env);
+    let module_path = argv
+        .first()
+        .and_then(|program| windows_powershell_module_path(program, env_remove, env));
+    if let Some(module_path) = module_path {
+        environment.set(PS_MODULE_PATH, module_path.into());
+    }
+    let child = launch::spawn_suspended(argv, cwd, &environment, streams)?;
+    let contained = (|| {
+        let identity = ProcessIdentity {
+            pid: NonZeroU32::new(child.pid).ok_or_else(|| io::Error::other("pid is zero"))?,
+            start_time_ns: creation_time_ns(child.process.as_raw_handle().cast())?,
+        };
+        let job = create_job_object(&orphan::job_name(&identity))?;
+        assign_process_to_job(
+            job.as_raw_handle().cast(),
+            child.process.as_raw_handle().cast(),
+        )?;
+        // SAFETY: the thread handle is valid and has THREAD_SUSPEND_RESUME.
+        if unsafe { ResumeThread(child.thread.as_raw_handle().cast()) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((identity, job))
+    })();
+    match contained {
+        Ok((identity, job)) => Ok((child.process, identity, job)),
+        Err(e) => {
+            // Still suspended (or in the job, which dropping closes): it has
+            // started nothing.
+            // SAFETY: the process handle is valid and has PROCESS_TERMINATE.
+            unsafe { TerminateProcess(child.process.as_raw_handle().cast(), 1) };
+            Err(e)
+        }
+    }
+}
+
+/// The hidden subcommand that runs a sidecar (`main.rs`), its first
+/// argument; an orphan kill finds other sessions' sidecars by it.
+const SIDECAR_ARG: &str = "_sidecar";
+
+/// Create a Job Object named `name` with KILL_ON_JOB_CLOSE (safety net for
+/// crashes) and no breakaway: nothing the run starts can leave it, so a
+/// stop reaches all of it. Cygwin and MSYS programs (Git Bash's `sh`, say)
+/// start every child with `CREATE_BREAKAWAY_FROM_JOB` when their job allows
+/// it, so a job that allowed breakaway would lose them. A session started
+/// inside the run stays in it too and ends with the run. If an object of
+/// that name already exists, which a run's own name never should, the job
+/// is anonymous instead, so it is never one someone else made.
+fn create_job_object(name: &str) -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::JobObjects::{
         CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
 
-    // SAFETY: null name = anonymous job object. Returns null on failure.
-    let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    // SAFETY: `wide` is NUL-terminated. Returns null on failure.
+    let mut handle = unsafe { CreateJobObjectW(std::ptr::null(), wide.as_ptr()) };
+    if !handle.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        // SAFETY: the handle was just returned to us.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        // SAFETY: null name = anonymous job object.
+        handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    }
     if handle.is_null() {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: handle is a valid non-null HANDLE from CreateJobObjectW.
+    let job = unsafe { OwnedHandle::from_raw_handle(handle) };
 
-    // Configure kill-on-close before returning, while we still have the raw handle.
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
+    // SAFETY: the buffer and its size match the information class.
     let ret = unsafe {
         SetInformationJobObject(
             handle,
@@ -788,13 +970,9 @@ fn create_job_object() -> io::Result<OwnedHandle> {
         )
     };
     if ret == 0 {
-        // Close the job handle before returning the error.
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
         return Err(io::Error::last_os_error());
     }
-
-    // SAFETY: handle is a valid non-null HANDLE from CreateJobObjectW.
-    Ok(unsafe { OwnedHandle::from_raw_handle(handle as *mut _) })
+    Ok(job)
 }
 
 /// Assign a process to a Job Object.
@@ -804,13 +982,43 @@ fn assign_process_to_job(
 ) -> io::Result<()> {
     use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 
-    // SAFETY: both handles are valid — job from create_job_object,
-    // process from std::process::Child (which owns the process HANDLE).
+    // SAFETY: both handles are valid: the job from create_job_object, the
+    // process from launch::spawn_suspended.
     let ret = unsafe { AssignProcessToJobObject(job, process) };
     if ret == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// The exit status of an exited process.
+fn exit_status(process: &OwnedHandle) -> io::Result<ExitStatus> {
+    use std::os::windows::process::ExitStatusExt;
+    use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+    let mut code = 0;
+    // SAFETY: the handle is valid; `code` is a valid out-pointer.
+    if unsafe { GetExitCodeProcess(process.as_raw_handle().cast(), &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ExitStatus::from_raw(code))
+}
+
+/// An anonymous pipe, `(read, write)`, neither end inheritable.
+fn pipe() -> io::Result<(File, File)> {
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    let mut read = std::ptr::null_mut();
+    let mut write = std::ptr::null_mut();
+    // SAFETY: valid out-pointers; null attributes = not inheritable.
+    if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both handles are valid and ours.
+    Ok(unsafe { (File::from_raw_handle(read), File::from_raw_handle(write)) })
+}
+
+/// The `NUL` device for reading, as a child's stdin when none is piped.
+fn null_device() -> io::Result<File> {
+    std::fs::OpenOptions::new().read(true).open("NUL")
 }
 
 /// Terminate all processes in a Job Object. Idempotent — already-dead is Ok.
@@ -955,31 +1163,6 @@ impl io::Read for PipeReader {
     }
 }
 
-/// Terminate a single process by PID. No tree kill — use only for orphans.
-fn terminate_process_by_pid(pid: u32) -> io::Result<()> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        // Can't open — process likely already exited.
-        return Ok(());
-    }
-
-    let ret = unsafe { TerminateProcess(handle, 1) };
-    unsafe { CloseHandle(handle) };
-
-    if ret == 0 {
-        let err = io::Error::last_os_error();
-        // Access denied may mean the process already exited between
-        // OpenProcess and TerminateProcess — treat as success.
-        if err.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32) {
-            return Err(err);
-        }
-    }
-    Ok(())
-}
-
 // --- Process identity implementation ---
 
 /// Get ProcessIdentity for a process by PID.
@@ -996,10 +1179,9 @@ fn terminate_process_by_pid(pid: u32) -> io::Result<()> {
 /// - `ERROR_ACCESS_DENIED` (5): process exists but we can't query it
 ///   (e.g., protected process, system process)
 fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        GetCurrentProcess, GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     let pid_nz = NonZeroU32::new(pid).ok_or_else(|| io::Error::other("pid is zero"))?;
@@ -1019,6 +1201,25 @@ fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
         h
     };
 
+    let start_time_ns = creation_time_ns(handle);
+
+    // Close handle unless it's the pseudo-handle for current process
+    if !is_self {
+        unsafe { CloseHandle(handle) };
+    }
+
+    Ok(ProcessIdentity {
+        pid: pid_nz,
+        start_time_ns: start_time_ns?,
+    })
+}
+
+/// When the process `handle` refers to was created, in nanoseconds since
+/// the Unix epoch: the start time of its [`ProcessIdentity`].
+fn creation_time_ns(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
     let mut creation = FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,
@@ -1027,13 +1228,9 @@ fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
     let mut kernel = creation;
     let mut user = creation;
 
+    // SAFETY: the handle is valid with at least
+    // PROCESS_QUERY_LIMITED_INFORMATION; the out-pointers are valid.
     let ret = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-
-    // Close handle unless it's the pseudo-handle for current process
-    if !is_self {
-        unsafe { CloseHandle(handle) };
-    }
-
     if ret == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1042,12 +1239,7 @@ fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
     // Epoch offset: 11,644,473,600 seconds = 116,444,736,000,000,000 100ns intervals.
     let ticks_100ns = (creation.dwHighDateTime as u64) << 32 | creation.dwLowDateTime as u64;
     let unix_ticks = ticks_100ns.saturating_sub(116_444_736_000_000_000);
-    let start_time_ns = unix_ticks * 100; // 100ns → ns
-
-    Ok(ProcessIdentity {
-        pid: pid_nz,
-        start_time_ns,
-    })
+    Ok(unix_ticks * 100) // 100ns → ns
 }
 
 /// Probe a process by identity on Windows.

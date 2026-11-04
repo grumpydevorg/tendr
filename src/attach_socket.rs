@@ -17,6 +17,31 @@ use thiserror::Error;
 use crate::model::ids::RunId;
 use crate::session::SessionRoot;
 
+/// The attach stream of this platform.
+pub type Stream = UnixStream;
+/// The attach listener of this platform.
+pub type Listener = UnixListener;
+
+/// Connect to the attach socket `path`.
+///
+/// # Errors
+///
+/// The connect's OS error.
+pub fn connect(path: &Path) -> io::Result<UnixStream> {
+    UnixStream::connect(path)
+}
+
+/// Whether a socket file is at `path`.
+#[must_use]
+pub fn exists(path: &Path) -> bool {
+    path.exists()
+}
+
+/// Remove the socket file at `path`; a missing one is already gone.
+pub fn remove(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
 /// Directory, under the state root, that holds attach sockets.
 pub const SOCKET_DIR: &str = "sockets";
 

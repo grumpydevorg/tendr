@@ -47,7 +47,6 @@ pub fn cmd_push(name: &str, namespace: &Namespace) -> anyhow::Result<()> {
 
     // PTY sessions take pushes over the attach socket, which reports exactly
     // what reached the terminal; pipe sessions keep the stdin FIFO.
-    #[cfg(unix)]
     if meta.pty().is_some() {
         return push_over_attach_socket(session.path());
     }
@@ -81,7 +80,6 @@ pub fn cmd_push(name: &str, namespace: &Namespace) -> anyhow::Result<()> {
 /// ([`push_outcome`]). A push refused because another client holds the
 /// terminal fails with exit 81; one revoked by a takeover or stopped by the
 /// session part-way fails with exit 84 and how many bytes were written.
-#[cfg(unix)]
 fn push_over_attach_socket(session_dir: &std::path::Path) -> anyhow::Result<()> {
     use std::io::Read;
     use tendr::attach_proto::{self, Frame, FrameError, Mode, read_frame, write_frame};
@@ -137,7 +135,6 @@ fn push_over_attach_socket(session_dir: &std::path::Path) -> anyhow::Result<()> 
 /// written (a takeover while its end marker was still on its way) wrote them
 /// all, so it succeeds whatever the outcome (PR #68 review, finding 4). One
 /// stopped with bytes unwritten is a partial write: exit 84, revoked or closed.
-#[cfg(unix)]
 fn push_outcome(
     outcome: tendr::attach_proto::PushOutcome,
     sent: u64,

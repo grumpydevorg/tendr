@@ -7,7 +7,7 @@ use tendr::model::ready::ReadyCheck;
 use tendr::model::spec::{
     DependencyBinding, ExecTarget, IoMode, LaunchSpec, LogDelimiter, RecordingPolicy, StdinMode,
 };
-use tendr::platform::{Current, Platform};
+use tendr::platform::{Current, Platform, SessionLifetime};
 use tendr::session::{self, SessionRoot};
 
 #[allow(clippy::too_many_arguments)] // the launch surface; `remote_op::dispatch` resolves a StartRequest into it
@@ -52,6 +52,7 @@ pub fn cmd_start(
         ready,
         after_ready,
         log_delimiter,
+        SessionLifetime::Detached,
     )?;
 
     let json = serde_json::to_string_pretty(&meta)?;
@@ -99,6 +100,7 @@ pub(crate) fn launch_session(
     ready: Option<ReadyCheck>,
     after_ready: &[String],
     log_delimiter: LogDelimiter,
+    lifetime: SessionLifetime,
 ) -> anyhow::Result<(tendr::model::meta::Meta, session::SessionDir)> {
     let session_name = SessionName::new(name)?;
     let root = SessionRoot::default_path()?;
@@ -186,7 +188,7 @@ pub(crate) fn launch_session(
         );
     }
 
-    let meta = spawn_and_wait_ready_inner(&session, &launch_spec)?;
+    let meta = spawn_and_wait_ready_inner(&session, &launch_spec, lifetime)?;
     Ok((meta, session))
 }
 
@@ -379,6 +381,7 @@ fn try_idempotent_start(
 fn spawn_and_wait_ready_inner(
     session: &session::SessionDir,
     launch_spec: &LaunchSpec,
+    lifetime: SessionLifetime,
 ) -> anyhow::Result<tendr::model::meta::Meta> {
     // Write launch spec for sidecar to read
     let spec_json = serde_json::to_string_pretty(launch_spec)?;
@@ -389,7 +392,7 @@ fn spawn_and_wait_ready_inner(
 
     // Spawn detached sidecar
     let tendr_bin = std::env::current_exe()?;
-    let sidecar_result = Current::spawn_sidecar(&tendr_bin, session.path(), &write_end);
+    let sidecar_result = Current::spawn_sidecar(&tendr_bin, session.path(), &write_end, lifetime);
 
     // Close write end in parent -- we only read
     drop(write_end);

@@ -70,9 +70,17 @@
 
 pub mod annotation;
 pub mod attach_escape;
+#[cfg(windows)]
+pub mod attach_pipe;
 pub mod attach_proto;
 #[cfg(unix)]
 pub mod attach_socket;
+/// This platform's attach endpoint, which carries the attach frames: a
+/// private socket on Unix, a private named pipe on Windows.
+#[cfg(windows)]
+pub use attach_pipe as attach_endpoint;
+#[cfg(unix)]
+pub use attach_socket as attach_endpoint;
 pub mod directive;
 pub mod events;
 pub mod exec_frame;

@@ -795,12 +795,13 @@ pub fn parse_resize(payload: &[u8]) -> Option<Geometry> {
     Geometry::new(rows, cols)
 }
 
-/// Read the attach socket path from the session's breadcrumb (`a.sock.path`),
-/// which the sidecar publishes atomically after binding its private socket.
-/// There is no fallback location: a session without a breadcrumb has no
-/// attachable listener.
+/// Read the attach endpoint's path from the session's breadcrumb
+/// (`a.sock.path`), which the sidecar publishes atomically after binding
+/// its private socket (on Windows, creating its named pipe). There is no
+/// fallback location: a session without a breadcrumb has no attachable
+/// listener.
 pub fn read_sock_path(session_dir: &Path) -> Option<PathBuf> {
-    read_breadcrumb(session_dir).filter(|path| path.exists())
+    read_breadcrumb(session_dir).filter(|path| crate::attach_endpoint::exists(path))
 }
 
 /// The socket path the session's breadcrumb names, whether or not it exists.

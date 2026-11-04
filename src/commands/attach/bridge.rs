@@ -3,7 +3,8 @@
 //!
 //! The client keeps the terminal (raw mode, resizes, the detach escape) and
 //! speaks the attach protocol on ssh's stdin and stdout. This end connects
-//! those frames to the session's attach socket. It decides nothing about
+//! those frames to the session's attach endpoint (a socket on Unix, a named
+//! pipe on Windows). It decides nothing about
 //! control: the sidecar grants and retires controllers and records the run.
 //! The bridge only reports what the session's event log already says, when a
 //! takeover cut the connection before the sidecar could tell the client.
@@ -12,8 +13,10 @@
 //! output holds up only the output; its resizes and its detach still reach
 //! the session, and a takeover by another client never waits for it.
 
-use tendr::attach_proto::{ResumePoint, Version};
+use super::Point;
+use tendr::attach_proto::{self, Frame, ResumePoint, Version, WatchPoint};
 use tendr::model::ids::Namespace;
+use tendr::pty_exit::PtyExitCode;
 
 /// `tendr _remote` for an attach request: check the session as a local
 /// attach does, read the client's hello from stdin, connect to the session's
@@ -74,99 +77,84 @@ pub fn cmd_attach_bridge(
     let (session, meta) =
         super::attachable(name, namespace, takeover || read_only || resume.is_some())?;
 
-    #[cfg(not(unix))]
-    {
-        let _ = (session, meta, version, resume);
-        anyhow::bail!("attach is only supported on Unix");
-    }
-
-    #[cfg(unix)]
-    {
-        use super::Point;
-        use tendr::attach_proto::{self, Frame, Version, WatchPoint};
-        use tendr::pty_exit::PtyExitCode;
-
-        let first = attach_proto::read_frame(&mut std::io::stdin().lock());
-        // A watcher sends no input, so what version 4 adds is not for it.
-        let version = if read_only {
-            version.min(Version::WATCH_LATEST)
+    let first = attach_proto::read_frame(&mut std::io::stdin().lock());
+    // A watcher sends no input, so what version 4 adds is not for it.
+    let version = if read_only {
+        version.min(Version::WATCH_LATEST)
+    } else {
+        version
+    };
+    let resume = resume.map(|point| {
+        if read_only {
+            Point::Watch(WatchPoint {
+                run_id: point.run_id,
+                offset: point.offset,
+            })
         } else {
-            version
-        };
-        let resume = resume.map(|point| {
-            if read_only {
-                Point::Watch(WatchPoint {
-                    run_id: point.run_id,
-                    offset: point.offset,
-                })
-            } else {
-                Point::Control(point)
-            }
-        });
-        let (stream, answer, epoch, version) = match resume {
-            None => {
-                let mode = super::mode(takeover, read_only);
-                match first {
-                    Ok(Frame::Hello { mode: hello, .. }) if hello == mode => {}
-                    other => {
-                        return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
-                            "the attach request must be followed by its {mode:?} hello, not {other:?}"
-                        )));
-                    }
-                }
-                let (stream, accept, version) = super::connect(session.path(), version, mode)?;
-                (stream, accept.frame(), accept.epoch(), version)
-            }
-            Some(point) => {
-                // The client's resume frame is version 2's, the only one a
-                // remote from before version 3 takes.
-                match first {
-                    Ok(asked) if asked == point.resume_frame(Version::V2) => {}
-                    other => {
-                        return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
-                            "the resume request must be followed by its resume frame, not {other:?}"
-                        )));
-                    }
-                }
-                // Resuming is part of version 2.
-                let (stream, resumed, version) =
-                    super::connect_resume(session.path(), point, version.max(Version::V2))?;
-                let epoch = match point {
-                    Point::Control(_) => Some(resumed.point().epoch),
-                    Point::Watch(_) => None,
-                };
-                (stream, resumed.frame(), epoch, version)
-            }
-        };
-        // A resumed client's control is its new epoch: a later takeover of
-        // it grants the one after. A watcher has none to be taken over.
-        let control = epoch.map(|epoch| super::Control {
-            session_dir: session.path().to_path_buf(),
-            run_id: meta.run_id(),
-            epoch,
-        });
-        match unix::run(stream, answer, control) {
-            // The client has been told, and says so itself.
-            unix::End::TakenOver => std::process::exit(PtyExitCode::Control.code()),
-            // The session ends a watcher's connection only at the run's end
-            // or to cut it off. From version 3 it says which: the end of
-            // output, passed on, or nothing.
-            unix::End::Closed if read_only && version.reports_end() => {
-                Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
-                    "tendr: the session cut this read-only attach off before the end of the run's output"
-                )))
-            }
-            // Before it, only this end can read which.
-            unix::End::Closed if read_only => super::run_ended(&session, meta.run_id()),
-            unix::End::Ended | unix::End::Closed | unix::End::Left => Ok(()),
+            Point::Control(point)
         }
+    });
+    let (stream, answer, epoch, version) = match resume {
+        None => {
+            let mode = super::mode(takeover, read_only);
+            match first {
+                Ok(Frame::Hello { mode: hello, .. }) if hello == mode => {}
+                other => {
+                    return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+                        "the attach request must be followed by its {mode:?} hello, not {other:?}"
+                    )));
+                }
+            }
+            let (stream, accept, version) = super::connect(session.path(), version, mode)?;
+            (stream, accept.frame(), accept.epoch(), version)
+        }
+        Some(point) => {
+            // The client's resume frame is version 2's, the only one a
+            // remote from before version 3 takes.
+            match first {
+                Ok(asked) if asked == point.resume_frame(Version::V2) => {}
+                other => {
+                    return Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+                        "the resume request must be followed by its resume frame, not {other:?}"
+                    )));
+                }
+            }
+            // Resuming is part of version 2.
+            let (stream, resumed, version) =
+                super::connect_resume(session.path(), point, version.max(Version::V2))?;
+            let epoch = match point {
+                Point::Control(_) => Some(resumed.point().epoch),
+                Point::Watch(_) => None,
+            };
+            (stream, resumed.frame(), epoch, version)
+        }
+    };
+    // A resumed client's control is its new epoch: a later takeover of it
+    // grants the one after. A watcher has none to be taken over.
+    let control = epoch.map(|epoch| super::Control {
+        session_dir: session.path().to_path_buf(),
+        run_id: meta.run_id(),
+        epoch,
+    });
+    match relay::run(stream, answer, control) {
+        // The client has been told, and says so itself.
+        relay::End::TakenOver => std::process::exit(PtyExitCode::Control.code()),
+        // The session ends a watcher's connection only at the run's end or
+        // to cut it off. From version 3 it says which: the end of output,
+        // passed on, or nothing.
+        relay::End::Closed if read_only && version.reports_end() => {
+            Err(PtyExitCode::Runtime.error(anyhow::anyhow!(
+                "tendr: the session cut this read-only attach off before the end of the run's output"
+            )))
+        }
+        // Before it, only this end can read which.
+        relay::End::Closed if read_only => super::run_ended(&session, meta.run_id()),
+        relay::End::Ended | relay::End::Closed | relay::End::Left => Ok(()),
     }
 }
 
-#[cfg(unix)]
-mod unix {
+mod relay {
     use std::io::{self, BufReader, BufWriter};
-    use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -198,7 +186,11 @@ mod unix {
     /// Pass the sidecar's acceptance on to the client, then bridge until
     /// either side ends. `control` is `None` for a watcher, which holds no
     /// control, so no takeover check runs for it.
-    pub(super) fn run(stream: UnixStream, accepted: Frame, control: Option<Control>) -> End {
+    pub(super) fn run(
+        stream: tendr::attach_endpoint::Stream,
+        accepted: Frame,
+        control: Option<Control>,
+    ) -> End {
         if attach_proto::write_frame(&mut io::stdout().lock(), &accepted).is_err() {
             return End::Left;
         }
@@ -271,7 +263,11 @@ mod unix {
     /// log says so, and the client is told as the sidecar would have told
     /// it. An end after the client's own detach (`detached`) is the client
     /// leaving.
-    fn forward_output(socket: UnixStream, control: Option<&Control>, detached: &AtomicBool) -> End {
+    fn forward_output(
+        socket: tendr::attach_endpoint::Stream,
+        control: Option<&Control>,
+        detached: &AtomicBool,
+    ) -> End {
         let mut socket = BufReader::new(socket);
         let mut retired = false;
         loop {
@@ -328,6 +324,7 @@ mod unix {
 
     /// Whether the client's end of stdin or stdout has closed, checked
     /// without blocking or reading.
+    #[cfg(unix)]
     fn client_hung_up() -> bool {
         use rustix::event::{PollFd, PollFlags, Timespec, poll};
         let (stdin, stdout) = (io::stdin(), io::stdout());
@@ -343,5 +340,14 @@ mod unix {
             && fds
                 .iter()
                 .any(|fd| fd.revents().intersects(PollFlags::HUP | PollFlags::ERR))
+    }
+
+    /// Never asked on Windows: a pipe cannot be checked while the input
+    /// thread reads it (synchronous I/O on one handle is serialized), and
+    /// Windows OpenSSH ends the connection's job, this bridge included,
+    /// when the client hangs up.
+    #[cfg(windows)]
+    fn client_hung_up() -> bool {
+        false
     }
 }

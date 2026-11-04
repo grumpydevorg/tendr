@@ -493,6 +493,45 @@ CTRL_BREAK, which is best-effort, then ends the Job Object after the grace
 period. For CTRL_BREAK to reach the child, the sidecar allocates a console and
 hides its window. Source: `src/platform/windows.rs`.
 
+*2026-11-04.* The child is created suspended (raw `CreateProcessW`, std's
+rules for finding the program and quoting its arguments) and resumed only
+once it is in its job: assigned after `std::process::Command` started it, a
+child that started a process at once could leave that process outside the
+job, out of reach of any stop. The job allows no breakaway. Allowing it
+would let the sidecar of a session started inside the run leave and
+outlive the run, as on Unix, but Cygwin and MSYS programs (Git Bash's
+`sh`) would leave too: they start every child with
+`CREATE_BREAKAWAY_FROM_JOB` when their job allows it (Cygwin's
+`winsup/cygwin/spawn.cc`), and CI showed a stop missing them while their
+open pipes kept the run from ending. Containment wins: a session started
+inside a run stays in the run's job and ends with the run. The job is
+named for the child's PID and creation time, so a `kill`
+without the sidecar (crashed or stuck) can open it and stop the whole run,
+and a recycled PID names no job. From another Terminal Services session,
+where the `Local\` name cannot be opened (every SSH login runs in session 0,
+a desktop's sign-in in its own), it falls back to the child's process tree,
+holding each process open while it searches so no PID changes hands. Its
+graceful stop needs the child's console, so a helper (`tendr _ctrl-break`)
+attaches to it.
+
+A sidecar that cannot leave its caller's job, which forbids breakaway, would
+end with that job: over SSH (`SSH_CONNECTION` is set, which every process
+started from an SSH login inherits), with the connection. `start` then
+fails and says so instead of reporting a session that may not last. The
+failure is exit 1, a plain error: nothing about it is for a script to
+retry. A foreground `run` is exempt: it lasts only as long as its caller
+anyway. Inside a tendr run started over SSH the job is the run's, which
+lets nothing leave, so a `tendr start` there is refused too; with
+`TENDR_RUN_ID` set the message says the session would end with the run,
+not the connection. Outside SSH, such a job is its owner's choice, as a
+cgroup is on Linux, and the sidecar stays in it. Cargo up to at least Rust
+1.100 runs every process it starts, tests included, in a kill-on-close job
+without `JOB_OBJECT_LIMIT_BREAKAWAY_OK` (`src/cargo/util/job.rs` at
+`rust-1.98.0`, the toolchain tendr pins), so refusing every such job
+failed every `start` under `cargo test`; Cargo allows breakaway since
+rust-lang/cargo e0064d2d6 (2026-09-28). Source: `src/platform/windows.rs`,
+`src/platform/windows/`.
+
 ### Windows clients attach over the bridge, through a console layer
 
 *2026-11-03.* The attach client is one platform-neutral core (frames, the
@@ -508,6 +547,20 @@ fallback would keep a second attach path alive for almost no users. Output
 is written with `WriteFile` under the UTF-8 code page, since Rust's console
 `Stdout` fails on bytes that are not valid UTF-8 and a PTY child can send
 any. Source: `src/commands/attach/terminal/windows.rs`, PRs #177, #179, #181.
+
+### Windows hosts run PTY sessions under ConPTY, attached over a named pipe
+
+*2026-11-05.* A `--pty` session on a Windows host runs its child under a
+pseudoconsole, launched suspended like any child so it is in its Job Object
+before it runs. Attach keeps its frames, its single input writer and its
+exit codes; only the carrier differs: an owner-only named pipe stands in
+for the Unix socket, behind a small stream type with the socket's
+interface, so the sidecar and client code stay one path. A pipe has no
+directory to secure, so ownership is the pipe's security descriptor plus
+each end checking the other's account. ConPTY renders the screen rather
+than passing the child's bytes through, and its output ends only when the
+pseudoconsole is closed, so the sidecar closes it when the child exits.
+Source: `src/platform/windows/conpty.rs`, `src/attach_pipe.rs`.
 
 ### Remote work runs the same tendr over SSH
 

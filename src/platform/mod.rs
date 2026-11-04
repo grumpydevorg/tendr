@@ -25,6 +25,25 @@ pub type Current = unix::UnixPlatform;
 #[cfg(windows)]
 pub type Current = windows::WindowsPlatform;
 
+/// How long a session must last, against the call that starts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLifetime {
+    /// `start`, or `run --detach`: the session must outlive the call. On
+    /// Windows, over SSH, a start that cannot ensure it fails.
+    Detached,
+    /// A foreground `run`: the call waits for the run, so the session only
+    /// has to last as long as its caller does.
+    Foreground,
+}
+
+/// A PTY's input, written without blocking, and its window size, of this
+/// platform: a PTY master on Unix, a ConPTY's input pipe and pseudoconsole on
+/// Windows. Each has `try_write`/`wait_writable` and `apply`/`size`.
+#[cfg(unix)]
+pub use unix::{PtyResize, PtyWriter};
+#[cfg(windows)]
+pub use windows::{PtyResize, PtyWriter};
+
 /// Start an external program tendr runs on the caller's behalf (ssh,
 /// duckdb). Windows hands a child every inheritable handle in its parent, not
 /// just the stdio it is given, and the stdin, stdout and stderr tendr
@@ -98,6 +117,7 @@ pub trait Platform {
         tendr_bin: &Path,
         session_dir: &Path,
         ready_writer: &Self::ReadyWriter,
+        lifetime: SessionLifetime,
     ) -> io::Result<u32>;
 
     // --- Readiness channel ---
@@ -133,13 +153,17 @@ pub trait Platform {
         env: &BTreeMap<String, String>,
     ) -> io::Result<Self::SupervisedChild>;
 
-    /// Spawn a child process under a pseudo-terminal.
-    /// child_stdout() returns PTY master read half.
-    /// child_stdin() returns PTY master write half.
+    /// Spawn a child process under a pseudo-terminal: a PTY on Unix, a
+    /// ConPTY (`CreatePseudoConsole`) on Windows, with the child started
+    /// suspended into its Job Object as `spawn_child` does.
+    /// child_stdout() returns the terminal's output.
+    /// child_stdin() returns the terminal's input.
     /// child_stderr() returns None (merged output).
     /// `env_remove` and `env` apply as for `spawn_child`.
     ///
-    /// Unix only in slice one. Windows returns Err.
+    /// On Windows the output ends once the child has exited: the
+    /// pseudoconsole is closed then, ending whatever else is still attached
+    /// to it.
     fn spawn_child_pty(
         argv: &[String],
         cwd: Option<&Path>,
@@ -174,10 +198,10 @@ pub trait Platform {
     /// Same take-once semantics.
     fn child_stdin(child: &mut Self::SupervisedChild) -> Option<Box<dyn io::Write + Send>>;
 
-    /// Get a dup'd file descriptor for applying PTY resize (TIOCSWINSZ).
+    /// Get a handle that applies the PTY's window size and reads it back.
     /// Must be called before `child_stdin` takes the write half.
-    /// Returns None for non-PTY children or on platforms without PTY support.
-    fn pty_resize_fd(child: &Self::SupervisedChild) -> Option<File>;
+    /// Returns None for non-PTY children.
+    fn pty_resizer(child: &Self::SupervisedChild) -> Option<PtyResize>;
 
     // --- Kill ---
 
@@ -192,7 +216,9 @@ pub trait Platform {
     /// - `force = false`: request graceful stop (SIGTERM on Unix,
     ///   best-effort CTRL_BREAK on Windows); waits up to 5s then
     ///   escalates to force termination. A Unix PTY child gets SIGHUP and
-    ///   up to 1s to act on it first, as when its terminal closes.
+    ///   up to 1s to act on it first, as when its terminal closes; a
+    ///   Windows PTY child's pseudoconsole closes instead of the CTRL_BREAK
+    ///   (`CTRL_CLOSE_EVENT` to everything attached).
     /// - `force = true`: immediate termination (SIGKILL / TerminateJobObject).
     ///
     /// Does not reap the child. Callers must still call `child_wait`
@@ -241,8 +267,14 @@ pub trait Platform {
 
     /// Kill an orphaned process by persisted identity (no live handle).
     ///
-    /// Used when the sidecar has crashed and we only have ProcessIdentity
-    /// from meta.json or the child_pid breadcrumb.
+    /// Used when the sidecar has crashed or does not answer, and we only
+    /// have ProcessIdentity from meta.json or the child_pid breadcrumb. A
+    /// PID that now names another process is refused, never signalled.
+    ///
+    /// - Unix: the child's process group, SIGTERM first unless `force`.
+    /// - Windows: the run's tree, found by the run's Job Object or by
+    ///   parent links from the child; CTRL_BREAK and up to 5 s first
+    ///   unless `force`.
     fn kill_orphan(id: &ProcessIdentity, force: bool) -> io::Result<()>;
 
     // --- Process identity ---

@@ -25,7 +25,6 @@ use pipe_framer::PipeFramer;
 use ready_check::OutputMatcher;
 use supervised_run::SupervisedRun;
 
-#[cfg(unix)]
 use crate::attach_proto::RejectClass;
 use crate::events::{self, EventDraft, EventWriter};
 use crate::model::dep_fail::DepFailReason;
@@ -34,7 +33,6 @@ use crate::model::ids::{
     EpochTimestamp, Generation, Namespace, ProcessIdentity, RunId, SessionName, Source,
 };
 use crate::model::meta::Meta;
-#[cfg(unix)]
 use crate::model::pty::PtyControl;
 #[cfg(all(test, unix))]
 use crate::model::pty::PtyMeta;
@@ -59,7 +57,6 @@ type ReadyWriter = <Current as Platform>::ReadyWriter;
 /// disconnected instead of stalling capture (and, through capture, the
 /// child).
 struct AttachViewer {
-    #[cfg(unix)]
     holder: crate::model::pty_control::HolderId,
     cursor: Arc<output_ring::Cursor>,
     /// Shut the viewer's socket down (used when its cursor is lost).
@@ -67,7 +64,6 @@ struct AttachViewer {
 }
 
 /// The most read-only viewers a run serves at once, beside its controller.
-#[cfg(unix)]
 const WATCH_CONNECTIONS: usize = 8;
 
 /// The most output one frame to a viewer carries: what capture reads at once.
@@ -75,7 +71,6 @@ const PTY_READ_BYTES: usize = 4096;
 
 /// What a newly installed viewer's sender sends: the mode replay, then the
 /// output from its cursor on.
-#[cfg(unix)]
 struct ViewerStart {
     ring: Arc<OutputRing>,
     cursor: Arc<output_ring::Cursor>,
@@ -90,7 +85,6 @@ struct ViewerStart {
 /// told so ([`crate::attach_proto::Frame::OutputEnd`]), with the final
 /// offset; one cut off before then never is. However it ends, it closes its
 /// cursor, which tells the run's end ([`flush_viewers`]) that it is done.
-#[cfg(unix)]
 fn run_viewer_sender(
     viewer: ViewerStart,
     version: crate::attach_proto::Version,
@@ -145,7 +139,6 @@ struct AttachTee {
     last_output: Option<std::time::Instant>,
 }
 
-#[cfg(unix)]
 impl AttachTee {
     /// Remove `holder`'s viewer, the controller's or a watcher's, and close
     /// its cursor, which ends its sender.
@@ -168,10 +161,8 @@ impl AttachTee {
 /// this long after the shrink: Claude Code re-sends its mouse modes 0.25 ms
 /// after a resize and redraws 19 ms after it (`scripts/pty-vm/README.md`,
 /// "Claude Code in a tendr PTY").
-#[cfg(unix)]
 const REPAINT_QUIET: std::time::Duration = std::time::Duration::from_millis(50);
 /// The longest a repaint keeps the PTY shrunk.
-#[cfg(unix)]
 const REPAINT_MAX: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Shared sink for teeing PTY output to the attached client.
@@ -182,49 +173,37 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The sidecar's PTY input authority (Unix only; PTY sessions are unsupported
-/// elsewhere, so the type is uninhabited there).
-#[cfg(unix)]
+/// The sidecar's PTY input authority.
 struct PtyInput {
     writer: crate::pty_input::InputWriter,
 }
-#[cfg(not(unix))]
-type PtyInput = std::convert::Infallible;
 
-/// Removes a run's attach socket, and its breadcrumb while it still names that
-/// socket, when dropped. The run drops it before releasing the session lock, and
-/// on every early exit. The socket is this run's own: its name derives from the
-/// run identity and binding refused any pre-existing path.
-#[cfg(unix)]
+/// Removes a run's attach endpoint, and its breadcrumb while it still names
+/// that endpoint, when dropped. The run drops it before releasing the session
+/// lock, and on every early exit. The endpoint is this run's own: its name
+/// derives from the run identity and binding refused any pre-existing one.
 struct AttachSocketCleanup {
     socket: PathBuf,
     session_dir: PathBuf,
 }
-#[cfg(not(unix))]
-type AttachSocketCleanup = std::convert::Infallible;
 
-#[cfg(unix)]
 impl Drop for AttachSocketCleanup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket);
+        crate::attach_endpoint::remove(&self.socket);
         if crate::attach_proto::read_breadcrumb(&self.session_dir).as_ref() == Some(&self.socket) {
             let _ = std::fs::remove_file(self.session_dir.join("a.sock.path"));
         }
     }
 }
 
-/// A PTY run's private attach socket, bound and published before the child is
-/// spawned (Unix only; the type is uninhabited elsewhere). The lifecycle guard
-/// owns it after spawn: starting the attach side moves the socket to the
-/// listener thread and keeps the cleanup, which removes the socket before the
-/// guard releases the session lock.
-#[cfg(unix)]
+/// A PTY run's private attach endpoint, bound and published before the child
+/// is spawned. The lifecycle guard owns it after spawn: starting the attach
+/// side moves the listener to its thread and keeps the cleanup, which removes
+/// the endpoint before the guard releases the session lock.
 struct AttachEndpoint {
-    socket: crate::attach_socket::BoundSocket,
+    socket: crate::attach_endpoint::BoundSocket,
     cleanup: AttachSocketCleanup,
 }
-#[cfg(not(unix))]
-type AttachEndpoint = std::convert::Infallible;
 
 /// Run the sidecar process. Called from the `_sidecar` subcommand.
 ///
@@ -972,7 +951,6 @@ impl LifecycleEvents {
 /// The non-lifecycle facts the sidecar appends. Only PTY runs (Unix) record
 /// the recording and control facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(unix), allow(dead_code))]
 enum Fact {
     CallbackFinished,
     RecordingStopped,
@@ -1096,7 +1074,6 @@ fn test_pty_read_delay() {
 }
 
 /// Forward pushed stdin for a PTY session through the single input writer.
-#[cfg(unix)]
 fn setup_pty_stdin_forwarding(
     session_dir: &Path,
     input: &PtyInput,
@@ -1120,15 +1097,6 @@ fn test_unlock_gate() {
     }
 }
 
-#[cfg(not(unix))]
-fn setup_pty_stdin_forwarding(
-    _session_dir: &Path,
-    input: &PtyInput,
-    _errors: &Arc<Mutex<Vec<String>>>,
-) -> io::Result<()> {
-    match *input {}
-}
-
 /// Each push connection claims the PTY as an agent for its duration and writes
 /// through the input writer, one acknowledged chunk at a time.
 ///
@@ -1145,7 +1113,6 @@ fn setup_pty_stdin_forwarding(
 /// how a complete frame ends. A frame waiting on a full PTY keeps the claim
 /// until the child reads it, or a takeover revokes it (PR #68 review,
 /// finding 6).
-#[cfg(unix)]
 fn forward_pty_stdin(
     transport: <Current as Platform>::StdinTransport,
     session_dir: &Path,
@@ -1209,7 +1176,6 @@ fn forward_pty_stdin(
 /// so the frame is queued behind it rather than dropped (PR #68 review,
 /// finding 2). A human at the terminal is never typed into, so a human holder
 /// refuses the frame, which is then discarded and reported as a run warning.
-#[cfg(unix)]
 fn claim_for_fifo(
     writer: &crate::pty_input::InputWriter,
     errors: &Mutex<Vec<String>>,
@@ -1448,9 +1414,8 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
     // the endpoint removes the socket and its breadcrumb: here if the spawn
     // fails, otherwise in the lifecycle guard before it releases the session
     // lock.
-    #[cfg(unix)]
     let attach = if meta.launch_spec().io_mode == IoMode::Pty {
-        match crate::attach_socket::bind_for_session(&session_root, session_dir, run_id) {
+        match crate::attach_endpoint::bind_for_session(&session_root, session_dir, run_id) {
             Ok(bound) => {
                 if let Some(tightened) = &bound.tightened_root {
                     meta.add_warning(tightened.to_string());
@@ -1475,8 +1440,6 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
     } else {
         None
     };
-    #[cfg(not(unix))]
-    let attach: Option<AttachEndpoint> = None;
 
     // Before the child exists, so nothing it orphans escapes the sidecar,
     // where a stop can find it.
@@ -1892,13 +1855,12 @@ fn capture_stream_with_tee(
     }
 }
 
-/// The PTY input the single writer drives: the master's write half, a dup used
-/// for window-size changes, and the recorder that records applied sizes and,
-/// with `record_input` (`start --record-input`), the input written.
-#[cfg(unix)]
-struct UnixPtyInput {
-    writer: crate::platform::unix::PtyWriter,
-    resize: Option<std::fs::File>,
+/// The PTY input the single writer drives: the terminal's input, its
+/// window size, and the recorder that records applied sizes and, with
+/// `record_input` (`start --record-input`), the input written.
+struct PtyDevice {
+    writer: crate::platform::PtyWriter,
+    resize: Option<crate::platform::PtyResize>,
     recorder: Option<Recorder>,
     record_input: bool,
     /// A file to create the first time the PTY refuses input as full
@@ -1910,7 +1872,6 @@ struct UnixPtyInput {
 /// input must be stuck on a full PTY learns that it is, rather than infer it
 /// from a forwarder that has not moved for a while, which load can fake.
 /// Release builds read no variable.
-#[cfg(unix)]
 fn pty_full_marker() -> Option<std::path::PathBuf> {
     if cfg!(debug_assertions) {
         std::env::var_os("TENDR_TEST_PTY_FULL_FILE").map(std::path::PathBuf::from)
@@ -1919,8 +1880,7 @@ fn pty_full_marker() -> Option<std::path::PathBuf> {
     }
 }
 
-#[cfg(unix)]
-impl crate::model::pty_control::PtyInputSink for UnixPtyInput {
+impl crate::model::pty_control::PtyInputSink for PtyDevice {
     fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let written = match &self.recorder {
             Some(recorder) if self.record_input => {
@@ -1937,17 +1897,16 @@ impl crate::model::pty_control::PtyInputSink for UnixPtyInput {
     }
 }
 
-#[cfg(unix)]
-impl crate::pty_input::WritablePty for UnixPtyInput {
+impl crate::pty_input::WritablePty for PtyDevice {
     fn wait_writable(&self, timeout: std::time::Duration) -> io::Result<bool> {
         self.writer.wait_writable(timeout)
     }
 
     fn resize(&self, size: crate::recording::Geometry, cause: crate::recording::ResizeCause) {
-        let Some(fd) = &self.resize else {
+        let Some(resize) = &self.resize else {
             return;
         };
-        let apply = || apply_pty_resize(fd, size);
+        let apply = || resize.apply(size);
         let _ = match &self.recorder {
             Some(recorder) => recorder.resize_applied(size, cause, apply),
             None => apply(),
@@ -1955,32 +1914,18 @@ impl crate::pty_input::WritablePty for UnixPtyInput {
     }
 
     fn size(&self) -> Option<crate::recording::Geometry> {
-        use std::os::unix::io::AsRawFd;
-        let fd = self.resize.as_ref()?;
-        let mut ws = libc::winsize {
-            ws_row: 0,
-            ws_col: 0,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: fd is a valid PTY master fd; TIOCGWINSZ fills a winsize.
-        if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) } == -1 {
-            return None;
-        }
-        crate::recording::Geometry::new(ws.ws_row, ws.ws_col)
+        self.resize.as_ref()?.size()
     }
 }
 
-/// A live attach-socket connection: a descriptor used only to shut the socket
+/// A live attach connection: a handle used only to shut the connection
 /// down, and how to retire it when a takeover supersedes it.
-#[cfg(unix)]
 struct Registered {
-    control: std::os::unix::net::UnixStream,
+    control: crate::attach_endpoint::Stream,
     retirement: Retirement,
 }
 
 /// How a superseded connection is retired.
-#[cfg(unix)]
 enum Retirement {
     /// An attach client: told with `MSG_RETIRED` through its framed writer
     /// (shared with its output sender), then shut down.
@@ -1998,11 +1943,9 @@ enum Retirement {
 /// Live attach connections by controller identity, so a takeover can retire
 /// exactly the superseded connection, and so the run's end can shut every
 /// connection down, watchers included.
-#[cfg(unix)]
 #[derive(Clone, Default)]
 struct ConnectionRegistry(Arc<Mutex<RegistryState>>);
 
-#[cfg(unix)]
 #[derive(Default)]
 struct RegistryState {
     live: std::collections::HashMap<crate::model::pty_control::HolderId, Registered>,
@@ -2010,7 +1953,6 @@ struct RegistryState {
     closed: bool,
 }
 
-#[cfg(unix)]
 impl ConnectionRegistry {
     /// Register a connection. Returns false, dropping `entry`, once the run has
     /// ended: the caller must reject the connection.
@@ -2068,14 +2010,12 @@ impl ConnectionRegistry {
 /// thread then stops, so nothing reaches the session paths after the
 /// terminal record, when they may belong to a replacement run (finding 3;
 /// invalid-states review, findings 1 and 5).
-#[cfg(unix)]
 struct PtyTeardown {
     registry: ConnectionRegistry,
     effects: RunEffects,
     sink: AttachSink,
 }
 
-#[cfg(unix)]
 impl PtyTeardown {
     fn run(&self) {
         flush_viewers(&self.sink, run_end_flush());
@@ -2083,19 +2023,15 @@ impl PtyTeardown {
         self.effects.flush_and_stop();
     }
 }
-#[cfg(not(unix))]
-type PtyTeardown = std::convert::Infallible;
 
 /// How long the run's end waits for its viewers to be sent the last of its
 /// output before it shuts their connections: a viewer that is not reading
 /// is cut off then, and gets no more.
-#[cfg(unix)]
 const RUN_END_FLUSH: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// [`RUN_END_FLUSH`]. Debug builds accept `TENDR_TEST_RUN_END_FLUSH_MS` so
 /// tests whose viewers must get the run's last output are not cut off by a
 /// loaded machine.
-#[cfg(unix)]
 fn run_end_flush() -> std::time::Duration {
     crate::test_timer::or_env("TENDR_TEST_RUN_END_FLUSH_MS", RUN_END_FLUSH)
 }
@@ -2105,7 +2041,6 @@ fn run_end_flush() -> std::time::Duration {
 /// up to `within` for every viewer installed now (the controller's and the
 /// watchers') to have been sent it all. Shutting a connection before then
 /// would cut its client off short of the run's last bytes.
-#[cfg(unix)]
 fn flush_viewers(sink: &AttachSink, within: std::time::Duration) {
     let (ring, cursors) = {
         let tee = lock(sink);
@@ -2123,7 +2058,6 @@ fn flush_viewers(sink: &AttachSink, within: std::time::Duration) {
 
 /// A change of who owns the PTY's input, with the controller epoch it
 /// concerns: the one granted, or the one released.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 enum ControlChange {
     /// A human took control.
@@ -2136,7 +2070,6 @@ enum ControlChange {
 }
 
 /// The `pty.control_changed` event's `trigger`.
-#[cfg(unix)]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ChangeTrigger {
@@ -2148,7 +2081,6 @@ enum ChangeTrigger {
     Detach,
 }
 
-#[cfg(unix)]
 impl ControlChange {
     fn owner(self) -> PtyControl {
         match self {
@@ -2177,7 +2109,6 @@ impl ControlChange {
 /// A side effect of a PTY run, for the session's event log and `meta.json`.
 /// The run's effects thread ([`RunEffects`]) is the only thread that writes
 /// them, so the teardown's flush orders every one before the terminal record.
-#[cfg(unix)]
 enum RunEffect {
     /// `pty.control_changed`, then the new owner published to the guard and
     /// patched into `meta.json`.
@@ -2197,7 +2128,6 @@ enum RunEffect {
     Flush(std::sync::mpsc::SyncSender<()>),
 }
 
-#[cfg(unix)]
 #[derive(serde::Serialize)]
 struct ControlChangedData {
     control: PtyControl,
@@ -2207,7 +2137,6 @@ struct ControlChangedData {
     epoch: u64,
 }
 
-#[cfg(unix)]
 #[derive(serde::Serialize)]
 struct InputRevokedData {
     kind: crate::model::pty_control::ControllerKind,
@@ -2215,7 +2144,6 @@ struct InputRevokedData {
     total: usize,
 }
 
-#[cfg(unix)]
 #[derive(serde::Serialize)]
 struct RecordingStoppedData {
     last_recorded_sequence: Option<u64>,
@@ -2226,12 +2154,10 @@ struct RecordingStoppedData {
 /// Records a PTY run's side effects on their own thread, in the order they
 /// were decided, so a slow or stalled state root never delays a takeover's
 /// acknowledgement, any PTY input step, or capture (PR #68 review, finding 3).
-#[cfg(unix)]
 struct RunEffects {
     tx: std::sync::mpsc::Sender<RunEffect>,
 }
 
-#[cfg(unix)]
 impl RunEffects {
     /// Start the thread. `control` is the live owner the guard folds into its
     /// whole-meta writes; this thread updates it.
@@ -2325,23 +2251,19 @@ impl RunEffects {
 /// Connections awaiting their first frame (a hello or a resume). Only the run
 /// owner can connect, so stalling them all locks only the owner out, and only
 /// for [`crate::attach_proto::HELLO_TIMEOUT`].
-#[cfg(unix)]
 const PENDING_CONNECTIONS: usize = 5;
 
 /// Attaches, takeovers, resumes and pushes. A retiring controller keeps its
 /// connection about 2.4 s (its retirement write plus
 /// [`TAKEOVER_RECORD_GRACE`]), so repeated takeovers need a cap.
-#[cfg(unix)]
 const CONTROLLER_CONNECTIONS: usize = 8;
 
 /// A capped count of connections of one kind.
-#[cfg(unix)]
 struct Pool {
     in_use: std::sync::atomic::AtomicUsize,
     cap: usize,
 }
 
-#[cfg(unix)]
 impl Pool {
     fn new(cap: usize) -> Arc<Self> {
         Arc::new(Self {
@@ -2362,10 +2284,8 @@ impl Pool {
 }
 
 /// One taken slot of a [`Pool`], returned when dropped.
-#[cfg(unix)]
 struct Slot(Arc<Pool>);
 
-#[cfg(unix)]
 impl Drop for Slot {
     fn drop(&mut self) {
         self.0.in_use.fetch_sub(1, Ordering::SeqCst);
@@ -2375,7 +2295,6 @@ impl Drop for Slot {
 /// The admission pools of one run's attach socket. Every connection holds a
 /// pending slot until its first frame is read, then gives it back before
 /// taking the slot of the mode it asked for.
-#[cfg(unix)]
 #[derive(Clone)]
 struct AttachPools {
     pending: Arc<Pool>,
@@ -2383,7 +2302,6 @@ struct AttachPools {
     watchers: Arc<Pool>,
 }
 
-#[cfg(unix)]
 impl Default for AttachPools {
     fn default() -> Self {
         Self {
@@ -2395,8 +2313,7 @@ impl Default for AttachPools {
 }
 
 /// Refuse a connection for which its pool has no free slot.
-#[cfg(unix)]
-fn reject_full(stream: &mut std::os::unix::net::UnixStream) {
+fn reject_full(stream: &mut crate::attach_endpoint::Stream) {
     reject_connection(stream, RejectClass::Runtime, "too many attach connections");
 }
 
@@ -2404,7 +2321,6 @@ fn reject_full(stream: &mut std::os::unix::net::UnixStream) {
 /// connection registry is touched there; the event log and `meta.json` are
 /// written by [`RunEffects`]. Nothing here checks whether the run has ended:
 /// an effect sent after the teardown's flush is never recorded.
-#[cfg(unix)]
 struct SidecarControlHooks {
     effects: std::sync::mpsc::Sender<RunEffect>,
     registry: ConnectionRegistry,
@@ -2412,7 +2328,6 @@ struct SidecarControlHooks {
     retire_waits: RetireWaits,
 }
 
-#[cfg(unix)]
 impl SidecarControlHooks {
     /// Queue an effect. Never blocks: the queue is unbounded, and once the
     /// effects thread has stopped the send fails and the effect is dropped.
@@ -2421,7 +2336,6 @@ impl SidecarControlHooks {
     }
 }
 
-#[cfg(unix)]
 impl crate::pty_input::ControlHooks for SidecarControlHooks {
     fn human_control(
         &mut self,
@@ -2494,13 +2408,11 @@ impl crate::pty_input::ControlHooks for SidecarControlHooks {
 
 /// How long retiring a client that may not have been told waits for the
 /// takeover to reach the event log before ending its connection.
-#[cfg(unix)]
 const TAKEOVER_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How [`retire_connection`] waits: for the framed writer, then for the
 /// takeover's record. Always the default outside tests; a test lengthens
 /// them so that load cannot end either wait.
-#[cfg(unix)]
 #[derive(Clone)]
 struct RetireWaits {
     /// Attempts to take the framed writer, 10 ms apart.
@@ -2512,7 +2424,6 @@ struct RetireWaits {
     contended: Option<std::sync::mpsc::Sender<()>>,
 }
 
-#[cfg(unix)]
 impl Default for RetireWaits {
     fn default() -> Self {
         Self {
@@ -2549,12 +2460,11 @@ impl Default for RetireWaits {
 /// flight at the first attempt, even if `MSG_RETIRED` was then written: that
 /// write may have ended part-way through a frame, and the client cannot read
 /// a message that follows a torn frame.
-#[cfg(unix)]
 fn retire_connection(
     holder: crate::model::pty_control::HolderId,
     epoch: crate::model::pty_control::ControllerEpoch,
     conn: &Mutex<Box<dyn Write + Send>>,
-    control: &std::os::unix::net::UnixStream,
+    control: &crate::attach_endpoint::Stream,
     sink: &AttachSink,
     recorded: &std::sync::mpsc::Receiver<()>,
     waits: &RetireWaits,
@@ -2600,9 +2510,8 @@ fn retire_connection(
 ///
 /// A push that stops early reports how far it got. A vanished client gets no
 /// report; its connection is simply gone.
-#[cfg(unix)]
 fn handle_push_connection(
-    mut stream: std::os::unix::net::UnixStream,
+    mut stream: crate::attach_endpoint::Stream,
     writer: &crate::pty_input::InputWriter,
     registry: &ConnectionRegistry,
 ) {
@@ -2635,7 +2544,7 @@ fn handle_push_connection(
         }
     };
     // The client vanished or broke the protocol: cancel its input.
-    let gone = |stream: &std::os::unix::net::UnixStream, handle| {
+    let gone = |stream: &crate::attach_endpoint::Stream, handle| {
         registry.remove(holder);
         let _ = stream.shutdown(std::net::Shutdown::Both);
         writer.disconnect(handle);
@@ -2710,7 +2619,6 @@ fn handle_push_connection(
 }
 
 /// How waiting for one push write ended.
-#[cfg(unix)]
 enum PushWrite {
     Done(crate::model::pty_control::InputOutcome),
     WriterGone,
@@ -2720,10 +2628,9 @@ enum PushWrite {
 /// Wait for a push write's outcome, watching for the client to vanish. On
 /// [`PushWrite::ClientGone`] the caller disconnects the handle, which cancels
 /// the write, so the wait cannot outlast the PTY accepting nothing.
-#[cfg(unix)]
 fn await_push_write(
     outcome: &std::sync::mpsc::Receiver<crate::model::pty_control::InputOutcome>,
-    stream: &std::os::unix::net::UnixStream,
+    stream: &crate::attach_endpoint::Stream,
     revoked: &AtomicBool,
 ) -> PushWrite {
     use std::sync::mpsc::RecvTimeoutError;
@@ -2736,7 +2643,7 @@ fn await_push_write(
             // (NotAuthorized) is what ends the wait, not a hang-up.
             Err(RecvTimeoutError::Timeout)
                 if !revoked.load(Ordering::SeqCst)
-                    && crate::attach_socket::peer_hung_up(stream) =>
+                    && crate::attach_endpoint::peer_hung_up(stream) =>
             {
                 return PushWrite::ClientGone;
             }
@@ -2746,7 +2653,6 @@ fn await_push_write(
 }
 
 /// Where an installed viewer's output starts.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Placement {
     /// The offset of the first output byte the viewer is sent.
@@ -2757,7 +2663,6 @@ struct Placement {
 }
 
 /// Which of the tee's viewers a connection installs.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seat {
     /// The controller's, replacing its predecessor's.
@@ -2780,7 +2685,6 @@ enum Seat {
 /// registry synchronously (on the writer thread, before the successor is
 /// even granted control), a retired connection can never install its viewer
 /// over its successor's.
-#[cfg(unix)]
 fn install_viewer(
     registry: &ConnectionRegistry,
     sink: &AttachSink,
@@ -2839,9 +2743,8 @@ fn install_viewer(
 }
 
 /// Accept attach connections for the run `run_id` until the listener closes.
-#[cfg(unix)]
 fn run_attach_listener(
-    listener: &std::os::unix::net::UnixListener,
+    listener: &crate::attach_endpoint::Listener,
     run_id: RunId,
     writer: &crate::pty_input::InputWriter,
     registry: &ConnectionRegistry,
@@ -2854,7 +2757,7 @@ fn run_attach_listener(
         };
         // Only the run owner's own processes may attach. The socket directory
         // is already owner-only; this checks the connecting process itself.
-        if crate::attach_socket::verify_peer(&stream).is_err() {
+        if crate::attach_endpoint::verify_peer(&stream).is_err() {
             reject_connection(&mut stream, RejectClass::Identity, "peer identity rejected");
             continue;
         }
@@ -2874,9 +2777,8 @@ fn run_attach_listener(
     }
 }
 
-#[cfg(unix)]
 fn reject_connection(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut crate::attach_endpoint::Stream,
     class: RejectClass,
     reason: &str,
 ) {
@@ -2891,9 +2793,8 @@ fn reject_connection(
 }
 
 /// Refuse a connection whose claim or takeover the input writer turned down.
-#[cfg(unix)]
 fn reject_request(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut crate::attach_endpoint::Stream,
     error: &crate::pty_input::RequestError,
 ) {
     reject_connection(stream, request_reject_class(error), &error.to_string());
@@ -2902,7 +2803,6 @@ fn reject_request(
 /// A refused claim or takeover's class: every control refusal (a holder, a
 /// stale handle, an exhausted epoch) is a control conflict; a writer that has
 /// stopped is a runtime failure.
-#[cfg(unix)]
 fn request_reject_class(error: &crate::pty_input::RequestError) -> RejectClass {
     use crate::pty_input::RequestError;
     match error {
@@ -2913,9 +2813,8 @@ fn request_reject_class(error: &crate::pty_input::RequestError) -> RejectClass {
 
 /// Refuse a resume the input writer turned down, saying why in the words of
 /// the resume rule.
-#[cfg(unix)]
 fn reject_resume(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut crate::attach_endpoint::Stream,
     error: &crate::pty_input::RequestError,
 ) {
     use crate::model::pty_control::ControlError;
@@ -2937,7 +2836,6 @@ fn reject_resume(
 }
 
 /// What a viewer's connection asked for in its first frame.
-#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum Ask {
     Attach,
@@ -2965,9 +2863,8 @@ enum Ask {
 /// frame is read; the connection then holds a slot of the pool its mode
 /// belongs to in `pools` until it ends: a watcher's, or else a
 /// controller's.
-#[cfg(unix)]
 fn handle_attach_connection(
-    mut stream: std::os::unix::net::UnixStream,
+    mut stream: crate::attach_endpoint::Stream,
     run_id: RunId,
     writer: &crate::pty_input::InputWriter,
     registry: &ConnectionRegistry,
@@ -2982,7 +2879,7 @@ fn handle_attach_connection(
 
     // One overall deadline for the whole hello: a client trickling bytes cannot
     // hold a connection slot open by keeping each individual read short.
-    let hello = read_frame(&mut crate::attach_socket::DeadlineReader {
+    let hello = read_frame(&mut crate::attach_endpoint::DeadlineReader {
         stream: &stream,
         deadline: std::time::Instant::now() + hello_timeout(),
     });
@@ -3184,7 +3081,7 @@ fn handle_attach_connection(
                 Ok(Frame::Data(payload)) => {
                     // A full input queue must not hide a client that has left.
                     let queued = writer.write_nowait_unless(&handle, payload, || {
-                        crate::attach_socket::peer_hung_up(&stream)
+                        crate::attach_endpoint::peer_hung_up(&stream)
                     });
                     if !queued {
                         break;
@@ -3225,7 +3122,6 @@ fn handle_attach_connection(
 /// [`crate::attach_proto::HELLO_TIMEOUT`]. Debug builds accept
 /// `TENDR_TEST_HELLO_TIMEOUT_MS` so tests can hold hello-less connections
 /// pending however slow the machine.
-#[cfg(unix)]
 fn hello_timeout() -> std::time::Duration {
     crate::test_timer::or_env(
         "TENDR_TEST_HELLO_TIMEOUT_MS",
@@ -3235,7 +3131,6 @@ fn hello_timeout() -> std::time::Duration {
 
 /// How long a detaching controller's queued keystrokes may take to be
 /// written before the rest is revoked and control released.
-#[cfg(unix)]
 const DETACH_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One read-only viewer of the run `run_id`, registered as `holder`: told
@@ -3254,9 +3149,8 @@ const DETACH_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(1
 /// It never reaches the input writer: it asks for no control, so no
 /// control event records it and no takeover retires it, and its input,
 /// resizes and repaints are read and dropped.
-#[cfg(unix)]
 fn handle_watch_connection(
-    mut stream: std::os::unix::net::UnixStream,
+    mut stream: crate::attach_endpoint::Stream,
     run_id: RunId,
     version: crate::attach_proto::Version,
     resume: Option<u64>,
@@ -3346,7 +3240,6 @@ fn handle_watch_connection(
 /// Shrink the PTY by one row for `handle`'s repaint, if it applies, and restore
 /// it from another thread once the child's output goes quiet, so this
 /// connection's input is not held up meanwhile.
-#[cfg(unix)]
 fn start_repaint(
     writer: &crate::pty_input::InputWriter,
     sink: &AttachSink,
@@ -3368,7 +3261,6 @@ fn start_repaint(
 
 /// Wait until the child has written nothing for `quiet`, counted from now at
 /// the earliest, or until `max` has passed.
-#[cfg(unix)]
 fn wait_for_quiet_output(sink: &AttachSink, quiet: std::time::Duration, max: std::time::Duration) {
     use std::time::{Duration, Instant};
     let start = Instant::now();
@@ -3385,7 +3277,6 @@ fn wait_for_quiet_output(sink: &AttachSink, quiet: std::time::Duration, max: std
 /// When a wait for quiet output that began at `start` ends, given the last
 /// output so far: `quiet` after that output (output from before `start`
 /// counts as at `start`), but never later than `max` after `start`.
-#[cfg(unix)]
 fn quiet_output_deadline(
     start: std::time::Instant,
     last_output: Option<std::time::Instant>,
@@ -3394,23 +3285,6 @@ fn quiet_output_deadline(
 ) -> std::time::Instant {
     let last = last_output.map_or(start, |t| t.max(start));
     (last + quiet).min(start + max)
-}
-
-#[cfg(unix)]
-fn apply_pty_resize(fd: &std::fs::File, size: crate::recording::Geometry) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let ws = libc::winsize {
-        ws_row: size.rows(),
-        ws_col: size.cols(),
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: fd is a valid PTY master fd. TIOCSWINSZ with a valid winsize
-    // pointer is safe on any terminal fd.
-    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Serializes the sidecar's `meta.json` writes: the patches the effects thread
@@ -3469,7 +3343,6 @@ impl PtyRecordingRun {
 /// recordable). A stop is queued on the run's effects channel, which appends
 /// it as a `recording.stopped` event and writes it to `meta.json`; the
 /// recorder never touches the session paths itself.
-#[cfg(unix)]
 fn start_pty_recording(
     session_dir: &Path,
     run_id: RunId,
@@ -3519,7 +3392,6 @@ fn start_pty_recording(
 
 /// Recording limits. Debug builds accept `TENDR_TEST_RECORDING_MAX_BYTES` so
 /// tests can reach the size limit.
-#[cfg(unix)]
 fn recorder_limits() -> crate::recorder::RecorderLimits {
     let mut limits = crate::recorder::RecorderLimits::default();
     if cfg!(debug_assertions) {
