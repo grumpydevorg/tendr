@@ -39,10 +39,10 @@ pub fn cmd_attach(
         };
         let mode = mode(takeover, read_only);
         // A local controller does not reconnect, so it has no use for
-        // offsets. A watcher speaks the newest version, to be told where the
-        // run's output ends, and so whether it was cut off.
+        // offsets. A watcher speaks the newest version it needs, to be told
+        // where the run's output ends, and so whether it was cut off.
         let version = if read_only {
-            attach_proto::Version::LATEST
+            attach_proto::Version::WATCH_LATEST
         } else {
             attach_proto::Version::V1
         };
@@ -874,17 +874,25 @@ pub(super) fn connect(
 /// What the sidecar answered a resume: a controller's control regained at a
 /// new epoch (a watcher's answer is at epoch zero, which names no control),
 /// and where the output goes on from.
+///
+/// From version 4 a controller's answer also says how many bytes of input
+/// the connection it resumes wrote to the session's terminal
+/// (`input_written`); `None` from a session or remote before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Resumption {
     /// The output follows from `point.offset`, the offset asked for, with
     /// no mode replay: the terminal already has the modes.
-    Resumed(attach_proto::ResumePoint),
+    Resumed {
+        point: attach_proto::ResumePoint,
+        input_written: Option<u64>,
+    },
     /// The output from the offset asked for is gone: the session holds only
     /// `oldest` up to `point.offset`, its head. The mode replay follows,
     /// unstamped, then the output from the head.
     Gone {
         point: attach_proto::ResumePoint,
         oldest: u64,
+        input_written: Option<u64>,
     },
 }
 
@@ -892,7 +900,15 @@ impl Resumption {
     /// The epoch, and the offset the stamped output starts at.
     pub(super) fn point(self) -> attach_proto::ResumePoint {
         match self {
-            Self::Resumed(point) | Self::Gone { point, .. } => point,
+            Self::Resumed { point, .. } | Self::Gone { point, .. } => point,
+        }
+    }
+
+    /// How many bytes of the lost connection's input the session wrote, if
+    /// it said (version 4).
+    pub(super) fn input_written(self) -> Option<u64> {
+        match self {
+            Self::Resumed { input_written, .. } | Self::Gone { input_written, .. } => input_written,
         }
     }
 
@@ -900,8 +916,22 @@ impl Resumption {
     #[cfg(unix)]
     fn frame(self) -> Frame {
         match self {
-            Self::Resumed(point) => Frame::Resumed(point),
-            Self::Gone { point, oldest } => Frame::Gone { point, oldest },
+            Self::Resumed {
+                point,
+                input_written,
+            } => Frame::Resumed {
+                point,
+                input_written,
+            },
+            Self::Gone {
+                point,
+                oldest,
+                input_written,
+            } => Frame::Gone {
+                point,
+                oldest,
+                input_written,
+            },
         }
     }
 }
@@ -1065,24 +1095,36 @@ fn hello_reply(
 /// a watcher's names no control, so only its run and offsets count. A
 /// resumed one must be at the offset asked for, a gone one name a span that
 /// starts after it (an offset past the head means this client's count is
-/// broken). Otherwise as [`hello_reply`].
+/// broken). A watcher sent no input, so its answer must report none.
+/// Otherwise as [`hello_reply`].
 fn resume_reply(reply: Result<Frame, FrameError>, asked: Point) -> anyhow::Result<Resumption> {
-    let ours = |point: attach_proto::ResumePoint| match asked {
+    let ours = |point: attach_proto::ResumePoint, input_written: Option<u64>| match asked {
         Point::Control(asked) => point.run_id == asked.run_id && point.epoch > asked.epoch,
-        Point::Watch(asked) => point.run_id == asked.run_id,
+        Point::Watch(asked) => point.run_id == asked.run_id && input_written.is_none(),
     };
     match reply {
-        Ok(Frame::Resumed(point)) if ours(point) && point.offset == asked.offset() => {
-            Ok(Resumption::Resumed(point))
+        Ok(Frame::Resumed {
+            point,
+            input_written,
+        }) if ours(point, input_written) && point.offset == asked.offset() => {
+            Ok(Resumption::Resumed {
+                point,
+                input_written,
+            })
         }
-        Ok(Frame::Gone { point, oldest }) if ours(point) && asked.offset() < oldest => {
-            Ok(Resumption::Gone { point, oldest })
-        }
-        Ok(answer @ (Frame::Resumed(_) | Frame::Gone { .. })) => {
-            Err(PtyExitCode::Protocol.error(anyhow::anyhow!(
+        Ok(Frame::Gone {
+            point,
+            oldest,
+            input_written,
+        }) if ours(point, input_written) && asked.offset() < oldest => Ok(Resumption::Gone {
+            point,
+            oldest,
+            input_written,
+        }),
+        Ok(answer @ (Frame::Resumed { .. } | Frame::Gone { .. })) => Err(PtyExitCode::Protocol
+            .error(anyhow::anyhow!(
                 "the session's answer {answer:?} does not fit the resume from {asked:?}"
-            )))
-        }
+            ))),
         reply => reply_failure(reply, "resume"),
     }
 }
@@ -1397,10 +1439,22 @@ mod tests {
             epoch: ControllerEpoch::new(5),
             ..asked
         };
-        assert_eq!(
-            resume_reply(Ok(Frame::Resumed(resumed)), Point::Control(asked)).unwrap(),
-            Resumption::Resumed(resumed)
-        );
+        for input_written in [None, Some(7)] {
+            assert_eq!(
+                resume_reply(
+                    Ok(Frame::Resumed {
+                        point: resumed,
+                        input_written
+                    }),
+                    Point::Control(asked)
+                )
+                .unwrap(),
+                Resumption::Resumed {
+                    point: resumed,
+                    input_written
+                }
+            );
+        }
         let head = ResumePoint {
             offset: 500,
             ..resumed
@@ -1408,28 +1462,35 @@ mod tests {
         let gone = Frame::Gone {
             point: head,
             oldest: 101,
+            input_written: Some(3),
         };
         assert_eq!(
             resume_reply(Ok(gone), Point::Control(asked)).unwrap(),
             Resumption::Gone {
                 point: head,
-                oldest: 101
+                oldest: 101,
+                input_written: Some(3)
             }
         );
 
+        let resumed_at = |point| Frame::Resumed {
+            point,
+            input_written: None,
+        };
         for wrong in [
-            Frame::Resumed(ResumePoint {
+            resumed_at(ResumePoint {
                 run_id: RunId::new(),
                 ..resumed
             }),
-            Frame::Resumed(asked),
-            Frame::Resumed(ResumePoint {
+            resumed_at(asked),
+            resumed_at(ResumePoint {
                 offset: 99,
                 ..resumed
             }),
             Frame::Gone {
                 point: head,
                 oldest: 100,
+                input_written: None,
             },
             Frame::Gone {
                 point: ResumePoint {
@@ -1437,6 +1498,7 @@ mod tests {
                     ..resumed
                 },
                 oldest: 10,
+                input_written: None,
             },
             Frame::Accepted(ControllerEpoch::new(4)),
             Frame::AcceptedV2(head),
@@ -1466,9 +1528,16 @@ mod tests {
             epoch: ControllerEpoch::ZERO,
             offset: 100,
         };
+        let resumed_at = |point| Frame::Resumed {
+            point,
+            input_written: None,
+        };
         assert_eq!(
-            reply(Frame::Resumed(resumed)).unwrap(),
-            Resumption::Resumed(resumed)
+            reply(resumed_at(resumed)).unwrap(),
+            Resumption::Resumed {
+                point: resumed,
+                input_written: None
+            }
         );
         let head = ResumePoint {
             offset: 500,
@@ -1477,6 +1546,7 @@ mod tests {
         let gone = reply(Frame::Gone {
             point: head,
             oldest: 101,
+            input_written: None,
         })
         .unwrap();
         assert_eq!(
@@ -1488,17 +1558,23 @@ mod tests {
         );
 
         for wrong in [
-            Frame::Resumed(ResumePoint {
+            resumed_at(ResumePoint {
                 run_id: RunId::new(),
                 ..resumed
             }),
-            Frame::Resumed(ResumePoint {
+            resumed_at(ResumePoint {
                 offset: 99,
                 ..resumed
             }),
+            // It sent no input, so none can have been written.
+            Frame::Resumed {
+                point: resumed,
+                input_written: Some(0),
+            },
             Frame::Gone {
                 point: head,
                 oldest: 100,
+                input_written: None,
             },
             Frame::Watching(asked),
             Frame::Accepted(ControllerEpoch::new(4)),

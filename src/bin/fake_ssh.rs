@@ -300,13 +300,16 @@ fn forward(argv: &[String]) -> ! {
 /// The steps:
 ///
 /// ```text
-/// answer         accept it: `AcceptedV2` at epoch 1 and offset 0 of a new
+/// answer [<w>]   accept it: `AcceptedV2` at epoch 1 and offset 0 of a new
 ///                run for a hello, `Watching` at offset 0 for a watch, and
 ///                `Resumed` at the offset asked for, for a resume: at the
-///                next epoch, or at epoch zero for a watcher's
-/// gone <n>       answer a resume `Gone`, at the epoch `answer` gives: the
+///                next epoch, or at epoch zero for a watcher's. With <w>, a
+///                resume's answer is version 4's: the session wrote <w>
+///                bytes of the lost connection's input
+/// gone <n> [<w>] answer a resume `Gone`, at the epoch `answer` gives: the
 ///                head is <n> (at least 1) bytes past the offset asked for,
-///                of which the session still holds the last n - 1
+///                of which the session still holds the last n - 1; <w> as
+///                for `answer`
 /// output <text>  the session's output (`\n` is a newline), stamped from
 ///                the answer's offset, as the bridge sends it in version 2
 /// output-hex <hex>
@@ -410,6 +413,9 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
         let _ = attach_proto::write_frame(&mut stdout, &frame).and_then(|()| stdout.flush());
     };
     let mut log: Option<std::fs::File> = None;
+    let written = |value: &str| -> Option<u64> {
+        (!value.is_empty()).then(|| value.parse().expect("fake ssh: bytes of input written"))
+    };
     for line in lines {
         let (first_name, step) = line
             .split_once(' ')
@@ -427,17 +433,22 @@ fn play(argv: &[String], lines: Vec<&str>) -> ! {
                 }),
                 _ => {
                     point.epoch = answered(point.epoch);
-                    Frame::Resumed(point)
+                    Frame::Resumed {
+                        point,
+                        input_written: written(value),
+                    }
                 }
             }),
             "gone" => {
-                let skipped: u64 = value.parse().expect("fake ssh: gone <n>");
+                let (skipped, input) = value.split_once(' ').unwrap_or((value, ""));
+                let skipped: u64 = skipped.parse().expect("fake ssh: gone <n>");
                 let asked = point.offset;
                 point.epoch = answered(point.epoch);
                 point.offset = asked + skipped;
                 send(Frame::Gone {
                     point,
                     oldest: asked + 1,
+                    input_written: written(input),
                 });
             }
             "output" | "output-hex" => {

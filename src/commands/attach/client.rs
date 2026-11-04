@@ -301,11 +301,15 @@ pub(super) fn relay(
                     };
                     match (after_reader(end, resumable, takeover), host) {
                         (None, Some(host)) => {
+                            // Final: only this thread queues keystrokes, and
+                            // from here it discards them.
+                            let sent = outgoing.outbox.queued();
                             outgoing.close();
                             Phase::Reconnecting(reconnect::Job::start(
                                 *host,
                                 Arc::clone(&screen),
                                 Arc::clone(&status),
+                                sent,
                             ))
                         }
                         // A local socket has no link to lose: its close is
@@ -902,6 +906,10 @@ struct OutboxState {
     controls: VecDeque<Frame>,
     data: VecDeque<Vec<u8>>,
     data_bytes: usize,
+    /// Every keystroke byte queued for this connection, in the order it goes
+    /// out: what the escape parser forwarded, not what was typed. A resume
+    /// learns how many of them the session wrote.
+    queued: u64,
     sending_control: bool,
     /// A detach waits to be sent, once the input queued before it is.
     detach: bool,
@@ -938,6 +946,7 @@ impl Outbox {
             return false;
         }
         state.data_bytes += bytes.len();
+        state.queued += bytes.len() as u64;
         state.data.push_back(bytes);
         drop(state);
         self.changed.notify_all();
@@ -1028,6 +1037,12 @@ impl Outbox {
     pub(super) fn close(&self) {
         self.lock().closed = true;
         self.changed.notify_all();
+    }
+
+    /// The keystroke bytes queued so far ([`OutboxState::queued`]): those
+    /// sent, then those still waiting, which a lost connection never sends.
+    fn queued(&self) -> u64 {
+        self.lock().queued
     }
 }
 

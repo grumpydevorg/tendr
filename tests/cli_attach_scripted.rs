@@ -463,6 +463,131 @@ fn a_scripted_resume_that_is_gone_says_what_was_missed() {
     assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
 }
 
+/// The notice a resume answered in version 4 gives, for a connection that
+/// was sent `sent` keystroke bytes of which the session wrote `written`.
+fn input_notice(sent: u64, written: u64) -> String {
+    format!(
+        "tendr: reconnected; of the {sent} bytes of input sent before the connection was lost, \
+         {written} reached the session and {} did not",
+        sent - written
+    )
+}
+
+/// A remote that, once the keystrokes `typed` (hex) have arrived, drops the
+/// link, and answers the resume with `answer` (a script step), then `two`.
+fn drops_after_typing(typed: &str, answer: &str) -> Remote {
+    Remote::new(&format!(
+        "hello answer\n\
+         hello await Repaint\n\
+         hello output one\n\
+         hello await-typed {typed}\n\
+         hello drop\n\
+         resume log {{log}}\n\
+         resume {answer}\n\
+         resume output two\n\
+         resume drain"
+    ))
+}
+
+/// A resume answered in version 4 says how many of the keystroke bytes the
+/// lost connection sent were written: the client says how many reached the
+/// session and how many did not, on the screen as it resumes and on stderr
+/// once the terminal is restored, and sends none of them again.
+#[test]
+fn a_resume_says_how_much_of_the_input_sent_before_the_drop_arrived() {
+    let root = Home::new();
+    let remote = drops_after_typing("616263", "answer 2").sends_its_detach();
+    let mut client = remote.attach(&root);
+    client.wait_screen(&["one"]);
+    client.type_bytes(b"abc");
+    let notice = input_notice(3, 2);
+    client.wait_screen(&[&notice, "two"]);
+    client.type_bytes(DETACH);
+    assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+    assert!(client.stderr().contains(&notice), "{}", client.stderr());
+    let [resize, repaint] = greeting();
+    assert_eq!(
+        remote.frames()[1..],
+        debug(&[resize, repaint, Frame::Detach]),
+        "nothing typed before the drop is sent again"
+    );
+}
+
+/// What counts is what the escape parser sent, not what was typed: a
+/// doubled `Ctrl-\` goes out as one byte, and a prefix still held when the
+/// link drops was never sent. That prefix completes the detach after the
+/// resume.
+#[test]
+fn the_input_report_counts_what_the_escape_parser_sent() {
+    let root = Home::new();
+    let remote = drops_after_typing("611c62", "answer 3").sends_its_detach();
+    let mut client = remote.attach(&root);
+    client.wait_screen(&["one"]);
+    client.type_bytes(b"a\x1c\x1cb\x1c");
+    client.wait_screen(&[&input_notice(3, 3), "two"]);
+    client.type_bytes(b"d");
+    assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+    let [resize, repaint] = greeting();
+    assert_eq!(
+        remote.frames()[1..],
+        debug(&[resize, repaint, Frame::Detach])
+    );
+}
+
+/// A remote, or a session, from before version 4 answers the resume with no
+/// report on the input: the client says nothing about it, as before, and
+/// still asks for version 4 in the request.
+#[test]
+fn a_resume_without_an_input_report_says_nothing_of_the_input() {
+    let root = Home::new();
+    let dir = TempDir::new().unwrap();
+    let request = dir.path().join("request");
+    let remote = Remote::new(&format!(
+        "hello request {}\n\
+         hello answer\n\
+         hello await Repaint\n\
+         hello output one\n\
+         hello await-typed 616263\n\
+         hello drop\n\
+         resume answer\n\
+         resume output two\n\
+         resume drain",
+        request.display()
+    ))
+    .sends_its_detach();
+    let mut client = remote.attach(&root);
+    client.wait_screen(&["one"]);
+    client.type_bytes(b"abc");
+    client.wait_screen(&["two"]);
+    client.type_bytes(DETACH);
+    assert_eq!(client.wait_exit(), 0, "{}", client.stderr());
+    for said in [client.screen(), client.stderr()] {
+        assert!(!said.contains("bytes of input"), "{said:?}");
+    }
+    let sent = std::fs::read(&request).unwrap();
+    let len = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
+    let json: serde_json::Value = serde_json::from_slice(&sent[4..4 + len]).unwrap();
+    assert_eq!(json["params"]["protocol"], 4, "{json}");
+}
+
+/// A session that claims more of the lost connection's input written than
+/// it was sent has a broken count: a protocol failure (80).
+#[test]
+fn an_input_report_past_what_was_sent_exits_80() {
+    let root = Home::new();
+    let remote = drops_after_typing("616263", "answer 4");
+    let mut client = remote.attach(&root);
+    client.wait_screen(&["one"]);
+    client.type_bytes(b"abc");
+    assert_eq!(client.wait_exit(), 80, "{}", client.stderr());
+    assert!(
+        client.stderr().contains("4 bytes of input written"),
+        "{}",
+        client.stderr()
+    );
+    assert!(!client.screen().contains("two"));
+}
+
 /// A controller whose link drops, and whose reconnect's first dial then
 /// ends with exit 1 before the remote says hello, with no exit trailer: the
 /// remote, after `one`, waits for a typed `z`, then drops the link, and the
