@@ -1192,6 +1192,28 @@ fn claim_for_fifo(
     }
 }
 
+/// How long [`take_session_lock`] retries a held session lock.
+const LOCK_PROBE_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Take the session lock for this sidecar. Commands that ask whether a
+/// sidecar is alive (`session::is_locked`: `status`, `kill`, `start`,
+/// `prune`) take the lock themselves and drop it at once, and the sidecar's
+/// own take is two steps (create the lock file, then lock it), so such a
+/// probe can land in between. Its hold lasts one call, so a lock still held
+/// after [`LOCK_PROBE_GRACE`] is another sidecar's, and the start fails as
+/// before.
+fn take_session_lock(session: &SessionDir) -> Result<LockGuard, session::SessionError> {
+    let deadline = std::time::Instant::now() + LOCK_PROBE_GRACE;
+    loop {
+        match LockGuard::try_acquire(session) {
+            Err(session::SessionError::Locked(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            taken => return taken,
+        }
+    }
+}
+
 fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Result<()> {
     // --- Setup: lock, read spec, create meta ---
     let sidecar_identity = Current::self_identity()?;
@@ -1218,7 +1240,7 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
     let session_root = SessionRoot::new(root.to_path_buf());
     let session = session::open_raw(&session_root, &namespace, &session_name)?;
 
-    let lock = LockGuard::try_acquire(&session)?;
+    let lock = take_session_lock(&session)?;
 
     // Read launch spec
     let spec_path = session_dir.join("launch_spec.json");
@@ -4675,5 +4697,30 @@ mod tests {
             after_detach.pty().unwrap().control,
             PtyControl::AgentControl
         );
+    }
+}
+
+#[cfg(test)]
+mod take_session_lock_tests {
+    use super::*;
+    use crate::model::ids::{Namespace, SessionName};
+
+    /// A hold that outlasts the grace is another sidecar's: the start still
+    /// fails. (The grace itself is not tested by timing: a probe's hold ends
+    /// within its one call, far inside it.)
+    #[test]
+    fn a_lasting_hold_still_fails_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session::create(
+            &SessionRoot::new(dir.path().to_path_buf()),
+            &Namespace::new("default").unwrap(),
+            &SessionName::new("s").unwrap(),
+        )
+        .unwrap();
+        let _other = LockGuard::try_acquire(&session).unwrap();
+        assert!(matches!(
+            take_session_lock(&session),
+            Err(session::SessionError::Locked(_))
+        ));
     }
 }

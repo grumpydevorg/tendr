@@ -30,10 +30,10 @@ fn signal_kill_request(
     Ok(None)
 }
 
-/// How many 100 ms polls [`signal_kill_request`] makes: `default`, or in
-/// debug builds `TENDR_TEST_KILL_WAIT_MS` worth, so tests whose sidecar must
-/// record the kill itself are not sent to the direct kill by a loaded
-/// machine; release builds ignore it.
+/// How many 100 ms polls [`signal_kill_request`] and [`await_record`] make:
+/// `default`, or in debug builds `TENDR_TEST_KILL_WAIT_MS` worth, so tests
+/// whose sidecar must record the kill itself are not sent to the direct kill
+/// by a loaded machine; release builds ignore it.
 fn kill_wait_polls(default: u32) -> u32 {
     if cfg!(debug_assertions) {
         if let Some(ms) = std::env::var("TENDR_TEST_KILL_WAIT_MS")
@@ -46,9 +46,55 @@ fn kill_wait_polls(default: u32) -> u32 {
     default
 }
 
+/// Whether a sidecar holds `session` but has not recorded its run yet: a
+/// sidecar takes the session lock first and writes `meta.json` only once the
+/// child is spawned (or at `Starting`, for a run with `--after`). Such a
+/// session is starting, not orphaned: its directory is the sidecar's. A lock
+/// that cannot be probed counts as held, so an error never lets the orphan
+/// cleanup remove a live sidecar's directory.
+pub(crate) fn is_unrecorded(session: &SessionDir) -> bool {
+    !session.path().join("meta.json").exists() && session::is_locked(session).unwrap_or(true)
+}
+
+/// The error for a session [`is_unrecorded`].
+pub(crate) fn starting_error(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "session {name} is starting: its sidecar holds the session but has not recorded the run yet"
+    )
+}
+
+/// Wait while `session` [`is_unrecorded`], for a `command` that must act on
+/// the run: one landing there (the `start` client interrupted while waiting
+/// for readiness) would find no run to act on, and the run would start after
+/// it. Bounded like the wait for a kill request.
+///
+/// # Errors
+/// The sidecar has still not recorded the run when the bound passes.
+pub(crate) fn await_record(session: &SessionDir, name: &str, command: &str) -> anyhow::Result<()> {
+    if !is_unrecorded(session) {
+        return Ok(());
+    }
+    eprintln!("tendr {command}: {name} is starting; waiting for its sidecar to record the run");
+    let polls = kill_wait_polls(110);
+    for _ in 0..polls {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !is_unrecorded(session) {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "{name} is still starting after {} s: its sidecar holds the session but has not recorded the run",
+        polls.div_ceil(10)
+    )
+}
+
 pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Result<()> {
     let session_name = SessionName::new(name)?;
     let root = SessionRoot::default_path()?;
+
+    if let Ok(dir) = session::open_raw(&root, namespace, &session_name) {
+        await_record(&dir, name, "kill")?;
+    }
 
     // Session doesn't exist -- idempotent success
     let session = match session::open(&root, namespace, &session_name)? {

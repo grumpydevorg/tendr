@@ -71,6 +71,31 @@
   `tendr emit` inside it chains to the exec. Over `--host` this needs the
   remote `tendr` to be 0.8.0 or later.
 
+### Fixed
+
+- **Commands no longer miss or delete a run that is still starting, once
+  its sidecar holds the session.** A sidecar holds its session before it
+  records the run, until the child is spawned. The window is widest on
+  Windows, where starting a process is slow. Commands that landed in it,
+  for example right after interrupting `tendr run` or `tendr start` while
+  it waited for the run to start, went wrong in two ways:
+  - `kill` failed with "meta.json not found", and the run started anyway.
+    `kill` and `start --replace` now say the run is starting, wait for the
+    sidecar to record it (up to 11 s), and then stop or replace it. Past
+    that, they fail with "still starting".
+  - A second `start`, or `status`, took the session for an orphan: it
+    killed the child and deleted the directory under the live sidecar, so
+    two sidecars could end up sharing one session path. They now leave the
+    session alone and fail with "session … is starting".
+
+  A client interrupted before its sidecar took the session still leaves a
+  directory that looks orphaned, and those commands still treat it as one.
+- **A `start` no longer fails with "session is locked" because another
+  command looked at the session.** `status`, `kill`, `start` and `prune`
+  check whether a sidecar is alive by taking the session lock for a moment.
+  One landing just as a new sidecar took the lock made that sidecar give up.
+  The sidecar now retries for up to 100 ms.
+
 ## v0.7.2 — attach, push and exec fixes
 
 No protocol change: works with 0.7.1, 0.7.0, 0.6.0 and 0.5.0 exactly as 0.7.1
