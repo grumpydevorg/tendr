@@ -117,6 +117,11 @@
   `TENDR_BLOCK_ID` while the code runs, as the POSIX shell frame does, so a
   `tendr emit` inside it chains to the exec. Over `--host` this needs the
   remote `tendr` to be 0.8.0 or later.
+- **`output.log` rotates at 64 MiB and keeps the newest four files.** A
+  session's log grew without limit for as long as the session existed. It
+  now rotates into `output.log.<n>` and keeps about 256 MiB per session;
+  `log` (`--since`, `--tail`, `-f`), `watch --logs`, `events --include-logs`
+  and `exec` read across the rotated files, and a follower keeps its place.
 - **No `output.log` record holds more than 16 KiB.** A stretch of output
   without a terminator was held in the sidecar's memory until one came, with
   no limit, and landed as one record too large for `--tail` or a JSON reader.

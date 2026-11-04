@@ -54,7 +54,8 @@ create no state of their own.
 | Path | Written by | Notes |
 |---|---|---|
 | `meta.json` | sidecar; CLI reconciliation | Written to `meta.json.tmp`, then renamed. |
-| `output.log` | sidecar; `wrap`; `exec` | Append-only JSONL. See tags below. |
+| `output.log` | sidecar; `wrap`; `exec` | Append-only JSONL. See tags below. Rotates; see [Limits](#limits). |
+| `output.log.<n>` | sidecar (rename); rarely `wrap`, `exec` | A rotated `output.log`, `n` counting up from 1 for the session's life. Never renamed again; the sidecar writes nothing more to it, though an annotation line racing the rename can land in it ([Limits](#limits)). |
 | `events/<uuidv7>.jsonl` | sidecar; `emit`; `exec`; `wrap`; reconciliation | Append-only segments, never renamed. Format: [07-event-protocol.md](07-event-protocol.md). |
 | `events/blobs/<sha256>` | any event writer | Payloads over 16 KiB, keyed by SHA-256. |
 | `recording/<run_id>/seg-<index:08>.tndrrec` | sidecar (PTY sessions) | Directories `0700`, segments `0600` on Unix. Format: [08-pty-recording-format.md](08-pty-recording-format.md). |
@@ -83,7 +84,7 @@ time alone: removal is `prune` or `start --replace`.
 
 | File | Limit | Removed by |
 |---|---|---|
-| `output.log` | None: one file, no rotation. | `prune` or `--replace`, with the session. |
+| `output.log` | Rotates once it holds 64 MiB, between two records: the sidecar renames it to `output.log.<n>` and starts a new one. The newest 3 archives are kept, so a session normally holds at most 256 MiB of output; older ones are deleted at the next rotation. If the rename fails (on Windows, another program holding the file open without delete sharing), the sidecar keeps appending, warns once in the run's meta, and tries again after another 64 MiB, so the log can then grow past the limit. | Archives older than the newest 3: the next rotation. The rest: `prune` or `--replace`, with the session. |
 | `events/<uuidv7>.jsonl` | A new segment starts once the newest reaches 64 MiB, with a `segment.opened` event ([07-event-protocol.md §3.3](07-event-protocol.md#33-segments)). No cap on the number of segments. | `prune` or `--replace`, with the session. |
 | `events/blobs/<sha256>` | One file per distinct payload over 16 KiB; not rotated. | `prune` or `--replace`, with the session. |
 | `recording/<run_id>/` | 64 MiB segments; recording stops at 1 GiB and the session keeps running ([08-pty-recording-format.md](08-pty-recording-format.md)). | `prune` or `--replace`, with the session. |
@@ -92,6 +93,17 @@ time alone: removal is `prune` or `start --replace`.
 
 With `--namespace`, `prune --older-than` removes only that namespace's
 lost+found events and callback files.
+
+`log` (with `--since`, `--tail` and `-f`), `watch --logs`, `events
+--include-logs` and `exec` read the archives and `output.log` as one log,
+oldest first. A reader's position names the archive count and an offset
+(`tendr::log_files::LogCursor`), and archives are never renamed, so a
+follower keeps its place across a rotation. A follower that falls more than
+three files behind skips what retention deleted; a pending `exec` whose
+position was deleted cannot see its end, and the next `exec` says to `tendr
+kill` the session. An annotation line that `wrap` or `exec` appended while the
+file was being renamed lands in the archive, and a follower already past that
+file does not see it.
 
 ## Control files
 

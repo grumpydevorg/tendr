@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::log_files::{self, LogCursor, LogReader};
 
 use serde::{Deserialize, Serialize};
 
@@ -79,14 +81,14 @@ pub fn timestamp_secs() -> f64 {
         .as_secs_f64()
 }
 
-/// Read and filter a log file, writing matching lines to `out`.
+/// Read and filter a session's log (`output.log` and its retained archives,
+/// oldest first), writing matching lines to `out`.
 ///
 /// Returns the number of lines written. Malformed lines are silently skipped.
 /// Runs of `cr` updates collapse to their last one unless `all_updates`;
 /// `tail` counts what is left.
-pub fn query_log(path: &Path, query: &LogQuery, out: &mut dyn Write) -> io::Result<usize> {
-    let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
+pub fn query_log(dir: &Path, query: &LogQuery, out: &mut dyn Write) -> io::Result<usize> {
+    let mut reader = LogReader::new(dir, LogCursor::default());
 
     let tail_n = query.tail;
     let mut ring: VecDeque<LogLine> = VecDeque::with_capacity(tail_n.unwrap_or(0));
@@ -110,9 +112,9 @@ pub fn query_log(path: &Path, query: &LogQuery, out: &mut dyn Write) -> io::Resu
         Ok(())
     };
 
-    for raw_line in reader.lines() {
-        let raw_line = raw_line?;
-        let Some(parsed) = serde_json::from_str::<LogLine>(&raw_line).ok() else {
+    let mut raw_line = Vec::new();
+    while reader.next_line(&mut raw_line)? {
+        let Some(parsed) = serde_json::from_slice::<LogLine>(&raw_line).ok() else {
             continue;
         };
 
@@ -247,14 +249,15 @@ fn write_line(out: &mut dyn Write, line: &LogLine, raw: bool) -> io::Result<()> 
     }
 }
 
-/// Follow a log file, writing new lines as they appear.
+/// Follow a session's log, writing new lines as they appear, across
+/// rotations.
 ///
-/// Waits for the file to exist, then tails it. Applies since/raw filters
-/// from the query. If neither `tail` nor `since_us` is set, seeks to end
-/// of file (only showing new lines). Polls every 100ms and returns `Ok(())`
+/// Waits for the log to exist, then tails it. Applies since/raw filters
+/// from the query. If neither `tail` nor `since_us` is set, starts at the
+/// end (only showing new lines). Polls every 100ms and returns `Ok(())`
 /// when `should_stop` returns true.
 pub fn follow_log<F>(
-    path: &Path,
+    dir: &Path,
     query: &LogQuery,
     out: &mut dyn Write,
     should_stop: F,
@@ -262,36 +265,32 @@ pub fn follow_log<F>(
 where
     F: Fn() -> bool,
 {
-    while !path.exists() {
+    while !log_files::exists(dir) {
         if should_stop() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-
-    if query.tail.is_none() && query.since_us.is_none() {
-        reader.seek(SeekFrom::End(0))?;
-    }
+    let start = if query.tail.is_none() && query.since_us.is_none() {
+        LogCursor::end(dir)?
+    } else {
+        LogCursor::default()
+    };
+    let mut reader = LogReader::new(dir, start);
+    let mut raw_line = Vec::new();
+    let parse = |raw_line: &[u8]| {
+        serde_json::from_slice::<LogLine>(raw_line)
+            .ok()
+            .filter(|parsed| matches_query(parsed, query))
+    };
 
     if let Some(n) = query.tail {
         let mut ring: VecDeque<LogLine> = VecDeque::with_capacity(n);
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            let bytes = reader.read_line(&mut buf)?;
-            if bytes == 0 {
-                break;
-            }
-            let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
-            let Some(parsed) = serde_json::from_str::<LogLine>(trimmed).ok() else {
+        while reader.next_line(&mut raw_line)? {
+            let Some(parsed) = parse(&raw_line) else {
                 continue;
             };
-            if !matches_query(&parsed, query) {
-                continue;
-            }
             if n > 0 {
                 if ring.len() == n {
                     ring.pop_front();
@@ -305,27 +304,17 @@ where
         }
     }
 
-    let mut buf = String::new();
     loop {
-        buf.clear();
-        let bytes = reader.read_line(&mut buf)?;
-        if bytes == 0 {
+        if !reader.next_line(&mut raw_line)? {
             if should_stop() {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(100));
             continue;
         }
-
-        let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
-        let Some(parsed) = serde_json::from_str::<LogLine>(trimmed).ok() else {
+        let Some(parsed) = parse(&raw_line) else {
             continue;
         };
-
-        if !matches_query(&parsed, query) {
-            continue;
-        }
-
         write_line(out, &parsed, query.raw)?;
         out.flush()?;
     }
@@ -416,6 +405,7 @@ mod tests {
         }
     }
 
+    /// Write a session's `output.log` in `dir`; returns the session dir.
     fn write_test_log(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("output.log");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -428,7 +418,7 @@ mod tests {
         ] {
             writeln!(f, "{}", serde_json::to_string(&line).unwrap()).unwrap();
         }
-        path
+        dir.to_path_buf()
     }
 
     fn record(tag: &str, content: serde_json::Value, terminator: Option<Terminator>) -> LogLine {
@@ -590,13 +580,12 @@ mod tests {
     }
 
     #[test]
-    fn query_missing_file_returns_error() {
+    fn query_without_a_log_returns_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nonexistent.log");
         let mut buf = Vec::new();
         let query = LogQuery::default();
-        let result = query_log(&path, &query, &mut buf);
-        assert!(result.is_err());
+        assert_eq!(query_log(dir.path(), &query, &mut buf).unwrap(), 0);
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -617,7 +606,7 @@ mod tests {
     #[test]
     fn follow_picks_up_new_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("live.log");
+        let path = dir.path().join("output.log");
 
         {
             let mut f = std::fs::File::create(&path).unwrap();
@@ -658,7 +647,7 @@ mod tests {
         };
         let deadline = std::time::Instant::now() + HANG;
         let mut writer = SignallingWriter::new(b"appended line", seen);
-        follow_log(&path, &query, &mut writer, || {
+        follow_log(dir.path(), &query, &mut writer, || {
             following_for_stop.store(true, Ordering::Release);
             seen_for_stop.load(Ordering::Acquire) || std::time::Instant::now() >= deadline
         })
@@ -673,7 +662,7 @@ mod tests {
     #[test]
     fn follow_waits_for_file_creation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("delayed.log");
+        let path = dir.path().join("output.log");
 
         let seen = Arc::new(AtomicBool::new(false));
         let seen_for_stop = Arc::clone(&seen);
@@ -681,7 +670,7 @@ mod tests {
         let waiting = Arc::new(AtomicBool::new(false));
         let waiting_for_stop = Arc::clone(&waiting);
         let path_clone = path.clone();
-        let temp_path = dir.path().join("delayed.log.tmp");
+        let temp_path = dir.path().join("output.log.tmp");
 
         let creator = thread::spawn(move || {
             while !waiting.load(Ordering::Acquire) {
@@ -705,7 +694,7 @@ mod tests {
         };
         let deadline = std::time::Instant::now() + HANG;
         let mut writer = SignallingWriter::new(b"delayed line", seen);
-        follow_log(&path, &query, &mut writer, || {
+        follow_log(dir.path(), &query, &mut writer, || {
             waiting_for_stop.store(true, Ordering::Release);
             seen_for_stop.load(Ordering::Acquire) || std::time::Instant::now() >= deadline
         })
