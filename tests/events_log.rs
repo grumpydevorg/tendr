@@ -4,7 +4,7 @@ use std::path::Path;
 
 use tempfile::TempDir;
 use tendr::events::{EventDraft, EventWriter, read_session_events};
-use tendr::model::event::{Event, Kind, Uuid7};
+use tendr::model::event::{Event, EventTimestamp, Kind, Uuid7};
 use tendr::model::ids::{Namespace, RunId, SessionName, Source};
 
 fn draft(kind: &str, data: serde_json::Value) -> EventDraft {
@@ -462,4 +462,81 @@ fn lost_found_append_writes_fully_addressed_event() {
     let parsed: Event = serde_json::from_str(&lines[0]).unwrap();
     assert_eq!(parsed.id, event.id);
     assert_eq!(parsed.session.as_str(), "s1");
+}
+
+/// A lost+found line for `namespace`, stamped `ts`.
+fn lost_found_line(namespace: &str, ts: EventTimestamp, kind: &str) -> String {
+    let mut draft = draft(kind, serde_json::json!({}));
+    draft.namespace = Namespace::new(namespace).unwrap();
+    let mut event = tendr::events::stamp_orphan_event(draft);
+    event.ts = ts;
+    serde_json::to_string(&event).unwrap() + "\n"
+}
+
+#[test]
+fn lost_found_sweep_removes_only_dated_lines_before_the_cutoff() {
+    let tmp = TempDir::new().unwrap();
+    let tendr_root = tmp.path().join(".tendr");
+    let dir = tendr_root.join("lost+found");
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = EventTimestamp::from_parts(1_000, 0);
+    let cutoff = EventTimestamp::from_parts(2_000, 0);
+    let new = EventTimestamp::from_parts(3_000, 0);
+
+    let old_line = lost_found_line("default", old, "test.old");
+    let keep = [
+        lost_found_line("default", new, "test.new"),
+        "not json at all\n".to_owned(),
+        lost_found_line("ci", new, "test.new_ci"),
+    ];
+    let torn_tail = r#"{"v":1,"ts":"1970-01-01T00:00:01.000000Z""#;
+    let original = format!(
+        "{old_line}{}{}{old_line}{}{torn_tail}",
+        keep[0], keep[1], keep[2]
+    );
+    let path = dir.join("events.jsonl");
+    std::fs::write(&path, &original).unwrap();
+
+    // A dry run counts and changes nothing.
+    let swept = tendr::events::sweep_lost_found(&tendr_root, cutoff, None, true).unwrap();
+    assert_eq!(swept.events, 2);
+    assert_eq!(swept.bytes, 2 * old_line.len() as u64);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+    let swept = tendr::events::sweep_lost_found(&tendr_root, cutoff, None, false).unwrap();
+    assert_eq!(swept.events, 2);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{}{}{}{torn_tail}", keep[0], keep[1], keep[2]),
+        "newer, undatable and unfinished lines survive, in order"
+    );
+}
+
+#[test]
+fn lost_found_sweep_with_a_namespace_keeps_other_namespaces() {
+    let tmp = TempDir::new().unwrap();
+    let tendr_root = tmp.path().join(".tendr");
+    let dir = tendr_root.join("lost+found");
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = EventTimestamp::from_parts(1_000, 0);
+    let cutoff = EventTimestamp::from_parts(2_000, 0);
+    let other = lost_found_line("default", old, "test.other");
+    let path = dir.join("events.jsonl");
+    std::fs::write(
+        &path,
+        format!("{}{other}", lost_found_line("ci", old, "test.ci")),
+    )
+    .unwrap();
+
+    let ci = Namespace::new("ci").unwrap();
+    let swept = tendr::events::sweep_lost_found(&tendr_root, cutoff, Some(&ci), false).unwrap();
+    assert_eq!(swept.events, 1);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), other);
+
+    // Sweeping the last line removes the file; a later sweep finds nothing.
+    let swept = tendr::events::sweep_lost_found(&tendr_root, cutoff, None, false).unwrap();
+    assert_eq!(swept.events, 1);
+    assert!(!path.exists());
+    let swept = tendr::events::sweep_lost_found(&tendr_root, cutoff, None, false).unwrap();
+    assert_eq!(swept.events, 0, "a missing file is an empty sweep");
 }

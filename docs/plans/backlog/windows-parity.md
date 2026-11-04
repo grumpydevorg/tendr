@@ -57,16 +57,6 @@ run started over OpenSSH was still `Running` 10 s after the session closed
 Without the live Job handle (the sidecar crashed), `kill_orphan` terminates one
 PID: no descendants and no graceful stop (`src/platform/windows.rs:254-278`).
 
-### PowerShell state
-
-`exec` runs code with `& ([scriptblock]::Create($_code))`
-(`src/exec_frame.rs:80`), so `$x = 42` is lost after the call. The guide's
-workaround is `$global:x`. The PowerShell frame also does not set
-`TENDR_BLOCK_ID` for the payload; the test is ignored on Windows
-(`tests/cli_exec.rs:1715-1718`). Fix: keep ordinary assignments and functions
-between calls, clean up Tendr's own frame variables, and export
-`TENDR_BLOCK_ID`. Check under PowerShell 5.1 and 7.
-
 ### No PTY or attach on a Windows host
 
 `--pty` fails with "PTY not supported on Windows yet"
@@ -96,10 +86,6 @@ Native Windows tests show:
 - repeated connects to the stdin named pipe work;
 - several processes appending events at once leave complete, valid JSONL (a
   native multi-process stress test);
-- under PowerShell 5.1 and 7, `$x = 42` then `$x` returns 42, `function f {7}`
-  then `f` returns 7, and `Set-Location` and `$env:` changes persist, while
-  `$LASTEXITCODE`, native exit codes, terminating and non-terminating errors,
-  and clean stdout and stderr behave as today;
 - a `--pty` session can be attached, resized, detached and reattached.
 
 The guide's PowerShell and platform notes are updated to match.

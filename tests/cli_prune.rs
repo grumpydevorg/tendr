@@ -744,3 +744,175 @@ fn prune_removes_a_pruned_sessions_dead_socket() {
         "the pruned session's socket was left behind"
     );
 }
+
+// ── lost+found and --on-exit results (log retention) ───────────────────
+
+const DAY: u64 = 86_400;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Append a lost+found event for `namespace`, stamped `age_secs` ago, the way
+/// emit and the sidecar do.
+fn lost_found_event(root: &Home, namespace: &str, kind: &str, age_secs: u64) {
+    use tendr::events::EventDraft;
+    use tendr::model::event::{EventTimestamp, Kind};
+    use tendr::model::ids::{Namespace, RunId, SessionName, Source};
+
+    let mut event = tendr::events::stamp_orphan_event(EventDraft {
+        id: None,
+        kind: Kind::new(kind).unwrap(),
+        namespace: Namespace::new(namespace).unwrap(),
+        session: SessionName::new("gone").unwrap(),
+        run_id: RunId::new(),
+        generation: None,
+        source: Source::new("test.prune").unwrap(),
+        block_id: None,
+        parent_id: None,
+        data: None,
+        preview: None,
+    });
+    event.ts = EventTimestamp::from_parts(now_secs() - age_secs, 0);
+    tendr::events::append_lost_found(&root.path().join(".tendr"), &event).unwrap();
+}
+
+fn lost_found_kinds(root: &Home) -> Vec<String> {
+    let path = root.path().join(".tendr/lost+found/events.jsonl");
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["kind"].as_str().unwrap().to_owned()
+        })
+        .collect()
+}
+
+/// Write `callbacks/<name>.json` for `namespace`, last modified `age_secs` ago.
+fn callback_result(root: &Home, name: &str, namespace: &str, age_secs: u64) -> std::path::PathBuf {
+    let dir = root.path().join(".tendr/callbacks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.json"));
+    let record = serde_json::json!({"run_id": name, "session": "s", "namespace": namespace, "callbacks": []});
+    std::fs::write(&path, record.to_string()).unwrap();
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+    path
+}
+
+fn prune_summary(root: &Home, args: &[&str]) -> serde_json::Value {
+    let out = tendr(root).arg("prune").args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "prune {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    parse_ndjson(&out.stdout)
+        .into_iter()
+        .find(|line| line["type"] == "summary")
+        .expect("a summary line")
+}
+
+#[test]
+fn prune_older_than_removes_old_lost_found_events_and_callback_results() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    lost_found_event(&root, "default", "test.old", 10 * DAY);
+    lost_found_event(&root, "default", "test.new", 0);
+    let old_callback = callback_result(&root, "old", "default", 10 * DAY);
+    let new_callback = callback_result(&root, "new", "default", 0);
+
+    // Another namespace's prune leaves them all.
+    let summary = prune_summary(&root, &["--older-than", "7d", "--namespace", "ci"]);
+    assert_eq!(summary["lost_found_removed"], 0);
+    assert_eq!(summary["callbacks_removed"], 0);
+
+    // A dry run reports what would go and removes nothing.
+    let summary = prune_summary(&root, &["--older-than", "7d", "--dry-run"]);
+    assert_eq!(summary["lost_found_removed"], 1);
+    assert_eq!(summary["callbacks_removed"], 1);
+    assert_eq!(lost_found_kinds(&root), ["test.old", "test.new"]);
+    assert!(old_callback.exists());
+
+    let summary = prune_summary(&root, &["--older-than", "7d"]);
+    assert_eq!(summary["lost_found_removed"], 1);
+    assert_eq!(summary["callbacks_removed"], 1);
+    assert!(summary["bytes_reclaimed"].as_u64().unwrap() > 0);
+    assert_eq!(lost_found_kinds(&root), ["test.new"]);
+    assert!(
+        !old_callback.exists(),
+        "the old --on-exit result is removed"
+    );
+    assert!(new_callback.exists(), "a recent --on-exit result is kept");
+}
+
+/// prune rewrites lost+found while emits from pruned sessions keep appending
+/// to it: every emitted event must survive every sweep.
+#[test]
+fn prune_sweep_loses_no_concurrent_lost_found_emit() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    let home = root.path().to_path_buf();
+    let sweeping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let emitter = {
+        let sweeping = std::sync::Arc::clone(&sweeping);
+        let run_id = uuid::Uuid::now_v7().to_string();
+        std::thread::spawn(move || {
+            let mut emitted = 0u64;
+            // At least a few emits, then as many as overlap the sweeps.
+            while emitted < 5 || sweeping.load(std::sync::atomic::Ordering::SeqCst) {
+                let out = assert_cmd::Command::cargo_bin("tendr")
+                    .unwrap()
+                    .env("HOME", &home)
+                    .env("TENDR_SESSION", "gone")
+                    .env("TENDR_NAMESPACE", "default")
+                    .env("TENDR_RUN_ID", &run_id)
+                    .args(["emit", "--kind", "test.live", "--data"])
+                    .arg(format!(r#"{{"i":{emitted}}}"#))
+                    .timeout(harness::HANG)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                emitted += 1;
+            }
+            emitted
+        })
+    };
+
+    // Each round gives the sweep an old event to remove, so every prune
+    // rewrites the file while the emitter appends.
+    for _ in 0..20 {
+        lost_found_event(&root, "default", "test.old", 10 * DAY);
+        let summary = prune_summary(&root, &["--older-than", "1d"]);
+        assert_eq!(summary["lost_found_removed"], 1);
+    }
+    sweeping.store(false, std::sync::atomic::Ordering::SeqCst);
+    let emitted = emitter.join().unwrap();
+
+    let path = root.path().join(".tendr/lost+found/events.jsonl");
+    let mut seen: Vec<u64> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .inspect(|event| assert_eq!(event["kind"], "test.live", "only live events remain"))
+        .map(|event| event["data"]["i"].as_u64().unwrap())
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, (0..emitted).collect::<Vec<_>>(), "no emit was lost");
+}
