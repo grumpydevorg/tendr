@@ -100,26 +100,24 @@ impl Platform for WindowsPlatform {
     }
 
     fn ready_channel() -> io::Result<(File, File)> {
-        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
         use windows_sys::Win32::System::Pipes::CreatePipe;
-
-        let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
-        sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
-        sa.bInheritHandle = 1; // TRUE — both handles inheritable initially
 
         let mut read_handle = std::ptr::null_mut();
         let mut write_handle = std::ptr::null_mut();
 
-        // SAFETY: sa is valid, pointers are valid out params.
-        let ret = unsafe { CreatePipe(&mut read_handle, &mut write_handle, &sa, 0) };
+        // Both ends are created non-inheritable (null security attributes),
+        // never made inheritable and fixed up after: any process another
+        // thread starts in between would inherit them, and a stray copy of
+        // the read end keeps a write from failing once we drop ours, a
+        // stray write end keeps `read_ready_signal` from seeing EOF.
+        // `spawn_sidecar_raw` hands the sidecar an inheritable duplicate.
+        // SAFETY: pointers are valid out params; null attributes are allowed.
+        let ret = unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0) };
         if ret == 0 {
             return Err(io::Error::last_os_error());
         }
 
-        // Make read end non-inheritable — only the parent reads.
-        set_handle_inheritable(read_handle, false)?;
-
-        // SAFETY: both handles are valid from CreatePipe.
+        // SAFETY: both handles are valid from CreatePipe and owned by us.
         let read_file = unsafe { File::from_raw_handle(read_handle as *mut _) };
         let write_file = unsafe { File::from_raw_handle(write_handle as *mut _) };
 
@@ -430,8 +428,8 @@ impl Platform for WindowsPlatform {
                 "TENDR_READY_HANDLE is not a valid handle",
             )
         })?;
-        // SAFETY: handle was inherited from the parent via CreatePipe with
-        // bInheritHandle=TRUE. from_raw_handle takes ownership.
+        // SAFETY: handle is the inheritable duplicate the parent listed in
+        // PROC_THREAD_ATTRIBUTE_HANDLE_LIST. from_raw_handle takes ownership.
         Ok(unsafe { File::from_raw_handle(handle as *mut _) })
     }
 
@@ -514,6 +512,34 @@ fn set_handle_inheritable(
     Ok(())
 }
 
+/// An inheritable duplicate of `file`'s handle, created inheritable in one
+/// call rather than flagged after.
+fn inheritable_duplicate(file: &File) -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut dup = std::ptr::null_mut();
+    // SAFETY: the source handle is valid for the borrow of `file`; `dup` is
+    // a valid out param.
+    let ret = unsafe {
+        let process = GetCurrentProcess();
+        DuplicateHandle(
+            process,
+            file.as_raw_handle() as _,
+            process,
+            &mut dup,
+            0, // ignored with DUPLICATE_SAME_ACCESS
+            1, // bInheritHandle = TRUE
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ret == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: DuplicateHandle succeeded; we own the new handle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(dup) })
+}
+
 /// Clear the inheritable flag on this process's stdin, stdout and stderr, for
 /// [`super::spawn_external`]. A missing (null) handle makes the call fail,
 /// which is harmless: there is nothing to inherit.
@@ -589,6 +615,14 @@ fn parent_job_allows_breakaway() -> bool {
 /// with bInheritHandles=TRUE leaks every inheritable handle from the parent
 /// (stdout/stderr pipes from test harnesses, SSH sessions, etc.).
 ///
+/// `ready_writer` itself is not inheritable (see `ready_channel`), and the
+/// list may only name inheritable handles, so the sidecar is given an
+/// inheritable duplicate that is closed here once CreateProcessW returns.
+/// A process another thread starts while it exists can still inherit it,
+/// as with std's own stdio pipes (std serialises its spawns with a private
+/// lock we cannot share). That copy is the write end, so the cost is a
+/// readiness read that waits for that process too, never a lost failure.
+///
 /// Requires Windows 7+ (PROC_THREAD_ATTRIBUTE_HANDLE_LIST support).
 fn spawn_sidecar_raw(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) -> io::Result<u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -600,7 +634,8 @@ fn spawn_sidecar_raw(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) 
         UpdateProcThreadAttribute,
     };
 
-    let ready_handle: HANDLE = ready_writer.as_raw_handle() as *mut _;
+    let ready_dup = inheritable_duplicate(ready_writer)?;
+    let ready_handle: HANDLE = ready_dup.as_raw_handle() as *mut _;
 
     // --- Build command line ---
     // CreateProcessW wants a single mutable wide string for the command line.
