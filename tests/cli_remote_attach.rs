@@ -614,12 +614,12 @@ fn host_attach_falls_back_to_v1_for_an_old_sidecar() {
     wait_control(&root, "host-old-sidecar", "AgentControl");
     assert_eq!(
         *hellos.lock().unwrap(),
-        [vec![3, 1], vec![2, 1], vec![1, 1]],
-        "version 3 first, then each older version once"
+        [vec![4, 1], vec![3, 1], vec![2, 1], vec![1, 1]],
+        "version 4 first, then each older version once"
     );
 }
 
-/// The bridge speaks version 3 to the sidecar and passes its acceptance and
+/// The bridge speaks version 4 to the sidecar and passes its acceptance and
 /// stamped output to the client, which writes output that follows on with no
 /// gap and refuses output that skips: a protocol failure (80), after which
 /// the terminal is restored.
@@ -660,7 +660,7 @@ fn host_attach_tracks_offsets_and_refuses_output_that_skips() {
     assert!(!output.contains("after-the-gap"), "{output}");
     // The offset it expected: 100, then 6 and 7 bytes written.
     assert!(output.contains("113") && output.contains("200"), "{output}");
-    assert_eq!(*hellos.lock().unwrap(), [vec![3, 1]]);
+    assert_eq!(*hellos.lock().unwrap(), [vec![4, 1]]);
 }
 
 /// `tendr _remote` run by a client that speaks the attach protocol itself,
@@ -917,6 +917,15 @@ fn remote_request(json: &str) -> Vec<u8> {
 
 /// This client's attach request for `session`, resuming from `resume`.
 fn attach_json(session: &str, resume: Option<tendr::attach_proto::ResumePoint>) -> String {
+    attach_json_in(2, session, resume)
+}
+
+/// [`attach_json`], naming attach protocol version `protocol`.
+fn attach_json_in(
+    protocol: u8,
+    session: &str,
+    resume: Option<tendr::attach_proto::ResumePoint>,
+) -> String {
     let resume = resume.map_or(String::new(), |p| {
         format!(
             r#","resume":{{"run_id":"{}","epoch":{},"offset":{}}}"#,
@@ -926,7 +935,7 @@ fn attach_json(session: &str, resume: Option<tendr::attach_proto::ResumePoint>) 
         )
     });
     format!(
-        r#"{{"v":1,"op":"attach","params":{{"session":"{session}","namespace":null,"takeover":false,"escape":"ctrl-backslash","protocol":2{resume}}}}}"#
+        r#"{{"v":1,"op":"attach","params":{{"session":"{session}","namespace":null,"takeover":false,"escape":"ctrl-backslash","protocol":{protocol}{resume}}}}}"#
     )
 }
 
@@ -964,10 +973,13 @@ fn remote_resume_is_not_refused_by_the_human_control_check() {
     );
     assert_eq!(
         resumed.frame(),
-        Frame::Resumed(ResumePoint {
-            epoch: ControllerEpoch::new(2),
-            ..accepted
-        })
+        Frame::Resumed {
+            point: ResumePoint {
+                epoch: ControllerEpoch::new(2),
+                ..accepted
+            },
+            input_written: None,
+        }
     );
     assert_eq!(lost.frame(), Frame::Retired(ControllerEpoch::new(2)));
     assert_eq!(lost.child.wait().unwrap().code(), Some(81));
@@ -1816,11 +1828,14 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
     let mut resumed = watch_resume(&root, "host-ro-resume", asked, &watch_resume_frame);
     assert_eq!(
         resumed.frame(),
-        Frame::Resumed(ResumePoint {
-            run_id: admitted.run_id,
-            epoch: ControllerEpoch::ZERO,
-            offset: 3,
-        })
+        Frame::Resumed {
+            point: ResumePoint {
+                run_id: admitted.run_id,
+                epoch: ControllerEpoch::ZERO,
+                offset: 3,
+            },
+            input_written: None,
+        }
     );
     assert_eq!(resumed.detach(), Some(0));
 
@@ -1841,7 +1856,11 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
     harness::wait_log_tail(&root, "host-ro-resume", "FLOOD-END");
     let mut gone = watch_resume(&root, "host-ro-resume", asked, &watch_resume_frame);
     match gone.frame() {
-        Frame::Gone { point, oldest } => {
+        Frame::Gone {
+            point,
+            oldest,
+            input_written: None,
+        } => {
             assert_eq!(
                 (point.run_id, point.epoch),
                 (admitted.run_id, ControllerEpoch::ZERO)
@@ -1947,7 +1966,9 @@ fn remote_watch_resume_in_version_3_is_told_where_the_output_ends() {
         .map(|protocol| FrameClient::start_with(&root, &json(protocol, Some(admitted)), &first))
         .collect();
     for client in &mut resumed {
-        assert!(matches!(client.frame(), Frame::Resumed(point) if point.offset == admitted.offset));
+        assert!(
+            matches!(client.frame(), Frame::Resumed { point, .. } if point.offset == admitted.offset)
+        );
     }
     touch(&root, "GO");
     let ends: Vec<(Vec<Frame>, Option<i32>)> = resumed
@@ -2629,4 +2650,296 @@ fn a_watch_hello_and_watch_resume_are_refused_by_an_old_remote() {
             );
         }
     }
+}
+
+/// Keystrokes far past what a PTY's input buffer holds, so that most of
+/// them wait in the session's queue, the bridge or the pipes between.
+const FLOOD: usize = 256 * 1024;
+
+/// A version 4 attach through `_remote`, and the point it was accepted at.
+fn attach_v4(root: &Home, session: &str) -> (FrameClient, tendr::attach_proto::ResumePoint) {
+    let mut client = FrameClient::start(root, &attach_json_in(4, session, None));
+    match client.frame() {
+        tendr::attach_proto::Frame::AcceptedV2(point) => (client, point),
+        other => panic!("attach not accepted: {other:?}"),
+    }
+}
+
+/// A version 4 resume through `_remote` from `point`, as the client sends
+/// it after a lost link, and how many bytes of the lost connection's input
+/// its answer says were written.
+fn resume_v4(
+    root: &Home,
+    session: &str,
+    point: tendr::attach_proto::ResumePoint,
+) -> (FrameClient, u64) {
+    use tendr::attach_proto::{Frame, Version};
+    let mut resumed = FrameClient::start_with(
+        root,
+        &attach_json_in(4, session, Some(point)),
+        &Frame::Resume {
+            point,
+            version: Version::V2,
+        },
+    );
+    match resumed.frame() {
+        Frame::Resumed {
+            point: answer,
+            input_written: Some(written),
+        } if answer.epoch > point.epoch => (resumed, written),
+        other => panic!("not resumed with an input report: {other:?}"),
+    }
+}
+
+/// Send `bytes` as `client`'s keystrokes, in frames of 16 KiB, on a thread
+/// that returns its stdin, still open: the client has lost its link, not
+/// left, so the remote side goes on as sshd leaves it.
+fn type_frames(
+    client: &mut FrameClient,
+    bytes: Vec<u8>,
+) -> std::thread::JoinHandle<std::process::ChildStdin> {
+    use tendr::attach_proto::{Frame, write_frame};
+    let mut stdin = client.stdin.take().unwrap();
+    std::thread::spawn(move || {
+        for chunk in bytes.chunks(16 * 1024) {
+            // A remote side retired meanwhile stops reading: the rest was
+            // never sent.
+            if write_frame(&mut stdin, &Frame::Data(chunk.to_vec())).is_err() {
+                break;
+            }
+        }
+        stdin
+    })
+}
+
+/// Wait until `session`'s output log, its lines joined, holds `needle`.
+fn wait_logged(root: &Home, session: &str, needle: &str) {
+    wait_logged_times(root, session, needle, 1);
+}
+
+/// [`wait_logged`], `times` times over.
+fn wait_logged_times(root: &Home, session: &str, needle: &str, times: usize) {
+    poll_until(HANG, Duration::from_millis(50), || {
+        let found = harness::logged_output(root, session)
+            .matches(needle)
+            .count();
+        if found >= times {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("{needle:?} logged {found} times"))
+        }
+    })
+    .unwrap_or_else(|e| panic!("{session} never logged {needle:?} {times} times: {e}"));
+}
+
+/// A resume reports exactly the input the lost connection had written, and
+/// none of what it had queued behind a child that was not reading, which
+/// the resume revokes: the child, reading at last, finds exactly that many
+/// bytes of it, then the first byte the resumed client sends.
+#[test]
+fn remote_resume_reports_the_input_written_and_not_the_input_revoked() {
+    use tendr::attach_proto::{Frame, write_frame};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    let session = "host-input-revoked";
+    // The sidecar creates it once a write finds the PTY full: from then on
+    // input waits in its queue, unwritten.
+    let pty_full = root.path().join("pty-full");
+    start_script(
+        &root,
+        session,
+        "stty raw echo; printf READY; while [ ! -f \"$GO\" ]; do sleep 0.05; done; \
+         head -c \"$(cat \"$N\")\" > \"$GOT\"; printf DONE; sleep 3600",
+        &["GO", "N", "GOT"],
+        &[("TENDR_TEST_PTY_FULL_FILE", pty_full.to_str().unwrap())],
+    );
+    wait_logged(&root, session, "READY");
+    let (mut lost, accepted) = attach_v4(&root, session);
+    let typing = type_frames(&mut lost, vec![b'a'; FLOOD]);
+    // Some of it has been written: the terminal echoes what it takes in.
+    wait_logged(&root, session, "a");
+    // And some waits behind the full PTY, for the resume to revoke.
+    harness::poll_path_exists(&pty_full, HANG, Duration::from_millis(20))
+        .unwrap_or_else(|e| panic!("the PTY never filled: {e}"));
+
+    let (mut resumed, written) = resume_v4(&root, session, accepted);
+    assert!(
+        written > 0 && written < FLOOD as u64,
+        "{written} of {FLOOD} bytes written"
+    );
+    // Its echoes come first.
+    while !matches!(lost.frame(), Frame::Retired(_)) {}
+    assert_eq!(lost.child.wait().unwrap().code(), Some(81));
+    drop(typing.join().unwrap());
+    poll_until(HANG, Duration::from_millis(50), || {
+        if harness::read_events(&root, session)
+            .iter()
+            .any(|e| e["kind"] == "pty.input_revoked")
+        {
+            Observation::Ready(())
+        } else {
+            Observation::Pending("no pty.input_revoked".into())
+        }
+    })
+    .unwrap_or_else(|e| panic!("the queued rest was never revoked: {e}"));
+
+    std::fs::write(root.path().join("N"), (written + 1).to_string()).unwrap();
+    write_frame(resumed.stdin.as_mut().unwrap(), &Frame::Data(b"Z".to_vec())).unwrap();
+    touch(&root, "GO");
+    wait_logged(&root, session, "DONE");
+    let got = std::fs::read(root.path().join("GOT")).unwrap();
+    let mut expected = vec![b'a'; usize::try_from(written).unwrap()];
+    expected.push(b'Z');
+    assert!(
+        got == expected,
+        "the child read {} bytes, ending {:?}; {written} were reported written",
+        got.len(),
+        String::from_utf8_lossy(&got[got.len().saturating_sub(8)..])
+    );
+    assert_eq!(resumed.detach(), Some(0));
+}
+
+/// After a lost link, sshd keeps the old remote side open, and it goes on
+/// passing the keystrokes it already had to the session. Here all of them
+/// wait behind a child that is not reading until the link is lost; then
+/// the child reads every one, and the resume reports every one written.
+#[test]
+fn remote_resume_counts_what_the_half_open_old_connection_wrote_after_the_drop() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    let session = "host-input-half-open";
+    start_script(
+        &root,
+        session,
+        &format!(
+            "stty raw -echo; printf READY; while [ ! -f \"$GO\" ]; do sleep 0.05; done; \
+             head -c {FLOOD} > \"$GOT\"; printf DONE; sleep 3600"
+        ),
+        &["GO", "GOT"],
+        &[],
+    );
+    wait_logged(&root, session, "READY");
+    let (mut lost, accepted) = attach_v4(&root, session);
+    // Every byte is handed to the remote side, which the PTY cannot take
+    // in yet; then the link is lost, with the remote side left open.
+    let _half_open = type_frames(&mut lost, vec![b'a'; FLOOD]).join().unwrap();
+    touch(&root, "GO");
+    wait_logged(&root, session, "DONE");
+    assert_eq!(std::fs::read(root.path().join("GOT")).unwrap().len(), FLOOD);
+
+    let (resumed, written) = resume_v4(&root, session, accepted);
+    assert_eq!(written, FLOOD as u64);
+    assert_eq!(lost.child.wait().unwrap().code(), Some(81));
+    assert_eq!(resumed.detach(), Some(0));
+}
+
+/// A PTY session that prints `READY` once `GO` exists, then echoes lines.
+fn start_ready_cat(root: &Home, session: &str) {
+    start_script(
+        root,
+        session,
+        "while [ ! -f \"$GO\" ]; do sleep 0.05; done; printf READY; exec cat",
+        &["GO"],
+        &[],
+    );
+}
+
+/// The keystrokes typed once before the link is lost in these tests, and
+/// how many bytes the client sends for them.
+const BEFORE_THE_DROP: &[u8] = b"before-the-drop\r";
+
+/// `attach --host` through `link` to a [`start_ready_cat`] session, with
+/// [`BEFORE_THE_DROP`] typed once and written, then the link cut.
+fn type_then_cut(root: &Home, link: &Flaky, session: &str, label: &str) -> WrappedAttach {
+    let mut wrapped = link.attach(root, label, &[session]);
+    wait_control(root, session, "HumanControl");
+    touch(root, "GO");
+    wrapped.wait_output_contains("READY");
+    wrapped.cli.type_bytes(BEFORE_THE_DROP);
+    // The echo, then cat's copy: the line's end was written too.
+    wait_logged_times(root, session, "before-the-drop", 2);
+    link.cut();
+    wrapped
+}
+
+/// A reconnected attach says how many of the keystroke bytes sent before
+/// the link was lost reached the session, as it resumes and again on
+/// stderr once the terminal is restored.
+#[test]
+fn host_reconnect_says_how_much_input_reached_the_session() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    start_ready_cat(&root, "host-input-said");
+    let link = Flaky::new();
+    let mut wrapped = type_then_cut(&root, &link, "host-input-said", "input-said");
+    let sent = BEFORE_THE_DROP.len();
+    let notice = format!(
+        "tendr: reconnected; of the {sent} bytes of input sent before the connection was lost, \
+         {sent} reached the session and 0 did not"
+    );
+    wrapped.wait_output_contains(&notice);
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(), 0);
+    wrapped.assert_terminal_restored();
+    assert_eq!(
+        wrapped.cli.output().matches(&notice).count(),
+        2,
+        "on the screen, then on stderr"
+    );
+}
+
+/// The first frames a sidecar from before the input report decodes: a
+/// hello of versions 1 to 3, and a resume or a watch resume of version 2
+/// or 3.
+fn decoded_before_input_report(msg_type: u8, payload: &[u8]) -> bool {
+    use tendr::attach_proto::{MSG_HELLO, MSG_RESUME, MSG_WATCH_RESUME};
+    match (msg_type, payload) {
+        (MSG_HELLO, [version, mode]) => (1..=3).contains(version) && (1..=4).contains(mode),
+        (MSG_RESUME, point) => point.len() == 32 || (point.len() == 33 && point[32] == 3),
+        (MSG_WATCH_RESUME, point) => point.len() == 24 || (point.len() == 25 && point[24] == 3),
+        _ => false,
+    }
+}
+
+/// A session whose sidecar predates the input report refuses the bridge's
+/// version 4 hello and resume; it says each again in version 3, and the
+/// attach reconnects as before, saying nothing of the input.
+#[test]
+fn host_reconnect_to_a_session_from_before_the_input_report_steps_down() {
+    use tendr::attach_proto::{MSG_HELLO, MSG_RESUME};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    let session = "host-input-old";
+    start_ready_cat(&root, session);
+    let seen = old_sidecar(&root, session, "pre-input", decoded_before_input_report);
+    let link = Flaky::new();
+    let mut wrapped = type_then_cut(&root, &link, session, "input-old");
+    wait_resumes(&root, session, 1);
+    wrapped
+        .cli
+        .type_until_logged(&root, session, "after-the-drop\n");
+    wrapped.cli.type_bytes(b"\x1cd");
+    assert_eq!(wrapped.wait_exit(), 0);
+    wrapped.assert_terminal_restored();
+    assert!(
+        !wrapped.cli.output().contains("bytes of input"),
+        "{}",
+        wrapped.cli.output()
+    );
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    let resume = |version: u8| {
+        let mut payload = seen[2].1[..32].to_vec();
+        payload.push(version);
+        (MSG_RESUME, payload)
+    };
+    assert_eq!(
+        seen,
+        [
+            (MSG_HELLO, vec![4, 1]),
+            (MSG_HELLO, vec![3, 1]),
+            resume(4),
+            resume(3),
+        ]
+    );
 }

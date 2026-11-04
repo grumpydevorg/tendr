@@ -105,7 +105,7 @@ fn run_viewer_sender(
         let frame = match ring.next(&cursor, PTY_READ_BYTES) {
             output_ring::Next::Bytes { offset, bytes } => match version {
                 Version::V1 => Frame::Data(bytes),
-                Version::V2 | Version::V3 => Frame::Output { offset, bytes },
+                Version::V2 | Version::V3 | Version::V4 => Frame::Output { offset, bytes },
             },
             output_ring::Next::Ended(head) if version.reports_end() => {
                 let _ = write_frame(&mut *lock(conn), &Frame::OutputEnd(head));
@@ -2979,13 +2979,17 @@ fn handle_attach_connection(
     if !registered {
         return reject_connection(&mut stream, RejectClass::Control, "session ended");
     }
+    // A resume also learns how much input the epoch it resumes wrote: final
+    // now, since the grant ended that epoch's writes.
     let granted = match ask {
-        Ask::Attach => writer.claim(holder, ControllerKind::Human),
-        Ask::Takeover => writer.takeover(holder).map(|t| t.handle),
-        Ask::Resume(point) => writer.resume(holder, point.epoch).map(|t| t.handle),
+        Ask::Attach => writer.claim(holder, ControllerKind::Human).map(|h| (h, 0)),
+        Ask::Takeover => writer.takeover(holder).map(|t| (t.handle, 0)),
+        Ask::Resume(point) => writer
+            .resume(holder, point.epoch)
+            .map(|t| (t.handle, t.written)),
     };
-    let handle = match granted {
-        Ok(handle) => handle,
+    let (handle, input_written) = match granted {
+        Ok(granted) => granted,
         Err(e) => {
             registry.remove(holder);
             if matches!(ask, Ask::Resume(_)) {
@@ -3021,15 +3025,24 @@ fn handle_attach_connection(
         epoch: handle.epoch(),
         offset: placement.from,
     };
+    // From version 4 a resume is told how much of its lost connection's
+    // input was written.
+    let input_written = version.reports_input().then_some(input_written);
     let reply = match (ask, placement.gone, version) {
-        (Ask::Resume(_), None, _) => Frame::Resumed(point),
+        (Ask::Resume(_), None, _) => Frame::Resumed {
+            point,
+            input_written,
+        },
         (Ask::Resume(_), Some(span), _) => Frame::Gone {
             point,
             oldest: span.oldest,
+            input_written,
         },
         (Ask::Attach | Ask::Takeover, _, Version::V1) => Frame::Accepted(handle.epoch()),
-        // Version 3's answers are version 2's.
-        (Ask::Attach | Ask::Takeover, _, Version::V2 | Version::V3) => Frame::AcceptedV2(point),
+        // Version 3's and 4's answers are version 2's.
+        (Ask::Attach | Ask::Takeover, _, Version::V2 | Version::V3 | Version::V4) => {
+            Frame::AcceptedV2(point)
+        }
     };
     let accepted = write_frame(&mut *reply_to, &reply);
     drop(reply_to);
@@ -3171,10 +3184,15 @@ fn handle_watch_connection(
             run_id,
             offset: placement.from,
         }),
-        (Some(_), None) => Frame::Resumed(point),
+        // A watcher sends no input, so its answer reports none.
+        (Some(_), None) => Frame::Resumed {
+            point,
+            input_written: None,
+        },
         (Some(_), Some(span)) => Frame::Gone {
             point,
             oldest: span.oldest,
+            input_written: None,
         },
     };
     // Its sender starts only after the reply, so no output comes ahead of it.

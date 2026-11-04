@@ -99,7 +99,7 @@ flowchart LR
 ## The attach handshake
 
 - Every connection opens with a hello (`MSG_HELLO`, `[version, mode]`).
-  The sidecar speaks versions 1 to 3 (`attach_proto::Version`); any other
+  The sidecar speaks versions 1 to 4 (`attach_proto::Version`); any other
   version is refused with the protocol class.
 - Version 2 changes only what a viewer (an attach or takeover) receives. A
   push is answered the same in both versions.
@@ -136,6 +136,13 @@ flowchart LR
     protocol class. The client says it again one version lower, and goes
     on stepping down to version 1 (an attach, takeover or push), or to
     version 2 (a watch).
+- Version 4 adds only the report on a resuming controller's input
+  ([Resuming a viewer](#resuming-a-viewer)). Its hellos are answered as
+  version 3's, and its output is version 3's.
+  - A sidecar from before version 4 refuses a version 4 hello or resume
+    with the protocol class, and the client says it again in version 3.
+  - A watcher sends no input, so it never speaks version 4
+    (`Version::WATCH_LATEST`): it would only cost a refused connection.
 - A watch hello (`Mode::Watch`, mode byte 4, any version) asks for a
   read-only viewer, a *watcher*
   ([Read-only viewers](#read-only-viewers)). The sidecar admits it with
@@ -292,6 +299,24 @@ bytes ([design](../design.md#a-resume-decides-control-and-output-on-one-connecti
     on, and after the replay sends its size and a repaint, as a fresh attach
     does. An offset past the head is answered gone as well; the client
     treats that as a protocol failure (80), since its own count is broken.
+- In version 4 the answer, resumed or gone, also says how many bytes of
+  input were written to the PTY under the epoch the resume names: `[version
+  u8 = 4][written u64]` after its version 3 payload. The version travels
+  with the answer because over `--host` the client cannot tell which version
+  the bridge agreed with the sidecar (see
+  [design](../design.md#a-resume-reports-the-lost-connections-input-and-never-resends-it)).
+  - The input writer counts the bytes it writes under the last epoch granted
+    to a human (`InputArbiter`), and keeps the count until the next human
+    grant, so it outlives that connection: a lost connection's bridge that
+    sshd keeps open goes on writing what it had under that epoch until the
+    resume retires it, and that counts too. The resume grant reads it, and
+    no write under that epoch can follow, so it is final. Input revoked, or
+    never received, is not in it.
+  - The client compares it with the keystroke bytes it gave that connection
+    to send (see [Attaching over `--host`](#attaching-over---host)). A count
+    higher than that means its own count is broken: a protocol failure (80).
+  - There is no acknowledgement per write: the count crosses the wire only
+    in the answer.
 - A sidecar that predates resuming refuses `MSG_RESUME` with the protocol
   class, as it refuses anything that is not a hello.
 - From version 3 a resume names its version: one byte after its point
@@ -326,7 +351,7 @@ for people.
   frame. A client never guesses at a refusal.
 - The set of classes is part of the protocol version. The hello carries the
   client's version, and a sidecar sends only the classes that version knows.
-  A new class requires a new version; versions 1 to 3 know the same four.
+  A new class requires a new version; versions 1 to 4 know the same four.
 - A refusal sent before the hello is read (another user's peer, no free
   slot) may use only classes every supported version knows.
 
@@ -511,9 +536,9 @@ says what happens to bytes it holds when something ends:
 |---|---|---|
 |the client's tty input queue|what the kernel has not handed over; on Unix read in 4 KiB from the descriptor polled|discarded when the terminal is restored|
 |the escape parser (`attach_escape.rs`)|a held prefix, an unfinished sequence (up to 64 bytes, forwarded after 20 ms), or a possible paste end (held until the next byte)|discarded|
-|the client's outbox|up to 1 MiB of keystrokes behind the controls; more are dropped and counted (`N typed bytes were dropped`)|on a leave the detach goes after them, waiting up to 200 ms to be sent; then the connection closes, and what is still queued is never sent. While reconnecting there is no outbox, and keystrokes are discarded with a notice|
+|the client's outbox|up to 1 MiB of keystrokes behind the controls; more are dropped and counted (`N typed bytes were dropped`). Every byte queued is counted for the connection's input report|on a leave the detach goes after them, waiting up to 200 ms to be sent; then the connection closes, and what is still queued is never sent. While reconnecting there is no outbox, and keystrokes are discarded with a notice|
 |ssh, then the bridge's outbox (`--host` only)|the bridge stops reading ssh's stdin at 1 MiB, so the backlog waits in ssh|as the client's|
-|the sidecar's input queue (`pty_input.rs`)|32 writes; the connection's reader waits for room unless its client hung up|after a detach, written for up to 1 s first; otherwise, and after that, cancelled and recorded ([input arbitration](#input-arbitration))|
+|the sidecar's input queue (`pty_input.rs`)|32 writes; the connection's reader waits for room unless its client hung up|after a detach, written for up to 1 s first; otherwise, and after that, cancelled and recorded ([input arbitration](#input-arbitration)). What was written under the epoch is counted for a resume's report|
 |the PTY master|what the child has not read|kept for the child; once the PTY is closed (a write takes 0 bytes), that write and every later one end `Incomplete(Closed)`, unreported to an attach, since the run is ending|
 
 Output passes through these:
@@ -617,6 +642,20 @@ tendr that bridges them to the session's socket
     on the alternate screen covers it. Either way a controller then sends
     its size and the repaint nudge, the size first so the nudge can apply;
     a watcher sends neither.
+  - The client counts the keystroke bytes it queues for each connection,
+    after the escape parser: a doubled `Ctrl-\` is one byte, and bytes the
+    parser still holds were never queued. The count is final when the
+    connection's reader ends, since keystrokes are discarded from then on.
+    When a version 4 answer reports how many the session wrote and the
+    count is not zero, the client writes a notice the same way as the gone
+    one, and prints it again once the terminal is restored: `of the N bytes
+    of input sent before the connection was lost, W reached the session and
+    N - W did not`. Those N - W are never sent again. Bytes queued but not
+    yet sent at the drop count as not reached. An answer without the report
+    (a remote or a session from before version 4) says nothing of the
+    input, as before. The remote needs to be new enough as well: the client's
+    frames on ssh stay the version 1 hello and the version 2 resume, and the
+    request's `protocol` (4) agrees the version.
   - Without a terminal (a read-only attach streaming to stdout, Unix only),
     stdout still gets only the session's output: the status lines and the
     gone notice go to stderr, a line each, and so does ssh's stderr, as it

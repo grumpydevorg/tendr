@@ -340,6 +340,26 @@ the user cannot see what they would land on until the screen is back.
 Source: step 1 of the remote frame transport plan
 (`docs/plans/active/01_remote-frame-transport.md`) at `d282062`.
 
+### A resume reports the lost connection's input and never resends it
+
+*2026-11-04.* After a lost link the user could not tell whether the last
+thing typed reached the program. A resume now says how many of the
+keystroke bytes the client sent on the lost connection were written to the
+PTY, and how many were not; it never sends the rest again (Rick's
+decision), since redelivering them is the late input the paragraph above
+forbids. The count crosses the wire only in the resume's answer, not as an
+acknowledgement per write (Rick's decision): the sidecar already decides
+every write in one place, so it keeps the count of the last human epoch
+until the next human grant, a half-open old bridge's late writes included,
+and the grant that ends the epoch reads it final. The client counts the
+bytes it queued after the escape parser, since a held prefix or sequence is
+never sent and a doubled `Ctrl-\` is one byte. It is for `--host` only
+(Rick's decision): a local socket has no link to lose. It is attach protocol
+version 4, and the answer names its version, because over `--host` the
+bridge agrees the version with the sidecar and `MSG_ACCEPTED_V2` cannot tell
+version 3 from 4; a remote or a session from before it gives no report, and
+the attach says nothing of the input, as before.
+
 ### Watchers never touch control
 
 *2026-11-03.* A read-only viewer (a watcher) never reaches the input writer:

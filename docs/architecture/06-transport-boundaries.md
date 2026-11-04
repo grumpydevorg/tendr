@@ -149,11 +149,12 @@ command line as the other operations, and keeps the terminal on the client
   ([04-pty-lane.md](04-pty-lane.md)).
 - The attach protocol version is agreed in the request, not in that hello.
   The request's `protocol` field names the newest version the client speaks
-  (3), and the hello on ssh stdin is always a version 1 hello. A remote
+  (4), and the hello on ssh stdin is always a version 1 hello. A remote
   tendr from 0.5.0 takes only that hello and ignores the field, so it
   answers as before, in version 1. A newer remote tendr speaks the newest
   version both know (`attach_proto::Version::negotiate`; a request without
-  the field, from a 0.5.0 client, means version 1) to the sidecar.
+  the field, from a 0.5.0 client, means version 1) to the sidecar, at most
+  version 3 for a watcher, which version 4 has nothing for.
 - The remote tendr (`_remote`) makes the checks of a local attach (a PTY
   session, running, not under human control unless `--takeover`), reads the
   hello, which must name the request's mode (otherwise exit 80), and makes
@@ -163,7 +164,7 @@ command line as the other operations, and keeps the terminal on the client
   not speak with the protocol class; the remote tendr then connects once
   more and says hello one version lower, down to version 1 (version 2 for a
   watch hello). It passes the sidecar's acceptance to the client as it
-  came: `MSG_ACCEPTED_V2` for version 2 or 3, `MSG_ACCEPTED` for version 1,
+  came: `MSG_ACCEPTED_V2` for version 2 to 4, `MSG_ACCEPTED` for version 1,
   so the client learns from its type whether its output is stamped. A
   failure before that is its exit code and stderr, as for a local attach
   (1, 80, 81, 84, 85), and the client exits with it; a remote that ends
@@ -175,16 +176,25 @@ command line as the other operations, and keeps the terminal on the client
   human-control check: after a lost link sshd keeps the old remote tendr and
   its connection open, so `meta.json` still names the client's own control,
   and the sidecar decides. It passes the resume on in the agreed version
-  (from version 3 the frame names it; a sidecar from before that refuses it
-  with the protocol class, and the remote tendr says it again in version
-  2), then the sidecar's answer (`MSG_RESUMED` or `MSG_GONE`) as it came,
-  and keeps the new epoch as this client's, so a later takeover is read as
-  one. A sidecar that cannot resume refuses with the protocol class; the
-  remote tendr exits 80, saying it cannot resume, and neither attaches
-  afresh nor falls back to version 1. A
-  0.5.0 remote tendr ignores `resume` and refuses `MSG_RESUME` as not its
-  hello (80), unless its own human-control check refuses first (81); it
+  (from version 3 the frame names it; a sidecar from before a version
+  refuses it with the protocol class, and the remote tendr says it again
+  one version lower, down to version 2), then the sidecar's answer
+  (`MSG_RESUMED` or `MSG_GONE`) as it came, and keeps the new epoch as this
+  client's, so a later takeover is read as one. A sidecar that cannot
+  resume refuses with the protocol class; the remote tendr exits 80, saying
+  it cannot resume, and neither attaches afresh nor falls back to version
+  1. A 0.5.0 remote tendr ignores `resume` and refuses `MSG_RESUME` as not
+  its hello (80), unless its own human-control check refuses first (81); it
   never attaches afresh either.
+- In version 4 that answer carries the version and how many bytes of the
+  lost connection's input the session wrote, which the client reports
+  ([resuming a viewer](04-pty-lane.md#resuming-a-viewer)). Its type alone
+  cannot tell the client which version the remote tendr agreed with the
+  sidecar, as `MSG_ACCEPTED_V2` cannot tell 3 from 4, so the report names
+  it. No request field is added: the remote reads nothing new from the
+  client. A remote tendr from before version 4 (0.7) negotiates version 3,
+  and a sidecar from before it refuses version 4, so either way the answer
+  has no report and the client says nothing of the input, as before.
 - A read-only request (`read_only: true`, from `attach --read-only`) is a
   watcher's ([read-only viewers](04-pty-lane.md#read-only-viewers)). A Unix
   client needs no terminal for it: without one it streams the session's
