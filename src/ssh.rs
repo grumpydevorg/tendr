@@ -486,6 +486,13 @@ fn connect_deadline() -> Option<Duration> {
     }
 }
 
+/// The connect deadline a call has missed, `elapsed` after its watch
+/// started: only one still waiting for the remote tendr's hello can miss
+/// it. Once the hello has come the call runs as long as it needs.
+fn missed_hello(deadline: Option<Duration>, hello: bool, elapsed: Duration) -> Option<Duration> {
+    deadline.filter(|d| !hello && elapsed >= *d)
+}
+
 /// What [`Watch::wait`] waits for.
 #[derive(Debug, Clone, Copy)]
 enum Until {
@@ -665,9 +672,7 @@ impl Watch {
                 }
                 return Ok(self.exited(host, status, ended.unwrap_or_default()));
             }
-            if let Some(deadline) = self
-                .deadline
-                .filter(|d| !self.hello && self.started.elapsed() >= *d)
+            if let Some(deadline) = missed_hello(self.deadline, self.hello, self.started.elapsed())
             {
                 stop(child);
                 // The relay is not waited for: a lingering ProxyCommand may
@@ -1100,6 +1105,25 @@ mod tests {
         assert_eq!(filter.out, b"progress 50%\n", "a possible trailer waits");
         filter.write(b"x");
         assert_eq!(filter.out, b"progress 50%\ntendr-x");
+    }
+
+    /// The connect deadline stops only a call still waiting for the hello:
+    /// one that has had it runs past the deadline for as long as it needs
+    /// (`wait`, `log -f`), and one with no deadline is never stopped.
+    #[test]
+    fn only_a_call_without_its_hello_misses_the_deadline() {
+        let deadline = Some(Duration::from_secs(2));
+        let long = Duration::from_secs(24 * 3600);
+        assert_eq!(
+            missed_hello(deadline, false, Duration::from_millis(1999)),
+            None
+        );
+        assert_eq!(
+            missed_hello(deadline, false, Duration::from_secs(2)),
+            deadline
+        );
+        assert_eq!(missed_hello(deadline, true, long), None, "after the hello");
+        assert_eq!(missed_hello(None, false, long), None, "no deadline");
     }
 
     #[test]

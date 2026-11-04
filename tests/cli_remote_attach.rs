@@ -1362,6 +1362,11 @@ fn host_reconnect_fails_fast_backs_off_and_discards_typing() {
     );
     wrapped.wait_output_contains(APPROVAL_URL);
     wrapped.cli.type_bytes(b"typed-in-the-gap\r");
+    // The status line says the typing was discarded once the attach has
+    // read it: only then may the login work again, or the resume could
+    // come before the keystrokes are read. Matched short of its end, which
+    // 80 columns cut off once a slow test reaches attempt 10.
+    wrapped.wait_output_contains("; typed input is discard");
 
     link.set("prompt", false);
     wait_resumes(&root, "host-backoff", 1);

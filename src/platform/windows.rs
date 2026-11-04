@@ -20,6 +20,36 @@ use crate::platform::{Platform, ProcessStatus};
 /// Windows implementation of the Platform trait.
 pub struct WindowsPlatform;
 
+/// How long a graceful stop waits for the child to exit on CTRL_BREAK before
+/// terminating its Job Object.
+pub const GRACEFUL_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl WindowsPlatform {
+    /// A graceful [`Platform::kill_child`] that waits up to `grace`, not
+    /// [`GRACEFUL_STOP_GRACE`], before escalating: a test whose child must
+    /// exit on CTRL_BREAK passes a grace load cannot outlast, without
+    /// changing it for any other kill in the process.
+    ///
+    /// # Errors
+    /// Terminating the Job Object failed.
+    pub fn stop_gracefully(handle: &ChildKillHandle, grace: std::time::Duration) -> io::Result<()> {
+        // Best-effort CTRL_BREAK, then wait via WaitForSingleObject, then
+        // escalate. Uses a real waitable handle instead of process_status
+        // because Windows keeps the process object alive while any handle is
+        // open (e.g. SupervisedChild's std::process::Child), making PID-based
+        // liveness checks unreliable.
+        send_ctrl_break(handle.identity.pid.get());
+
+        let grace_ms = u32::try_from(grace.as_millis()).unwrap_or(u32::MAX - 1);
+        if wait_for_process_exit(handle.identity.pid.get(), grace_ms) {
+            return Ok(());
+        }
+
+        // Grace period expired — escalate to force.
+        terminate_job(&handle.job_object)
+    }
+}
+
 /// Opaque supervised-child state for Windows.
 /// Wraps a `std::process::Child` with its verified `ProcessIdentity`
 /// and an Arc'd Job Object for tree kill.
@@ -244,19 +274,7 @@ impl Platform for WindowsPlatform {
             return terminate_job(&handle.job_object);
         }
 
-        // Graceful: best-effort CTRL_BREAK, then poll via WaitForSingleObject,
-        // then escalate. Uses a real waitable handle instead of process_status
-        // because Windows keeps the process object alive while any handle is
-        // open (e.g. SupervisedChild's std::process::Child), making PID-based
-        // liveness checks unreliable.
-        send_ctrl_break(handle.identity.pid.get());
-
-        if wait_for_process_exit(handle.identity.pid.get(), 5000) {
-            return Ok(());
-        }
-
-        // Grace period expired — escalate to force.
-        terminate_job(&handle.job_object)
+        Self::stop_gracefully(handle, GRACEFUL_STOP_GRACE)
     }
 
     /// The Job Object keeps every process the run starts, orphaned or not.

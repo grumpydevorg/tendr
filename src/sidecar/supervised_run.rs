@@ -401,6 +401,7 @@ impl RunCore {
                     writer,
                     resize,
                     recorder: Some(recording.thread.recorder()),
+                    full_marker: super::pty_full_marker(),
                 },
                 hooks,
             ),

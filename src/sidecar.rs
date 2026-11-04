@@ -1784,12 +1784,34 @@ struct UnixPtyInput {
     writer: crate::platform::unix::PtyWriter,
     resize: Option<std::fs::File>,
     recorder: Option<Recorder>,
+    /// A file to create the first time the PTY refuses input as full
+    /// ([`pty_full_marker`]).
+    full_marker: Option<std::path::PathBuf>,
+}
+
+/// In debug builds, the path in `TENDR_TEST_PTY_FULL_FILE`: a test whose
+/// input must be stuck on a full PTY learns that it is, rather than infer it
+/// from a forwarder that has not moved for a while, which load can fake.
+/// Release builds read no variable.
+#[cfg(unix)]
+fn pty_full_marker() -> Option<std::path::PathBuf> {
+    if cfg!(debug_assertions) {
+        std::env::var_os("TENDR_TEST_PTY_FULL_FILE").map(std::path::PathBuf::from)
+    } else {
+        None
+    }
 }
 
 #[cfg(unix)]
 impl crate::model::pty_control::PtyInputSink for UnixPtyInput {
     fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.writer.try_write(bytes)
+        let written = self.writer.try_write(bytes);
+        if matches!(&written, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
+            if let Some(marker) = self.full_marker.take() {
+                let _ = std::fs::write(marker, b"");
+            }
+        }
+        written
     }
 }
 
