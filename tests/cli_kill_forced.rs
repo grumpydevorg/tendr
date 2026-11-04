@@ -1,8 +1,8 @@
 mod harness;
+use harness::Home;
 
-use harness::{HANG, SessionGuard, tendr, wait_running, wait_terminal};
+use harness::{HANG, tendr, wait_running, wait_terminal};
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -16,13 +16,12 @@ fn kill_wait_ms() -> String {
 #[test]
 fn force_kill_produces_killed_forced() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "fk-job", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "fk-job");
     wait_running(&root, "fk-job");
 
     tendr(&root)
@@ -39,13 +38,12 @@ fn force_kill_produces_killed_forced() {
 #[test]
 fn graceful_kill_produces_killed() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "gk-job", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "gk-job");
     wait_running(&root, "gk-job");
 
     tendr(&root)

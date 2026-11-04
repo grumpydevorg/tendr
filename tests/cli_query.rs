@@ -5,13 +5,14 @@
 //! external `duckdb` CLI. Read-only; no new write path.
 
 mod harness;
+use harness::Home;
 
 use harness::tendr;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
 /// Write `lines` as one JSONL segment under `<ns>/<session>/events/`.
-fn seed(root: &TempDir, ns: &str, session: &str, lines: &[&str]) {
+fn seed(root: &Home, ns: &str, session: &str, lines: &[&str]) {
     let dir = root
         .path()
         .join(format!(".tendr/sessions/{ns}/{session}/events"));
@@ -24,7 +25,7 @@ fn seed(root: &TempDir, ns: &str, session: &str, lines: &[&str]) {
 }
 
 /// Two exec.result events (exit 0 and 7) in default/s1, one hook event in agents/s2.
-fn seed_mixed(root: &TempDir) {
+fn seed_mixed(root: &Home) {
     seed(
         root,
         "default",
@@ -49,7 +50,7 @@ fn query_counts_all_events_across_namespaces() {
     if !harness::duckdb_or_skip() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     seed_mixed(&root);
 
     tendr(&root)
@@ -64,7 +65,7 @@ fn query_group_by_kind_reads_kind_column() {
     if !harness::duckdb_or_skip() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     seed_mixed(&root);
 
     tendr(&root)
@@ -83,7 +84,7 @@ fn query_data_is_json_and_ts_is_timestamp() {
     if !harness::duckdb_or_skip() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     seed_mixed(&root);
 
     // data->>'exit_code' proves `data` is JSON; the ts comparison proves ts is a
@@ -105,7 +106,7 @@ fn query_namespace_scopes_the_view() {
     if !harness::duckdb_or_skip() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     seed_mixed(&root);
 
     // Only the agents namespace is in scope: default/s1's events are excluded.
@@ -127,7 +128,7 @@ fn query_from_file_runs_sql_from_disk() {
     if !harness::duckdb_or_skip() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     seed_mixed(&root);
 
     let sql_path = root.path().join("q.sql");
@@ -146,7 +147,7 @@ fn query_empty_scope_returns_zero() {
     if !harness::duckdb_or_skip() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     // No sessions seeded at all: the view exists but is empty.
 
     tendr(&root)
@@ -161,7 +162,7 @@ fn query_bad_sql_propagates_failure() {
     if !harness::duckdb_or_skip() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     seed_mixed(&root);
 
     tendr(&root)
@@ -173,7 +174,7 @@ fn query_bad_sql_propagates_failure() {
 
 #[test]
 fn query_missing_duckdb_errors_clearly() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     seed_mixed(&root);
 
     // Empty PATH: the `duckdb` binary cannot be found. The error must name the
@@ -192,7 +193,7 @@ fn query_version_reports_duckdb() {
     if !harness::duckdb_or_skip() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["query", "--version"])
@@ -203,7 +204,7 @@ fn query_version_reports_duckdb() {
 
 #[test]
 fn query_requires_sql_file_or_shell() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Bare `tendr query` with no SQL, no --file, no --shell, no --version is a
     // usage error.
@@ -215,7 +216,7 @@ fn query_tolerates_a_malformed_line() {
     if !harness::duckdb_or_skip() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     // A corrupt/torn line between two valid events must not kill the query: it
     // is skipped, and the two real events still count. (Unparseable JSON is not
     // rescued by TRY_CAST — the reader itself must tolerate it.)
@@ -317,7 +318,7 @@ fn read_to_closed_end(
 /// clock decides it.
 #[test]
 fn query_is_not_held_open_by_what_duckdb_leaves_running() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     seed_mixed(&root);
 
     for args in [&["query", "--version"][..], &["query", "SELECT 1"][..]] {

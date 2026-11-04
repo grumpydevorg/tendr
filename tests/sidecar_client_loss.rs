@@ -11,13 +11,13 @@
 //! readiness, kills and reaps it, and only then opens the gate.
 
 mod harness;
+use harness::Home;
 
 use harness::{HANG, Observation, poll_until, read_events, tendr, touch_cmd};
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
-use tempfile::TempDir;
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::session::{self, LockGuard, SessionRoot};
 
@@ -25,14 +25,14 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 const READINESS_WARNING: &str = "readiness not delivered: start client gone";
 
-fn meta_path(root: &TempDir, session: &str) -> PathBuf {
+fn meta_path(root: &Home, session: &str) -> PathBuf {
     root.path()
         .join(format!(".tendr/sessions/default/{session}/meta.json"))
 }
 
 /// Spawn `tendr start <args>` with the readiness gate closed. The gate's own
 /// bound is put off, so the sidecar holds until the test opens the gate.
-fn spawn_gated_start(root: &TempDir, gate: &std::path::Path, args: &[&str]) -> Child {
+fn spawn_gated_start(root: &Home, gate: &std::path::Path, args: &[&str]) -> Child {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"));
     cmd.arg("start")
         .args(args)
@@ -58,7 +58,7 @@ fn spawn_gated_start(root: &TempDir, gate: &std::path::Path, args: &[&str]) -> C
 /// once the sidecar has written meta (it holds the lock and the ready pipe), the
 /// client — still blocked on readiness — is killed and reaped before the gate
 /// opens, so the sidecar's readiness write has no reader.
-fn start_and_lose_client(root: &TempDir, session: &str, rest: &[&str]) {
+fn start_and_lose_client(root: &Home, session: &str, rest: &[&str]) {
     let gate = root.path().join(format!("ready-gate-{session}"));
     let _open = harness::OpenGate(gate.clone());
     let mut args = vec![session];
@@ -91,7 +91,7 @@ fn start_and_lose_client(root: &TempDir, session: &str, rest: &[&str]) {
 /// return the meta it left behind. Holding the guard keeps the observation
 /// stable while the caller asserts. A sidecar that dies at the readiness write
 /// releases the lock at once, leaving non-terminal meta: exactly the defect.
-fn wait_sidecar_gone(root: &TempDir, session: &str) -> (serde_json::Value, LockGuard) {
+fn wait_sidecar_gone(root: &Home, session: &str) -> (serde_json::Value, LockGuard) {
     let session_root = SessionRoot::new(root.path().join(".tendr/sessions"));
     let namespace = Namespace::new("default").unwrap();
     let name = SessionName::new(session).unwrap();
@@ -134,7 +134,7 @@ fn assert_readiness_warning(meta: &serde_json::Value) {
     );
 }
 
-fn assert_exited_ok_with_event(root: &TempDir, session: &str, meta: &serde_json::Value) {
+fn assert_exited_ok_with_event(root: &Home, session: &str, meta: &serde_json::Value) {
     assert_eq!(
         meta["status"], "Exited",
         "the sidecar let go of {session} before the run ended (SidecarLost residue): {meta}"
@@ -153,7 +153,7 @@ fn assert_exited_ok_with_event(root: &TempDir, session: &str, meta: &serde_json:
 #[test]
 fn client_lost_after_spawn_still_supervises_to_exit() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     start_and_lose_client(&root, "s1", &["--", "sleep", "1"]);
 
@@ -165,7 +165,7 @@ fn client_lost_after_spawn_still_supervises_to_exit() {
 #[test]
 fn client_lost_after_spawn_still_runs_on_exit_hook() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let marker = root.path().join("on-exit-marker");
 
     let hook = touch_cmd(&marker);
@@ -183,7 +183,7 @@ fn client_lost_after_spawn_still_runs_on_exit_hook() {
 #[test]
 fn client_lost_during_dependency_wait_still_runs_after_deps() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "dep1", "--", "sleep", "1"])
@@ -201,7 +201,7 @@ fn client_lost_during_dependency_wait_still_runs_after_deps() {
 #[test]
 fn client_lost_on_spawn_failure_records_the_warning() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     start_and_lose_client(&root, "bad", &["--", "nonexistent-command-xyz-12345"]);
 

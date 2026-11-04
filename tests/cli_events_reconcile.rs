@@ -4,18 +4,18 @@
 #![cfg(unix)]
 
 mod harness;
+use harness::Home;
 
 use harness::{HANG, Observation, poll_until, tendr, wait_pid_dead, wait_running};
 use std::sync::Mutex;
 use std::time::Duration;
-use tempfile::TempDir;
 
 /// Sidecar-killing and crash-injection tests are serialised within this
 /// binary (same pattern as cli_reconcile.rs), to keep its own load down.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Read all events for a session, merged by (ts, writer, seq).
-fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
+fn read_events(root: &Home, session: &str) -> Vec<serde_json::Value> {
     let events_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/events"));
@@ -45,7 +45,7 @@ fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
     events
 }
 
-fn read_meta_json(root: &TempDir, session: &str) -> serde_json::Value {
+fn read_meta_json(root: &Home, session: &str) -> serde_json::Value {
     let path = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/meta.json"));
@@ -61,7 +61,7 @@ fn sidecar_pid(meta: &serde_json::Value) -> i32 {
 /// session lock only when the process finishes dying (macOS crash reporting
 /// can delay that well past the fsync'd event append), and reconciliation
 /// deliberately no-ops while the lock is held.
-fn poll_status_until_terminal(root: &TempDir, session: &str) -> serde_json::Value {
+fn poll_status_until_terminal(root: &Home, session: &str) -> serde_json::Value {
     poll_until(HANG, Duration::from_millis(50), || {
         let output = tendr(root).args(["status", session]).output().unwrap();
         assert!(output.status.success());
@@ -75,7 +75,7 @@ fn poll_status_until_terminal(root: &TempDir, session: &str) -> serde_json::Valu
 }
 
 /// Poll until the session's event log contains `kind`, or panic at `HANG`.
-fn wait_for_event_kind(root: &TempDir, session: &str, kind: &str) {
+fn wait_for_event_kind(root: &Home, session: &str, kind: &str) {
     let events_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/events"));
@@ -94,7 +94,7 @@ fn wait_for_event_kind(root: &TempDir, session: &str, kind: &str) {
 #[test]
 fn killed_sidecar_appends_inferred_sidecar_lost_event() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "s1", "--", "sleep", "3600"])
@@ -102,7 +102,6 @@ fn killed_sidecar_appends_inferred_sidecar_lost_event() {
         .success();
     // The child never exits by itself, so it is still there to be reaped as
     // an orphan however long the test takes.
-    let _session = harness::SessionGuard::new(&root, "s1");
     wait_running(&root, "s1");
 
     let meta = read_meta_json(&root, "s1");
@@ -145,7 +144,7 @@ fn killed_sidecar_appends_inferred_sidecar_lost_event() {
 #[test]
 fn crash_between_event_and_meta_heals_meta_from_event_log() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .env("TENDR_TEST_ABORT", "before_terminal_meta")
@@ -180,7 +179,7 @@ fn crash_between_event_and_meta_heals_meta_from_event_log() {
 #[test]
 fn wait_exit_code_reflects_healed_state() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .env("TENDR_TEST_ABORT", "before_terminal_meta")
@@ -206,13 +205,12 @@ fn wait_exit_code_reflects_healed_state() {
 #[test]
 fn sidecar_lost_stops_a_pty_recording() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "p1", "--pty", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "p1");
     wait_running(&root, "p1");
     let meta = read_meta_json(&root, "p1");
     assert_eq!(meta["pty"]["recording"]["state"], "Recording");
@@ -248,7 +246,7 @@ fn sidecar_lost_stops_a_pty_recording() {
 #[test]
 fn healed_pty_run_stops_its_recording() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .env("TENDR_TEST_ABORT", "before_terminal_meta")

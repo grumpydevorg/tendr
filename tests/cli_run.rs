@@ -1,9 +1,9 @@
 mod harness;
+use harness::Home;
 
 use assert_cmd::Command;
-use harness::{DeadlineAssertExt, SessionGuard};
+use harness::DeadlineAssertExt;
 use predicates::prelude::*;
-use tempfile::TempDir;
 
 use std::sync::Mutex;
 
@@ -13,7 +13,7 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn tendr(root: &TempDir) -> Command {
+fn tendr(root: &Home) -> Command {
     harness::tendr(root)
 }
 
@@ -43,7 +43,7 @@ fn write_bash_script(dir: &std::path::Path, name: &str, body: &str) -> std::path
 
 #[test]
 fn run_blocks_and_returns_exit_code_zero() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(root.path(), "hello.py", "print('hello-from-run')");
 
     tendr(&root)
@@ -55,7 +55,7 @@ fn run_blocks_and_returns_exit_code_zero() {
 
 #[test]
 fn run_propagates_nonzero_exit_code() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(root.path(), "fail.py", "print('failing')\nsys.exit(7)");
 
     tendr(&root)
@@ -67,7 +67,7 @@ fn run_propagates_nonzero_exit_code() {
 
 #[test]
 fn run_passes_script_arguments() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(
         root.path(),
         "args.py",
@@ -83,7 +83,7 @@ fn run_passes_script_arguments() {
 
 #[test]
 fn run_unset_env_removes_inherited_var() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(
         root.path(),
         "ci.py",
@@ -102,7 +102,7 @@ fn run_unset_env_removes_inherited_var() {
 /// `env=CI=…` directive, and `--env CI=…` still wins over the unset.
 #[test]
 fn run_unset_env_drops_directive_env_but_cli_env_wins() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(
         root.path(),
         "ci_directive.py",
@@ -134,7 +134,7 @@ fn run_unset_env_drops_directive_env_but_cli_env_wins() {
 
 #[test]
 fn run_replace_reruns_script() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(root.path(), "rerun.py", "print('rerun-output')");
 
     tendr(&root)
@@ -151,7 +151,7 @@ fn run_replace_reruns_script() {
 
 #[test]
 fn run_foreground_overrides_detach_directive() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     // Python uses # for comments, so #tendr: directives work natively.
     let script = write_py_script(
         root.path(),
@@ -176,8 +176,7 @@ fn run_foreground_overrides_detach_directive() {
 
 #[test]
 fn run_detach_returns_immediately_with_json() {
-    let root = TempDir::new().unwrap();
-    let _run = SessionGuard::new_ns(&root, "default", "slow");
+    let root = Home::new();
     let script = write_py_script(root.path(), "slow.py", FOREVER_PY);
 
     tendr(&root)
@@ -189,8 +188,7 @@ fn run_detach_returns_immediately_with_json() {
 
 #[test]
 fn run_session_name_from_filename() {
-    let root = TempDir::new().unwrap();
-    let _run = SessionGuard::new_ns(&root, "default", "my-build");
+    let root = Home::new();
     let script = write_py_script(
         root.path(),
         "my-build.py",
@@ -206,8 +204,7 @@ fn run_session_name_from_filename() {
 
 #[test]
 fn run_session_directive_overrides_filename() {
-    let root = TempDir::new().unwrap();
-    let _run = SessionGuard::new_ns(&root, "default", "custom-name");
+    let root = Home::new();
     let script = write_py_script(
         root.path(),
         "build.py",
@@ -223,8 +220,7 @@ fn run_session_directive_overrides_filename() {
 
 #[test]
 fn run_directives_map_to_launch_spec() {
-    let root = TempDir::new().unwrap();
-    let _run = SessionGuard::new_ns(&root, "test-ns", "my-session");
+    let root = Home::new();
     let script = write_py_script(
         root.path(),
         "directives.py",
@@ -244,8 +240,7 @@ fn run_directives_map_to_launch_spec() {
 
 #[test]
 fn run_cli_flags_override_directives() {
-    let root = TempDir::new().unwrap();
-    let _run = SessionGuard::new_ns(&root, "cli-ns", "override");
+    let root = Home::new();
     let script = write_py_script(
         root.path(),
         "override.py",
@@ -274,7 +269,7 @@ fn run_cli_flags_override_directives() {
 
 #[test]
 fn run_shell_flag_uses_specified_interpreter() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     // Write a plain text file with Python code — no mapped extension.
     let script_path = root.path().join("noshebang.txt");
     std::fs::write(&script_path, "print('shell-flag-works')\n").unwrap();
@@ -292,7 +287,7 @@ fn run_shell_flag_uses_specified_interpreter() {
 
 #[test]
 fn run_py_extension_uses_python() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(root.path(), "check.py", "print('py-ext-works')");
 
     tendr(&root)
@@ -306,7 +301,7 @@ fn run_py_extension_uses_python() {
 
 #[test]
 fn run_nonexistent_script_fails() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["run", "/nonexistent/path/script.sh"])
@@ -317,7 +312,7 @@ fn run_nonexistent_script_fails() {
 
 #[test]
 fn run_unknown_extension_fails_with_hint() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script_path = root.path().join("mystery.xyz");
     std::fs::write(&script_path, "some content\n").unwrap();
 
@@ -331,7 +326,7 @@ fn run_unknown_extension_fails_with_hint() {
 
 #[test]
 fn run_invalid_cli_namespace_fails() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(root.path(), "good.py", "print('hi')");
 
     tendr(&root)
@@ -343,7 +338,7 @@ fn run_invalid_cli_namespace_fails() {
 
 #[test]
 fn run_invalid_namespace_directive_fails() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(
         root.path(),
         "badns.py",
@@ -359,7 +354,7 @@ fn run_invalid_namespace_directive_fails() {
 
 #[test]
 fn run_invalid_session_directive_fails() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(
         root.path(),
         "badsession.py",
@@ -375,7 +370,7 @@ fn run_invalid_session_directive_fails() {
 
 #[test]
 fn run_unknown_directive_errors() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_py_script(root.path(), "bad.py", "#tendr: timout=30\nprint('hi')");
 
     tendr(&root)
@@ -390,7 +385,7 @@ fn run_unknown_directive_errors() {
 #[test]
 fn run_session_rejects_exec() {
     let _lock = lock();
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let script = write_py_script(
         root.path(),
@@ -403,7 +398,6 @@ fn run_session_rejects_exec() {
         .assert_within_deadline()
         .success();
 
-    let _session = harness::SessionGuard::new(&root, "server");
     harness::wait_running(&root, "server");
 
     tendr(&root)
@@ -422,10 +416,9 @@ fn run_session_rejects_exec() {
 // shared deadline helper).
 #[test]
 fn harness_deadline_reports_timeout_with_command_and_deadline() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     // The run never ends by itself, so the deadline is the only way out; the
     // guard stops the session the killed client leaves behind.
-    let _run = SessionGuard::new_ns(&root, "default", "hang");
     let script = write_py_script(root.path(), "hang.py", FOREVER_PY);
     let script_str = script.to_str().unwrap().to_owned();
 
@@ -458,7 +451,7 @@ fn harness_deadline_reports_timeout_with_command_and_deadline() {
 #[cfg(unix)]
 #[test]
 fn run_bash_sh_extension() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_bash_script(root.path(), "test.sh", "echo bash-ext-works");
 
     tendr(&root)
@@ -471,7 +464,7 @@ fn run_bash_sh_extension() {
 #[cfg(unix)]
 #[test]
 fn run_shebang_fallback_for_extensionless() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     // Extensionless file with shebang, not executable
     let script_path = root.path().join("myscript");
     std::fs::write(&script_path, "#!/bin/bash\necho shebang-fallback\n").unwrap();
@@ -486,7 +479,7 @@ fn run_shebang_fallback_for_extensionless() {
 #[cfg(unix)]
 #[test]
 fn run_executable_bit_direct() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = write_bash_script(root.path(), "direct", "echo direct-exec");
 
     tendr(&root)

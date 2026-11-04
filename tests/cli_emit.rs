@@ -1,12 +1,12 @@
 //! `tendr emit` — spec §6 (write surface) and §7 (orphan emitters).
 
 mod harness;
+use harness::Home;
 
 use harness::{tendr, wait_terminal};
-use tempfile::TempDir;
 
 /// Read all events for a session, merged by (ts, writer, seq).
-fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
+fn read_events(root: &Home, session: &str) -> Vec<serde_json::Value> {
     let events_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/events"));
@@ -37,7 +37,7 @@ fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
 }
 
 /// Start a session running `echo hi`, wait for it to finish, return run_id.
-fn finished_session(root: &TempDir, name: &str) -> String {
+fn finished_session(root: &Home, name: &str) -> String {
     tendr(root)
         .args(["start", name, "--", "echo", "hi"])
         .assert()
@@ -49,7 +49,7 @@ fn finished_session(root: &TempDir, name: &str) -> String {
 /// The plan's canonical validation example: a hook emitting with env context.
 #[test]
 fn emit_with_env_context_appends_event() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let run_id = finished_session(&root, "s1");
 
     tendr(&root)
@@ -86,7 +86,7 @@ fn emit_with_env_context_appends_event() {
 
 #[test]
 fn emit_with_explicit_session_resolves_run_id_from_meta() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let run_id = finished_session(&root, "s1");
 
     tendr(&root)
@@ -114,7 +114,7 @@ fn emit_with_explicit_session_resolves_run_id_from_meta() {
 
 #[test]
 fn emit_bare_session_name_defaults_namespace() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     tendr(&root)
@@ -130,7 +130,7 @@ fn emit_bare_session_name_defaults_namespace() {
 
 #[test]
 fn emit_parent_flag_sets_parent_id() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     let parent = uuid::Uuid::now_v7().to_string();
@@ -158,7 +158,7 @@ fn emit_parent_flag_sets_parent_id() {
 
 #[test]
 fn emit_defaults_block_and_parent_from_block_env() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     let block = uuid::Uuid::now_v7().to_string();
@@ -180,7 +180,7 @@ fn emit_defaults_block_and_parent_from_block_env() {
 
 #[test]
 fn emit_parent_event_env_beats_block_for_parent() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     let block = uuid::Uuid::now_v7().to_string();
@@ -200,7 +200,7 @@ fn emit_parent_event_env_beats_block_for_parent() {
 
 #[test]
 fn emit_parent_flag_beats_env_chain() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     let explicit = uuid::Uuid::now_v7().to_string();
@@ -226,7 +226,7 @@ fn emit_parent_flag_beats_env_chain() {
 
 #[test]
 fn emit_malformed_env_chain_warns_and_is_ignored() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     tendr(&root)
@@ -249,7 +249,7 @@ fn emit_malformed_env_chain_warns_and_is_ignored() {
 
 #[test]
 fn emit_reserved_kind_exits_6() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     for kind in ["run.custom", "tendr.x", "exec.thing"] {
@@ -267,7 +267,7 @@ fn emit_reserved_kind_exits_6() {
 
 #[test]
 fn emit_invalid_kind_grammar_exits_6() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     tendr(&root)
@@ -278,7 +278,7 @@ fn emit_invalid_kind_grammar_exits_6() {
 
 #[test]
 fn emit_reserved_source_exits_6() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     tendr(&root)
@@ -297,7 +297,7 @@ fn emit_reserved_source_exits_6() {
 
 #[test]
 fn emit_without_context_exits_3() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .env_remove("TENDR_SESSION")
         .args(["emit", "--kind", "ci.done"])
@@ -307,7 +307,7 @@ fn emit_without_context_exits_3() {
 
 #[test]
 fn emit_missing_session_exits_5() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["emit", "--kind", "ci.done", "--session", "nope"])
         .assert()
@@ -316,7 +316,7 @@ fn emit_missing_session_exits_5() {
 
 #[test]
 fn emit_non_object_data_exits_2() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     tendr(&root)
@@ -347,7 +347,7 @@ fn emit_non_object_data_exits_2() {
 
 #[test]
 fn emit_invalid_parent_exits_2() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     tendr(&root)
@@ -368,7 +368,7 @@ fn emit_invalid_parent_exits_2() {
 
 #[test]
 fn emit_best_effort_swallows_all_failures() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args([
@@ -403,7 +403,7 @@ fn emit_best_effort_swallows_all_failures() {
 
 #[test]
 fn emit_from_pruned_session_lands_in_lost_found() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let run_id = uuid::Uuid::now_v7().to_string();
 
     // Env context names a session whose dir no longer exists (pruned mid-run).

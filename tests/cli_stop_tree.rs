@@ -8,12 +8,12 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod harness;
+use harness::Home;
 
-use harness::{HANG, Observation, SessionGuard, poll_until, tendr};
+use harness::{HANG, Observation, poll_until, tendr};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -83,7 +83,7 @@ enum Stop {
 struct Kinds(PathBuf);
 
 impl Kinds {
-    fn new(root: &TempDir) -> Self {
+    fn new(root: &Home) -> Self {
         let dir = root.path().join("kinds");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("hold.sh"), HOLD).unwrap();
@@ -119,7 +119,7 @@ impl Kinds {
 
     /// Wait until every kind has started (`ready`: true), or until `session`
     /// ended before that (false).
-    fn await_ready(&self, root: &TempDir, session: &str) -> bool {
+    fn await_ready(&self, root: &Home, session: &str) -> bool {
         let ready = self.0.join("ready");
         poll_until(HANG, Duration::from_millis(20), || {
             if ready.exists() {
@@ -158,7 +158,7 @@ fn running(pid: i32) -> bool {
 }
 
 /// A session's meta as it is on disk, if readable.
-fn read_meta(root: &TempDir, namespace: &str, session: &str) -> Option<serde_json::Value> {
+fn read_meta(root: &Home, namespace: &str, session: &str) -> Option<serde_json::Value> {
     let path = root
         .path()
         .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
@@ -173,7 +173,7 @@ fn ended(meta: &serde_json::Value) -> bool {
 /// Stop a run with `stop` and return its terminal meta. `kill` returns once
 /// the run's end is recorded, however long its sidecar takes (the kill's own
 /// wait for that is put off); a timed-out run is waited for.
-fn stop_run(root: &TempDir, session: &str, stop: Stop) -> serde_json::Value {
+fn stop_run(root: &Home, session: &str, stop: Stop) -> serde_json::Value {
     let args: &[&str] = match stop {
         Stop::Kill => &["kill", session],
         Stop::Force => &["kill", "--force", session],
@@ -226,7 +226,7 @@ fn every_kind_ends_with_the_run(stop: Stop, session: &str, reason: &str) {
 /// One run of [`every_kind_ends_with_the_run`]: false if the run ended
 /// before every kind had started, which only its timeout may do.
 fn one_run_ends_every_kind(stop: Stop, session: &str, reason: &str) -> bool {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let kinds = Kinds::new(&root);
 
     let mut start = tendr(&root);
@@ -242,7 +242,6 @@ fn one_run_ends_every_kind(stop: Stop, session: &str, reason: &str) -> bool {
         .arg(&kinds.0)
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, session);
     if !kinds.await_ready(&root, session) {
         assert!(
             matches!(stop, Stop::Timeout),
@@ -292,7 +291,7 @@ fn timeout_ends_every_process_the_run_started() {
 #[test]
 fn kill_ends_a_pipe_run_whose_output_a_setsid_process_holds() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let kinds = Kinds::new(&root);
 
     let script = r#"sh "$1/setsid.sh" sh "$1/hold.sh" "$1/pipe-holder" &
@@ -303,7 +302,6 @@ exec sleep 600"#;
         .arg(&kinds.0)
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "pipe-held");
     kinds.await_file("pipe-holder");
 
     let meta = stop_run(&root, "pipe-held", Stop::Kill);
@@ -325,7 +323,7 @@ while :; do sleep 0.1; done"#;
 #[test]
 fn kill_lets_every_process_clean_up_on_sigterm_first() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let kinds = Kinds::new(&root);
     std::fs::write(kinds.0.join("cleans-up.sh"), CLEANS_UP).unwrap();
 
@@ -343,7 +341,6 @@ wait"#;
         .arg(&kinds.0)
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "cleans-up");
     kinds.await_file("member");
     kinds.await_file("escapee");
 
@@ -359,18 +356,6 @@ wait"#;
     assert!(survivors.is_empty(), "{survivors:?}: {meta}");
 }
 
-/// Force-kills the session `nest/inner` when dropped.
-struct InnerSession<'a>(&'a TempDir);
-
-impl Drop for InnerSession<'_> {
-    fn drop(&mut self) {
-        let _ = tendr(self.0)
-            .args(["kill", "--force", "--namespace", "nest", "inner"])
-            .timeout(HANG)
-            .output();
-    }
-}
-
 /// A tendr session started from inside a run is a session of its own, and
 /// stopping the outer run must leave it and its child running. Its sidecar
 /// is orphaned once `tendr start` returns: on Linux the outer sidecar adopts
@@ -379,7 +364,7 @@ impl Drop for InnerSession<'_> {
 #[test]
 fn a_stop_leaves_a_session_started_inside_the_run_running() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let started = root.path().join("inner-started");
 
     let script = r#""$1" start --namespace nest inner -- sleep 300 >/dev/null && touch "$2"
@@ -390,8 +375,6 @@ exec sleep 600"#;
         .arg(&started)
         .assert()
         .success();
-    let _outer = SessionGuard::new(&root, "outer");
-    let _inner = InnerSession(&root);
     harness::poll_path_exists(&started, HANG, Duration::from_millis(20))
         .unwrap_or_else(|e| panic!("the inner session never started: {e}"));
     harness::wait_running_ns(&root, "nest", "inner");
@@ -422,7 +405,7 @@ exec sleep 600"#;
 #[test]
 fn orphans_that_exit_during_the_run_are_reaped() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let dir = root.path();
 
     // Each `( … &)` leaves an orphan that exits 0.1 s later, its pid in
@@ -434,7 +417,6 @@ touch "$1/orphaned"; exec sleep 600"#;
         .arg(dir)
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "orphans");
     harness::poll_path_exists(&dir.join("orphaned"), HANG, Duration::from_millis(20)).unwrap();
     let orphans: Vec<i32> = (1..=3)
         .map(|i| {

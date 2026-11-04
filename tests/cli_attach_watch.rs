@@ -4,13 +4,13 @@
 #![cfg(unix)]
 
 mod harness;
+use harness::Home;
 
-use harness::{HANG, Observation, SessionGuard, poll_until, read_events, tendr};
+use harness::{HANG, Observation, poll_until, read_events, tendr};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
-use tempfile::TempDir;
 use tendr::attach_proto::{
     Frame, FrameError, Mode, RejectClass, ResumePoint, Version, WatchPoint, read_frame, write_frame,
 };
@@ -21,14 +21,14 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// The most watchers a run admits.
 const WATCHERS: usize = 8;
 
-fn session_dir(root: &TempDir, session: &str) -> PathBuf {
+fn session_dir(root: &Home, session: &str) -> PathBuf {
     root.path()
         .join(format!(".tendr/sessions/default/{session}"))
 }
 
 /// Start a PTY session running `script` under `sh -c`, with `env` set for
 /// the sidecar, and wait for its attach socket.
-fn start(root: &TempDir, session: &str, script: &str, env: &[(&str, &str)]) {
+fn start(root: &Home, session: &str, script: &str, env: &[(&str, &str)]) {
     let mut start = tendr(root);
     for (key, value) in env {
         start.env(key, value);
@@ -42,7 +42,7 @@ fn start(root: &TempDir, session: &str, script: &str, env: &[(&str, &str)]) {
     socket(root, session);
 }
 
-fn socket(root: &TempDir, session: &str) -> PathBuf {
+fn socket(root: &Home, session: &str) -> PathBuf {
     let dir = session_dir(root, session);
     poll_until(
         HANG,
@@ -60,7 +60,7 @@ fn touch(path: &Path) {
 }
 
 /// Connect, say hello in `version` and `mode`, and return the reply.
-fn hello(root: &TempDir, session: &str, version: Version, mode: Mode) -> (UnixStream, Frame) {
+fn hello(root: &Home, session: &str, version: Version, mode: Mode) -> (UnixStream, Frame) {
     let mut stream = UnixStream::connect(socket(root, session)).unwrap();
     write_frame(&mut stream, &Frame::Hello { version, mode }).unwrap();
     stream.set_read_timeout(Some(HANG)).unwrap();
@@ -69,7 +69,7 @@ fn hello(root: &TempDir, session: &str, version: Version, mode: Mode) -> (UnixSt
 }
 
 /// A version 2 watcher, and where its output starts.
-fn watch(root: &TempDir, session: &str) -> (UnixStream, WatchPoint) {
+fn watch(root: &Home, session: &str) -> (UnixStream, WatchPoint) {
     match hello(root, session, Version::V2, Mode::Watch) {
         (stream, Frame::Watching(point)) => (stream, point),
         (_, other) => panic!("watch refused: {other:?}"),
@@ -77,7 +77,7 @@ fn watch(root: &TempDir, session: &str) -> (UnixStream, WatchPoint) {
 }
 
 /// A version 2 controller, and the point it was accepted at.
-fn control(root: &TempDir, session: &str, mode: Mode) -> (UnixStream, ResumePoint) {
+fn control(root: &Home, session: &str, mode: Mode) -> (UnixStream, ResumePoint) {
     match hello(root, session, Version::V2, mode) {
         (stream, Frame::AcceptedV2(point)) => (stream, point),
         (_, other) => panic!("{mode:?} refused: {other:?}"),
@@ -141,7 +141,7 @@ fn assert_ended(stream: &mut UnixStream, who: &str) {
 }
 
 /// Wait until `meta.json` names `expected` as the PTY's controller.
-fn wait_control(root: &TempDir, session: &str, expected: &str) {
+fn wait_control(root: &Home, session: &str, expected: &str) {
     let control = || {
         let meta: serde_json::Value = serde_json::from_slice(
             &std::fs::read(session_dir(root, session).join("meta.json")).ok()?,
@@ -157,7 +157,7 @@ fn wait_control(root: &TempDir, session: &str, expected: &str) {
 }
 
 /// The run's `pty.control_changed` events, `(trigger, epoch)` in order.
-fn control_changes(root: &TempDir, session: &str) -> Vec<(String, u64)> {
+fn control_changes(root: &Home, session: &str) -> Vec<(String, u64)> {
     read_events(root, session)
         .into_iter()
         .filter(|e| e["kind"] == "pty.control_changed")
@@ -172,7 +172,7 @@ fn control_changes(root: &TempDir, session: &str) -> Vec<(String, u64)> {
 
 /// Wait until the run's control changes are `expected`: the sidecar records
 /// them on their own thread.
-fn assert_control_changes(root: &TempDir, session: &str, expected: &[(&str, u64)]) {
+fn assert_control_changes(root: &Home, session: &str, expected: &[(&str, u64)]) {
     poll_until(HANG, Duration::from_millis(50), || {
         let changes = control_changes(root, session);
         let matches = changes.len() == expected.len()
@@ -196,8 +196,7 @@ fn assert_control_changes(root: &TempDir, session: &str, expected: &[(&str, u64)
 #[test]
 fn eight_watchers_and_a_controller_share_a_run_and_a_ninth_watcher_is_refused() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "watch-full");
+    let root = Home::new();
     start(&root, "watch-full", "cat", &[]);
 
     let mut watchers: Vec<UnixStream> = (0..WATCHERS)
@@ -230,8 +229,7 @@ fn eight_watchers_and_a_controller_share_a_run_and_a_ninth_watcher_is_refused() 
 #[test]
 fn a_takeover_leaves_every_watcher_attached_and_receiving() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "watch-takeover");
+    let root = Home::new();
     start(&root, "watch-takeover", "cat", &[]);
 
     let mut watchers: Vec<UnixStream> = (0..3).map(|_| watch(&root, "watch-takeover").0).collect();
@@ -263,8 +261,7 @@ fn a_takeover_leaves_every_watcher_attached_and_receiving() {
 #[test]
 fn a_watchers_input_resize_and_repaint_never_reach_the_child() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "watch-input");
+    let root = Home::new();
     let input = root.path().join("input.log");
     let script = format!(
         "stty -echo; while IFS= read -r line; do \
@@ -337,8 +334,7 @@ fn a_watcher_a_ring_behind_is_cut_off_and_nothing_else_is() {
     const RING: u64 = 1024 * 1024;
     const PHASES: u64 = 6;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "watch-evict");
+    let root = Home::new();
     let (go, end) = (root.path().join("go"), root.path().join("end"));
     let line = "0123456789abcdef".repeat(62);
     // About 3 MB in six phases of about 500 KB. After each phase the run
@@ -414,8 +410,7 @@ fn a_watcher_a_ring_behind_is_cut_off_and_nothing_else_is() {
 #[test]
 fn the_runs_end_closes_every_watcher() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "watch-end");
+    let root = Home::new();
     let end = root.path().join("end");
     start(
         &root,

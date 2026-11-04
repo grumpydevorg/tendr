@@ -1,15 +1,15 @@
 mod harness;
+use harness::Home;
 
 use harness::{tendr, wait_terminal, wait_terminal_ns};
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 #[test]
 fn watch_emits_initial_state_snapshot() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start a session and let it finish.
     tendr(&root)
@@ -52,7 +52,7 @@ fn watch_emits_initial_state_snapshot() {
 #[test]
 fn watch_emits_log_events() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start a session that produces output.
     tendr(&root)
@@ -83,7 +83,7 @@ fn watch_emits_log_events() {
 #[test]
 fn watch_filters_by_namespace() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Create sessions in two namespaces.
     tendr(&root)
@@ -132,7 +132,7 @@ fn watch_filters_by_namespace() {
 #[test]
 fn watch_from_now_skips_existing() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start and complete a session before running watch.
     tendr(&root)
@@ -176,7 +176,7 @@ fn watch_from_now_skips_existing() {
 #[test]
 fn watch_both_events_and_logs_by_default() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start a session that produces output.
     tendr(&root)
@@ -217,7 +217,7 @@ fn watch_both_events_and_logs_by_default() {
 #[test]
 fn watch_from_now_surfaces_new_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let follower = harness::ReadyFollower::spawn(&root, "watch", &["--from-now"]);
     // Baseline established: a session started now is not skipped by --from-now.
@@ -235,7 +235,7 @@ fn watch_from_now_surfaces_new_session() {
 #[test]
 fn watch_detects_replace_and_resets_log_offset() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start a session that produces output.
     tendr(&root)

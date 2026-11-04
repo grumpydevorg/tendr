@@ -7,6 +7,7 @@
 //! user-edited file without `--force`.
 
 mod harness;
+use harness::Home;
 
 use harness::tendr;
 use predicates::prelude::*;
@@ -17,7 +18,7 @@ const SKILL_REL: &str = ".claude/skills/using-tendr/SKILL.md";
 
 #[test]
 fn skill_print_emits_frontmatter_and_bootstrap_rules() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["skill", "print"])
@@ -36,7 +37,7 @@ fn skill_print_emits_frontmatter_and_bootstrap_rules() {
 
 #[test]
 fn skill_install_writes_project_local_file() {
-    let home = TempDir::new().unwrap();
+    let home = Home::new();
     let project = TempDir::new().unwrap();
     let target = project.path().join(SKILL_REL);
 
@@ -56,7 +57,7 @@ fn skill_install_writes_project_local_file() {
 
 #[test]
 fn skill_install_is_idempotent() {
-    let home = TempDir::new().unwrap();
+    let home = Home::new();
     let project = TempDir::new().unwrap();
 
     // First install writes the file.
@@ -78,7 +79,7 @@ fn skill_install_is_idempotent() {
 
 #[test]
 fn skill_install_refuses_to_clobber_without_force() {
-    let home = TempDir::new().unwrap();
+    let home = Home::new();
     let project = TempDir::new().unwrap();
     let target = project.path().join(SKILL_REL);
 
@@ -118,7 +119,7 @@ fn skill_install_refuses_to_clobber_without_force() {
 
 #[test]
 fn skill_install_global_writes_under_home() {
-    let home = TempDir::new().unwrap();
+    let home = Home::new();
     let project = TempDir::new().unwrap();
     let target = home.path().join(SKILL_REL);
 
@@ -139,7 +140,7 @@ fn skill_install_global_writes_under_home() {
 
 #[test]
 fn skill_path_prints_project_target_without_writing() {
-    let home = TempDir::new().unwrap();
+    let home = Home::new();
     let project = TempDir::new().unwrap();
     let target = project.path().join(SKILL_REL);
 
@@ -158,7 +159,7 @@ fn skill_path_prints_project_target_without_writing() {
 
 #[test]
 fn skill_path_global_prints_home_target() {
-    let home = TempDir::new().unwrap();
+    let home = Home::new();
     let project = TempDir::new().unwrap();
     let target = home.path().join(SKILL_REL);
 

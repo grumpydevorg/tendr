@@ -1,16 +1,16 @@
 #![cfg(unix)]
 
 mod harness;
+use harness::Home;
 
-use harness::{HANG, SessionGuard, tendr, wait_pid_dead, wait_running};
+use harness::{HANG, tendr, wait_pid_dead, wait_running};
 use predicates::prelude::*;
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Read meta.json from disk and return parsed JSON.
-fn read_meta_json(root: &TempDir, session: &str) -> serde_json::Value {
+fn read_meta_json(root: &Home, session: &str) -> serde_json::Value {
     let path = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/meta.json"));
@@ -28,14 +28,13 @@ fn sidecar_pid(meta: &serde_json::Value) -> i32 {
 #[test]
 fn status_reconciles_crashed_sidecar() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "crashed-sc", "sleep", "3600"])
         .assert()
         .success();
     // Never exits by itself: still there to be found as an orphan.
-    let _session = SessionGuard::new(&root, "crashed-sc");
     wait_running(&root, "crashed-sc");
 
     let meta = read_meta_json(&root, "crashed-sc");
@@ -67,13 +66,12 @@ fn status_reconciles_crashed_sidecar() {
 #[test]
 fn status_does_not_reconcile_running_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "still-running", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "still-running");
     wait_running(&root, "still-running");
 
     tendr(&root)
@@ -92,13 +90,12 @@ fn status_does_not_reconcile_running_session() {
 #[test]
 fn wait_reconciles_crashed_sidecar() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "wait-crashed", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "wait-crashed");
     wait_running(&root, "wait-crashed");
 
     let meta = read_meta_json(&root, "wait-crashed");

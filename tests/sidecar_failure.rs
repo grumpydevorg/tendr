@@ -11,13 +11,13 @@
 //! then prove the whole group was stopped. No timing races.
 
 mod harness;
+use harness::Home;
 
 use harness::{HANG, Observation, echo_env_cmd, poll_until, read_events, tendr, touch_cmd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
-use tempfile::TempDir;
 use tendr::model::ids::{Namespace, ProcessIdentity, SessionName};
 use tendr::platform::{Current, Platform, ProcessStatus};
 use tendr::session::{self, LockGuard, SessionRoot};
@@ -28,7 +28,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// only ever stops a run that hangs.
 const RUN_TIMEOUT: &str = "120";
 
-fn session_dir(root: &TempDir, session: &str) -> PathBuf {
+fn session_dir(root: &Home, session: &str) -> PathBuf {
     root.path()
         .join(format!(".tendr/sessions/default/{session}"))
 }
@@ -42,19 +42,14 @@ enum Inject {
 
 /// `tendr start` in the background, so a row can act while the client is
 /// still blocked on readiness.
-fn spawn_start(root: &TempDir, inject: Inject, gate: &Path, args: &[&str]) -> Child {
+fn spawn_start(root: &Home, inject: Inject, gate: &Path, args: &[&str]) -> Child {
     start_command(root, inject, gate, args)
         .spawn()
         .expect("spawn tendr start")
 }
 
 /// The `tendr start` command [`spawn_start`] runs, for a row that adds to it.
-fn start_command(
-    root: &TempDir,
-    inject: Inject,
-    gate: &Path,
-    args: &[&str],
-) -> std::process::Command {
+fn start_command(root: &Home, inject: Inject, gate: &Path, args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"));
     cmd.arg("start")
         .args(args)
@@ -103,7 +98,7 @@ fn finish_client(mut client: Child) -> (Option<i32>, String, String) {
 
 /// Wait until the sidecar has let go of the session (its lock is ours) and
 /// return the meta it left, holding the lock so the observation is stable.
-fn wait_sidecar_gone(root: &TempDir, session: &str) -> (serde_json::Value, LockGuard) {
+fn wait_sidecar_gone(root: &Home, session: &str) -> (serde_json::Value, LockGuard) {
     let session_root = SessionRoot::new(root.path().join(".tendr/sessions"));
     let namespace = Namespace::new("default").unwrap();
     let name = SessionName::new(session).unwrap();
@@ -177,7 +172,7 @@ fn assert_pid_gone(pid_file: &Path, what: &str) {
         .unwrap_or_else(|e| panic!("{what} (pid {pid}) survived the group kill: {e}"));
 }
 
-fn event_kinds(root: &TempDir, session: &str) -> Vec<String> {
+fn event_kinds(root: &Home, session: &str) -> Vec<String> {
     read_events(root, session)
         .iter()
         .filter_map(|e| e["kind"].as_str().map(str::to_owned))
@@ -200,7 +195,7 @@ fn wait_file_content(path: &Path) -> String {
 
 /// Everything a `SidecarFailed { step }` must show: meta, event, `wait`'s exit
 /// code, the hook's `TENDR_EXIT_REASON`, a stopped child, no breadcrumb.
-fn assert_sidecar_failed(root: &TempDir, session: &str, step: &str, error: &str, hook_out: &Path) {
+fn assert_sidecar_failed(root: &Home, session: &str, step: &str, error: &str, hook_out: &Path) {
     let (meta, lock) = wait_sidecar_gone(root, session);
     assert_eq!(meta["status"], "Exited", "{meta}");
     assert_eq!(meta["reason"], "SidecarFailed", "{meta}");
@@ -283,7 +278,7 @@ fn ends_the_run(
     quiet_child: bool,
 ) -> Option<i32> {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let gate = root.path().join("fault-gate");
     let _open = harness::OpenGate(gate.clone());
     let hook_out = root.path().join("hook-env");
@@ -457,7 +452,7 @@ fn pty_io_failure_stops_the_session_leader_and_records_sidecar_failed() {
 #[test]
 fn pty_failure_stops_a_child_whose_output_was_never_read() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let gate = root.path().join("fault-gate");
     let _open = harness::OpenGate(gate.clone());
     let hook_out = root.path().join("hook-env");
@@ -506,7 +501,7 @@ fn pty_failure_stops_a_child_whose_output_was_never_read() {
 #[test]
 fn failure_record_failure_still_stops_the_child_and_says_so() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let gate = root.path().join("fault-gate");
     let _open = harness::OpenGate(gate.clone());
     let client = spawn_start(
@@ -563,7 +558,7 @@ fn failure_record_failure_still_stops_the_child_and_says_so() {
 #[test]
 fn failure_record_failure_on_the_after_path_heals_to_sidecar_failed() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "dep", "--", "true"])
         .assert()
@@ -618,8 +613,8 @@ fn failure_record_failure_on_the_after_path_heals_to_sidecar_failed() {
 
 /// Run `-- <argv>` with `inject`, and return the terminal meta once the
 /// sidecar is gone.
-fn recovers(inject: Inject, flags: &[&str], argv: &[&str]) -> (TempDir, serde_json::Value) {
-    let root = TempDir::new().unwrap();
+fn recovers(inject: Inject, flags: &[&str], argv: &[&str]) -> (Home, serde_json::Value) {
+    let root = Home::new();
     let gate = root.path().join("fault-gate");
     std::fs::write(&gate, b"").unwrap();
     let mut args: Vec<&str> = vec!["s1"];
@@ -721,7 +716,7 @@ fn output_log_write_failure_drains_output_and_recovers() {
 #[test]
 fn output_log_write_failure_warns_while_the_run_is_live() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let gate = root.path().join("fault-gate");
     std::fs::write(&gate, b"").unwrap();
     let release = root.path().join("release");
@@ -807,7 +802,7 @@ fn invalid_utf8_line_is_logged_and_capture_continues() {
 #[test]
 fn terminal_meta_failure_still_runs_hooks_and_heals() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let marker = root.path().join("hook-ran");
     let hook = touch_cmd(&marker);
     let gate = root.path().join("fault-gate");
@@ -867,7 +862,7 @@ fn pty_group_kill_reaches_the_session_leader_and_its_children() {
     // its pid. Under load it can fire first; then nothing was proved, so run
     // again with a fresh root until a run got that far.
     let (_root, gpid, meta) = poll_until(HANG, Duration::ZERO, || {
-        let root = TempDir::new().unwrap();
+        let root = Home::new();
         let (argv, gpid) = family_child(root.path(), false);
         let mut args = vec!["start", "s1", "--pty", "--timeout", "1", "--"];
         args.extend(argv.iter().map(String::as_str));
@@ -893,7 +888,7 @@ fn pty_group_kill_reaches_the_session_leader_and_its_children() {
 
 /// Start with `TENDR_TEST_ABORT=<point>` (a true crash), then return the meta
 /// the dead sidecar left, with the lock released again for reconciliation.
-fn crash_at(root: &TempDir, point: &str, args: &[&str]) -> serde_json::Value {
+fn crash_at(root: &Home, point: &str, args: &[&str]) -> serde_json::Value {
     tendr(root)
         .env("TENDR_TEST_ABORT", point)
         .args(["start"])
@@ -907,7 +902,7 @@ fn crash_at(root: &TempDir, point: &str, args: &[&str]) -> serde_json::Value {
 
 /// Runs the test's own cleanup, `status` (reconciliation kills the orphan),
 /// on drop, so a failing assertion does not leave the crashed run's child.
-struct ReconcileOnDrop<'a>(&'a TempDir, &'a str);
+struct ReconcileOnDrop<'a>(&'a Home, &'a str);
 
 impl Drop for ReconcileOnDrop<'_> {
     fn drop(&mut self) {
@@ -915,7 +910,7 @@ impl Drop for ReconcileOnDrop<'_> {
     }
 }
 
-fn status_of(root: &TempDir, session: &str) -> serde_json::Value {
+fn status_of(root: &Home, session: &str) -> serde_json::Value {
     let output = tendr(root).args(["status", session]).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     serde_json::from_slice(&output.stdout).unwrap()
@@ -936,7 +931,7 @@ fn evidence(meta: &serde_json::Value) -> Vec<String> {
 #[test]
 fn crash_while_running_leaves_an_orphan_that_status_kills() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     #[cfg(unix)]
     let (argv, gpid) = family_child(root.path(), false);
     #[cfg(windows)]
@@ -990,7 +985,7 @@ fn crash_while_running_leaves_an_orphan_that_status_kills() {
 #[test]
 fn crash_before_running_is_found_through_the_breadcrumb() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "dep", "--", "true"])
         .assert()

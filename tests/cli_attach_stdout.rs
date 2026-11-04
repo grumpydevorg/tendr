@@ -4,17 +4,15 @@
 #![cfg(unix)]
 
 mod harness;
+use harness::Home;
 
-use harness::{
-    BURST, HANG, Observation, SessionGuard, assert_prefix_of_the_burst, poll_until, tendr,
-};
+use harness::{BURST, HANG, Observation, assert_prefix_of_the_burst, poll_until, tendr};
 use std::io::{Read, Seek, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tempfile::TempDir;
 use tendr::attach_proto::{Frame, Mode, Version, read_frame, write_frame};
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -29,19 +27,19 @@ fn run_end_flush_outlasting_load() -> (&'static str, String) {
 }
 
 /// [`start`] with [`run_end_flush_outlasting_load`].
-fn start_flushing_all(root: &TempDir, session: &str, script: &str) {
+fn start_flushing_all(root: &Home, session: &str, script: &str) {
     let (key, value) = run_end_flush_outlasting_load();
     start(root, session, script, &[(key, &value)]);
 }
 
-fn session_dir(root: &TempDir, session: &str) -> PathBuf {
+fn session_dir(root: &Home, session: &str) -> PathBuf {
     root.path()
         .join(format!(".tendr/sessions/default/{session}"))
 }
 
 /// Start a PTY session running `script` under `sh -c`, with `env` set for
 /// the sidecar, and wait for its attach socket.
-fn start(root: &TempDir, session: &str, script: &str, env: &[(&str, &str)]) {
+fn start(root: &Home, session: &str, script: &str, env: &[(&str, &str)]) {
     let mut start = tendr(root);
     for (key, value) in env {
         start.env(key, value);
@@ -55,7 +53,7 @@ fn start(root: &TempDir, session: &str, script: &str, env: &[(&str, &str)]) {
     socket(root, session);
 }
 
-fn socket(root: &TempDir, session: &str) -> PathBuf {
+fn socket(root: &Home, session: &str) -> PathBuf {
     let dir = session_dir(root, session);
     poll_until(
         HANG,
@@ -74,7 +72,7 @@ fn touch(path: &Path) {
 
 /// `tendr attach --read-only <session>` with `stdin`, stdout and stderr
 /// piped, and `env` set.
-fn attach(root: &TempDir, session: &str, stdin: Stdio, env: &[(&str, &str)]) -> Child {
+fn attach(root: &Home, session: &str, stdin: Stdio, env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("tendr"));
     cmd.env("HOME", root.path())
         .env_remove("TENDR_TEST_ATTACH_TERMINAL")
@@ -135,8 +133,7 @@ fn ticking_then(go: &Path, then: &str) -> String {
 #[test]
 fn stdout_is_exactly_the_runs_output_and_stdin_is_never_read() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro-out");
+    let root = Home::new();
     let go = root.path().join("go");
     start_flushing_all(
         &root,
@@ -178,8 +175,7 @@ fn stdout_is_exactly_the_runs_output_and_stdin_is_never_read() {
 #[test]
 fn stdout_gets_the_mode_replay_but_no_resets_when_leaving() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro-modes");
+    let root = Home::new();
     let go = root.path().join("go");
     // Bracketed paste on, then ticks, then the end.
     let script = format!(
@@ -213,8 +209,7 @@ fn a_watcher_cut_off_while_its_consumer_stalls_exits_84() {
     // Far smaller than the flood, so the stalled attach falls behind it.
     const RING: &str = "1048576";
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro-cut");
+    let root = Home::new();
     let (go, end) = (root.path().join("go"), root.path().join("end"));
     let line = "0123456789abcdef".repeat(62);
     let flood = format!(
@@ -261,7 +256,7 @@ fn a_watcher_cut_off_while_its_consumer_stalls_exits_84() {
 }
 
 /// Connect a raw watcher: the connection, if the sidecar admitted it.
-fn watcher_admitted(root: &TempDir, session: &str) -> Option<UnixStream> {
+fn watcher_admitted(root: &Home, session: &str) -> Option<UnixStream> {
     let mut stream = UnixStream::connect(socket(root, session)).unwrap();
     write_frame(
         &mut stream,
@@ -280,8 +275,7 @@ fn watcher_admitted(root: &TempDir, session: &str) -> Option<UnixStream> {
 #[test]
 fn a_consumer_that_closes_early_detaches_the_watcher_and_exits_1() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro-pipe");
+    let root = Home::new();
     let end = root.path().join("end");
     start(&root, "ro-pipe", &ticking_then(&end, "true"), &[]);
 
@@ -316,8 +310,7 @@ fn a_consumer_that_closes_early_detaches_the_watcher_and_exits_1() {
 #[test]
 fn sigterm_ends_the_attach_with_1_while_stdin_would_block() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro-term");
+    let root = Home::new();
     let end = root.path().join("end");
     start(&root, "ro-term", &ticking_then(&end, "true"), &[]);
 
@@ -354,8 +347,7 @@ fn sigterm_ends_the_attach_with_1_while_stdin_would_block() {
 #[test]
 fn every_viewer_behind_at_the_runs_end_gets_its_last_bytes() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro-flush");
+    let root = Home::new();
     let go = root.path().join("go");
     start_flushing_all(
         &root,
@@ -427,8 +419,7 @@ fn every_viewer_behind_at_the_runs_end_gets_its_last_bytes() {
 #[test]
 fn a_burst_as_the_run_ends_reaches_a_piped_watcher_through_its_marker() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro-burst");
+    let root = Home::new();
     let go = root.path().join("go");
     start_flushing_all(&root, "ro-burst", &ticking_then(&go, BURST));
 
@@ -460,8 +451,7 @@ fn a_burst_as_the_run_ends_reaches_a_piped_watcher_through_its_marker() {
 #[test]
 fn a_watcher_stalled_past_the_run_end_flush_exits_84() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro-stall");
+    let root = Home::new();
     let go = root.path().join("go");
     start(&root, "ro-stall", &ticking_then(&go, BURST), &[]);
 
@@ -490,7 +480,7 @@ fn a_watcher_stalled_past_the_run_end_flush_exits_84() {
 /// is refused with the protocol class, as that decoder refuses it, and any
 /// other first frame is passed through to the real sidecar, which serves
 /// it as the old one would. Returns the hellos it was sent.
-fn sidecar_before_output_end(root: &TempDir, session: &str) -> Arc<Mutex<Vec<Vec<u8>>>> {
+fn sidecar_before_output_end(root: &Home, session: &str) -> Arc<Mutex<Vec<Vec<u8>>>> {
     use tendr::attach_proto::{MSG_HELLO, RejectClass, read_msg, write_msg};
     let real = socket(root, session);
     let sock = root.path().join("old.sock");
@@ -540,8 +530,7 @@ fn sidecar_before_output_end(root: &TempDir, session: &str) -> Arc<Mutex<Vec<Vec
 #[test]
 fn a_sidecar_from_before_the_end_of_output_keeps_the_run_end_verdict() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "ro-old");
+    let root = Home::new();
     let go = root.path().join("go");
     start_flushing_all(&root, "ro-old", &ticking_then(&go, "echo ALL-DONE"));
     let hellos = sidecar_before_output_end(&root, "ro-old");

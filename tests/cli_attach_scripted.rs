@@ -12,6 +12,7 @@
 //! own tests under a pseudo console (`windows_attach_console.rs`).
 
 mod harness;
+use harness::Home;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -54,12 +55,7 @@ struct Client {
 }
 
 impl Client {
-    fn spawn(
-        root: &TempDir,
-        path: &std::ffi::OsStr,
-        args: &[&str],
-        env: &[(String, String)],
-    ) -> Self {
+    fn spawn(root: &Home, path: &std::ffi::OsStr, args: &[&str], env: &[(String, String)]) -> Self {
         Self::spawn_on(root, path, args, true, None, env)
     }
 
@@ -68,7 +64,7 @@ impl Client {
     /// test terminal takes no writes while that file exists. `env` is set
     /// for the client.
     fn spawn_on(
-        root: &TempDir,
+        root: &Home,
         path: &std::ffi::OsStr,
         args: &[&str],
         terminal: bool,
@@ -246,7 +242,7 @@ impl Remote {
     }
 
     /// `tendr --host box attach s` against this remote.
-    fn attach(&self, root: &TempDir) -> Client {
+    fn attach(&self, root: &Home) -> Client {
         Client::spawn(
             root,
             &shim_path_env(&self.ssh),
@@ -257,7 +253,7 @@ impl Remote {
 
     /// [`Remote::attach`], on a screen that takes no writes while `hold`
     /// exists.
-    fn attach_held(&self, root: &TempDir, hold: &Path) -> Client {
+    fn attach_held(&self, root: &Home, hold: &Path) -> Client {
         Client::spawn_on(
             root,
             &shim_path_env(&self.ssh),
@@ -270,7 +266,7 @@ impl Remote {
 
     /// `tendr --host box attach --read-only s` against this remote, on the
     /// test terminal if `terminal`.
-    fn watch(&self, root: &TempDir, terminal: bool) -> Client {
+    fn watch(&self, root: &Home, terminal: bool) -> Client {
         Client::spawn_on(
             root,
             &shim_path_env(&self.ssh),
@@ -325,7 +321,7 @@ fn greeting() -> [Frame; 2] {
 /// escape with exit 0.
 #[test]
 fn a_scripted_attach_greets_shows_output_types_and_detaches() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::new(
         "hello log {log}\n\
          hello answer\n\
@@ -360,7 +356,7 @@ fn a_scripted_attach_greets_shows_output_types_and_detaches() {
 /// never after it, where the session would no longer read them (#111).
 #[test]
 fn keystrokes_typed_with_the_escape_go_out_before_the_detach() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::new(
         "hello log {log}\n\
          hello answer\n\
@@ -388,7 +384,7 @@ fn keystrokes_typed_with_the_escape_go_out_before_the_detach() {
 /// Told another client took over, the client exits 81 and says so.
 #[test]
 fn a_scripted_takeover_exits_81() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::new(
         "hello answer\n\
          hello await Repaint\n\
@@ -413,7 +409,7 @@ fn a_scripted_takeover_exits_81() {
 /// new connection is greeted as a fresh one is.
 #[test]
 fn a_scripted_drop_resumes_where_the_screen_stopped() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::new(
         "hello answer\n\
          hello await Repaint\n\
@@ -445,7 +441,7 @@ fn a_scripted_drop_resumes_where_the_screen_stopped() {
 /// says how much output was missed and how much was lost, then goes on.
 #[test]
 fn a_scripted_resume_that_is_gone_says_what_was_missed() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::new(
         "hello answer\n\
          hello await Repaint\n\
@@ -472,7 +468,7 @@ fn a_scripted_resume_that_is_gone_says_what_was_missed() {
 /// remote, after `one`, waits for a typed `z`, then drops the link, and the
 /// next ssh dies at once. Returns the client and the file whose removal
 /// shows that dial ran.
-fn reconnect_dial_exits_1(root: &TempDir, dir: &TempDir) -> (Client, Remote, PathBuf) {
+fn reconnect_dial_exits_1(root: &Home, dir: &TempDir) -> (Client, Remote, PathBuf) {
     let dial_dies = dir.path().join("dial-dies");
     let remote = Remote::after(
         &format!("die-if {} 1", dial_dies.display()),
@@ -500,7 +496,7 @@ fn reconnect_dial_exits_1(root: &TempDir, dir: &TempDir) -> (Client, Remote, Pat
 #[cfg(windows)]
 #[test]
 fn a_reconnect_dial_that_exits_1_is_tried_again_on_windows() {
-    let (root, dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (root, dir) = (Home::new(), TempDir::new().unwrap());
     let (mut client, _remote, dial_dies) = reconnect_dial_exits_1(&root, &dir);
     client.wait_screen(&[
         "one",
@@ -518,7 +514,7 @@ fn a_reconnect_dial_that_exits_1_is_tried_again_on_windows() {
 #[cfg(not(windows))]
 #[test]
 fn a_reconnect_dial_that_exits_1_ends_the_attach_on_unix() {
-    let (root, dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (root, dir) = (Home::new(), TempDir::new().unwrap());
     let (mut client, _remote, dial_dies) = reconnect_dial_exits_1(&root, &dir);
     assert_eq!(client.wait_exit(), 1, "{}", client.stderr());
     assert!(!dial_dies.exists(), "the reconnect never dialled");
@@ -536,7 +532,7 @@ fn a_reconnect_dial_that_exits_1_ends_the_attach_on_unix() {
 /// every byte the remote sent before it exits with the remote's code.
 #[test]
 fn a_controller_shows_all_output_before_the_remote_s_exit() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let dir = TempDir::new().unwrap();
     let (hold, hung_up) = (dir.path().join("hold"), dir.path().join("hung-up"));
     std::fs::write(&hold, b"").unwrap();
@@ -587,7 +583,7 @@ const LAST_ROW_ERASED: &str = "\x1b7\x1b[24;1H\x1b[0m\x1b[2K\x1b8";
 /// stays while attached, and leaving erases it with the rest of the status.
 #[test]
 fn a_read_only_attach_says_typing_is_dropped() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::new(
         "watch log {log}\n\
          watch answer\n\
@@ -629,7 +625,7 @@ fn a_read_only_attach_says_typing_is_dropped() {
 /// attached and still drops typing. Leaving erases it.
 #[test]
 fn a_watcher_s_read_only_note_returns_after_a_reconnect() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::after(
         "give-up-if {drop}",
         "watch answer\n\
@@ -665,7 +661,7 @@ fn a_watcher_s_read_only_note_returns_after_a_reconnect() {
 /// sent no size and no repaint.
 #[test]
 fn a_scripted_watcher_resumes_with_a_watch_resume_and_never_sizes() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::after(
         "give-up-if {drop}",
         "watch answer\n\
@@ -699,7 +695,7 @@ fn a_scripted_watcher_resumes_with_a_watch_resume_and_never_sizes() {
 /// still sending no size and no repaint.
 #[test]
 fn a_scripted_watcher_resume_that_is_gone_says_what_was_missed() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::after(
         "give-up-if {drop}",
         "watch answer\n\
@@ -735,7 +731,7 @@ fn a_scripted_watcher_resume_that_is_gone_says_what_was_missed() {
 #[test]
 fn a_scripted_watcher_without_a_terminal_keeps_stdout_to_the_output() {
     for verdict in [0, 84] {
-        let root = TempDir::new().unwrap();
+        let root = Home::new();
         let remote = Remote::after(
             "give-up-if {drop}",
             &format!(
@@ -776,7 +772,7 @@ fn a_scripted_watcher_without_a_terminal_keeps_stdout_to_the_output() {
 #[test]
 fn a_scripted_end_of_output_ends_the_watch_at_its_offset() {
     for (end, code, said) in [("end", 0, ""), ("end 1", 80, "ended at offset 4")] {
-        let root = TempDir::new().unwrap();
+        let root = Home::new();
         let remote = Remote::new(&format!(
             "watch answer\n\
              watch output one\n\
@@ -823,7 +819,7 @@ fn a_watcher_refused_by_an_old_remote_says_it_needs_0_7_0() {
             (81, OLD_CONTROL, Some(OLDER)),
             (80, NEW_SESSION, None),
         ] {
-            let root = TempDir::new().unwrap();
+            let root = Home::new();
             let remote = Remote::new(&format!("watch say {said}\nwatch exit {code}"));
             let mut client = remote.watch(&root, terminal);
             let case = format!("{code} {said:?}, terminal {terminal}");
@@ -834,7 +830,7 @@ fn a_watcher_refused_by_an_old_remote_says_it_needs_0_7_0() {
             assert_eq!(stderr, expected, "{case}");
         }
     }
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::new(&format!("hello say {OLD_CONTROL}\nhello exit 81"));
     let mut client = remote.attach(&root);
     assert_eq!(client.wait_exit(), 81, "{}", client.stderr());

@@ -4,13 +4,13 @@
 //! events_log.rs (2×1000 concurrent writers at the append layer).
 
 mod harness;
+use harness::Home;
 
 #[cfg(unix)]
 use harness::{HANG, Observation, poll_until};
 use harness::{tendr, wait_running, wait_terminal};
 #[cfg(unix)]
 use std::time::Duration;
-use tempfile::TempDir;
 
 fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
     String::from_utf8_lossy(stdout)
@@ -26,14 +26,13 @@ fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
 #[cfg(unix)]
 #[test]
 fn kill_nine_replays_full_lifecycle_via_events() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "sleep", "3600"])
         .assert()
         .success();
     // The child never exits by itself: the run can only end by losing its
     // sidecar, however long the test takes to kill it.
-    let _session = harness::SessionGuard::new(&root, "s1");
     wait_running(&root, "s1");
 
     let meta_path = root.path().join(".tendr/sessions/default/s1/meta.json");
@@ -80,7 +79,7 @@ fn kill_nine_replays_full_lifecycle_via_events() {
 /// torn lines and every event survives.
 #[test]
 fn concurrent_emit_processes_no_torn_lines() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "hi"])
         .assert()
@@ -141,7 +140,7 @@ fn concurrent_emit_processes_no_torn_lines() {
 /// twice stores one blob.
 #[test]
 fn one_mib_emit_spills_to_deduped_blob() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "hi"])
         .assert()
@@ -231,7 +230,7 @@ fn duckdb_reads_events_as_typed_rows() {
         return;
     }
 
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "hi"])
         .assert()
@@ -270,12 +269,11 @@ fn duckdb_reads_events_as_typed_rows() {
 #[cfg(unix)]
 #[test]
 fn exec_payload_emit_chains_and_env_unsets() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "shell", "--stdin", "--", "bash"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     wait_running(&root, "shell");
 
     let bin = assert_cmd::cargo::cargo_bin("tendr");
@@ -338,12 +336,11 @@ fn exec_payload_emit_chains_and_env_unsets() {
 #[cfg(unix)]
 #[test]
 fn exec_one_mib_stdout_spills_with_structured_preview() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "shell", "--stdin", "--", "bash"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     wait_running(&root, "shell");
 
     let output = tendr(&root)
@@ -410,12 +407,11 @@ fn wrap_hook_causal_tree_rebuilds_in_duckdb() {
         return;
     }
 
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "agent", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "agent");
     wait_running(&root, "agent");
 
     let meta: serde_json::Value = serde_json::from_str(

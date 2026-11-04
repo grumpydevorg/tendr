@@ -1,17 +1,15 @@
 mod harness;
+use harness::Home;
 
-use harness::{
-    DeadlineAssertExt, HANG, SessionGuard, tendr, wait_log_tail, wait_running, wait_terminal,
-};
+use harness::{DeadlineAssertExt, HANG, tendr, wait_log_tail, wait_running, wait_terminal};
 use predicates::prelude::*;
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Kill `session` once the sidecar records it, waiting for that up to the hang
 /// deadline rather than kill's 11 s before it kills the child itself.
-fn kill(root: &TempDir, session: &str) {
+fn kill(root: &Home, session: &str) {
     tendr(root)
         .env("TENDR_TEST_KILL_WAIT_MS", HANG.as_millis().to_string())
         .args(["kill", session])
@@ -19,7 +17,7 @@ fn kill(root: &TempDir, session: &str) {
         .success();
 }
 
-fn tendr_with_stdin(root: &TempDir, args: &[&str], input: &[u8]) -> std::process::Output {
+fn tendr_with_stdin(root: &Home, args: &[&str], input: &[u8]) -> std::process::Output {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -44,7 +42,7 @@ fn tendr_with_stdin(root: &TempDir, args: &[&str], input: &[u8]) -> std::process
 #[test]
 fn push_delivers_stdin_to_child() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "--stdin", "push-echo", "cat"])
@@ -71,7 +69,7 @@ fn push_delivers_stdin_to_child() {
 #[test]
 fn push_multiple_sequential() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "--stdin", "push-multi", "cat"])
@@ -101,13 +99,12 @@ fn push_multiple_sequential() {
 #[test]
 fn push_to_session_without_stdin_fails() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "nostdin-job", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "nostdin-job");
     wait_running(&root, "nostdin-job");
 
     let push_out = tendr_with_stdin(&root, &["push", "nostdin-job"], b"nope\n");
@@ -122,7 +119,7 @@ fn push_to_session_without_stdin_fails() {
 #[test]
 fn push_to_nonexistent_session_fails() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let push_out = tendr_with_stdin(&root, &["push", "nope"], b"data\n");
     assert!(!push_out.status.success());
@@ -131,7 +128,7 @@ fn push_to_nonexistent_session_fails() {
 #[test]
 fn push_to_terminal_session_fails() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "--stdin", "term-push", "true"])
@@ -148,7 +145,7 @@ fn push_to_terminal_session_fails() {
 #[test]
 fn push_fails_promptly_when_session_dies() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "--stdin", "push-die", "sleep", "1"])
@@ -168,7 +165,7 @@ fn push_fails_promptly_when_session_dies() {
 #[test]
 fn push_immediately_after_start() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "--stdin", "imm-push", "cat"])

@@ -9,13 +9,13 @@
 //! its terminal meta write and releasing the lock.
 
 mod harness;
+use harness::Home;
 
 use harness::{DeadlineAssertExt, HANG, tendr, wait_running, wait_terminal};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::session::{self, SessionRoot};
 
@@ -27,7 +27,7 @@ const FOREVER_MS: &str = "3600000";
 
 /// Start `name` with the unlock gate armed at `gate`. The sidecar holds the
 /// lock until the test opens the gate: the gate's own bound is put off.
-fn start_gated(root: &TempDir, name: &str, gate: &Path, argv: &[&str]) {
+fn start_gated(root: &Home, name: &str, gate: &Path, argv: &[&str]) {
     tendr(root)
         .env("TENDR_TEST_UNLOCK_GATE", gate)
         .env("TENDR_TEST_GATE_BOUND_MS", FOREVER_MS)
@@ -37,7 +37,7 @@ fn start_gated(root: &TempDir, name: &str, gate: &Path, argv: &[&str]) {
         .success();
 }
 
-fn locked(root: &TempDir, name: &str) -> bool {
+fn locked(root: &Home, name: &str) -> bool {
     let dir = session::open(
         &SessionRoot::new(root.path().join(".tendr/sessions")),
         &Namespace::new("default").unwrap(),
@@ -52,7 +52,7 @@ fn locked(root: &TempDir, name: &str) -> bool {
 /// as `harness::tendr` (temp HOME; on Windows, Git's coreutils on PATH). Its
 /// release grace, `--replace` wait and kill wait are put off, so it waits for
 /// the sidecar however long the test takes to open the gate.
-fn spawn_tendr(root: &TempDir, args: &[&str]) -> KillOnDrop {
+fn spawn_tendr(root: &Home, args: &[&str]) -> KillOnDrop {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("tendr"));
     cmd.args(args)
         .env("HOME", root.path())
@@ -116,11 +116,10 @@ fn assert_still_waiting(bg: &mut KillOnDrop, what: &str) {
 #[test]
 fn wait_returns_only_after_the_sidecar_releases_the_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let gate = root.path().join("gate");
     let _open = harness::OpenGate(gate.clone());
     start_gated(&root, "rel-wait", &gate, &["true"]);
-    let _session = harness::SessionGuard::new(&root, "rel-wait");
 
     wait_terminal(&root, "rel-wait");
     assert!(locked(&root, "rel-wait"), "setup: the gate holds the lock");
@@ -142,11 +141,10 @@ fn wait_returns_only_after_the_sidecar_releases_the_session() {
 #[test]
 fn wait_warns_and_returns_when_the_sidecar_keeps_the_lock() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let gate = root.path().join("gate");
     let _open = harness::OpenGate(gate.clone());
     start_gated(&root, "rel-grace", &gate, &["true"]);
-    let _session = harness::SessionGuard::new(&root, "rel-grace");
     wait_terminal(&root, "rel-grace");
 
     // The sidecar holds the lock until the gate opens, after the assertions,
@@ -180,11 +178,10 @@ fn wait_warns_and_returns_when_the_sidecar_keeps_the_lock() {
 #[test]
 fn replace_waits_for_a_finished_sidecar_to_release() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let gate = root.path().join("gate");
     let _open = harness::OpenGate(gate.clone());
     start_gated(&root, "rel-replace", &gate, &["true"]);
-    let _session = harness::SessionGuard::new(&root, "rel-replace");
     wait_terminal(&root, "rel-replace");
 
     let mut replace = spawn_tendr(
@@ -206,11 +203,10 @@ fn replace_waits_for_a_finished_sidecar_to_release() {
 #[test]
 fn kill_returns_only_after_the_sidecar_releases_the_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let gate = root.path().join("gate");
     let _open = harness::OpenGate(gate.clone());
     start_gated(&root, "rel-kill", &gate, &["sleep", "3600"]);
-    let _session = harness::SessionGuard::new(&root, "rel-kill");
     wait_running(&root, "rel-kill");
 
     let mut kill = spawn_tendr(&root, &["kill", "rel-kill"]);

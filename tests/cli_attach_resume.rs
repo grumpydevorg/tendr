@@ -4,13 +4,13 @@
 #![cfg(unix)]
 
 mod harness;
+use harness::Home;
 
-use harness::{HANG, Observation, SessionGuard, poll_until, read_events, tendr};
+use harness::{HANG, Observation, poll_until, read_events, tendr};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
-use tempfile::TempDir;
 use tendr::attach_proto::{
     Frame, Mode, RejectClass, ResumePoint, Version, read_frame, write_frame,
 };
@@ -24,14 +24,14 @@ fn line() -> String {
     "0123456789abcdef".repeat(62)
 }
 
-fn session_dir(root: &TempDir, session: &str) -> PathBuf {
+fn session_dir(root: &Home, session: &str) -> PathBuf {
     root.path()
         .join(format!(".tendr/sessions/default/{session}"))
 }
 
 /// Start a PTY session running `script` under `sh -c`, with `env` set for
 /// the sidecar (and so the run), and wait for its attach socket.
-fn start(root: &TempDir, session: &str, script: &str, env: &[(&str, &str)]) {
+fn start(root: &Home, session: &str, script: &str, env: &[(&str, &str)]) {
     let mut start = tendr(root);
     for (key, value) in env {
         start.env(key, value);
@@ -60,11 +60,11 @@ fn gated(body: &str) -> String {
     )
 }
 
-fn touch(root: &TempDir, name: &str) {
+fn touch(root: &Home, name: &str) {
     std::fs::write(root.path().join(name), b"").unwrap();
 }
 
-fn socket(root: &TempDir, session: &str) -> PathBuf {
+fn socket(root: &Home, session: &str) -> PathBuf {
     let dir = session_dir(root, session);
     poll_until(
         HANG,
@@ -78,7 +78,7 @@ fn socket(root: &TempDir, session: &str) -> PathBuf {
 }
 
 /// Connect and send `first` (a hello or a resume); the sidecar's reply.
-fn open(root: &TempDir, session: &str, first: &Frame) -> (UnixStream, Frame) {
+fn open(root: &Home, session: &str, first: &Frame) -> (UnixStream, Frame) {
     let mut stream = UnixStream::connect(socket(root, session)).unwrap();
     write_frame(&mut stream, first).unwrap();
     stream.set_read_timeout(Some(HANG)).unwrap();
@@ -86,19 +86,19 @@ fn open(root: &TempDir, session: &str, first: &Frame) -> (UnixStream, Frame) {
     (stream, reply)
 }
 
-fn hello(root: &TempDir, session: &str, version: Version, mode: Mode) -> (UnixStream, Frame) {
+fn hello(root: &Home, session: &str, version: Version, mode: Mode) -> (UnixStream, Frame) {
     open(root, session, &Frame::Hello { version, mode })
 }
 
 /// A version 2 attach, and the point it was accepted at.
-fn attach_v2(root: &TempDir, session: &str) -> (UnixStream, ResumePoint) {
+fn attach_v2(root: &Home, session: &str) -> (UnixStream, ResumePoint) {
     match hello(root, session, Version::V2, Mode::Attach) {
         (stream, Frame::AcceptedV2(point)) => (stream, point),
         (_, other) => panic!("attach refused: {other:?}"),
     }
 }
 
-fn resume(root: &TempDir, session: &str, point: ResumePoint) -> (UnixStream, Frame) {
+fn resume(root: &Home, session: &str, point: ResumePoint) -> (UnixStream, Frame) {
     open(
         root,
         session,
@@ -151,14 +151,14 @@ fn drain(stream: &mut UnixStream) {
     while read_frame(stream).is_ok() {}
 }
 
-fn control(root: &TempDir, session: &str) -> Option<String> {
+fn control(root: &Home, session: &str) -> Option<String> {
     let meta: serde_json::Value =
         serde_json::from_slice(&std::fs::read(session_dir(root, session).join("meta.json")).ok()?)
             .ok()?;
     meta["pty"]["control"].as_str().map(str::to_owned)
 }
 
-fn wait_control(root: &TempDir, session: &str, expected: &str) {
+fn wait_control(root: &Home, session: &str, expected: &str) {
     poll_until(HANG, Duration::from_millis(50), || {
         match control(root, session) {
             Some(c) if c == expected => Observation::Ready(()),
@@ -170,7 +170,7 @@ fn wait_control(root: &TempDir, session: &str, expected: &str) {
 
 /// Wait until the run's `pty.control_changed` events, `(trigger, epoch)` in
 /// order, are `expected`: the sidecar records them on their own thread.
-fn assert_control_changes(root: &TempDir, session: &str, expected: &[(&str, u64)]) {
+fn assert_control_changes(root: &Home, session: &str, expected: &[(&str, u64)]) {
     poll_until(HANG, Duration::from_millis(50), || {
         let changes: Vec<(String, u64)> = read_events(root, session)
             .into_iter()
@@ -198,7 +198,7 @@ fn assert_control_changes(root: &TempDir, session: &str, expected: &[(&str, u64)
 
 /// The text at the end of output.log, with the lines a marker may straddle
 /// joined.
-fn log_tail(root: &TempDir, session: &str) -> String {
+fn log_tail(root: &Home, session: &str) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let mut tail = Vec::new();
     if let Ok(mut file) = std::fs::File::open(session_dir(root, session).join("output.log")) {
@@ -212,7 +212,7 @@ fn log_tail(root: &TempDir, session: &str) -> String {
 }
 
 /// Wait until capture has written `marker` to output.log.
-fn wait_captured(root: &TempDir, session: &str, marker: &str) {
+fn wait_captured(root: &Home, session: &str, marker: &str) {
     poll_until(HANG, Duration::from_millis(100), || {
         let text = log_tail(root, session);
         if text.contains(marker) {
@@ -225,13 +225,13 @@ fn wait_captured(root: &TempDir, session: &str, marker: &str) {
 }
 
 /// End the run and return its whole output, as recorded.
-fn finish(root: &TempDir, session: &str) -> Vec<u8> {
+fn finish(root: &Home, session: &str) -> Vec<u8> {
     touch(root, "end");
     harness::wait_terminal(root, session);
     harness::recorded_output(root, session)
 }
 
-fn run_id(root: &TempDir, session: &str) -> String {
+fn run_id(root: &Home, session: &str) -> String {
     let meta: serde_json::Value = serde_json::from_slice(
         &std::fs::read(session_dir(root, session).join("meta.json")).unwrap(),
     )
@@ -247,8 +247,7 @@ fn run_id(root: &TempDir, session: &str) -> String {
 #[test]
 fn a_half_open_resume_under_a_running_flood_has_no_gap_and_no_duplicate() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "resume-flood");
+    let root = Home::new();
     // About 3 MB over at least 3 s. Half way it ticks until the test has
     // resumed, so output is still being appended when the resume is
     // answered however long load makes the test take to get there.
@@ -321,8 +320,7 @@ fn a_half_open_resume_under_a_running_flood_has_no_gap_and_no_duplicate() {
 fn gone_at_the_ring_edge_names_the_exact_span() {
     const RING: u64 = 64 * 1024;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "resume-gone");
+    let root = Home::new();
     // Bracketed paste on, then about 2 MB: far past the ring and any socket
     // buffer, so a viewer that never reads is evicted.
     let script = format!(
@@ -418,8 +416,7 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
 #[test]
 fn a_resume_after_a_human_took_control_is_refused() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "resume-taken");
+    let root = Home::new();
     start(&root, "resume-taken", "cat", &[]);
 
     let (_lost, accepted) = attach_v2(&root, "resume-taken");
@@ -436,8 +433,7 @@ fn a_resume_after_a_human_took_control_is_refused() {
 #[test]
 fn a_finished_push_lets_the_resume_through_and_a_running_one_does_not() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "resume-push");
+    let root = Home::new();
     start(&root, "resume-push", "cat", &[]);
 
     // The connection is lost and its end noticed: control is released.
@@ -472,8 +468,7 @@ fn a_finished_push_lets_the_resume_through_and_a_running_one_does_not() {
 #[test]
 fn a_resume_from_another_run_is_refused() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "resume-stale");
+    let root = Home::new();
     start(&root, "resume-stale", "cat", &[]);
 
     let (_holder, accepted) = attach_v2(&root, "resume-stale");
@@ -495,8 +490,7 @@ fn a_resume_from_another_run_is_refused() {
 #[test]
 fn a_resumed_client_taken_over_is_retired_as_by_any_takeover() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let _kill = SessionGuard::new(&root, "resume-retire");
+    let root = Home::new();
     start(&root, "resume-retire", "cat", &[]);
 
     let (_lost, accepted) = attach_v2(&root, "resume-retire");

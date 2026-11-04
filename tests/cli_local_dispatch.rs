@@ -8,14 +8,15 @@
 //! behaviour in depth.
 
 mod harness;
+use harness::Home;
 
-use harness::{SessionGuard, tendr, wait_running_ns, wait_terminal_ns};
+use harness::{tendr, wait_running_ns, wait_terminal_ns};
 use std::sync::Mutex;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-fn run(root: &TempDir, args: &[&str]) -> (i32, String, String) {
+fn run(root: &Home, args: &[&str]) -> (i32, String, String) {
     let out = tendr(root)
         .args(args)
         .write_stdin("")
@@ -32,7 +33,7 @@ fn run(root: &TempDir, args: &[&str]) -> (i32, String, String) {
 #[test]
 fn missing_session_is_reported_per_command() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     for verb in ["status", "log", "push", "attach", "wait"] {
         let (code, stdout, stderr) = run(&root, &[verb, "ghost"]);
@@ -51,7 +52,7 @@ fn missing_session_is_reported_per_command() {
 #[test]
 fn invalid_namespace_is_rejected_first_per_command() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // The namespace is checked before the session name or any other input.
     let cases: &[&[&str]] = &[
@@ -85,7 +86,7 @@ fn invalid_namespace_is_rejected_first_per_command() {
 #[test]
 fn start_rejects_malformed_env_before_launch() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let (code, stdout, stderr) = run(&root, &["start", "--env", "NOEQUALS", "x", "--", "true"]);
     assert_eq!(code, 1);
@@ -102,7 +103,7 @@ fn start_rejects_malformed_env_before_launch() {
 #[test]
 fn start_carries_every_launch_field_into_meta() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let cwd = TempDir::new().unwrap();
     let cwd_str = cwd.path().to_str().unwrap();
 
@@ -139,7 +140,6 @@ fn start_carries_every_launch_field_into_meta() {
             "3600",
         ],
     );
-    let _dep = SessionGuard::new_ns(&root, "golden", "dep");
     assert_eq!(code, 0, "{stderr}");
     let meta: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let spec = &meta["launch_spec"];
@@ -181,7 +181,6 @@ fn start_carries_every_launch_field_into_meta() {
             "true",
         ],
     );
-    let _next = SessionGuard::new_ns(&root, "golden", "next");
     assert_eq!(code, 0, "{stderr}");
     let next: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
@@ -211,7 +210,7 @@ fn start_carries_every_launch_field_into_meta() {
 #[test]
 fn namespace_routes_every_session_command() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args([

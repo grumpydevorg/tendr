@@ -4,12 +4,12 @@
 //! the legacy fallback; cli_watch.rs continues to pin the frozen shape.
 
 mod harness;
+use harness::Home;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use harness::{HANG, tendr, wait_terminal};
-use tempfile::TempDir;
 use tendr::model::event::EventTimestamp;
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -25,7 +25,7 @@ fn run_names(records: &[serde_json::Value], session: &str) -> Vec<String> {
 #[test]
 fn fast_exit_session_shows_all_three_transitions_uncollapsed() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Watch starts (baseline established) BEFORE the session exists.
     let follower = harness::ReadyFollower::spawn(&root, "watch", &["--events"]);
@@ -62,7 +62,7 @@ fn fast_exit_session_shows_all_three_transitions_uncollapsed() {
 #[test]
 fn preexisting_session_still_gets_current_state_snapshot_only() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "done", "--", "echo", "hi"])
         .assert()
@@ -84,7 +84,7 @@ fn preexisting_session_still_gets_current_state_snapshot_only() {
 #[test]
 fn rebacked_snapshot_carries_the_true_timestamp() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "stamped", "--", "echo", "hi"])
         .assert()
@@ -127,7 +127,7 @@ fn rebacked_snapshot_carries_the_true_timestamp() {
 #[test]
 fn session_without_events_dir_keeps_legacy_meta_diff_synthesis() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "legacy", "--", "echo", "hi"])
         .assert()
@@ -158,7 +158,7 @@ fn session_without_events_dir_keeps_legacy_meta_diff_synthesis() {
 #[test]
 fn from_now_skips_existing_but_streams_new_sessions_uncollapsed() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "old", "--", "echo", "hi"])
         .assert()
@@ -190,7 +190,7 @@ fn from_now_skips_existing_but_streams_new_sessions_uncollapsed() {
 #[test]
 fn replaced_session_streams_the_new_generation_uncollapsed() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "swap", "--", "echo", "first"])
         .assert()

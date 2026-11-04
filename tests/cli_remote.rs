@@ -4,6 +4,7 @@
 // `cli_remote_frame.rs`.
 
 mod harness;
+use harness::Home;
 
 use harness::{HANG, Observation, fake_ssh, poll_child_exit, poll_until, shim_path_env};
 use std::sync::Mutex;
@@ -744,7 +745,7 @@ fn host_refusal_quoting_hello_is_not_upgrade_advice() {
 /// first stderr line, before the command's own output.
 #[test]
 fn hello_flag_writes_the_hello_line_first() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let output = harness::tendr(&root)
         .args(["--hello", "status", "missing"])
         .output()
@@ -1170,7 +1171,7 @@ fn fake_ssh_frame_shim() -> TempDir {
 // in `cli_exec.rs`: bash on Unix, PowerShell on Windows.
 
 /// Start the native-shell session "shell" and wait until it runs.
-fn start_native_shell(root: &TempDir) -> harness::SessionGuard<'_> {
+fn start_native_shell(root: &Home) {
     let shell: &[&str] = if cfg!(windows) {
         &[
             "--exec-target",
@@ -1187,9 +1188,7 @@ fn start_native_shell(root: &TempDir) -> harness::SessionGuard<'_> {
         .args(shell)
         .assert()
         .success();
-    let guard = harness::SessionGuard::new(root, "shell");
     harness::wait_running(root, "shell");
-    guard
 }
 
 /// A command that prints `text` verbatim and a newline. On Unix the newline
@@ -1227,9 +1226,9 @@ fn native_sleep(secs: u64) -> Vec<String> {
 #[test]
 fn host_exec_frame_end_to_end() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = start_native_shell(&root);
+    start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
@@ -1258,9 +1257,9 @@ fn host_exec_frame_end_to_end() {
 #[test]
 fn host_exec_inner_exit_code_propagates() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = start_native_shell(&root);
+    start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
@@ -1282,9 +1281,9 @@ fn host_exec_inner_exit_code_propagates() {
 #[test]
 fn host_exec_timeout_propagates() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = start_native_shell(&root);
+    start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
@@ -1311,9 +1310,9 @@ fn host_exec_timeout_propagates() {
 #[test]
 fn host_exec_torture_payload_matches_local() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = start_native_shell(&root);
+    start_native_shell(&root);
 
     let torture = r#"it's a "test" $VAR `tick` back\slash ;&|"#;
     let argv = native_echo(torture);
@@ -1364,7 +1363,7 @@ fn host_exec_torture_payload_matches_local() {
 #[test]
 fn host_exec_remote_argv_carries_no_payload() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let tmp = fake_ssh_echo();
     let payload = "SELECT count(*) FROM t;";
@@ -1404,9 +1403,9 @@ fn host_exec_remote_argv_carries_no_payload() {
 #[test]
 fn host_exec_frame_stdin_passes_through() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
-    let _session = start_native_shell(&root);
+    start_native_shell(&root);
 
     let tmp = fake_ssh_frame_shim();
     let frame = serde_json::json!({"v": 1, "session": "shell", "cmd": native_echo("piped frame")})
@@ -1437,7 +1436,7 @@ fn host_exec_frame_stdin_passes_through() {
 #[test]
 fn host_exec_frame_stdin_reaches_ssh_unchanged() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let captured = TempDir::new().unwrap();
     let captured = captured.path().join("stdin");

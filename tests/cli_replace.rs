@@ -1,14 +1,14 @@
 mod harness;
+use harness::Home;
 
-use harness::{HANG, SessionGuard, tendr, wait_running, wait_terminal};
+use harness::{HANG, tendr, wait_running, wait_terminal};
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// `start --replace`, waiting for the old run to end and release its
 /// session up to the hang deadline rather than the product's 10 s.
-fn replace(root: &TempDir, name: &str) -> std::process::Output {
+fn replace(root: &Home, name: &str) -> std::process::Output {
     tendr(root)
         .env("TENDR_TEST_REPLACE_WAIT_MS", HANG.as_millis().to_string())
         .args(["start", "--replace", name, "sleep", "3600"])
@@ -18,7 +18,7 @@ fn replace(root: &TempDir, name: &str) -> std::process::Output {
 
 /// `kill --force`, waiting for the sidecar to record it up to the hang
 /// deadline rather than kill's 11 s.
-fn kill_force(root: &TempDir, name: &str) {
+fn kill_force(root: &Home, name: &str) {
     tendr(root)
         .env("TENDR_TEST_KILL_WAIT_MS", HANG.as_millis().to_string())
         .args(["kill", "--force", name])
@@ -29,14 +29,13 @@ fn kill_force(root: &TempDir, name: &str) {
 #[test]
 fn replace_running_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out1 = tendr(&root)
         .args(["start", "repl-run", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(out1.status.success());
-    let _session = SessionGuard::new(&root, "repl-run");
     wait_running(&root, "repl-run");
 
     let meta1: serde_json::Value = serde_json::from_slice(&out1.stdout).unwrap();
@@ -56,7 +55,7 @@ fn replace_running_session() {
 #[test]
 fn replace_terminal_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "repl-term", "true"])
@@ -65,7 +64,6 @@ fn replace_terminal_session() {
     wait_terminal(&root, "repl-term");
 
     let out2 = replace(&root, "repl-term");
-    let _session = SessionGuard::new(&root, "repl-term");
     assert!(out2.status.success());
 
     let meta2: serde_json::Value = serde_json::from_slice(&out2.stdout).unwrap();
@@ -77,7 +75,7 @@ fn replace_terminal_session() {
 #[test]
 fn replace_nonexistent_is_noop() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .args(["start", "--replace", "repl-nope", "true"])
@@ -92,14 +90,13 @@ fn replace_nonexistent_is_noop() {
 #[test]
 fn replace_increments_generation() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out1 = tendr(&root)
         .args(["start", "gen-test", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(out1.status.success());
-    let _session = SessionGuard::new(&root, "gen-test");
     let meta1: serde_json::Value = serde_json::from_slice(&out1.stdout).unwrap();
     assert_eq!(meta1["generation"], 1);
 

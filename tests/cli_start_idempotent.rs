@@ -1,15 +1,15 @@
 mod harness;
+use harness::Home;
 
-use harness::{HANG, SessionGuard, tendr, test_callback_bin, wait_running, wait_terminal};
+use harness::{HANG, tendr, test_callback_bin, wait_running, wait_terminal};
 use predicates::prelude::*;
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// `kill --force`, waiting for the sidecar to record it up to the hang
 /// deadline rather than kill's 11 s.
-fn kill_force(root: &TempDir, name: &str) {
+fn kill_force(root: &Home, name: &str) {
     tendr(root)
         .env("TENDR_TEST_KILL_WAIT_MS", HANG.as_millis().to_string())
         .args(["kill", "--force", name])
@@ -23,14 +23,13 @@ fn kill_force(root: &TempDir, name: &str) {
 #[test]
 fn start_same_spec_is_idempotent() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out1 = tendr(&root)
         .args(["start", "idem-same", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(out1.status.success(), "first start failed");
-    let _session = SessionGuard::new(&root, "idem-same");
     wait_running(&root, "idem-same");
 
     let meta1: serde_json::Value =
@@ -63,13 +62,12 @@ fn start_same_spec_is_idempotent() {
 #[test]
 fn start_different_spec_is_conflict() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "idem-diff", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "idem-diff");
     wait_running(&root, "idem-diff");
 
     tendr(&root)
@@ -84,7 +82,7 @@ fn start_different_spec_is_conflict() {
 #[test]
 fn start_after_terminal_is_error() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "idem-term", "true"])
@@ -102,7 +100,7 @@ fn start_after_terminal_is_error() {
 #[test]
 fn start_with_cwd_child_runs_in_requested_directory() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let work_dir = root.path().join("myworkdir");
     std::fs::create_dir_all(&work_dir).unwrap();
 
@@ -140,7 +138,7 @@ fn start_with_cwd_child_runs_in_requested_directory() {
 #[test]
 fn start_with_env_child_sees_overridden_vars() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .args([
@@ -177,7 +175,7 @@ fn start_with_env_child_sees_overridden_vars() {
 #[test]
 fn start_with_different_cwd_is_spec_conflict() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let dir_a = root.path().join("dir_a");
     let dir_b = root.path().join("dir_b");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -196,7 +194,6 @@ fn start_with_different_cwd_is_spec_conflict() {
         .output()
         .unwrap();
     assert!(out1.status.success());
-    let _session = SessionGuard::new(&root, "cwd-conflict");
 
     let out2 = tendr(&root)
         .args([
@@ -231,7 +228,7 @@ fn start_with_different_cwd_is_spec_conflict() {
 #[test]
 fn start_with_different_env_is_spec_conflict() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out1 = tendr(&root)
         .args([
@@ -246,7 +243,6 @@ fn start_with_different_env_is_spec_conflict() {
         .output()
         .unwrap();
     assert!(out1.status.success());
-    let _session = SessionGuard::new(&root, "env-conflict");
 
     let out2 = tendr(&root)
         .args([
@@ -281,7 +277,7 @@ fn start_with_different_env_is_spec_conflict() {
 #[test]
 fn start_with_invalid_env_format_fails() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .args(["start", "bad-env", "--env", "NO_EQUALS_SIGN", "--", "true"])
@@ -298,7 +294,7 @@ fn start_with_invalid_env_format_fails() {
 #[test]
 fn start_with_empty_env_key_fails() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .args(["start", "empty-key", "--env", "=foo", "--", "true"])
@@ -317,7 +313,7 @@ fn start_with_empty_env_key_fails() {
 
 /// Start `sh -c 'echo CI=${CI-unset}'` with `CI=true` in tendr's own
 /// environment, plus `extra` tendr flags. Returns the child's output.
-fn start_ci_probe(root: &TempDir, name: &str, extra: &[&str]) -> String {
+fn start_ci_probe(root: &Home, name: &str, extra: &[&str]) -> String {
     let out = tendr(root)
         .env("CI", "true")
         .args(["start", name])
@@ -338,7 +334,7 @@ fn start_ci_probe(root: &TempDir, name: &str, extra: &[&str]) -> String {
 #[test]
 fn start_with_unset_env_child_does_not_see_inherited_var() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Control: without the flag the child inherits CI from tendr.
     let log = start_ci_probe(&root, "ci-inherit", &[]);
@@ -354,7 +350,7 @@ fn start_with_unset_env_child_does_not_see_inherited_var() {
 #[test]
 fn start_with_unset_env_and_env_of_same_name_sets_it() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let log = start_ci_probe(
         &root,
@@ -370,7 +366,7 @@ fn start_with_unset_env_and_env_of_same_name_sets_it() {
 #[test]
 fn start_with_invalid_unset_env_name_fails() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     for (name, bad, expected) in [
         ("unset-eq", "CI=true", "cannot contain '='"),
@@ -395,7 +391,7 @@ fn start_with_invalid_unset_env_name_fails() {
 #[test]
 fn start_with_env_preserves_inherited_environment() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .args([
@@ -436,7 +432,7 @@ fn start_with_env_preserves_inherited_environment() {
 #[test]
 fn start_with_same_cwd_and_env_is_idempotent() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let work_dir = root.path().join("samedir");
     std::fs::create_dir_all(&work_dir).unwrap();
 
@@ -455,7 +451,6 @@ fn start_with_same_cwd_and_env_is_idempotent() {
         .output()
         .unwrap();
     assert!(out1.status.success());
-    let _session = SessionGuard::new(&root, "idem-cwd-env");
     let meta1: serde_json::Value = serde_json::from_slice(&out1.stdout).unwrap();
     let run_id1 = meta1["run_id"].as_str().unwrap().to_string();
 

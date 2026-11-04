@@ -1,15 +1,15 @@
 mod harness;
+use harness::Home;
 
-use harness::{HANG, SessionGuard, tendr, wait_running_ns, wait_terminal, wait_terminal_ns};
+use harness::{HANG, tendr, wait_running_ns, wait_terminal, wait_terminal_ns};
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 #[test]
 fn start_in_explicit_namespace() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .args([
@@ -41,7 +41,7 @@ fn start_in_explicit_namespace() {
 #[test]
 fn same_name_different_namespace() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start "job" in ns-a
     let out_a = tendr(&root)
@@ -53,7 +53,6 @@ fn same_name_different_namespace() {
         "start in ns-a failed: {}",
         String::from_utf8_lossy(&out_a.stderr)
     );
-    let _session_a = SessionGuard::new_ns(&root, "ns-a", "job");
     wait_running_ns(&root, "ns-a", "job");
 
     // Start "job" in ns-b — should succeed because different namespace
@@ -66,7 +65,6 @@ fn same_name_different_namespace() {
         "start in ns-b failed: {}",
         String::from_utf8_lossy(&out_b.stderr)
     );
-    let _session_b = SessionGuard::new_ns(&root, "ns-b", "job");
     wait_running_ns(&root, "ns-b", "job");
 
     // Verify status works for each
@@ -98,7 +96,7 @@ fn same_name_different_namespace() {
 #[test]
 fn list_with_namespace_filters() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Create sessions in two namespaces
     tendr(&root)
@@ -113,7 +111,6 @@ fn list_with_namespace_filters() {
         ])
         .assert()
         .success();
-    let _session_a = SessionGuard::new_ns(&root, "ns-a", "alpha");
     wait_running_ns(&root, "ns-a", "alpha");
 
     tendr(&root)
@@ -128,7 +125,6 @@ fn list_with_namespace_filters() {
         ])
         .assert()
         .success();
-    let _session_b = SessionGuard::new_ns(&root, "ns-b", "beta");
     wait_running_ns(&root, "ns-b", "beta");
 
     // list --namespace ns-a should only show ns-a sessions
@@ -161,21 +157,19 @@ fn list_with_namespace_filters() {
 #[test]
 fn list_without_namespace_returns_all() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Create sessions in two namespaces
     tendr(&root)
         .args(["start", "one", "--namespace", "ns-a", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session_a = SessionGuard::new_ns(&root, "ns-a", "one");
     wait_running_ns(&root, "ns-a", "one");
 
     tendr(&root)
         .args(["start", "two", "--namespace", "ns-b", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session_b = SessionGuard::new_ns(&root, "ns-b", "two");
     wait_running_ns(&root, "ns-b", "two");
 
     // list without --namespace should return all
@@ -229,7 +223,7 @@ fn list_without_namespace_returns_all() {
 #[test]
 fn start_with_namespace_idempotent() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out1 = tendr(&root)
         .args([
@@ -248,7 +242,6 @@ fn start_with_namespace_idempotent() {
         "first start failed: {}",
         String::from_utf8_lossy(&out1.stderr)
     );
-    let _session = SessionGuard::new_ns(&root, "myns", "idem-ns");
     wait_running_ns(&root, "myns", "idem-ns");
 
     let meta1: serde_json::Value =
@@ -296,7 +289,7 @@ fn start_with_namespace_idempotent() {
 #[test]
 fn default_namespace_used_when_omitted() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let out = tendr(&root)
         .args(["start", "no-ns", "--", "echo", "hi"])
@@ -322,7 +315,7 @@ fn default_namespace_used_when_omitted() {
 #[test]
 fn push_resolves_session_in_namespace() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start a session with stdin in a non-default namespace
     tendr(&root)
@@ -378,7 +371,7 @@ fn push_resolves_session_in_namespace() {
 #[test]
 fn log_resolves_session_in_namespace() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args([
@@ -413,7 +406,7 @@ fn log_resolves_session_in_namespace() {
 #[test]
 fn wait_resolves_session_in_namespace() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args([

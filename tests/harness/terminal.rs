@@ -1,13 +1,13 @@
 //! A terminal driver for tests: runs a command in a PTY, types into it and
 //! captures what it writes, as a person at a terminal would.
 
+use super::Home;
 use super::{HANG, Observation, logged_output, poll_path_exists, poll_until};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 use tendr::platform::{Current, Platform};
 
 /// Path to the `tendr` binary under test.
@@ -32,17 +32,17 @@ pub struct CliAttach {
 
 #[allow(dead_code)]
 impl CliAttach {
-    pub fn spawn(root: &TempDir, args: &[&str]) -> Self {
+    pub fn spawn(root: &Home, args: &[&str]) -> Self {
         let mut argv = vec![tendr_bin(), "attach".to_owned()];
         argv.extend(args.iter().map(|a| (*a).to_owned()));
         Self::spawn_argv(root, &argv)
     }
 
-    pub fn spawn_argv(root: &TempDir, argv: &[String]) -> Self {
+    pub fn spawn_argv(root: &Home, argv: &[String]) -> Self {
         Self::spawn_argv_env(root, argv, &[])
     }
 
-    pub fn spawn_argv_env(root: &TempDir, argv: &[String], extra_env: &[(&str, &str)]) -> Self {
+    pub fn spawn_argv_env(root: &Home, argv: &[String], extra_env: &[(&str, &str)]) -> Self {
         let mut env = std::collections::BTreeMap::new();
         env.insert(
             "HOME".to_owned(),
@@ -123,7 +123,7 @@ impl CliAttach {
     /// races the handshake; the marker is idempotent, so retyping is safe. The
     /// output is read joined ([`logged_output`]): a shell may echo the line in
     /// pieces, and capture logs each piece it reads on lines of its own.
-    pub fn type_until_logged(&mut self, root: &TempDir, session: &str, line: &str) {
+    pub fn type_until_logged(&mut self, root: &Home, session: &str, line: &str) {
         poll_until(HANG, Duration::from_millis(200), || {
             self.type_bytes(line.as_bytes());
             let joined = logged_output(root, session);
@@ -179,7 +179,7 @@ pub struct WrappedAttach {
 #[allow(dead_code)]
 impl WrappedAttach {
     /// Wrap `tendr attach <args>`.
-    pub fn spawn(root: &TempDir, label: &str, args: &[&str]) -> Self {
+    pub fn spawn(root: &Home, label: &str, args: &[&str]) -> Self {
         let argv: Vec<String> = [tendr_bin(), "attach".to_owned()]
             .into_iter()
             .chain(args.iter().map(|a| (*a).to_owned()))
@@ -188,14 +188,14 @@ impl WrappedAttach {
     }
 
     /// Wrap an arbitrary command. `label` names its record files under `root`.
-    pub fn spawn_argv(root: &TempDir, label: &str, argv: &[String]) -> Self {
+    pub fn spawn_argv(root: &Home, label: &str, argv: &[String]) -> Self {
         Self::spawn_argv_env(root, label, argv, &[])
     }
 
     /// [`spawn_argv`](Self::spawn_argv) with `extra_env` set in the terminal,
     /// such as a `PATH` that finds a fake `ssh` first.
     pub fn spawn_argv_env(
-        root: &TempDir,
+        root: &Home,
         label: &str,
         argv: &[String],
         extra_env: &[(&str, &str)],

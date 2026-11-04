@@ -1,15 +1,15 @@
 mod harness;
+use harness::Home;
 
 use harness::{tendr, wait_running, wait_terminal};
 use std::sync::Mutex;
-use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 #[test]
 fn timeout_kills_child() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     tendr(&root)
         .args(["start", "--timeout", "2", "timeout-job", "sleep", "3600"])
@@ -27,7 +27,7 @@ fn timeout_kills_child() {
 #[test]
 fn timeout_not_triggered() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     // A timeout no load can reach before `true` exits.
     tendr(&root)
@@ -40,25 +40,16 @@ fn timeout_not_triggered() {
     assert_eq!(meta["reason"], "ExitedOk");
 }
 
-/// Run `script` under `--timeout 1` and return its session guard and its
-/// terminal meta. The guard is created right after `start`, so a failed wait
-/// still stops the sidecar.
+/// Run `script` under `--timeout 1` and return its terminal meta.
 #[cfg(unix)]
-fn timed_out_run<'a>(
-    root: &'a TempDir,
-    session: &str,
-    pty: bool,
-    script: &str,
-) -> (harness::SessionGuard<'a>, serde_json::Value) {
+fn timed_out_run(root: &Home, session: &str, pty: bool, script: &str) -> serde_json::Value {
     let mut args = vec!["start", "--timeout", "1", session];
     if pty {
         args.push("--pty");
     }
     args.extend(["--", "sh", "-c", script]);
     tendr(root).args(&args).assert().success();
-    let guard = harness::SessionGuard::new(root, session);
-    let meta = wait_terminal(root, session);
-    (guard, meta)
+    wait_terminal(root, session)
 }
 
 /// [`timed_out_run`] for a script that sets its traps and then prints
@@ -66,17 +57,12 @@ fn timed_out_run<'a>(
 /// machine the 1 s timeout can fire before the shell gets that far, which
 /// fails the premise, not the product. Returns that run's terminal meta.
 #[cfg(unix)]
-fn timed_out_trapped_run(
-    root: &TempDir,
-    session: &str,
-    pty: bool,
-    script: &str,
-) -> serde_json::Value {
+fn timed_out_trapped_run(root: &Home, session: &str, pty: bool, script: &str) -> serde_json::Value {
     let mut attempt = 0;
     harness::poll_until(harness::HANG, std::time::Duration::from_millis(10), || {
         attempt += 1;
         let name = format!("{session}-{attempt}");
-        let (_run, meta) = timed_out_run(root, &name, pty, script);
+        let meta = timed_out_run(root, &name, pty, script);
         if harness::logged_output(root, &name).contains("ready") {
             harness::Observation::Ready(meta)
         } else {
@@ -93,7 +79,7 @@ fn timed_out_trapped_run(
 #[test]
 fn timeout_lets_a_pipe_run_clean_up_on_sigterm() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let marker = root.path().join("cleaned");
     let script = format!(
         "trap 'echo term > {m}; exit 0' TERM; echo ready; while :; do sleep 0.1; done",
@@ -109,7 +95,7 @@ fn timeout_lets_a_pipe_run_clean_up_on_sigterm() {
 #[test]
 fn timeout_hangs_up_a_pty_run_first() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let marker = root.path().join("cleaned");
     let script = format!(
         "trap 'echo hup > {m}; exit 0' HUP; trap 'echo term > {m}; exit 0' TERM; \
@@ -130,8 +116,8 @@ fn timeout_hangs_up_a_pty_run_first() {
 #[test]
 fn timeout_escalates_to_sigkill() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let script = "trap '' HUP TERM; while :; do sleep 0.1; done";
-    let (_session, meta) = timed_out_run(&root, "pty-stubborn", true, script);
+    let meta = timed_out_run(&root, "pty-stubborn", true, script);
     assert_eq!(meta["reason"], "TimedOut", "{meta}");
 }

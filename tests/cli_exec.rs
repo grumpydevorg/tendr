@@ -1,4 +1,5 @@
 mod harness;
+use harness::Home;
 
 use std::sync::Mutex;
 
@@ -154,7 +155,7 @@ fn exec_argv(session: &str, cmd: Vec<String>) -> Vec<String> {
 #[test]
 fn exec_session_not_found() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     harness::tendr(&root)
         .args(["exec", "nonexistent", "--", "pwd"])
         .assert()
@@ -166,7 +167,7 @@ fn exec_session_not_found() {
 #[test]
 fn exec_session_not_running() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     harness::tendr(&root)
         .args(["start", "job1", "--", "true"])
         .assert()
@@ -183,14 +184,13 @@ fn exec_session_not_running() {
 #[test]
 fn exec_basic_command() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start the native shell with --stdin
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     // Exec a command
@@ -222,12 +222,11 @@ fn exec_basic_command() {
 #[test]
 fn exec_session_no_stdin() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     harness::tendr(&root)
         .args(["start", "job1", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "job1");
     harness::wait_running(&root, "job1");
     harness::tendr(&root)
         .args(["exec", "job1", "--", "pwd"])
@@ -240,13 +239,12 @@ fn exec_session_no_stdin() {
 #[test]
 fn exec_nonzero_exit() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let output = harness::tendr(&root)
@@ -271,13 +269,12 @@ fn exec_nonzero_exit() {
 #[test]
 fn exec_cwd_persists() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     // A test-chosen directory (distinct from HOME) so the assertion is exact
@@ -318,13 +315,12 @@ fn exec_cwd_persists() {
 #[test]
 fn exec_writes_annotation() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     harness::tendr(&root)
@@ -353,13 +349,12 @@ fn exec_writes_annotation() {
 #[test]
 fn exec_oversized_output_is_quiet_and_leaves_breadcrumb() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     // Both streams multi-KB so even the field-truncated annotation overflows
@@ -420,13 +415,12 @@ fn exec_oversized_output_is_quiet_and_leaves_breadcrumb() {
 #[test]
 fn exec_timeout() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let mut args = vec![
@@ -457,13 +451,12 @@ fn exec_timeout() {
 #[test]
 fn exec_concurrent_busy() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     // Start a long exec in the background (holds the exec lock while it
@@ -498,7 +491,7 @@ fn exec_concurrent_busy() {
 #[test]
 fn exec_explicit_posix_target() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     harness::tendr(&root)
         .args([
             "start",
@@ -511,7 +504,6 @@ fn exec_explicit_posix_target() {
         ])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let output = harness::tendr(&root)
@@ -532,13 +524,12 @@ fn exec_explicit_posix_target() {
 #[test]
 fn exec_none_target_rejected() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     // sleep is not a shell — infers ExecTarget::None
     harness::tendr(&root)
         .args(["start", "sleeper", "--stdin", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "sleeper");
     harness::wait_running(&root, "sleeper");
 
     harness::tendr(&root)
@@ -554,12 +545,11 @@ fn exec_none_target_rejected() {
 #[test]
 fn exec_infers_posix_from_bash() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     harness::tendr(&root)
         .args(["start", "shell", "--stdin", "--", "bash"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let output = harness::tendr(&root)
@@ -579,7 +569,7 @@ fn exec_infers_posix_from_bash() {
 #[test]
 fn start_invalid_exec_target() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     harness::tendr(&root)
         .args([
             "start",
@@ -598,7 +588,7 @@ fn start_invalid_exec_target() {
 #[test]
 fn exec_target_changes_session_identity() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     // Start the native shell; its exec-target is expected_shell_target().
     harness::tendr(&root)
@@ -622,7 +612,6 @@ fn exec_target_changes_session_identity() {
         other_target,
         "--",
     ];
-    let _session = harness::SessionGuard::new(&root, "shell");
     conflict_args.extend_from_slice(interp);
     harness::tendr(&root)
         .args(conflict_args)
@@ -635,13 +624,12 @@ fn exec_target_changes_session_identity() {
 #[test]
 fn exec_python_repl_basic() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(python_start_args("py"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "py");
     harness::wait_running(&root, "py");
 
     let output = harness::tendr(&root)
@@ -680,13 +668,12 @@ fn exec_python_repl_basic() {
 #[test]
 fn exec_python_repl_exception() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(python_start_args("py"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "py");
     harness::wait_running(&root, "py");
 
     let output = harness::tendr(&root)
@@ -712,13 +699,12 @@ fn exec_python_repl_exception() {
 #[test]
 fn exec_python_repl_cwd() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(python_start_args("py"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "py");
     harness::wait_running(&root, "py");
 
     let tmp = std::env::temp_dir();
@@ -751,13 +737,12 @@ fn exec_python_repl_cwd() {
 #[test]
 fn exec_python_inferred() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(python_start_args_no_target("py"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "py");
     harness::wait_running(&root, "py");
 
     let output = harness::tendr(&root)
@@ -783,13 +768,12 @@ fn exec_infers_duckdb() {
         return;
     }
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "db", "--stdin", "--", "duckdb"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "db");
     harness::wait_running(&root, "db");
 
     // Verify the session was created with DuckDb exec target
@@ -811,7 +795,7 @@ fn exec_duckdb_basic_select() {
         return;
     }
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args([
@@ -825,7 +809,6 @@ fn exec_duckdb_basic_select() {
         ])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "db");
     harness::wait_running(&root, "db");
 
     let output = harness::tendr(&root)
@@ -872,7 +855,7 @@ fn exec_duckdb_sql_error() {
         return;
     }
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args([
@@ -886,7 +869,6 @@ fn exec_duckdb_sql_error() {
         ])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "db");
     harness::wait_running(&root, "db");
 
     // Invalid SQL — error goes to stderr, sentinel still fires, exit_code = 1.
@@ -954,7 +936,7 @@ fn exec_duckdb_multi_statement() {
         return;
     }
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args([
@@ -968,7 +950,6 @@ fn exec_duckdb_multi_statement() {
         ])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "db");
     harness::wait_running(&root, "db");
 
     let output = harness::tendr(&root)
@@ -1010,7 +991,7 @@ fn exec_duckdb_explicit_target() {
         return;
     }
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args([
@@ -1024,7 +1005,6 @@ fn exec_duckdb_explicit_target() {
         ])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "db");
     harness::wait_running(&root, "db");
 
     let output = harness::tendr(&root)
@@ -1056,7 +1036,7 @@ fn exec_duckdb_mixed_success_reports_error() {
         return;
     }
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args([
@@ -1070,7 +1050,6 @@ fn exec_duckdb_mixed_success_reports_error() {
         ])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "db");
     harness::wait_running(&root, "db");
 
     let output = harness::tendr(&root)
@@ -1124,7 +1103,7 @@ fn exec_duckdb_mixed_success_reports_error() {
 #[test]
 fn exec_duckdb_error_logged_after_the_sentinel_fails_the_exec() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     let gate = root.path().join("gate");
     let _open = harness::OpenGate(gate.clone());
     let late_duckdb = format!(
@@ -1146,7 +1125,6 @@ done"#,
         .args(["sh", "-c", &late_duckdb])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "db");
     harness::wait_running(&root, "db");
 
     let exec = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
@@ -1187,7 +1165,7 @@ done"#,
 }
 
 /// A `tendr exec` in DuckDB session `name`, as its parsed result.
-fn duckdb_exec(root: &tempfile::TempDir, name: &str, sql: &str) -> serde_json::Value {
+fn duckdb_exec(root: &Home, name: &str, sql: &str) -> serde_json::Value {
     let output = harness::tendr(root)
         .args(["exec", name, "--timeout", EXEC_TIMEOUT, "--", sql])
         .output()
@@ -1213,7 +1191,7 @@ fn exec_duckdb_in_safe_mode_does_not_fail_a_good_statement() {
         return;
     }
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     for (name, argv) in [
         ("safe", &["duckdb", "-safe"][..]),
         ("toggled", &["duckdb"][..]),
@@ -1223,7 +1201,6 @@ fn exec_duckdb_in_safe_mode_does_not_fail_a_good_statement() {
             .args(argv)
             .assert()
             .success();
-        let _session = harness::SessionGuard::new(&root, name);
         harness::wait_running(&root, name);
         if name == "toggled" {
             duckdb_exec(&root, name, ".safe_mode");
@@ -1350,13 +1327,12 @@ fn powershell_start_args(session: &str) -> Vec<String> {
 #[test]
 fn exec_powershell_clean_stdout() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(powershell_start_args("ps"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "ps");
     harness::wait_running(&root, "ps");
 
     let output = harness::tendr(&root)
@@ -1399,13 +1375,12 @@ fn exec_powershell_clean_stdout() {
 #[test]
 fn exec_powershell_arbitrary_expression() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(powershell_start_args("ps"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "ps");
     harness::wait_running(&root, "ps");
 
     let output = harness::tendr(&root)
@@ -1435,13 +1410,12 @@ fn exec_powershell_arbitrary_expression() {
 #[test]
 fn exec_powershell_pipeline() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(powershell_start_args("ps"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "ps");
     harness::wait_running(&root, "ps");
 
     let output = harness::tendr(&root)
@@ -1477,13 +1451,12 @@ fn exec_powershell_pipeline() {
 #[test]
 fn exec_powershell_state_persists_across_calls() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(powershell_start_args("ps"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "ps");
     harness::wait_running(&root, "ps");
 
     // Set a variable
@@ -1527,13 +1500,12 @@ fn exec_powershell_state_persists_across_calls() {
 #[test]
 fn exec_powershell_stderr_separated() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(powershell_start_args("ps"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "ps");
     harness::wait_running(&root, "ps");
 
     let output = harness::tendr(&root)
@@ -1567,13 +1539,12 @@ fn exec_powershell_stderr_separated() {
 #[test]
 fn exec_powershell_cwd_after() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(powershell_start_args("ps"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "ps");
     harness::wait_running(&root, "ps");
 
     // Change directory to C:\
@@ -1606,13 +1577,12 @@ fn exec_powershell_cwd_after() {
 #[test]
 fn exec_python_result_file_cleaned() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(python_start_args("py"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "py");
     harness::wait_running(&root, "py");
 
     harness::tendr(&root)
@@ -1645,13 +1615,12 @@ fn exec_python_result_file_cleaned() {
 #[test]
 fn exec_emits_started_and_result_events() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let echo_cmd = native_echo("event brigade");
@@ -1740,13 +1709,12 @@ fn exec_emits_started_and_result_events() {
 #[test]
 fn exec_events_inherit_parent_from_env_chain() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let outer = uuid::Uuid::now_v7().to_string();
@@ -1774,13 +1742,12 @@ fn exec_events_inherit_parent_from_env_chain() {
 #[test]
 fn exec_aline_links_event_id_and_block_id() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     harness::tendr(&root)
@@ -1811,13 +1778,12 @@ fn exec_aline_links_event_id_and_block_id() {
 #[test]
 fn exec_timeout_still_emits_result_event() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let mut args = vec![
@@ -1848,13 +1814,12 @@ fn exec_event_append_is_best_effort() {
     use std::os::unix::fs::PermissionsExt;
 
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "shell", "--stdin", "--", "bash"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let events_dir = root.path().join(".tendr/sessions/default/shell/events");
@@ -1881,13 +1846,12 @@ fn exec_event_append_is_best_effort() {
 #[test]
 fn exec_payload_sees_block_id_env() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "shell", "--stdin", "--", "bash"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let output = harness::tendr(&root)
@@ -1910,13 +1874,12 @@ fn exec_payload_sees_block_id_env() {
 #[test]
 fn exec_frame_from_stdin_runs_payload() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let frame = serde_json::json!({
@@ -1955,13 +1918,12 @@ fn exec_frame_from_stdin_runs_payload() {
 #[test]
 fn exec_frame_payload_survives_quoting_torture() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(["start", "shell", "--stdin", "--", "bash"])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     // printf's FORMAT string interprets \n (the payload arg does not),
@@ -1994,13 +1956,12 @@ fn exec_frame_payload_survives_quoting_torture() {
 #[test]
 fn exec_frame_timeout_exits_124() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let frame = serde_json::json!({
@@ -2026,7 +1987,7 @@ fn exec_frame_timeout_exits_124() {
 #[test]
 fn exec_frame_bad_json_exits_2() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     let output = harness::tendr(&root)
         .args(["exec", "--frame-from-stdin"])
@@ -2047,7 +2008,7 @@ fn exec_frame_bad_json_exits_2() {
 #[test]
 fn exec_frame_unsupported_version_exits_2() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     let frame = r#"{"v":2,"session":"shell","cmd":["true"]}"#;
     let output = harness::tendr(&root)
@@ -2069,7 +2030,7 @@ fn exec_frame_unsupported_version_exits_2() {
 #[test]
 fn exec_frame_conflicts_with_positional_args() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     let output = harness::tendr(&root)
         .args(["exec", "shell", "--frame-from-stdin", "--", "ls"])
@@ -2089,7 +2050,7 @@ fn exec_frame_conflicts_with_positional_args() {
 #[test]
 fn exec_frame_invalid_session_exits_2() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     let output = harness::tendr(&root)
         .args(["exec", "--frame-from-stdin"])
@@ -2110,7 +2071,7 @@ fn exec_frame_invalid_session_exits_2() {
 #[test]
 fn exec_frame_empty_cmd_exits_2() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
 
     let output = harness::tendr(&root)
         .args(["exec", "--frame-from-stdin"])
@@ -2178,16 +2139,14 @@ fn windows_ignored_exec_set_is_exactly_tracked() {
 
 use harness::DeadlineAssertExt;
 
-/// Start a POSIX shell session and return a guard that stops it.
+/// Start a POSIX shell session and wait until it runs.
 #[cfg(unix)]
-fn posix_shell<'a>(root: &'a tempfile::TempDir, name: &str) -> harness::SessionGuard<'a> {
+fn posix_shell(root: &Home, name: &str) {
     harness::tendr(root)
         .args(["start", name, "--stdin", "--", "bash"])
         .assert()
         .success();
-    let guard = harness::SessionGuard::new(root, name);
     harness::wait_running(root, name);
-    guard
 }
 
 /// Output without a trailing newline used to glue the sentinel onto the last
@@ -2196,8 +2155,8 @@ fn posix_shell<'a>(root: &'a tempfile::TempDir, name: &str) -> harness::SessionG
 #[cfg(unix)]
 fn exec_stdout_without_trailing_newline_returns() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = posix_shell(&root, "shell");
+    let root = Home::new();
+    posix_shell(&root, "shell");
 
     let output = harness::tendr(&root)
         .args([
@@ -2226,8 +2185,8 @@ fn exec_stdout_without_trailing_newline_returns() {
 #[cfg(unix)]
 fn exec_stderr_marker_is_stripped() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = posix_shell(&root, "shell");
+    let root = Home::new();
+    posix_shell(&root, "shell");
 
     // The marker arrives, so the grace for a missing one must not cut the
     // wait short however late the sidecar logs it.
@@ -2265,8 +2224,8 @@ fn exec_stderr_marker_is_stripped() {
 #[cfg(unix)]
 fn exec_survives_redirected_shell_stderr() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = posix_shell(&root, "shell");
+    let root = Home::new();
+    posix_shell(&root, "shell");
 
     harness::tendr(&root)
         .args(["push", "shell"])
@@ -2313,25 +2272,18 @@ fn result_keys(stdout: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn ndjson_session<'a>(root: &'a tempfile::TempDir, name: &str) -> harness::SessionGuard<'a> {
+fn ndjson_session(root: &Home, name: &str) {
     harness::tendr(root)
         .args(["start", name, "--stdin", "--exec-target", "ndjson", "--"])
         .arg(harness::test_callback_bin())
         .arg("ndjson-echo")
         .assert()
         .success();
-    let guard = harness::SessionGuard::new(root, name);
     harness::wait_running(root, name);
-    guard
 }
 
 /// `tendr exec <name> --timeout <secs> -- <request>`, run to completion.
-fn ndjson_exec(
-    root: &tempfile::TempDir,
-    name: &str,
-    timeout: &str,
-    request: &str,
-) -> std::process::Output {
+fn ndjson_exec(root: &Home, name: &str, timeout: &str, request: &str) -> std::process::Output {
     harness::tendr(root)
         .args(["exec", name, "--timeout", timeout, "--", request])
         .assert_within_deadline()
@@ -2345,7 +2297,7 @@ fn json(bytes: &[u8]) -> serde_json::Value {
 }
 
 /// `tendr exec <name> -- <request>` in the background.
-fn spawn_exec(root: &tempfile::TempDir, name: &str, request: &str) -> std::process::Child {
+fn spawn_exec(root: &Home, name: &str, request: &str) -> std::process::Child {
     std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .env("HOME", root.path())
         .args(["exec", name, "--timeout", EXEC_TIMEOUT, "--", request])
@@ -2368,7 +2320,7 @@ fn finish_exec(mut child: std::process::Child) -> std::process::Output {
 }
 
 /// Wait until `session`'s output.log holds the stderr line `line`.
-fn wait_logged_stderr(root: &tempfile::TempDir, session: &str, line: &str) {
+fn wait_logged_stderr(root: &Home, session: &str, line: &str) {
     let log = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/output.log"));
@@ -2392,8 +2344,8 @@ fn wait_logged_stderr(root: &tempfile::TempDir, session: &str, line: &str) {
 #[test]
 fn exec_ndjson_returns_the_matching_reply() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = ndjson_session(&root, "dev");
+    let root = Home::new();
+    ndjson_session(&root, "dev");
 
     // The child holds its reply until the gate opens, which the test does
     // once the sidecar has logged the stderr line.
@@ -2440,8 +2392,8 @@ fn exec_ndjson_returns_the_matching_reply() {
 #[test]
 fn exec_ndjson_failure_reply_exits_1() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = ndjson_session(&root, "dev");
+    let root = Home::new();
+    ndjson_session(&root, "dev");
 
     for request in [
         r#"{"cmd":"open","ok":false}"#,
@@ -2476,8 +2428,8 @@ fn exec_ndjson_failure_reply_exits_1() {
 #[test]
 fn exec_ndjson_late_reply_lands_in_the_next_exec() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = ndjson_session(&root, "dev");
+    let root = Home::new();
+    ndjson_session(&root, "dev");
 
     // The child answers the slow request only once it has read the next
     // one, so the timeout is the only way out of this exec, and the late
@@ -2521,8 +2473,8 @@ fn exec_ndjson_late_reply_lands_in_the_next_exec() {
 #[test]
 fn exec_ndjson_rejects_bad_requests_with_exit_2() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = ndjson_session(&root, "dev");
+    let root = Home::new();
+    ndjson_session(&root, "dev");
 
     let cases: [&[&str]; 5] = [
         &["not json"],
@@ -2564,8 +2516,8 @@ fn exec_ndjson_rejects_bad_requests_with_exit_2() {
 #[test]
 fn exec_ndjson_child_exit_before_reply_fails() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = ndjson_session(&root, "dev");
+    let root = Home::new();
+    ndjson_session(&root, "dev");
 
     let output = ndjson_exec(&root, "dev", EXEC_TIMEOUT, r#"{"cmd":"quit","exit":3}"#);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
@@ -2581,7 +2533,7 @@ fn exec_ndjson_child_exit_before_reply_fails() {
 #[test]
 fn exec_ndjson_refuses_pty_sessions() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     harness::tendr(&root)
         .args([
             "start",
@@ -2596,7 +2548,6 @@ fn exec_ndjson_refuses_pty_sessions() {
         .arg("ndjson-echo")
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "pty");
     harness::wait_running(&root, "pty");
 
     harness::tendr(&root)
@@ -2611,8 +2562,8 @@ fn exec_ndjson_refuses_pty_sessions() {
 #[test]
 fn exec_ndjson_target_is_explicit_only() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = ndjson_session(&root, "dev");
+    let root = Home::new();
+    ndjson_session(&root, "dev");
     let status = json(
         &harness::tendr(&root)
             .args(["status", "dev"])
@@ -2628,7 +2579,6 @@ fn exec_ndjson_target_is_explicit_only() {
         .arg("ndjson-echo")
         .assert()
         .success();
-    let _plain = harness::SessionGuard::new(&root, "plain");
     harness::wait_running(&root, "plain");
     harness::tendr(&root)
         .args(["exec", "plain", "--", r#"{"cmd":"read"}"#])
@@ -2642,12 +2592,11 @@ fn exec_ndjson_target_is_explicit_only() {
 #[test]
 fn exec_result_shape_of_other_targets_is_unchanged() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     harness::tendr(&root)
         .args(native_shell_start_args("shell"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
     let output = harness::tendr(&root)
@@ -2663,7 +2612,7 @@ fn exec_result_shape_of_other_targets_is_unchanged() {
 
 /// The token of the session's timed-out exec, from its `agent.exec`
 /// annotation in output.log.
-fn timed_out_token(root: &tempfile::TempDir, session: &str) -> String {
+fn timed_out_token(root: &Home, session: &str) -> String {
     let log = std::fs::read_to_string(
         root.path()
             .join(format!(".tendr/sessions/default/{session}/output.log")),
@@ -2704,7 +2653,7 @@ fn assert_refused(output: &std::process::Output, token: Option<&str>) {
 /// (each refusal checked by [`assert_refused`]), and return the result of the
 /// exec that ran it.
 fn exec_once_earlier_finishes(
-    root: &tempfile::TempDir,
+    root: &Home,
     session: &str,
     cmd: &[&str],
     token: Option<&str>,
@@ -2745,12 +2694,11 @@ fn gated_shell_command(gate: &std::path::Path) -> String {
 #[test]
 fn exec_after_python_timeout_waits_for_the_earlier_frame() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
+    let root = Home::new();
     harness::tendr(&root)
         .args(python_start_args("py"))
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "py");
     harness::wait_running(&root, "py");
 
     let gate = root.path().join("frame-gate");
@@ -2806,8 +2754,8 @@ fn exec_after_python_timeout_waits_for_the_earlier_frame() {
 #[cfg(unix)]
 fn exec_after_shell_timeout_never_gets_the_late_output() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = posix_shell(&root, "shell");
+    let root = Home::new();
+    posix_shell(&root, "shell");
 
     let gate = root.path().join("command-gate");
     let slow = harness::tendr(&root)
@@ -2846,8 +2794,8 @@ fn exec_after_shell_timeout_never_gets_the_late_output() {
 #[cfg(unix)]
 fn exec_after_a_killed_client_never_gets_the_late_output() {
     let _lock = lock();
-    let root = tempfile::TempDir::new().unwrap();
-    let _session = posix_shell(&root, "shell");
+    let root = Home::new();
+    posix_shell(&root, "shell");
 
     let gate = root.path().join("command-gate");
     let mut client = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))

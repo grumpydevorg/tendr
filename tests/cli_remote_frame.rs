@@ -9,10 +9,11 @@
 //! crafted stdin.
 
 mod harness;
+use harness::Home;
 
 use harness::{
-    HANG, Observation, SessionGuard, fake_ssh, poll_child_exit, poll_until, shim_path_env, tendr,
-    wait_running, wait_terminal_ns,
+    HANG, Observation, fake_ssh, poll_child_exit, poll_until, shim_path_env, tendr, wait_running,
+    wait_terminal_ns,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -70,7 +71,7 @@ impl Remote {
     /// `tendr --host box`, through this remote, with `root` as HOME on both
     /// sides. The connect deadline is far past anything load can do to the
     /// remote tendr's start: no test here is about it.
-    fn command(&self, root: &TempDir) -> std::process::Command {
+    fn command(&self, root: &Home) -> std::process::Command {
         let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"));
         cmd.args(["--host", "box"])
             .env("HOME", root.path())
@@ -81,14 +82,14 @@ impl Remote {
     }
 
     /// [`Self::command`], run to completion.
-    fn tendr(&self, root: &TempDir) -> assert_cmd::Command {
+    fn tendr(&self, root: &Home) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::from_std(self.command(root));
         cmd.timeout(HANG);
         cmd
     }
 
     /// [`Self::command`] with `args`, read while it runs.
-    fn spawn(&self, root: &TempDir, args: &[&str], stdin: Stdio) -> Child {
+    fn spawn(&self, root: &Home, args: &[&str], stdin: Stdio) -> Child {
         self.command(root)
             .args(args)
             .stdin(stdin)
@@ -118,7 +119,7 @@ fn outcome(output: &Output) -> (Option<i32>, String, String) {
     )
 }
 
-fn meta_path(root: &TempDir, namespace: &str, session: &str) -> PathBuf {
+fn meta_path(root: &Home, namespace: &str, session: &str) -> PathBuf {
     root.path()
         .join(".tendr")
         .join("sessions")
@@ -178,7 +179,7 @@ fn wait_exit(child: &mut Child, what: &str) -> std::process::ExitStatus {
 #[test]
 fn host_start_records_every_field_and_hostile_value_exactly() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let ns = format!("ns-{HOSTILE_NAME}");
     let name = HOSTILE_NAME;
     let dep = format!("dep-{HOSTILE_NAME}");
@@ -191,14 +192,12 @@ fn host_start_records_every_field_and_hostile_value_exactly() {
         .args(["start", "--namespace", &ns, &dep, "--", "sleep", "3600"])
         .output()
         .unwrap();
-    let _dep = SessionGuard::new_ns(&root, &ns, &dep);
     assert!(dep_meta.status.success(), "{:?}", outcome(&dep_meta));
     let dep_meta: serde_json::Value = serde_json::from_slice(&dep_meta.stdout).unwrap();
     tendr(&root)
         .args(["start", "--namespace", &ns, name, "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session = SessionGuard::new_ns(&root, &ns, name);
 
     let env_a = format!("A={HOSTILE}");
     let boundary = format!("container:{HOSTILE}");
@@ -297,7 +296,7 @@ fn host_start_records_every_field_and_hostile_value_exactly() {
 #[test]
 fn host_operations_match_local_byte_for_byte() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args([
             "start",
@@ -413,12 +412,11 @@ fn host_operations_match_local_byte_for_byte() {
 #[test]
 fn host_log_follow_streams() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "--stdin", "follow", "--", "cat"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "follow");
     wait_running(&root, "follow");
     tendr(&root)
         .args(["push", "follow"])
@@ -448,7 +446,7 @@ fn host_log_follow_streams() {
 #[test]
 fn host_watch_streams() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args([
             "start",
@@ -461,7 +459,6 @@ fn host_watch_streams() {
         ])
         .assert()
         .success();
-    let _session = SessionGuard::new_ns(&root, "watched", "w");
 
     let remote = Remote::new();
     let mut child = remote.spawn(
@@ -489,7 +486,7 @@ fn host_watch_streams() {
 
 /// Start `name` with a child that copies its stdin to a file; returns the
 /// file.
-fn start_copier<'a>(root: &'a TempDir, name: &str) -> (SessionGuard<'a>, PathBuf) {
+fn start_copier(root: &Home, name: &str) -> PathBuf {
     let out = root.path().join(format!("{name}.bin"));
     tendr(root)
         .args(["start", "--stdin", name, "--"])
@@ -498,17 +495,16 @@ fn start_copier<'a>(root: &'a TempDir, name: &str) -> (SessionGuard<'a>, PathBuf
         .arg(&out)
         .assert()
         .success();
-    let guard = SessionGuard::new(root, name);
     wait_running(root, name);
-    (guard, out)
+    out
 }
 
 /// Every byte value, and more than a MiB of them, reach the session exactly.
 #[test]
 fn host_push_preserves_binary_bytes() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let (_session, out) = start_copier(&root, "binary");
+    let root = Home::new();
+    let out = start_copier(&root, "binary");
     let body: Vec<u8> = (0..=255u8).cycle().take((1 << 20) + 4321).collect();
 
     let remote = Remote::new();
@@ -532,8 +528,8 @@ fn host_push_preserves_binary_bytes() {
 #[test]
 fn host_push_streams_before_stdin_ends() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let (_session, out) = start_copier(&root, "streamed");
+    let root = Home::new();
+    let out = start_copier(&root, "streamed");
 
     let remote = Remote::new();
     let mut child = remote.spawn(&root, &["push", "streamed"], Stdio::piped());
@@ -560,12 +556,11 @@ fn host_push_streams_before_stdin_ends() {
 #[test]
 fn host_push_reaches_a_pty_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "--pty", "pty", "--", "cat"])
         .assert()
         .success();
-    let _session = SessionGuard::new(&root, "pty");
     wait_running(&root, "pty");
 
     let remote = Remote::new();
@@ -591,7 +586,7 @@ fn host_push_reaches_a_pty_session() {
 #[test]
 fn host_ndjson_exec_matches_its_reply() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let remote = Remote::new();
     let output = remote
         .tendr(&root)
@@ -602,7 +597,6 @@ fn host_ndjson_exec_matches_its_reply() {
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{:?}", outcome(&output));
     remote.assert_constant_argv();
-    let _session = SessionGuard::new(&root, "dev");
     wait_running(&root, "dev");
     let meta = read_json(&meta_path(&root, "default", "dev"));
     assert_eq!(meta["launch_spec"]["exec_target"], "Ndjson");
@@ -655,7 +649,7 @@ fn start_frame(changes: serde_json::Value) -> Vec<u8> {
     )
 }
 
-fn run_remote_entry(root: &TempDir, stdin: Vec<u8>) -> Output {
+fn run_remote_entry(root: &Home, stdin: Vec<u8>) -> Output {
     tendr(root)
         .arg("_remote")
         .write_stdin(stdin)
@@ -665,7 +659,7 @@ fn run_remote_entry(root: &TempDir, stdin: Vec<u8>) -> Output {
 }
 
 /// The sessions on disk, by namespace and name.
-fn sessions_on_disk(root: &TempDir) -> Vec<String> {
+fn sessions_on_disk(root: &Home) -> Vec<String> {
     let sessions = root.path().join(".tendr").join("sessions");
     let mut found = Vec::new();
     for ns in std::fs::read_dir(&sessions).unwrap() {
@@ -689,12 +683,11 @@ fn sessions_on_disk(root: &TempDir) -> Vec<String> {
 #[test]
 fn remote_entry_refuses_bad_requests_without_side_effects() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let started = tendr(&root)
         .args(["start", "victim", "--", "sleep", "3600"])
         .output()
         .unwrap();
-    let _victim = SessionGuard::new(&root, "victim");
     assert!(started.status.success(), "{:?}", outcome(&started));
     let run_id =
         serde_json::from_slice::<serde_json::Value>(&started.stdout).unwrap()["run_id"].clone();
@@ -809,7 +802,7 @@ fn remote_entry_refuses_bad_requests_without_side_effects() {
 #[test]
 fn remote_entry_ignores_unknown_fields() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
 
     let output = run_remote_entry(
         &root,
@@ -825,7 +818,7 @@ fn remote_entry_ignores_unknown_fields() {
 // -- `--exit-trailer`: the remote end of the exit trailer --
 
 /// Run `tendr --exit-trailer <args>` here and return its outcome.
-fn with_trailer(root: &TempDir, args: &[&str]) -> (Option<i32>, String, String) {
+fn with_trailer(root: &Home, args: &[&str]) -> (Option<i32>, String, String) {
     let output = tendr(root)
         .arg("--exit-trailer")
         .args(args)
@@ -841,17 +834,15 @@ fn with_trailer(root: &TempDir, args: &[&str]) -> (Option<i32>, String, String) 
 #[test]
 fn exit_trailer_is_the_last_stderr_line_and_matches_the_exit_code() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "failed", "--", "false"])
         .assert()
         .success();
-    let _failed = SessionGuard::new(&root, "failed");
     tendr(&root)
         .args(["start", "running", "--", "sleep", "3600"])
         .assert()
         .success();
-    let _running = SessionGuard::new(&root, "running");
 
     let cases: [(&[&str], i32); 4] = [
         (&["wait", "failed"], 42),
@@ -887,7 +878,7 @@ fn exit_trailer_is_the_last_stderr_line_and_matches_the_exit_code() {
 /// last.
 #[test]
 fn exit_trailer_keeps_the_hello_first_and_single() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let output = tendr(&root)
         .args(["--hello", "--exit-trailer", "status", "missing"])
         .output()
@@ -908,8 +899,8 @@ fn exit_trailer_keeps_the_hello_first_and_single() {
 #[test]
 fn exit_trailer_leaves_stdin_to_the_command() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let (_session, out) = start_copier(&root, "wrapped");
+    let root = Home::new();
+    let out = start_copier(&root, "wrapped");
     let body: Vec<u8> = (0..=255u8).cycle().take(200_000).collect();
 
     let output = tendr(&root)

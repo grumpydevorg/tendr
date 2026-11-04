@@ -2,11 +2,11 @@
 //! and their mutual exclusion (slice 2 plan, scope item 2).
 
 mod harness;
+use harness::Home;
 
 use harness::{tendr, wait_terminal};
-use tempfile::TempDir;
 
-fn finished_session(root: &TempDir, name: &str) {
+fn finished_session(root: &Home, name: &str) {
     tendr(root)
         .args(["start", name, "--", "echo", "hi"])
         .assert()
@@ -14,7 +14,7 @@ fn finished_session(root: &TempDir, name: &str) {
     wait_terminal(root, name);
 }
 
-fn emit(root: &TempDir, session: &str, kind: &str) {
+fn emit(root: &Home, session: &str, kind: &str) {
     tendr(root)
         .args(["emit", "--kind", kind, "--session", session])
         .assert()
@@ -29,7 +29,7 @@ fn parse_ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn replay(root: &TempDir, args: &[&str]) -> Vec<serde_json::Value> {
+fn replay(root: &Home, args: &[&str]) -> Vec<serde_json::Value> {
     let output = tendr(root)
         .arg("events")
         .args(args)
@@ -41,7 +41,7 @@ fn replay(root: &TempDir, args: &[&str]) -> Vec<serde_json::Value> {
 
 #[test]
 fn last_returns_exactly_the_last_n_by_merge_order() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
     for i in 0..4 {
         emit(&root, "s1", &format!("test.e{i}"));
@@ -63,7 +63,7 @@ fn last_returns_exactly_the_last_n_by_merge_order() {
 
 #[test]
 fn since_excludes_earlier_events() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
     emit(&root, "s1", "test.late");
 
@@ -84,7 +84,7 @@ fn since_excludes_earlier_events() {
 
 #[test]
 fn since_accepts_second_precision_utc() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     // A whole-second timestamp far in the future excludes everything.
@@ -98,7 +98,7 @@ fn since_accepts_second_precision_utc() {
 
 #[test]
 fn since_rejects_malformed_timestamps_as_usage_error() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["events", "--since", "yesterday"])
         .assert()
@@ -107,7 +107,7 @@ fn since_rejects_malformed_timestamps_as_usage_error() {
 
 #[test]
 fn from_now_without_follow_prints_nothing() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     finished_session(&root, "s1");
 
     let output = tendr(&root)
@@ -123,7 +123,7 @@ fn from_now_without_follow_prints_nothing() {
 
 #[test]
 fn warm_start_flags_are_mutually_exclusive() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     let combos: &[&[&str]] = &[
         &["--from-now", "--since", "2026-01-01T00:00:00Z"],
         &["--from-now", "--last", "5"],

@@ -1,13 +1,13 @@
 //! Sidecar lifecycle events with WAL ordering — spec §3.6, plan scope item 3.
 
 mod harness;
+use harness::Home;
 
 use harness::{HANG, Observation, poll_until, tendr, wait_running, wait_terminal};
 use std::time::Duration;
-use tempfile::TempDir;
 
 /// Read all events for a session, merged by (ts, writer, seq).
-fn read_events(root: &TempDir, session: &str) -> Vec<serde_json::Value> {
+fn read_events(root: &Home, session: &str) -> Vec<serde_json::Value> {
     let events_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/events"));
@@ -45,7 +45,7 @@ fn kinds(events: &[serde_json::Value]) -> Vec<String> {
 }
 
 /// Poll until the session's event log contains `kind`, or panic at `HANG`.
-fn wait_for_event_kind(root: &TempDir, session: &str, kind: &str) -> Vec<serde_json::Value> {
+fn wait_for_event_kind(root: &Home, session: &str, kind: &str) -> Vec<serde_json::Value> {
     let events_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/events"));
@@ -65,7 +65,7 @@ fn wait_for_event_kind(root: &TempDir, session: &str, kind: &str) -> Vec<serde_j
 
 #[test]
 fn normal_run_logs_starting_started_exited() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "echo", "hi"])
         .assert()
@@ -108,7 +108,7 @@ fn normal_run_logs_starting_started_exited() {
 
 #[test]
 fn nonzero_exit_logs_exit_code() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "false"])
         .assert()
@@ -124,7 +124,7 @@ fn nonzero_exit_logs_exit_code() {
 
 #[test]
 fn spawn_failure_logs_spawn_failed() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     // Spawn failure is a normal terminal outcome for start; ignore its exit.
     let _ = tendr(&root)
         .args(["start", "s1", "--", "/nonexistent-cmd-tendr-test"])
@@ -139,13 +139,12 @@ fn spawn_failure_logs_spawn_failed() {
 
 #[test]
 fn graceful_kill_logs_run_killed() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "s1", "--", "sleep", "3600"])
         .assert()
         .success();
     // Never exits by itself: only the kill can end it.
-    let _session = harness::SessionGuard::new(&root, "s1");
     wait_running(&root, "s1");
     // The sidecar must record the kill itself (run.killed), so `kill` waits for
     // it up to the hang deadline instead of 11 s.
@@ -165,7 +164,7 @@ fn graceful_kill_logs_run_killed() {
 
 #[test]
 fn failed_dependency_logs_dependency_failed() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .args(["start", "dep", "--", "false"])
         .assert()
@@ -190,7 +189,7 @@ fn failed_dependency_logs_dependency_failed() {
 
 #[test]
 fn crash_after_terminal_event_leaves_event_without_meta() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .env("TENDR_TEST_ABORT", "before_terminal_meta")
         .args(["start", "s1", "--", "echo", "hi"])
@@ -212,7 +211,7 @@ fn crash_after_terminal_event_leaves_event_without_meta() {
 
 #[test]
 fn crash_before_terminal_event_leaves_neither() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     tendr(&root)
         .env("TENDR_TEST_ABORT", "before_terminal_event")
         .args(["start", "s1", "--", "echo", "hi"])
@@ -238,7 +237,7 @@ fn crash_before_terminal_event_leaves_neither() {
 /// a meta warning, while supervision still writes terminal meta.
 #[test]
 fn unwritable_event_log_salvages_terminal_event_to_lost_found() {
-    let root = TempDir::new().unwrap();
+    let root = Home::new();
     // The child exits (0) only once the gate exists, which the test creates
     // after the sabotage, so its terminal record is always the one that fails
     // to append, however slowly the test gets there.
@@ -256,7 +255,6 @@ fn unwritable_event_log_salvages_terminal_event_to_lost_found() {
         ])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "s1");
     wait_running(&root, "s1");
 
     // Sabotage: replace the events dir with a regular file so every further
