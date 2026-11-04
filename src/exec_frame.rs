@@ -121,10 +121,10 @@ pub fn duckdb_safe_mode(argv: &[String]) -> bool {
     argv.iter().any(|arg| arg == "-safe" || arg == "--safe")
 }
 
-/// What a DuckDB in safe mode prints to stderr for each `.output` it refuses:
-/// the frame's doing, not the SQL's, so never an error of the exec. Safe
-/// mode switched on with `.safe_mode` in a session started without it gets
-/// these for the frame's marker.
+/// What a DuckDB in safe mode prints to stderr for each `.output`, `.once` or
+/// `.excel` it refuses. A session put in safe mode with `.safe_mode`, whose
+/// frame still has the marker, prints it twice for the frame's `.output`s:
+/// the last two lines of the exec's stderr. Any other is the SQL's own.
 pub const DUCKDB_SAFE_MODE_REFUSAL: &str = ".output/.once/.excel cannot be used in -safe mode";
 
 /// Parse a sentinel line into `(residual, exit code, cwd)`.

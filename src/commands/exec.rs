@@ -693,12 +693,9 @@ fn run_exec(
         WaitMode::SentinelWithStderrCheck(fence) => {
             let mut result =
                 wait_sentinel_result(session, &session_name, token, cursor, deadline, fence)?;
-            result.stderr = result
-                .stderr
-                .lines()
-                .filter(|line| *line != exec_frame::DUCKDB_SAFE_MODE_REFUSAL)
-                .collect::<Vec<_>>()
-                .join("\n");
+            if fence == ErrFence::Stderr {
+                result.stderr = without_frame_refusals(&result.stderr);
+            }
             // DuckDB's sentinel hardcodes exit code 0 (SQL has no $?), so an
             // error is told by stderr, all of which is in by the end marker,
             // including a partial success ("SELECT 1; SELECT * FROM bad;").
@@ -708,6 +705,21 @@ fn run_exec(
             Ok(result)
         }
     }
+}
+
+/// `stderr` without the refusals of the DuckDB frame's two `.output`s in a
+/// session put in safe mode with `.safe_mode`: its last two lines, when they
+/// are refusals, since the frame's `.output`s run after all the SQL. A
+/// refusal of the SQL's own `.output`, `.once` or `.excel` stays an error.
+fn without_frame_refusals(stderr: &str) -> String {
+    let mut lines: Vec<&str> = stderr.lines().collect();
+    for _ in 0..2 {
+        if lines.last() != Some(&exec_frame::DUCKDB_SAFE_MODE_REFUSAL) {
+            break;
+        }
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 /// What tells an exec that the command's stderr is all in the log.
@@ -1244,6 +1256,46 @@ mod tests {
         assert_eq!(result.stdout, "foo");
         assert_eq!(result.stderr, "y");
         assert_eq!(result.exit_code, 3);
+    }
+
+    /// A DuckDB marker on stdout (safe mode switched on, so its `.output
+    /// stderr` was refused) says nothing about stderr: the exec reads on and
+    /// keeps stderr logged after it, and the marker stays out of stdout. A
+    /// shell frame, whose marker is on stdout under a PTY, ends there.
+    #[test]
+    fn a_duckdb_marker_on_stdout_does_not_end_its_stderr() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = session_with_log(
+            &tmp,
+            &[
+                ("O", "__TENDR_EXEC_ERR__ tok"),
+                ("O", "__TENDR_EXEC__ tok 0 ."),
+                ("E", "boom"),
+            ],
+        );
+        let duckdb = wait_sentinel_result(&dir, "s", "tok", 0, None, ErrFence::Stderr).unwrap();
+        assert_eq!(
+            (duckdb.stdout.as_str(), duckdb.stderr.as_str()),
+            ("", "boom")
+        );
+        let shell = wait_sentinel_result(&dir, "s", "tok", 0, None, ErrFence::AnyStream).unwrap();
+        assert_eq!(shell.stderr, "");
+    }
+
+    /// Only the frame's two trailing refusals go; the SQL's own stays.
+    #[test]
+    fn only_the_frames_safe_mode_refusals_are_dropped() {
+        let refused = exec_frame::DUCKDB_SAFE_MODE_REFUSAL;
+        assert_eq!(without_frame_refusals(&format!("{refused}\n{refused}")), "");
+        assert_eq!(
+            without_frame_refusals(&format!("{refused}\n{refused}\n{refused}")),
+            refused
+        );
+        assert_eq!(
+            without_frame_refusals(&format!("boom\n{refused}\n{refused}")),
+            "boom"
+        );
+        assert_eq!(without_frame_refusals("boom"), "boom");
     }
 
     fn pending(token: &str, log_offset: u64) -> PendingExec {

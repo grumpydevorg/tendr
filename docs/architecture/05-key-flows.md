@@ -107,13 +107,16 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
     stdout again. This also undoes a `.output` to a file in the SQL, which
     used to send the sentinel there and leave the exec waiting.
   - DuckDB in safe mode refuses `.output`, and has no other way to write to
-    stderr. A session started with DuckDB's `-safe` option (one dash or two) gets a frame without
-    the marker, and `exec` waits one second after the sentinel for stderr,
-    without the warning: such an exec takes a second longer. Each refusal
-    (`.output/.once/.excel cannot be used in -safe mode`), which is what a
-    session put in safe mode with `.safe_mode` prints for the frame's
-    `.output`, is dropped from stderr. There the marker comes on stdout,
-    where it says nothing about stderr, so `exec` waits the second too.
+    stderr. A session started with DuckDB's `-safe` option (one dash or two)
+    gets a frame without the marker, and `exec` waits one second after the
+    sentinel for stderr, without the warning: such an exec takes a second
+    longer. A session put in safe mode with `.safe_mode` refuses the frame's
+    two `.output`s, printing `.output/.once/.excel cannot be used in -safe
+    mode` twice, as the last lines of its stderr; `exec` drops those two, and
+    since the marker then comes on stdout, where it says nothing about
+    stderr, waits the second too. A refusal of the SQL's own `.output`,
+    `.once` or `.excel` stays an error. With `-bail` that first refusal ends
+    the session: start such a session with `-safe` instead.
   - Either marker may end a line rather than start one, when the command's
     last output has no newline. The bytes before the marker are command
     output.
