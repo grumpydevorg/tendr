@@ -166,14 +166,23 @@ tendr exec  py -- 'print(df.describe())'                   # df is still loaded
 
 ### PowerShell
 
-`pwsh` and `powershell` return the same JSON result, with two differences:
+`pwsh` and `powershell` return the same JSON result. `exec` runs the code in
+the session's own scope, as if typed at its prompt, so variables, functions,
+`Set-Location` and `$env:` changes persist between calls:
 
-- Each `exec` runs in a new scriptblock scope. Use `$global:` for variables
-  that must persist (`$global:x = 42`). `Set-Location`, modules and
-  dot-sourced functions persist without it.
-- `Format-*` cmdlets fail inside `exec` because there is no interactive host.
-  Use `ConvertTo-Json`, `ConvertTo-Csv` or `Out-String`, and format the result
-  on the calling side.
+```bash
+tendr start --stdin ps -- pwsh -NoProfile                  # or: powershell -NoProfile
+tendr exec  ps -- '$x = 42; function f { 7 }'
+tendr exec  ps -- '$x + (f)'                               # → 49
+```
+
+While the code runs, tendr keeps its own state in `$__tendr_frame`, which the
+code cannot change. Over `--host` this needs a newer remote `tendr`; see
+**Versions** under [Reach remote hosts](#reach-remote-hosts-with---host).
+
+`Format-*` cmdlets fail inside `exec` because there is no interactive host.
+Use `ConvertTo-Json`, `ConvertTo-Csv` or `Out-String`, and format the result
+on the calling side.
 
 On Windows, a `powershell` (Windows PowerShell 5.1) child does not get pwsh 7's
 module directories. pwsh 7 adds its own to `PSModulePath`, and everything it
@@ -580,7 +589,7 @@ Start work under `--host`, disconnect, and come back later to `log`, `status`,
 
 **Versions.** The remote `tendr` must be 0.5.0 or newer for every command,
 `exec` included. An older one fails at once, and tendr says to upgrade it.
-Two features need more:
+Three features need more:
 
 - Reconnecting a dropped `attach --host` needs 0.6.0 or newer on the remote
   host, and a session started by 0.6.0 or newer. Otherwise the attach ends
@@ -591,6 +600,10 @@ Two features need more:
   is too old. The 81's own hint, `--takeover`, would take the terminal from
   that human: do not follow it to watch. A session started by an older
   `tendr` refuses it with 80.
+- PowerShell `exec` keeping variables and functions between calls (see
+  [PowerShell](#powershell)) needs 0.8.0 or newer on the remote host. An
+  older remote runs each `exec` in a scope of its own, where only `$global:`
+  variables persist.
 
 An older client still works against a newer remote.
 
@@ -836,7 +849,7 @@ exits 1 on failure.
 |`TENDR_GENERATION`|tendr, for the child and `--on-exit`|Run counter for the session; `--replace` increments it|
 |`TENDR_SESSION_DIR`|tendr, for the child and `--on-exit`|Path of the session directory|
 |`TENDR_EXIT_REASON`|tendr, for `--on-exit` only|`ExitedOk`, `ExitedError { code: N }`, `Killed`, `KilledForced`, `TimedOut` or `SidecarFailed`|
-|`TENDR_BLOCK_ID`|`tendr wrap`, and `exec` in a POSIX shell, for the command they run|ID that links events emitted inside the command to its wrap or exec event|
+|`TENDR_BLOCK_ID`|`tendr wrap`, and `exec` in a POSIX shell or PowerShell, for the command they run|ID that links events emitted inside the command to its wrap or exec event|
 |`TENDR_PARENT_EVENT_ID`|`tendr wrap`, for its command|ID of the wrap event|
 |`PSModulePath`|tendr, on Windows, for a child or `tendr wrap` command that is Windows PowerShell (`powershell`)|The inherited value without pwsh 7's module directories; see [PowerShell](#powershell)|
 |`TENDR_SSH_CONNECT_TIMEOUT`|you|Connect deadline for `--host` commands, in seconds. Default 30; `0` turns it off.|
