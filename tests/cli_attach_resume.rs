@@ -293,6 +293,8 @@ fn a_half_open_resume_under_a_running_flood_has_no_gap_and_no_duplicate() {
     let after = read_stamped(&mut new, reached, b"FLOOD-DONE\r\n", 0);
     // The old connection was retired.
     drain(&mut old);
+    // meta.json shows AgentControl before the attach is recorded too.
+    wait_control(&root, "resume-flood", "HumanControl");
     write_frame(&mut new, &Frame::Detach).unwrap();
     wait_control(&root, "resume-flood", "AgentControl");
 
@@ -334,6 +336,7 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
         &[("TENDR_TEST_OUTPUT_RING_BYTES", &RING.to_string())],
     );
     let (_evicted, accepted) = attach_v2(&root, "resume-gone");
+    wait_control(&root, "resume-gone", "HumanControl");
     touch(&root, "go");
     wait_captured(&root, "resume-gone", "ALL-DONE");
     // Evicted and disconnected, it lost control.
@@ -437,7 +440,10 @@ fn a_finished_push_lets_the_resume_through_and_a_running_one_does_not() {
     start(&root, "resume-push", "cat", &[]);
 
     // The connection is lost and its end noticed: control is released.
+    // meta.json shows AgentControl before the attach is recorded too, so the
+    // release is only seen once the attach has been.
     let (mut lost, accepted) = attach_v2(&root, "resume-push");
+    wait_control(&root, "resume-push", "HumanControl");
     write_frame(&mut lost, &Frame::Detach).unwrap();
     wait_control(&root, "resume-push", "AgentControl");
 
