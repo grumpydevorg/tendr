@@ -400,7 +400,8 @@ impl RunCore {
                 UnixPtyInput {
                     writer,
                     resize,
-                    recorder: Some(recording.thread.recorder()),
+                    recorder: recording.as_ref().map(|r| r.thread.recorder()),
+                    record_input: recording.as_ref().is_some_and(|r| r.input_recorded),
                     full_marker: super::pty_full_marker(),
                 },
                 hooks,
@@ -427,7 +428,7 @@ impl RunCore {
         let started = StartedPty {
             _socket: cleanup,
             sink: Arc::clone(&sink),
-            recording: Some(recording),
+            recording,
             control,
             teardown: PtyTeardown {
                 registry,
@@ -487,12 +488,14 @@ impl RunCore {
         let Some(PtySide::Started(pty)) = &mut self.pty else {
             return;
         };
-        if let Some(PtyRecordingRun { thread, dir }) = pty.recording.take() {
-            let (state, warning) = finished_recording(thread.finish());
+        if let Some(run) = pty.recording.take() {
+            let input_recorded = run.input_recorded;
+            let (state, warning) = finished_recording(run.thread.finish());
             self.meta.set_pty_recording(PtyRecording {
-                dir,
-                input_recorded: false,
+                dir: run.dir,
+                input_recorded,
                 state,
+                deleted_at: None,
             });
             if let Some(warning) = warning {
                 self.meta.add_warning(warning);

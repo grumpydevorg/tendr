@@ -1778,12 +1778,14 @@ fn capture_stream_with_tee(
 }
 
 /// The PTY input the single writer drives: the master's write half, a dup used
-/// for window-size changes, and the recorder that records applied sizes.
+/// for window-size changes, and the recorder that records applied sizes and,
+/// with `record_input` (`start --record-input`), the input written.
 #[cfg(unix)]
 struct UnixPtyInput {
     writer: crate::platform::unix::PtyWriter,
     resize: Option<std::fs::File>,
     recorder: Option<Recorder>,
+    record_input: bool,
     /// A file to create the first time the PTY refuses input as full
     /// ([`pty_full_marker`]).
     full_marker: Option<std::path::PathBuf>,
@@ -1805,7 +1807,12 @@ fn pty_full_marker() -> Option<std::path::PathBuf> {
 #[cfg(unix)]
 impl crate::model::pty_control::PtyInputSink for UnixPtyInput {
     fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let written = self.writer.try_write(bytes);
+        let written = match &self.recorder {
+            Some(recorder) if self.record_input => {
+                recorder.input_written(bytes, |bytes| self.writer.try_write(bytes))
+            }
+            _ => self.writer.try_write(bytes),
+        };
         if matches!(&written, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
             if let Some(marker) = self.full_marker.take() {
                 let _ = std::fs::write(marker, b"");
@@ -3327,23 +3334,27 @@ struct PtyRecordingRun {
     thread: RecorderThread,
     /// Relative to the session directory.
     dir: String,
+    input_recorded: bool,
 }
 
 impl PtyRecordingRun {
     fn meta(&self, state: RecordingState) -> PtyRecording {
         PtyRecording {
             dir: self.dir.clone(),
-            input_recorded: false,
+            input_recorded: self.input_recorded,
             state,
+            deleted_at: None,
         }
     }
 }
 
-/// Start recording a PTY run: output and applied geometry, not input. The child
-/// starts at the platform's initial PTY size, under its `TERM` ([`pty_term`];
-/// recorded empty if not recordable). A stop is queued on the run's effects channel,
-/// which appends it as a `recording.stopped` event and writes it to
-/// `meta.json`; the recorder never touches the session paths itself.
+/// Start recording a PTY run as its launch spec asks: output and applied
+/// geometry, and input too with `RecordingPolicy::OutputAndInput`; `None`
+/// for `RecordingPolicy::Off`. The child starts at the platform's initial
+/// PTY size, under its `TERM` ([`pty_term`]; recorded empty if not
+/// recordable). A stop is queued on the run's effects channel, which appends
+/// it as a `recording.stopped` event and writes it to `meta.json`; the
+/// recorder never touches the session paths itself.
 #[cfg(unix)]
 fn start_pty_recording(
     session_dir: &Path,
@@ -3351,9 +3362,15 @@ fn start_pty_recording(
     launch_spec: &LaunchSpec,
     limits: crate::recorder::RecorderLimits,
     effects: std::sync::mpsc::Sender<RunEffect>,
-) -> PtyRecordingRun {
+) -> Option<PtyRecordingRun> {
+    use crate::model::spec::RecordingPolicy;
     use crate::recording::{Geometry, SegmentHeader, Sequence, TermName};
 
+    let input_recorded = match launch_spec.recording {
+        RecordingPolicy::Off => return None,
+        RecordingPolicy::Output => false,
+        RecordingPolicy::OutputAndInput => true,
+    };
     let dir = format!("recording/{run_id}");
     let term = TermName::new(pty_term(launch_spec))
         .unwrap_or_else(|_| TermName::new("").expect("an empty TERM is recordable"));
@@ -3370,7 +3387,7 @@ fn start_pty_recording(
             crate::platform::INITIAL_PTY_COLS,
         )
         .expect("the initial PTY size is nonzero"),
-        input_recorded: false,
+        input_recorded,
         term,
     };
 
@@ -3379,7 +3396,11 @@ fn start_pty_recording(
     let thread = RecorderThread::start(header, store, limits, move |stopped| {
         let _ = effects.send(RunEffect::RecordingStopped(stopped));
     });
-    PtyRecordingRun { thread, dir }
+    Some(PtyRecordingRun {
+        thread,
+        dir,
+        input_recorded,
+    })
 }
 
 /// Recording limits. Debug builds accept `TENDR_TEST_RECORDING_MAX_BYTES` so
@@ -3961,6 +3982,7 @@ mod tests {
             dir: format!("recording/{run_id}"),
             input_recorded: false,
             state: RecordingState::Recording,
+            deleted_at: None,
         });
         meta
     }
@@ -4008,7 +4030,8 @@ mod tests {
             &LaunchSpec::new(vec!["true".into()]).unwrap(),
             limits,
             hooks.effects.clone(),
-        );
+        )
+        .expect("the default spec records");
         let deadline = std::time::Instant::now() + crate::test_support::HANG;
         while recording.thread.recorder().stopped().is_none() {
             assert!(

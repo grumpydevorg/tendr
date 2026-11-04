@@ -22,8 +22,9 @@ as `seg-<index:08>.tndrrec`, one file per segment (`src/recorder.rs`).
   is synced, then renamed into place, before any record is appended.
 - The sidecar starts a new segment at 64 MiB and stops recording at 1 GiB
   in total ([04-pty-lane.md](04-pty-lane.md#recording)).
-- The sidecar never records input, so `input_recorded` is always 0 in its
-  segments. The format still defines `INPUT` records.
+- The sidecar records input only for a run started with
+  `tendr start --record-input`; then `input_recorded` is 1 and `INPUT`
+  records hold the bytes written to the terminal. Otherwise it is 0.
 
 ## Conventions
 

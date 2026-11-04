@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tendr::attach_escape::EscapeMode;
 use tendr::model::boundary::{Boundary, BoundaryContext};
 use tendr::model::ids::Namespace;
-use tendr::model::spec::ExecTarget;
+use tendr::model::spec::{ExecTarget, RecordingPolicy};
 
 use crate::{AttachEscape, Commands, commands, parse_optional_namespace, resolve_namespace};
 
@@ -60,6 +60,14 @@ pub struct StartRequest {
     pub any_exit: bool,
     pub boundary: Option<Boundary>,
     pub boundary_parent: Vec<Boundary>,
+    /// `--record-input`. Left out when false, so a request without it reads
+    /// as it always has; a remote that would drop it is never sent it
+    /// (`remote_frame::min_frame_version`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_input: bool,
+    /// `--no-record`, likewise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_record: bool,
 }
 
 /// Debug shows the shape of the payload, never its values: argv, cwd, env and
@@ -83,6 +91,8 @@ impl fmt::Debug for StartRequest {
             .field("any_exit", &self.any_exit)
             .field("boundary", &self.boundary)
             .field("boundary_parent", &self.boundary_parent)
+            .field("record_input", &self.record_input)
+            .field("no_record", &self.no_record)
             .finish()
     }
 }
@@ -224,8 +234,8 @@ pub fn is_operation(name: &str) -> bool {
 
 /// A command that cannot be a [`RemoteOperation`]: it runs only locally (or,
 /// for `exec`, travels on its own frame). `wrap` relies on local process
-/// context, `run` reads a local script file and `prune` walks the local
-/// session root.
+/// context, `run` reads a local script file, `prune` walks the local
+/// session root and `replay` plays a local recording in the local terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
     "command '{command}' is not supported over SSH (--host).\n\
@@ -260,6 +270,8 @@ impl TryFrom<&Commands> for RemoteOperation {
                 any_exit,
                 boundary,
                 boundary_parent,
+                record_input,
+                no_record,
                 cmd,
             } => Self::Start(StartRequest {
                 session: name.clone(),
@@ -278,6 +290,8 @@ impl TryFrom<&Commands> for RemoteOperation {
                 any_exit: *any_exit,
                 boundary: boundary.clone(),
                 boundary_parent: boundary_parent.clone(),
+                record_input: *record_input,
+                no_record: *no_record,
             }),
             Commands::Status { name, namespace } => Self::Status(StatusRequest {
                 session: name.clone(),
@@ -365,6 +379,7 @@ impl TryFrom<&Commands> for RemoteOperation {
             Commands::Query { .. } => return local("query"),
             Commands::Emit { .. } => return local("emit"),
             Commands::Prune { .. } => return local("prune"),
+            Commands::Replay { .. } => return local("replay"),
             Commands::Guide { .. } => return local("guide"),
             Commands::Skill { .. } => return local("skill"),
             Commands::Sidecar { .. } => return local("_sidecar"),
@@ -390,6 +405,7 @@ struct StartInputs {
     pty: bool,
     exec_target: Option<ExecTarget>,
     boundary: Option<BoundaryContext>,
+    recording: RecordingPolicy,
 }
 
 /// Resolve a start request on the host that runs it. Only the namespace can
@@ -412,6 +428,8 @@ fn start_inputs(request: StartRequest) -> anyhow::Result<StartInputs> {
         any_exit,
         boundary,
         boundary_parent,
+        record_input,
+        no_record,
     } = request;
     Ok(StartInputs {
         namespace: resolve_namespace(namespace)?,
@@ -432,6 +450,13 @@ fn start_inputs(request: StartRequest) -> anyhow::Result<StartInputs> {
             current,
             parents: boundary_parent,
         }),
+        recording: if no_record {
+            RecordingPolicy::Off
+        } else if record_input {
+            RecordingPolicy::OutputAndInput
+        } else {
+            RecordingPolicy::Output
+        },
     })
 }
 
@@ -456,6 +481,7 @@ pub fn dispatch(operation: RemoteOperation) -> anyhow::Result<()> {
                 i.pty,
                 i.exec_target,
                 i.boundary,
+                i.recording,
             )
         }
         RemoteOperation::Status(r) => {
@@ -571,6 +597,7 @@ mod tests {
             "vm:beta",
             "--boundary-parent",
             "pod:gamma",
+            "--record-input",
             "x&calc",
             "--",
             "prog",
@@ -593,6 +620,8 @@ mod tests {
             any_exit,
             boundary: parsed_boundary,
             boundary_parent,
+            record_input,
+            no_record,
             cmd,
         } = &command
         else {
@@ -620,6 +649,7 @@ mod tests {
             pty: in_pty,
             exec_target: in_exec_target,
             boundary: in_boundary,
+            recording: in_recording,
         } = start_inputs(request).expect("resolves");
 
         assert_eq!(name, "x&calc");
@@ -663,6 +693,30 @@ mod tests {
         );
         assert_eq!(cmd, &strings(&["prog", "--flag", "a b\r\n`é`"]));
         assert_eq!(&in_cmd, cmd);
+        assert!(*record_input && !*no_record);
+        assert_eq!(in_recording, RecordingPolicy::OutputAndInput);
+    }
+
+    /// `--no-record` (which conflicts with `--record-input`) arrives, and
+    /// neither flag means the default recording.
+    #[test]
+    fn recording_flags_resolve_on_the_target() {
+        for (flags, expected) in [
+            (&["--pty", "--no-record"][..], RecordingPolicy::Off),
+            (&["--pty"][..], RecordingPolicy::Output),
+        ] {
+            let mut args = vec!["start"];
+            args.extend_from_slice(flags);
+            args.extend(["s", "--", "true"]);
+            let RemoteOperation::Start(request) = round_trip(&op(&args)) else {
+                panic!("not a start request");
+            };
+            assert_eq!(
+                start_inputs(request).unwrap().recording,
+                expected,
+                "{flags:?}"
+            );
+        }
     }
 
     #[test]
@@ -788,6 +842,7 @@ mod tests {
             (&["run", "script.sh"], "run"),
             (&["wrap", "--source", "s", "--event", "e", "true"], "wrap"),
             (&["prune", "--all"], "prune"),
+            (&["replay", "rec"], "replay"),
             (&["query", "select 1"], "query"),
             (&["guide"], "guide"),
             (&["skill", "print"], "skill"),

@@ -35,7 +35,7 @@ pub fn cmd_attach(
         let terminal = if no_terminal {
             terminal::none()
         } else {
-            terminal::open()?
+            terminal::open("attach")?
         };
         let mode = mode(takeover, read_only);
         // A local controller does not reconnect, so it has no use for
@@ -257,10 +257,10 @@ pub fn cmd_attach_host(
     let terminal = if request.read_only && terminal::absent()? {
         terminal::none()
     } else {
-        terminal::open()?
+        terminal::open("attach")?
     };
     #[cfg(not(unix))]
-    let terminal = terminal::open()?;
+    let terminal = terminal::open("attach")?;
     let mode = mode(request.takeover, request.read_only);
     attach_proto::write_frame(
         &mut frame,
@@ -741,17 +741,23 @@ const PRE_HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// writes. Every sidecar since answers every hello, or closes the
 /// connection; and every one of them, from 0.4.0 on, records its PTY
 /// recording in `meta.json` (`pty.recording`) in each write while the run is
-/// running, which no earlier one did. So only a session whose `meta.json`
-/// lacks it, or cannot be read, gets [`PRE_HELLO_REPLY_TIMEOUT`]: an answer
-/// from any other is waited for, so a loaded machine slows the attach but
-/// cannot fail it. A debug build's `TENDR_TEST_PRE_HELLO_REPLY_MS` shortens
-/// the timeout, so a test can show it is not applied.
+/// running, which no earlier one did. A run started with `--no-record` (0.8.0
+/// on) has no recording, but its launch spec's `recording: off`, which no
+/// earlier tendr wrote, proves the same. So only a session whose `meta.json`
+/// has neither, or cannot be read, gets [`PRE_HELLO_REPLY_TIMEOUT`]: an
+/// answer from any other is waited for, so a loaded machine slows the attach
+/// but cannot fail it. A debug build's `TENDR_TEST_PRE_HELLO_REPLY_MS`
+/// shortens the timeout, so a test can show it is not applied.
 #[cfg(unix)]
 fn reply_deadline(session_dir: &std::path::Path) -> Option<std::time::Duration> {
+    use tendr::model::spec::RecordingPolicy;
     let answers = std::fs::read(session_dir.join("meta.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<tendr::model::meta::Meta>(&bytes).ok())
-        .is_some_and(|meta| meta.pty().is_some_and(|pty| pty.recording.is_some()));
+        .is_some_and(|meta| {
+            meta.pty().is_some_and(|pty| pty.recording.is_some())
+                || meta.launch_spec().recording == RecordingPolicy::Off
+        });
     (!answers).then(|| {
         tendr::test_timer::or_env("TENDR_TEST_PRE_HELLO_REPLY_MS", PRE_HELLO_REPLY_TIMEOUT)
     })
@@ -1165,7 +1171,8 @@ fn reply_failure<T>(reply: Result<Frame, FrameError>, what: &str) -> anyhow::Res
 }
 
 mod client;
-mod terminal;
+
+use super::terminal;
 
 #[cfg(unix)]
 impl client::Link {
@@ -1348,9 +1355,28 @@ mod tests {
             dir: format!("recording/{run_id}"),
             input_recorded: false,
             state: RecordingState::Recording,
+            deleted_at: None,
         });
         write(&meta);
         assert_eq!(reply_deadline(dir.path()), None, "a sidecar with a hello");
+
+        // `--no-record`: no recording, but a launch spec no 0.3 tendr wrote.
+        let mut spec = LaunchSpec::new(vec!["bash".into()]).unwrap();
+        spec.recording = tendr::model::spec::RecordingPolicy::Off;
+        let mut meta = Meta::new_starting(
+            SessionName::new("s").unwrap(),
+            run_id,
+            Generation::first(),
+            spec,
+            ProcessIdentity {
+                pid: NonZeroU32::new(100).unwrap(),
+                start_time_ns: 1000,
+            },
+            EpochTimestamp::now(),
+        );
+        meta.set_pty(PtyMeta::new());
+        write(&meta);
+        assert_eq!(reply_deadline(dir.path()), None, "a --no-record run");
     }
 
     #[test]
