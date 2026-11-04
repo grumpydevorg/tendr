@@ -54,6 +54,24 @@ impl From<CliExecTarget> for tendr::model::spec::ExecTarget {
     }
 }
 
+/// What ends a pipe session's log record (`LogDelimiter`).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CliLogDelimiter {
+    /// A line feed; CRLF counts as one
+    Newline,
+    /// A line feed or a carriage return: progress updates arrive at once
+    NewlineOrCr,
+}
+
+impl From<CliLogDelimiter> for tendr::model::spec::LogDelimiter {
+    fn from(c: CliLogDelimiter) -> Self {
+        match c {
+            CliLogDelimiter::Newline => Self::Newline,
+            CliLogDelimiter::NewlineOrCr => Self::NewlineOrCr,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "tendr",
@@ -106,6 +124,10 @@ enum Commands {
         /// Interactive pseudo-terminal mode
         #[arg(long)]
         pty: bool,
+        /// What ends a pipe session's log record: newline (default) or
+        /// newline-or-cr, which logs each carriage-return progress update at once
+        #[arg(long = "log-delimiter", value_enum, conflicts_with = "pty")]
+        log_delimiter: Option<CliLogDelimiter>,
         /// Exec target protocol (inferred from argv[0] if omitted)
         #[arg(long = "exec-target", value_enum)]
         exec_target: Option<CliExecTarget>,
@@ -280,6 +302,10 @@ enum Commands {
         /// Output content only, stripping the JSONL envelope
         #[arg(short, long)]
         raw: bool,
+        /// Keep every carriage-return update (by default each run of updates
+        /// shows only its last; -f always shows every update)
+        #[arg(long = "all-updates")]
+        all_updates: bool,
     },
     /// Block until session(s) exit and their sidecar releases them
     Wait {
@@ -400,6 +426,10 @@ enum Commands {
         /// Merge output.log lines in as derived log.stdout/log.stderr records
         #[arg(long = "include-logs")]
         include_logs: bool,
+        /// Keep every carriage-return update (by default a replay keeps the
+        /// last of each run; --follow always shows every update)
+        #[arg(long = "all-updates")]
+        all_updates: bool,
         /// Exit 65 when unparseable lines were skipped
         #[arg(long)]
         strict: bool,
@@ -1151,6 +1181,7 @@ fn main() {
             last,
             cursors,
             include_logs,
+            all_updates,
             strict,
             ready_file,
             data,
@@ -1168,6 +1199,7 @@ fn main() {
             last,
             cursors,
             include_logs,
+            all_updates,
             strict,
             ready_file,
             data,

@@ -79,6 +79,7 @@ pub mod exec_frame;
 pub mod exec_request;
 pub mod log;
 pub mod model;
+pub mod pipe_reader;
 pub mod platform;
 pub mod pty_exit;
 pub mod pty_input;

@@ -21,6 +21,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{Fact, LifecycleEvents, META_WRITE, lock, patch_meta_file};
+use crate::log::Terminator;
 use crate::model::ids::EpochTimestamp;
 use crate::model::ready::{ReadyCheck as ReadySpec, ReadyState, ReadyWhen, output_regex};
 
@@ -30,8 +31,9 @@ const PORT_POLL: Duration = Duration::from_millis(200);
 /// How long one probe of a port waits for its connection.
 const PORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The longest unended output line a PTY matcher keeps: a longer one is
-/// matched by its last this many bytes.
+/// The longest unended output line a matcher keeps (a PTY line, or a pipe
+/// line split into `fragment` records): a longer one is matched by its last
+/// this many bytes.
 const MAX_CARRY: usize = 64 * 1024;
 
 /// A run's ready check. Dropping it does not stop the thread; [`Self::close`]
@@ -159,15 +161,40 @@ impl ReadyCheck {
 pub(super) struct OutputMatcher {
     regex: Arc<regex::bytes::Regex>,
     shared: Arc<Shared>,
-    /// A PTY stream's line not yet ended.
+    /// A PTY stream's line not yet ended, or a pipe line's fragments so far.
     carry: Vec<u8>,
 }
 
 impl OutputMatcher {
-    /// One whole line, as `output.log` records it (pipe sessions).
-    pub(super) fn line(&self, line: &[u8]) {
+    /// One whole pipe line.
+    fn line(&self, line: &[u8]) {
         if !self.shared.done.load(Ordering::Relaxed) && self.regex.is_match(line) {
             self.matched(line);
+        }
+    }
+
+    /// One `output.log` record (pipe sessions), with its terminator (`None`
+    /// for LF). A line over the record cap arrives as `fragment` records:
+    /// they are joined, as a PTY line is, and the whole line (its last
+    /// [`MAX_CARRY`] bytes if longer) is matched once a record that is not a
+    /// fragment ends it.
+    pub(super) fn record(&mut self, bytes: &[u8], terminator: Option<Terminator>) {
+        let fragment = terminator == Some(Terminator::Fragment);
+        if !fragment && self.carry.is_empty() {
+            self.line(bytes);
+            return;
+        }
+        if self.shared.done.load(Ordering::Relaxed) {
+            self.carry = Vec::new();
+            return;
+        }
+        self.carry.extend_from_slice(bytes);
+        if self.carry.len() > MAX_CARRY {
+            self.carry.drain(..self.carry.len() - MAX_CARRY);
+        }
+        if !fragment {
+            let line = std::mem::take(&mut self.carry);
+            self.line(&line);
         }
     }
 

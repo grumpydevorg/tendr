@@ -102,6 +102,59 @@ fn a_matching_output_line_makes_a_pipe_session_ready() {
     assert_eq!(lines[0]["kind"], "run.ready");
 }
 
+/// A ready line longer than an `output.log` record is matched whole: the
+/// match spans the 16 KiB cut between its `fragment` records.
+#[test]
+fn a_ready_line_split_across_the_record_cap_makes_the_session_ready() {
+    let root = Home::new();
+    let gate = OpenGate(root.path().join("gate"));
+    // 16376 bytes of padding put "listening on 8080" across the cut.
+    let script = format!("printf '%16376s' '' | tr ' ' x; echo 'listening on 8080'; {UNTIL_GATE}");
+    start(
+        &root,
+        &["srv", "--ready-when-output", r"listening on \d+$"],
+        &sh(&script, &gate.0),
+    );
+
+    let out = tendr(&root)
+        .args(["wait", "--ready", "srv"])
+        .assert_within_deadline()
+        .success();
+    let reported: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(reported[0]["ready"]["state"], "Ready", "{reported}");
+}
+
+/// Under `--log-delimiter newline-or-cr`, an update ended by a carriage
+/// return is a line the ready check matches.
+#[test]
+fn a_cr_ended_ready_line_makes_a_newline_or_cr_session_ready() {
+    let root = Home::new();
+    let gate = OpenGate(root.path().join("gate"));
+    let script = format!("printf 'booting\\nlistening on 8080\\r'; {UNTIL_GATE}");
+    start(
+        &root,
+        &[
+            "srv",
+            "--log-delimiter",
+            "newline-or-cr",
+            "--ready-when-output",
+            r"^listening on \d+$",
+        ],
+        &sh(&script, &gate.0),
+    );
+
+    tendr(&root)
+        .args(["wait", "--ready", "srv"])
+        .assert_within_deadline()
+        .success();
+    let events = read_events(&root, "srv");
+    let ready = events
+        .iter()
+        .find(|e| e["kind"] == "run.ready")
+        .expect("a run.ready event");
+    assert_eq!(ready["data"]["line"], "listening on 8080");
+}
+
 /// A PTY session's output is matched as the terminal shows it: a prompt that
 /// never ends its line makes the session ready.
 #[cfg(unix)]

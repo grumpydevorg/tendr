@@ -21,7 +21,7 @@ use tendr::attach_escape::EscapeMode;
 use tendr::model::boundary::{Boundary, BoundaryContext};
 use tendr::model::ids::Namespace;
 use tendr::model::ready::{ReadyCheck, ReadyWhen};
-use tendr::model::spec::{ExecTarget, RecordingPolicy};
+use tendr::model::spec::{ExecTarget, LogDelimiter, RecordingPolicy};
 
 use crate::{AttachEscape, Commands, commands, parse_optional_namespace, resolve_namespace};
 
@@ -81,6 +81,9 @@ pub struct StartRequest {
     pub ready_within_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after_ready: Vec<String>,
+    /// Left out at the default, so the frame is one a 0.7 remote reads.
+    #[serde(default, skip_serializing_if = "LogDelimiter::is_newline")]
+    pub log_delimiter: LogDelimiter,
 }
 
 impl StartRequest {
@@ -140,6 +143,7 @@ impl fmt::Debug for StartRequest {
             .field("ready_when_port", &self.ready_when_port)
             .field("ready_within_ms", &self.ready_within_ms)
             .field("after_ready", &self.after_ready)
+            .field("log_delimiter", &self.log_delimiter)
             .finish()
     }
 }
@@ -173,6 +177,9 @@ pub struct LogRequest {
     pub follow: bool,
     pub since: Option<String>,
     pub raw: bool,
+    /// An older remote never collapses, so it may ignore this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all_updates: bool,
 }
 
 /// `push`: the bytes come from stdin, not the request.
@@ -311,6 +318,7 @@ impl TryFrom<&Commands> for RemoteOperation {
                 namespace,
                 stdin,
                 pty,
+                log_delimiter,
                 exec_target,
                 replace,
                 timeout,
@@ -353,6 +361,7 @@ impl TryFrom<&Commands> for RemoteOperation {
                 ready_within_ms: ready_within
                     .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                 after_ready: after_ready.clone(),
+                log_delimiter: (*log_delimiter).map(LogDelimiter::from).unwrap_or_default(),
             }),
             Commands::Status { name, namespace } => Self::Status(StatusRequest {
                 session: name.clone(),
@@ -368,6 +377,7 @@ impl TryFrom<&Commands> for RemoteOperation {
                 follow,
                 since,
                 raw,
+                all_updates,
             } => Self::Log(LogRequest {
                 session: name.clone(),
                 namespace: namespace.clone(),
@@ -375,6 +385,7 @@ impl TryFrom<&Commands> for RemoteOperation {
                 follow: *follow,
                 since: since.clone(),
                 raw: *raw,
+                all_updates: *all_updates,
             }),
             Commands::Push { name, namespace } => Self::Push(PushRequest {
                 session: name.clone(),
@@ -471,6 +482,7 @@ struct StartInputs {
     recording: RecordingPolicy,
     ready: Option<ReadyCheck>,
     after_ready: Vec<String>,
+    log_delimiter: LogDelimiter,
 }
 
 /// Resolve a start request on the host that runs it. Only the namespace and
@@ -502,6 +514,7 @@ fn start_inputs(request: StartRequest) -> anyhow::Result<StartInputs> {
         ready_when_port: _,
         ready_within_ms: _,
         after_ready,
+        log_delimiter,
     } = request;
     Ok(StartInputs {
         namespace,
@@ -531,6 +544,7 @@ fn start_inputs(request: StartRequest) -> anyhow::Result<StartInputs> {
         },
         ready,
         after_ready,
+        log_delimiter,
     })
 }
 
@@ -558,6 +572,7 @@ pub fn dispatch(operation: RemoteOperation) -> anyhow::Result<()> {
                 i.recording,
                 i.ready,
                 &i.after_ready,
+                i.log_delimiter,
             )
         }
         RemoteOperation::Status(r) => {
@@ -568,7 +583,15 @@ pub fn dispatch(operation: RemoteOperation) -> anyhow::Result<()> {
         }
         RemoteOperation::Log(r) => {
             let ns = resolve_namespace(r.namespace)?;
-            commands::cmd_log(&r.session, r.tail, r.follow, r.since, r.raw, &ns)
+            commands::cmd_log(
+                &r.session,
+                r.tail,
+                r.follow,
+                r.since,
+                r.raw,
+                r.all_updates,
+                &ns,
+            )
         }
         RemoteOperation::Push(r) => {
             commands::cmd_push(&r.session, &resolve_namespace(r.namespace)?)
@@ -691,6 +714,7 @@ mod tests {
             namespace,
             stdin,
             pty,
+            log_delimiter: _, // conflicts with --pty; its trip: remote_frame's version test
             exec_target,
             replace,
             timeout,
@@ -738,6 +762,7 @@ mod tests {
             recording: in_recording,
             ready: in_ready,
             after_ready: in_after_ready,
+            log_delimiter: _,
         } = start_inputs(request).expect("resolves");
 
         assert_eq!(name, "x&calc");

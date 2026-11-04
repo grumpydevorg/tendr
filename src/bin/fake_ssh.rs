@@ -9,8 +9,12 @@
 //! ```text
 //! args [<path>]     print each argv entry as `ARG:<value>` on stdout, or
 //!                   write those lines to <path>
-//! out <text>        write <text> to stdout (`\n` is a newline, `\\` a backslash)
+//! out <text>        write <text> to stdout (`\n` is a newline, `\r` a carriage
+//!                   return, `\\` a backslash)
+//! out-hex <hex>     write these bytes to stdout, two hex digits each, which
+//!                   need not be UTF-8
 //! err <text>        write <text> to stderr (likewise)
+//! until <path>      wait until <path> exists
 //! stdin <path>      copy all of stdin to <path>
 //! pidfile <path>    write this process's id to <path>, atomically
 //! touch <path>      create an empty file at <path>
@@ -98,6 +102,16 @@ fn main() {
                 let mut out = std::io::stdout().lock();
                 out.write_all(unescape(value).as_bytes()).unwrap();
                 out.flush().unwrap();
+            }
+            "out-hex" => {
+                let mut out = std::io::stdout().lock();
+                out.write_all(&hex(value)).unwrap();
+                out.flush().unwrap();
+            }
+            "until" => {
+                while !std::path::Path::new(value).exists() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
             "err" => {
                 let mut err = std::io::stderr().lock();
@@ -234,7 +248,8 @@ fn give_up_if(path: String) {
     });
 }
 
-/// `\n` becomes a newline and `\\` a backslash; any other backslash stays.
+/// `\n` becomes a newline, `\r` a carriage return and `\\` a backslash; any
+/// other backslash stays.
 fn unescape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
@@ -245,6 +260,7 @@ fn unescape(text: &str) -> String {
         }
         match chars.next() {
             Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
             Some('\\') => out.push('\\'),
             Some(other) => {
                 out.push('\\');

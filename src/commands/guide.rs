@@ -29,6 +29,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("herdr", "inside herdr"),
     ("replay", "Replay a recording"),
     ("agent-turns", "Drive an agent turn"),
+    ("pty", "Partial lines"),
 ];
 
 pub fn cmd_guide(topic: Option<&str>) -> anyhow::Result<()> {

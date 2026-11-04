@@ -753,7 +753,8 @@ pub fn read_segment_records(path: &Path, from: u64) -> io::Result<SegmentReadOut
 /// Project one `output.log` O/E line as a derived event (spec §5.1
 /// `--include-logs`): read-time only, no stored identity (`id`/`writer`/
 /// `seq`), `derived:true`, f64 seconds converted to the envelope ts format.
-/// Annotation (`A`) and unknown tags project to nothing.
+/// Annotation (`A`) and unknown tags project to nothing. A record's
+/// `terminator`, when it has one, is in `data` beside the content.
 #[must_use]
 pub fn project_log_line(
     line: &LogLine,
@@ -766,6 +767,11 @@ pub fn project_log_line(
         "E" => "log.stderr",
         _ => return None,
     };
+    let mut data = serde_json::json!({"content": line.format_raw()});
+    if let Some(terminator) = line.terminator {
+        data["terminator"] =
+            serde_json::to_value(terminator).expect("Terminator is always serializable");
+    }
     Some(serde_json::json!({
         "kind": kind,
         "ts": EventTimestamp::from_epoch_secs_f64(line.ts).to_string(),
@@ -774,7 +780,7 @@ pub fn project_log_line(
         "session": session,
         "run_id": run_id,
         "source": "tendr.sidecar",
-        "data": {"content": line.format_raw()},
+        "data": data,
     }))
 }
 

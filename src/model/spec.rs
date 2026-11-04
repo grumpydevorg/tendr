@@ -51,6 +51,25 @@ impl RecordingPolicy {
     }
 }
 
+/// What ends a pipe session's `output.log` record besides the size cap.
+/// PTY sessions ignore it: their capture writes per read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogDelimiter {
+    /// A line feed (CRLF counts as one).
+    #[default]
+    Newline,
+    /// A line feed or a carriage return, so progress updates arrive at once.
+    NewlineOrCr,
+}
+
+impl LogDelimiter {
+    #[must_use]
+    pub fn is_newline(&self) -> bool {
+        *self == Self::Newline
+    }
+}
+
 /// What exec protocol the session speaks. Determined at start time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecTarget {
@@ -122,6 +141,10 @@ pub struct LaunchSpec {
     /// bound to run ids as `after` is. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after_ready: Vec<DependencyBinding>,
+    /// What ends a pipe session's log record. Omitted at the default so
+    /// existing specs keep their canonical hash.
+    #[serde(default, skip_serializing_if = "LogDelimiter::is_newline")]
+    pub log_delimiter: LogDelimiter,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +173,7 @@ impl LaunchSpec {
             recording: RecordingPolicy::Output,
             ready: None,
             after_ready: vec![],
+            log_delimiter: LogDelimiter::Newline,
         })
     }
 
@@ -197,6 +221,8 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             ready: Option<ReadyCheck>,
             #[serde(default)]
             after_ready: Vec<DependencyBinding>,
+            #[serde(default)]
+            log_delimiter: LogDelimiter,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -220,6 +246,7 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             recording: raw.recording,
             ready: raw.ready,
             after_ready: raw.after_ready,
+            log_delimiter: raw.log_delimiter,
         })
     }
 }

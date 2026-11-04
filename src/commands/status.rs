@@ -31,9 +31,25 @@ pub fn cmd_status(name: &str, namespace: &Namespace) -> anyhow::Result<()> {
     // exists; infers SidecarLost otherwise (spec §3.6).
     tendr::reconcile::reconcile_sidecar_gone(&session, &mut meta)?;
 
-    let json = serde_json::to_string_pretty(&meta)?;
+    // A pipe session's reader telemetry (`reader.json`), best effort: absent
+    // until capture starts, and not live once the sidecar is gone.
+    let pipe_reader = tendr::pipe_reader::read(session.path())
+        .map(|s| s.report(!meta.status().is_terminal(), tendr::log::timestamp_secs()));
+    let json = serde_json::to_string_pretty(&StatusOut {
+        meta: &meta,
+        pipe_reader,
+    })?;
     outln!("{json}");
     Ok(())
+}
+
+/// `status` prints the meta, then what a pipe session's reader holds.
+#[derive(serde::Serialize)]
+struct StatusOut<'a> {
+    #[serde(flatten)]
+    meta: &'a tendr::model::meta::Meta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pipe_reader: Option<tendr::pipe_reader::Report>,
 }
 
 /// Clean up an orphaned session dir that has child_pid but no meta.json.

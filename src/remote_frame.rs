@@ -16,9 +16,9 @@
 //! version that introduced it ([`min_frame_version`]), which an older remote
 //! refuses ([`FrameError::Version`]); every other request is still sent as
 //! version 1, which every remote since 0.5.0 reads. Version 2 (tendr 0.8.0)
-//! carries `start --record-input` and `--no-record`, and the ready check:
-//! `start --ready-when-*`, `--ready-within`, `--after-ready`, and
-//! `wait --ready`.
+//! carries `start --record-input`, `--no-record` and `--log-delimiter`, and
+//! the ready check: `start --ready-when-*`, `--ready-within`,
+//! `--after-ready`, and `wait --ready`.
 //!
 //! [`serve`] (`tendr _remote`) reads the frame, checks everything it can
 //! before anything runs, then dispatches the request as if typed on this
@@ -104,6 +104,7 @@ fn min_frame_version(operation: &RemoteOperation) -> u32 {
         RemoteOperation::Start(r)
             if r.record_input
                 || r.no_record
+                || !r.log_delimiter.is_newline()
                 || r.ready_when_output.is_some()
                 || r.ready_when_port.is_some()
                 || r.ready_within_ms.is_some()
@@ -270,6 +271,9 @@ fn validate_start(r: &StartRequest) -> Result<(), String> {
         SessionName::new(dependency).map_err(|e| e.to_string())?;
     }
     r.ready_check()?;
+    if r.pty && !r.log_delimiter.is_newline() {
+        return Err("--log-delimiter cannot be used with --pty".to_owned());
+    }
     if r.boundary.is_none() && !r.boundary_parent.is_empty() {
         return Err("--boundary-parent requires --boundary".to_owned());
     }
@@ -407,6 +411,29 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// A request a 0.7 remote would carry out in full stays version 1, which
+    /// it reads; one using a 0.8 field is version 2, which it refuses (it
+    /// accepts version 1 only) rather than dropping the field.
+    #[test]
+    fn a_request_is_version_2_only_when_it_needs_a_newer_remote() {
+        let version = |args: &[&str]| {
+            let frame = encode(&op(args)).unwrap();
+            serde_json::from_slice::<serde_json::Value>(&frame[4..]).unwrap()["v"].clone()
+        };
+        assert_eq!(version(&["start", "s", "--", "true"]), 1);
+        assert_eq!(version(&["log", "s", "--all-updates"]), 1);
+        let cr = [
+            "start",
+            "s",
+            "--log-delimiter",
+            "newline-or-cr",
+            "--",
+            "true",
+        ];
+        assert_eq!(version(&cr), 2);
+        assert_eq!(read(&encode(&op(&cr)).unwrap()).unwrap(), op(&cr));
     }
 
     /// The body after the header is left for push to read.

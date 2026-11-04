@@ -38,6 +38,8 @@ pub struct EventsOptions {
     pub last: Option<usize>,
     pub cursors: bool,
     pub include_logs: bool,
+    /// `--include-logs` without `--follow`: keep every `cr` update.
+    pub all_updates: bool,
     pub strict: bool,
     /// Follow-only: atomically publish this file once the baseline is
     /// established and initial replay is flushed. See [`ready_file`](tendr::ready_file).
@@ -235,6 +237,8 @@ struct StreamReader {
     explicit: Option<Vec<(Namespace, SessionName)>>,
     filters: Filters,
     include_logs: bool,
+    /// A replay that is not followed collapses `cr` runs ([`tendr::log::Collapse`]).
+    collapse_updates: bool,
     /// After `--from-cursor`, log projection restarts at the resume
     /// wall-clock — cursors never cover output.log.
     logs_from_end: bool,
@@ -354,6 +358,17 @@ impl StreamReader {
         if lines.is_empty() {
             return;
         }
+        let lines = if self.collapse_updates {
+            let mut collapse = tendr::log::Collapse::default();
+            let mut kept = Vec::with_capacity(lines.len());
+            for line in lines {
+                collapse.push(line, &mut kept);
+            }
+            collapse.finish(&mut kept);
+            kept
+        } else {
+            lines
+        };
 
         // output.log lines carry no run identity; attribute them to the
         // session's current run like watch does.
@@ -574,6 +589,7 @@ pub fn cmd_events(opts: EventsOptions) -> anyhow::Result<()> {
             data: opts.data.clone(),
         },
         include_logs: opts.include_logs,
+        collapse_updates: !opts.follow && !opts.all_updates,
         logs_from_end: opts.from_cursor.is_some(),
         tracker: CursorTracker::default(),
         seg_offsets: seeded_offsets.clone(),

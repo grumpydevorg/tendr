@@ -49,6 +49,7 @@ use crate::model::meta::Meta;
 use crate::model::pty::{PtyControl, PtyMeta, PtyRecording, RecordingState};
 use crate::model::spec::StdinMode;
 use crate::model::state::{ExitReason, SidecarStep};
+use crate::pipe_reader::{PUBLISH_INTERVAL, Telemetry};
 use crate::platform::{Current, Platform, ProcessStatus};
 use crate::session::{self, LockGuard, SessionDir};
 
@@ -596,10 +597,29 @@ impl RunCore {
                 .and_then(ReadyCheck::output_matcher)
         };
         let (stdout_ready, stderr_ready) = (matcher(), matcher());
+        let delimiter = self.meta.launch_spec().log_delimiter;
+        // A pipe session publishes what its reader holds (`reader.json`).
+        let telemetry = attach_sink
+            .is_none()
+            .then(|| (Telemetry::new(), self.session_dir().to_path_buf()));
+        let (stop_publishing, publish_stop) = std::sync::mpsc::channel::<()>();
 
         let log_ref = &log;
+        let unpublished = Telemetry::new(); // a PTY session's reader holds nothing
+        let reader = telemetry.as_ref().map_or(&unpublished, |(t, _)| t);
         let (failed, failures) = std::sync::mpsc::channel();
         let panicked = std::thread::scope(|scope| {
+            if let Some((telemetry, dir)) = &telemetry {
+                scope.spawn(move || {
+                    telemetry.publish(dir, false);
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        publish_stop.recv_timeout(PUBLISH_INTERVAL)
+                    {
+                        telemetry.publish(dir, false);
+                    }
+                    telemetry.publish(dir, true);
+                });
+            }
             let stdout_failed = failed.clone();
             let stdout_handle = stdout.map(|s| match attach_sink {
                 Some(sink) => scope.spawn(move || {
@@ -615,11 +635,21 @@ impl RunCore {
                     );
                 }),
                 None => scope.spawn(move || {
-                    capture_stream(s, 'O', log_ref, &stdout_failed, stdout_ready);
+                    capture_stream(
+                        s,
+                        'O',
+                        log_ref,
+                        &stdout_failed,
+                        stdout_ready,
+                        delimiter,
+                        reader,
+                    );
                 }),
             });
             let stderr_handle = stderr.map(|s| {
-                scope.spawn(move || capture_stream(s, 'E', log_ref, &failed, stderr_ready))
+                scope.spawn(move || {
+                    capture_stream(s, 'E', log_ref, &failed, stderr_ready, delimiter, reader);
+                })
             });
             // Ends once both capture threads have dropped their senders.
             for warning in failures {
@@ -627,10 +657,12 @@ impl RunCore {
                 // Best effort; the terminal write carries the warning regardless.
                 let _ = self.write_meta();
             }
-            [(stdout_handle, "stdout"), (stderr_handle, "stderr")]
+            let panicked = [(stdout_handle, "stdout"), (stderr_handle, "stderr")]
                 .into_iter()
                 .filter_map(|(handle, name)| handle?.join().is_err().then_some(name))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            drop(stop_publishing); // capture ended: publish the final values
+            panicked
         });
         for name in panicked {
             self.meta

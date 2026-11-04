@@ -108,7 +108,10 @@ tendr start tests --after-ready api -- ./run-tests
 
 - `--ready-when-output <regex>` holds once a line of the child's output,
   stdout or stderr, matches the regular expression (Rust `regex` syntax,
-  unanchored). Lines are matched as `output.log` records them. A PTY
+  unanchored). A pipe session's line is matched whole, even one
+  `output.log` splits into 16 KiB records (a line over 64 KiB by its last
+  64 KiB), and under `--log-delimiter newline-or-cr` an update ended by a
+  carriage return counts as a line. A PTY
   session's output is matched as the terminal shows it, escape sequences
   included: a line ends at `\n` or `\r`, and the line still being written
   counts too, so a prompt such as `^ready> $` matches. So a `$`-anchored
@@ -581,6 +584,53 @@ tendr watch --namespace nightly --events --logs
 - `wait` waits for processes to exit. An interactive agent keeps running
   between turns, so wait for a turn with `tendr events`, not `wait`.
 
+### Partial lines and progress output
+
+A pipe session logs a record when its child ends a line. Output with no
+newline yet, such as a progress meter that redraws itself with carriage
+returns (`rsync --info=progress2`, `curl`, `pv`), stays in the reader: `tendr
+log` shows nothing of it, and a stale log looks the same as a hung child.
+Check `tendr log <name>` within a minute of starting a long job. If it is
+empty, `tendr status <name>` tells the two apart:
+
+```json
+"pipe_reader": {"pending_partial_bytes": 412000, "last_record_age_s": 1203.4, "live": true}
+```
+
+- `pending_partial_bytes` are bytes read from stdout and stderr that no record
+  holds yet: a child writing progress without newlines. 0 with a growing
+  `last_record_age_s` is a child that writes nothing at all.
+- `last_record_age_s` is the time since the last record, or since capture
+  started.
+- The sidecar updates the values at most once a second. `live` is false once
+  capture has ended or the sidecar is gone; the values then no longer change.
+  PTY sessions have no `pipe_reader`.
+
+To see progress as it happens, choose one of:
+
+- `tendr start --log-delimiter newline-or-cr`, which ends a record at a
+  carriage return too, at once. CRLF stays one record. The default is
+  `newline`.
+- A newline-framed mode of the child, such as `rsync --info=name2,stats2`.
+- `--pty`, which logs each read as it comes but merges stdout and stderr and
+  makes the child see a terminal. `--pty` takes no `--log-delimiter`.
+
+Records ended by a carriage return carry `"terminator": "cr"`. Every update is
+stored, but `tendr log` (with `--tail N`, counted after) and `tendr events
+--include-logs` keep only the last update of each run of them in one stream:
+stderr lines in between do not end the run. `--all-updates` keeps them all.
+`log -f`, `watch --logs` and `events --follow` show every update, as they
+cannot know which one is last.
+
+No record holds more than 16 KiB, in either mode. A longer stretch without a
+terminator becomes several records marked
+`"terminator": "fragment"`, cut between characters, whose contents join to the
+original output. A record the stream's end cut short is marked `"eof"`. Bytes
+that are not UTF-8 are shown as U+FFFD.
+
+Over `--host`, these need a newer remote `tendr`
+([Versions](#reach-remote-hosts-with---host)).
+
 ## Lifecycle, batches, and hooks
 
 ```bash
@@ -757,6 +807,12 @@ Some features need more:
   newer on the remote host. An older remote refuses the request with exit 2
   and `unsupported remote request version 2`, before anything runs; a
   request without these flags still goes to it as before.
+- `start --log-delimiter newline-or-cr` needs 0.8.0 or newer on the remote
+  host ([Partial lines](#partial-lines-and-progress-output)). An older remote
+  refuses the request with exit 2 (`unsupported remote request version 2`)
+  rather than start the session without it. `--all-updates` and
+  `status`'s `pipe_reader` need 0.8.0 too; an older remote shows every update
+  and no `pipe_reader`.
 
 An older client still works against a newer remote.
 

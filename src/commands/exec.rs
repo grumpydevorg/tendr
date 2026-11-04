@@ -186,6 +186,7 @@ impl PendingExec {
         let mut sentinel = false;
         let mut err_marked = false;
         let mut buf: Vec<u8> = Vec::new();
+        let mut joined = tendr::log::Reassemble::default();
         while !(sentinel && err_marked) {
             buf.clear();
             if reader.read_until(b'\n', &mut buf)? == 0 {
@@ -198,6 +199,9 @@ impl PendingExec {
             let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
             let Ok(parsed) = serde_json::from_str::<LogLine>(trimmed) else {
                 continue;
+            };
+            let Some(parsed) = joined.push(parsed) else {
+                continue; // a fragment: the rest of the line follows
             };
             let Some(content) = parsed.content_text() else {
                 continue;
@@ -829,6 +833,7 @@ fn wait_sentinel_result(
     reader.seek(SeekFrom::Start(cursor))?;
 
     let mut buf = String::new();
+    let mut joined = tendr::log::Reassemble::default();
     loop {
         if let Some((code, cwd, _)) = &sentinel {
             if err_marked {
@@ -899,6 +904,10 @@ fn wait_sentinel_result(
 
         let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
         let Some(parsed) = serde_json::from_str::<LogLine>(trimmed).ok() else {
+            continue;
+        };
+        // A line over the record cap arrives as fragments; match it whole.
+        let Some(parsed) = joined.push(parsed) else {
             continue;
         };
         let Some(content) = parsed.content_text() else {
@@ -1054,6 +1063,7 @@ fn wait_ndjson_result(
 
     let mut grace_ends: Option<Instant> = None;
     let mut buf: Vec<u8> = Vec::new();
+    let mut joined = tendr::log::Reassemble::default();
     loop {
         buf.clear();
         // Bytes, not a String: a torn read can end mid-character.
@@ -1090,6 +1100,10 @@ fn wait_ndjson_result(
         };
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
         let Some(parsed) = serde_json::from_str::<LogLine>(trimmed).ok() else {
+            continue;
+        };
+        // A reply over the record cap arrives as fragments; parse it whole.
+        let Some(parsed) = joined.push(parsed) else {
             continue;
         };
         let Some(content) = parsed.content_text() else {
