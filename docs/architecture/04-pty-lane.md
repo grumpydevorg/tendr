@@ -50,6 +50,15 @@ flowchart LR
 
 - `start --pty` spawns the child under a PTY. The sidecar owns the PTY
   master. Its read and write halves are nonblocking and poll-aware.
+- On Windows the PTY is a pseudoconsole (`CreatePseudoConsole`,
+  `src/platform/windows/conpty.rs`): conhost runs it on two pipes, takes the
+  keyboard from one and writes its rendering of the screen to the other. The
+  child is launched suspended with the pseudoconsole attached, then put in
+  its Job Object. A resize is `ResizePseudoConsole`. The output pipe ends
+  only when conhost exits, so the sidecar closes the pseudoconsole as soon
+  as the child has exited; conhost then writes its last frame and ends what
+  else is attached. A graceful stop also starts by closing it, which reaches
+  the child as `CTRL_CLOSE_EVENT`, as a hangup does on Unix.
 - One sidecar thread, the *input writer*, owns the run's `InputArbiter`
   (`src/model/pty_control.rs`) and the PTY input. It checks every write
   against the current controller epoch. It serves control requests before
@@ -421,6 +430,14 @@ gets the 10 s deadline (`reply_deadline` in `src/commands/attach.rs`).
   `SidecarFailed { step: attach_bind }`
   ([03-run-lifecycle.md](03-run-lifecycle.md#the-lifecycle-guard)).
 - Both ends verify the peer's user id.
+- On Windows the carrier is a named pipe, `\\.\pipe\tendr-attach-<hash>`,
+  named from the session and run as the socket is and published in the same
+  `a.sock.path` (`src/attach_pipe.rs`). Its security descriptor admits only
+  the owner's account, it refuses remote clients, and the sidecar creates
+  its first instance exclusively, so no other process can serve the name
+  first. Both ends check the other's account, and the frames are the same.
+  A pipe lives in no directory, so the root checks above and `prune`'s
+  socket cleanup do not apply: the name is gone when the sidecar exits.
 - A sidecar killed outright cannot remove its socket. `prune` removes such
   orphans and reports them as `sockets_removed`. It removes a socket only if
   all three hold:

@@ -499,6 +499,13 @@ after the run ended but before writing the recording's end, it shows reason
 `end_unrecorded`; the recording on disk is complete. Recordings are kept
 until you delete them ([Pruning](#lifecycle-batches-and-hooks)).
 
+On a Windows host the child runs under a pseudoconsole (ConPTY), so what
+`attach` shows and the recording holds is conhost's rendering of the
+screen, not the child's own bytes: conhost may repaint or coalesce output,
+as it does in any Windows terminal. Ctrl-C reaches the child as a console
+Ctrl-C. When the child exits, tendr closes the pseudoconsole, which ends
+every other process still attached to that console.
+
 The child gets `TERM=xterm-256color` when `TERM` was missing, empty, `dumb`,
 or removed with `--unset-env TERM` for the `tendr start` that launched it, as
 in an agent's tool shell or `ssh -T`. Otherwise `TERM` passes through, and
@@ -649,8 +656,10 @@ tendr run --detach ./job.sh      # run a script as a session
 **Stopping.** `kill` sends SIGTERM to the session's process group, then SIGKILL
 after 5 s. A PTY session first gets SIGHUP and up to 1 s to act on it, as when
 a terminal window closes, so an interactive shell also hangs up its background
-jobs. `--timeout` stops the same way, so a timed-out child exits up to about
-6 s after the deadline. `kill --force` sends SIGKILL at once.
+jobs. On Windows a PTY session's console is closed instead, which its
+processes get as `CTRL_CLOSE_EVENT`, and the job ends after 5 s. `--timeout`
+stops the same way, so a timed-out child exits up to about 6 s after the
+deadline. `kill --force` sends SIGKILL at once.
 
 A stop then ends every other process the run started, wherever it went: a
 shell's background jobs, `nohup` and `disown` jobs, `setsid` processes, and
@@ -834,6 +843,8 @@ Some features need more:
   rather than start the session without it. `--all-updates` and
   `status`'s `pipe_reader` need 0.8.0 too; an older remote shows every update
   and no `pipe_reader`.
+- A PTY session (`start --pty`) and `attach` on a Windows host need 0.8.0
+  or newer there. An older one fails `start --pty`.
 
 An older client still works against a newer remote.
 

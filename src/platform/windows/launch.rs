@@ -23,6 +23,10 @@ pub(super) enum Streams {
     /// Inheritable handles for stdin, stdout and stderr. They are the only
     /// handles the child inherits.
     Handles([HANDLE; 3]),
+    /// A pseudoconsole the child attaches to, whose handles become its
+    /// stdio. It inherits no handles, and shares the process group of the
+    /// console's other processes, so Ctrl+C typed into it reaches it.
+    PseudoConsole(windows_sys::Win32::System::Console::HPCON),
 }
 
 /// A child created suspended: its main thread has not run yet.
@@ -102,8 +106,9 @@ fn fold(name: &OsStr) -> String {
     name.to_string_lossy().to_uppercase()
 }
 
-/// Create `argv` suspended, in a new process group, connected by `streams`.
-/// The caller resumes `thread` once the process is in its job.
+/// Create `argv` suspended, connected by `streams` (in a new process group
+/// unless on a pseudoconsole). The caller resumes `thread` once the process
+/// is in its job.
 pub(super) fn spawn_suspended(
     argv: &[String],
     cwd: Option<&Path>,
@@ -112,8 +117,9 @@ pub(super) fn spawn_suspended(
 ) -> io::Result<Suspended> {
     use windows_sys::Win32::System::Threading::{
         CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-        EXTENDED_STARTUPINFO_PRESENT, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
-        STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        EXTENDED_STARTUPINFO_PRESENT, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW,
     };
 
     let (program, args) = argv
@@ -133,8 +139,10 @@ pub(super) fn spawn_suspended(
     let mut attributes = AttributeList::new()?;
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    // Under STARTF_USESTDHANDLES, null std handles on a pseudoconsole give
+    // the child the console's, not the ones tendr's own stdio would hand it.
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    let inherit = match streams {
+    let (inherit, group) = match streams {
         Streams::Handles(handles) => {
             // SAFETY: `handles` outlives the CreateProcessW call below.
             unsafe {
@@ -149,7 +157,19 @@ pub(super) fn spawn_suspended(
                 si.StartupInfo.hStdOutput,
                 si.StartupInfo.hStdError,
             ] = *handles;
-            true
+            (true, CREATE_NEW_PROCESS_GROUP)
+        }
+        Streams::PseudoConsole(hpc) => {
+            // SAFETY: the attribute takes the HPCON value itself, which the
+            // caller keeps open across the CreateProcessW call.
+            unsafe {
+                attributes.update(
+                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                    *hpc as *const core::ffi::c_void,
+                    std::mem::size_of_val(hpc),
+                )?;
+            }
+            (false, 0)
         }
     };
     si.lpAttributeList = attributes.as_ptr();
@@ -165,10 +185,7 @@ pub(super) fn spawn_suspended(
             std::ptr::null(),
             std::ptr::null(),
             i32::from(inherit),
-            CREATE_SUSPENDED
-                | CREATE_NEW_PROCESS_GROUP
-                | CREATE_UNICODE_ENVIRONMENT
-                | EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_SUSPENDED | group | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             env_block.as_ptr().cast(),
             cwd.as_ref().map_or(std::ptr::null(), |dir| dir.as_ptr()),
             &si.StartupInfo,

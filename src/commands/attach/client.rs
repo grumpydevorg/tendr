@@ -954,8 +954,7 @@ impl Outbox {
     }
 
     /// Queue input, waiting while the backlog is full; `false` once
-    /// closed. The remote bridge's, which runs on Unix only.
-    #[cfg(unix)]
+    /// closed. The remote bridge's.
     pub(super) fn push_data_waiting(&self, bytes: Vec<u8>) -> bool {
         let mut state = self.lock();
         while !state.closed

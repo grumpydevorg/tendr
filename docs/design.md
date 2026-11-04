@@ -548,6 +548,20 @@ is written with `WriteFile` under the UTF-8 code page, since Rust's console
 `Stdout` fails on bytes that are not valid UTF-8 and a PTY child can send
 any. Source: `src/commands/attach/terminal/windows.rs`, PRs #177, #179, #181.
 
+### Windows hosts run PTY sessions under ConPTY, attached over a named pipe
+
+*2026-11-05.* A `--pty` session on a Windows host runs its child under a
+pseudoconsole, launched suspended like any child so it is in its Job Object
+before it runs. Attach keeps its frames, its single input writer and its
+exit codes; only the carrier differs: an owner-only named pipe stands in
+for the Unix socket, behind a small stream type with the socket's
+interface, so the sidecar and client code stay one path. A pipe has no
+directory to secure, so ownership is the pipe's security descriptor plus
+each end checking the other's account. ConPTY renders the screen rather
+than passing the child's bytes through, and its output ends only when the
+pseudoconsole is closed, so the sidecar closes it when the child exits.
+Source: `src/platform/windows/conpty.rs`, `src/attach_pipe.rs`.
+
 ### Remote work runs the same tendr over SSH
 
 *2026-04-01.* `tendr --host <host> <command>` runs the remote host's own

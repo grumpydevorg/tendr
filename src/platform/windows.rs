@@ -1,13 +1,15 @@
 //! Windows implementation of the Platform trait.
 //!
 //! All Platform methods are implemented: process lifecycle (spawn suspended
-//! into a Job Object, kill, identity, status), sidecar spawn with
-//! STARTUPINFOEXW handle whitelisting, readiness channel (CreatePipe), and
-//! stdin transport (named pipes).
+//! into a Job Object, kill, identity, status), PTY children on a
+//! pseudoconsole, sidecar spawn with STARTUPINFOEXW handle whitelisting,
+//! readiness channel (CreatePipe), and stdin transport (named pipes).
 
+mod conpty;
 mod launch;
 mod orphan;
 
+pub use conpty::{PtyResize, PtyWriter};
 pub use orphan::ctrl_break_helper;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,12 +40,16 @@ impl WindowsPlatform {
     /// # Errors
     /// Terminating the Job Object failed.
     pub fn stop_gracefully(handle: &ChildKillHandle, grace: std::time::Duration) -> io::Result<()> {
-        // Best-effort CTRL_BREAK, then wait via WaitForSingleObject, then
-        // escalate. Uses a real waitable handle instead of process_status
-        // because Windows keeps the process object alive while any handle is
-        // open (e.g. SupervisedChild's own), making PID-based liveness
-        // checks unreliable.
-        send_ctrl_break(handle.identity.pid.get());
+        // A PTY child's console closes, as a terminal window would: everything
+        // attached gets CTRL_CLOSE_EVENT. Any other child gets a best-effort
+        // CTRL_BREAK. Then wait via WaitForSingleObject, then escalate. Uses a
+        // real waitable handle instead of process_status because Windows keeps
+        // the process object alive while any handle is open (e.g.
+        // SupervisedChild's own), making PID-based liveness checks unreliable.
+        match &handle.console {
+            Some(console) => console.close_for_stop(),
+            None => send_ctrl_break(handle.identity.pid.get()),
+        }
 
         let grace_ms = u32::try_from(grace.as_millis()).unwrap_or(u32::MAX - 1);
         if wait_for_process_exit(handle.identity.pid.get(), grace_ms) {
@@ -57,7 +63,9 @@ impl WindowsPlatform {
 
 /// Opaque supervised-child state for Windows: the process, its verified
 /// `ProcessIdentity`, an Arc'd Job Object for tree kill, and the parent
-/// ends of its standard streams until they are taken.
+/// ends of its standard streams until they are taken. A PTY child's
+/// output is held by its pseudoconsole until taken, and its input is
+/// `pty_writer`.
 pub struct SupervisedChild {
     process: OwnedHandle,
     identity: ProcessIdentity,
@@ -65,15 +73,29 @@ pub struct SupervisedChild {
     stdin: Option<File>,
     stdout: Option<File>,
     stderr: Option<File>,
+    /// A PTY child's pseudoconsole. None for pipe sessions.
+    console: Option<Arc<conpty::PseudoConsole>>,
+    /// A PTY child's input, until taken. None for pipe sessions.
+    pty_writer: Option<PtyWriter>,
+}
+
+impl SupervisedChild {
+    /// Take the pseudoconsole's input for the sidecar's single input
+    /// writer. `None` for pipe sessions or once taken.
+    pub fn take_pty_writer(&mut self) -> Option<PtyWriter> {
+        self.pty_writer.take()
+    }
 }
 
 /// Lightweight kill handle for Windows.
-/// Carries an Arc'd Job Object HANDLE for tree kill and ProcessIdentity
-/// for status checks and GenerateConsoleCtrlEvent targeting.
+/// Carries an Arc'd Job Object HANDLE for tree kill, ProcessIdentity
+/// for status checks and GenerateConsoleCtrlEvent targeting, and a PTY
+/// child's pseudoconsole, which a graceful stop closes.
 #[derive(Clone)]
 pub struct ChildKillHandle {
     identity: ProcessIdentity,
     job_object: Arc<OwnedHandle>,
+    console: Option<Arc<conpty::PseudoConsole>>,
 }
 
 /// Stdin transport for Windows.
@@ -192,19 +214,55 @@ impl Platform for WindowsPlatform {
             stdin,
             stdout: Some(stdout),
             stderr: Some(stderr),
+            console: None,
+            pty_writer: None,
         })
     }
 
+    /// The child runs on a new pseudoconsole of the initial size. Its
+    /// output ends once it has exited: a watcher closes the pseudoconsole
+    /// then (see [`conpty`]).
     fn spawn_child_pty(
-        _argv: &[String],
-        _cwd: Option<&Path>,
-        _env_remove: &BTreeSet<String>,
-        _env: &BTreeMap<String, String>,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env_remove: &BTreeSet<String>,
+        env: &BTreeMap<String, String>,
     ) -> io::Result<SupervisedChild> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "PTY not supported on Windows yet",
-        ))
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+        let size =
+            crate::recording::Geometry::new(super::INITIAL_PTY_ROWS, super::INITIAL_PTY_COLS)
+                .ok_or_else(|| io::Error::other("initial PTY size is zero"))?;
+        let (console, input) = conpty::PseudoConsole::create(size)?;
+        let hpc = console
+            .handle()
+            .ok_or_else(|| io::Error::other("pseudoconsole closed before spawn"))?;
+        // The sidecar ignores Ctrl+C (it was started in a new process group),
+        // and a child inherits that: it would ignore the Ctrl+C typed into
+        // its terminal. Handle it for the spawn only.
+        // SAFETY: a null handler with FALSE only clears the ignore flag.
+        unsafe { SetConsoleCtrlHandler(None, 0) };
+        let started = start_contained(
+            argv,
+            cwd,
+            env_remove,
+            env,
+            &launch::Streams::PseudoConsole(hpc),
+        );
+        // SAFETY: as above, setting the flag back.
+        unsafe { SetConsoleCtrlHandler(None, 1) };
+        let (process, identity, job) = started?;
+        conpty::close_on_exit(process.try_clone()?, Arc::clone(&console))?;
+        Ok(SupervisedChild {
+            process,
+            identity,
+            job_object: Arc::new(job),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            console: Some(console),
+            pty_writer: Some(PtyWriter::spawn(input)?),
+        })
     }
 
     fn child_identity(child: &SupervisedChild) -> ProcessIdentity {
@@ -235,9 +293,12 @@ impl Platform for WindowsPlatform {
     }
 
     fn child_stdout(child: &mut SupervisedChild) -> Option<Box<dyn io::Read + Send>> {
+        // A PTY child's output is its pseudoconsole's, which keeps it until
+        // taken (see `PseudoConsole::close`).
         child
             .stdout
             .take()
+            .or_else(|| child.console.as_ref()?.take_output())
             .map(|s| Box::new(s) as Box<dyn io::Read + Send>)
     }
 
@@ -249,20 +310,24 @@ impl Platform for WindowsPlatform {
     }
 
     fn child_stdin(child: &mut SupervisedChild) -> Option<Box<dyn io::Write + Send>> {
+        if let Some(writer) = child.pty_writer.take() {
+            return Some(Box::new(writer));
+        }
         child
             .stdin
             .take()
             .map(|s| Box::new(s) as Box<dyn io::Write + Send>)
     }
 
-    fn pty_resize_fd(_child: &SupervisedChild) -> Option<File> {
-        None // No PTY support on Windows in slice one
+    fn pty_resizer(child: &SupervisedChild) -> Option<PtyResize> {
+        child.console.as_ref().map(|c| PtyResize(Arc::clone(c)))
     }
 
     fn child_kill_handle(child: &SupervisedChild) -> ChildKillHandle {
         ChildKillHandle {
             identity: child.identity,
             job_object: child.job_object.clone(),
+            console: child.console.clone(),
         }
     }
 

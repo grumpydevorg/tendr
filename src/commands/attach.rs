@@ -20,82 +20,74 @@ pub fn cmd_attach(
 ) -> anyhow::Result<()> {
     let (session, meta) = attachable(name, namespace, takeover || read_only)?;
 
-    #[cfg(not(unix))]
-    {
-        let _ = (session, meta, escape);
-        anyhow::bail!("attach is only supported on Unix");
-    }
-
+    // Fail before any side effect — a takeover included — if there is no
+    // terminal to drive. On Unix a read-only attach needs none: without one
+    // it streams the session's output to stdout.
     #[cfg(unix)]
-    {
-        // Fail before any side effect — a takeover included — if there is no
-        // terminal to drive. A read-only attach needs none: without one it
-        // streams the session's output to stdout.
-        let no_terminal = read_only && terminal::absent()?;
-        let terminal = if no_terminal {
-            terminal::none()
-        } else {
-            terminal::open("attach")?
-        };
-        let mode = mode(takeover, read_only);
-        // A local controller does not reconnect, so it has no use for
-        // offsets. A watcher speaks the newest version it needs, to be told
-        // where the run's output ends, and so whether it was cut off.
-        let version = if read_only {
-            attach_proto::Version::WATCH_LATEST
-        } else {
-            attach_proto::Version::V1
-        };
-        let (stream, accept, version) = connect(session.path(), version, mode)?;
-        // A watcher holds no control, so nothing can take it over.
-        let control = accept.epoch().map(|epoch| Control {
-            session_dir: session.path().to_path_buf(),
-            run_id: meta.run_id(),
-            epoch,
-        });
-        let recorded_takeover = || {
-            control
-                .as_ref()
-                .is_some_and(|control| control.taken_over_by().is_some())
-        };
-        let end = if version.reports_end() {
-            client::EndNotice::Promised
-        } else {
-            client::EndNotice::Unknown
-        };
-        // A local relay's code is always 0: its failures are errors.
-        client::relay(
-            client::Link::socket(stream)?,
-            accept.resume_point(),
-            escape,
-            accept.access(),
-            client::Peer::Local {
-                recorded_takeover: &recorded_takeover,
-            },
-            terminal,
-            end,
-        )?;
-        // Without a terminal nothing typed ends the attach: the session
-        // ended it, at the end of the run or by cutting this watcher off. A
-        // session that reports the end of its output has said which; one
-        // started by a tendr from before that leaves `meta.json` to tell.
-        if no_terminal && end == client::EndNotice::Unknown {
-            run_ended(&session, meta.run_id())?;
-        }
-        Ok(())
+    let (no_terminal, terminal) = if read_only && terminal::absent()? {
+        (true, terminal::none())
+    } else {
+        (false, terminal::open("attach")?)
+    };
+    #[cfg(not(unix))]
+    let terminal = terminal::open("attach")?;
+    let mode = mode(takeover, read_only);
+    // A local controller does not reconnect, so it has no use for offsets. A
+    // watcher speaks the newest version it needs, to be told where the run's
+    // output ends, and so whether it was cut off.
+    let version = if read_only {
+        attach_proto::Version::WATCH_LATEST
+    } else {
+        attach_proto::Version::V1
+    };
+    let (stream, accept, version) = connect(session.path(), version, mode)?;
+    // A watcher holds no control, so nothing can take it over.
+    let control = accept.epoch().map(|epoch| Control {
+        session_dir: session.path().to_path_buf(),
+        run_id: meta.run_id(),
+        epoch,
+    });
+    let recorded_takeover = || {
+        control
+            .as_ref()
+            .is_some_and(|control| control.taken_over_by().is_some())
+    };
+    let end = if version.reports_end() {
+        client::EndNotice::Promised
+    } else {
+        client::EndNotice::Unknown
+    };
+    // A local relay's code is always 0: its failures are errors.
+    client::relay(
+        client::Link::socket(stream)?,
+        accept.resume_point(),
+        escape,
+        accept.access(),
+        client::Peer::Local {
+            recorded_takeover: &recorded_takeover,
+        },
+        terminal,
+        end,
+    )?;
+    // Without a terminal nothing typed ends the attach: the session ended it,
+    // at the end of the run or by cutting this watcher off. A session that
+    // reports the end of its output has said which; one started by a tendr
+    // from before that leaves `meta.json` to tell.
+    #[cfg(unix)]
+    if no_terminal && end == client::EndNotice::Unknown {
+        run_ended(&session, meta.run_id())?;
     }
+    Ok(())
 }
 
 /// How long a no-terminal read-only attach whose connection the session
 /// closed waits for the run to record that it ended, while the session
 /// still publishes its attach socket, before counting the close as a
 /// cut-off.
-#[cfg(unix)]
 const RUN_END_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// [`RUN_END_GRACE`]. Debug builds accept `TENDR_TEST_RUN_END_GRACE_MS` so
 /// tests are not cut off by a sidecar a loaded machine slows.
-#[cfg(unix)]
 fn run_end_grace() -> std::time::Duration {
     tendr::test_timer::or_env("TENDR_TEST_RUN_END_GRACE_MS", RUN_END_GRACE)
 }
@@ -104,7 +96,6 @@ fn run_end_grace() -> std::time::Duration {
 /// run ends, before the durable writes that record the end, which a busy
 /// disk can hold past [`RUN_END_GRACE`]. Beyond this the sidecar is taken to
 /// have died before recording it.
-#[cfg(unix)]
 const RUN_END_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// After the session closed a no-terminal read-only attach whose sidecar
@@ -115,7 +106,6 @@ const RUN_END_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// sidecar. It cannot tell a watcher cut off at the run's end, when the
 /// sidecar stops waiting for a slow one, from one that had everything: both
 /// read as the run ended.
-#[cfg(unix)]
 fn run_ended(session: &SessionDir, run_id: tendr::model::ids::RunId) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     loop {
@@ -690,14 +680,12 @@ fn unanswered(code: i32) -> anyhow::Result<i32> {
 }
 
 /// The control this attach was granted: its run and controller epoch.
-#[cfg(unix)]
 struct Control {
     session_dir: std::path::PathBuf,
     run_id: tendr::model::ids::RunId,
     epoch: tendr::model::pty_control::ControllerEpoch,
 }
 
-#[cfg(unix)]
 impl Control {
     /// The epoch of the client that took this control over, if one did: in
     /// this run, the event log records a takeover granting the epoch after
@@ -731,7 +719,6 @@ impl Control {
 /// How long a client waits for the answer to its hello from a sidecar that
 /// may predate the hello (see [`reply_deadline`]). Every later sidecar
 /// answers, so its answer is waited for however long it takes.
-#[cfg(unix)]
 const PRE_HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The deadline for the answer to a hello in session `session_dir`, if any.
@@ -748,7 +735,6 @@ const PRE_HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// answer from any other is waited for, so a loaded machine slows the attach
 /// but cannot fail it. A debug build's `TENDR_TEST_PRE_HELLO_REPLY_MS`
 /// shortens the timeout, so a test can show it is not applied.
-#[cfg(unix)]
 fn reply_deadline(session_dir: &std::path::Path) -> Option<std::time::Duration> {
     use tendr::model::spec::RecordingPolicy;
     let answers = std::fs::read(session_dir.join("meta.json"))
@@ -777,7 +763,6 @@ pub(super) enum Accept {
 impl Accept {
     /// The controller epoch granted; `None` for a watcher, which holds
     /// none, so no takeover check applies to it.
-    #[cfg(unix)]
     fn epoch(self) -> Option<tendr::model::pty_control::ControllerEpoch> {
         match self {
             Self::V1(epoch) => Some(epoch),
@@ -808,7 +793,6 @@ impl Accept {
     }
 
     /// The acceptance as the sidecar sent it.
-    #[cfg(unix)]
     fn frame(self) -> Frame {
         match self {
             Self::V1(epoch) => Frame::Accepted(epoch),
@@ -835,13 +819,12 @@ impl Accept {
 /// that is missing or cannot be reached is a runtime failure (84), a listener
 /// of another user an identity failure (85), and the hello's reply is
 /// classified by [`hello_reply`].
-#[cfg(unix)]
 pub(super) fn connect(
     session_dir: &std::path::Path,
     version: attach_proto::Version,
     mode: Mode,
 ) -> anyhow::Result<(
-    std::os::unix::net::UnixStream,
+    tendr::attach_endpoint::Stream,
     Accept,
     attach_proto::Version,
 )> {
@@ -919,7 +902,6 @@ impl Resumption {
     }
 
     /// The answer as the sidecar sent it.
-    #[cfg(unix)]
     fn frame(self) -> Frame {
         match self {
             Self::Resumed {
@@ -951,13 +933,12 @@ impl Resumption {
 /// however long it takes: a session that can be resumed answered a hello
 /// before. Returns the connection, the answer, and the version it was given
 /// in.
-#[cfg(unix)]
 fn connect_resume(
     session_dir: &std::path::Path,
     point: Point,
     version: attach_proto::Version,
 ) -> anyhow::Result<(
-    std::os::unix::net::UnixStream,
+    tendr::attach_endpoint::Stream,
     Resumption,
     attach_proto::Version,
 )> {
@@ -991,13 +972,12 @@ fn connect_resume(
     Ok((stream, resumed, version))
 }
 
-/// Connect to the session's attach socket and check that its listener is
+/// Connect to the session's attach endpoint and check that its listener is
 /// this user's.
-#[cfg(unix)]
-fn open_socket(session_dir: &std::path::Path) -> anyhow::Result<std::os::unix::net::UnixStream> {
+fn open_socket(session_dir: &std::path::Path) -> anyhow::Result<tendr::attach_endpoint::Stream> {
     let sock_path = attach_proto::read_sock_path(session_dir)
         .ok_or_else(|| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket not found")))?;
-    let stream = std::os::unix::net::UnixStream::connect(&sock_path).map_err(|e| {
+    let stream = tendr::attach_endpoint::connect(&sock_path).map_err(|e| {
         PtyExitCode::Runtime.error(anyhow::anyhow!(
             "cannot connect to attach socket {}: {e}",
             sock_path.display()
@@ -1005,7 +985,7 @@ fn open_socket(session_dir: &std::path::Path) -> anyhow::Result<std::os::unix::n
     })?;
     // Keystrokes and pushed input go only to a listener run by this same user:
     // a spoofed socket owned by someone else is refused before the hello.
-    tendr::attach_socket::verify_peer(&stream).map_err(|e| {
+    tendr::attach_endpoint::verify_peer(&stream).map_err(|e| {
         PtyExitCode::of_peer_check(&e).error(anyhow::anyhow!(
             "refusing attach socket {}: {e}",
             sock_path.display()
@@ -1023,9 +1003,8 @@ fn open_socket(session_dir: &std::path::Path) -> anyhow::Result<std::os::unix::n
 /// first, the hello cannot be written, but the refusal is still waiting to be
 /// read: it, not the failed write, decides the outcome. The write's error is
 /// the error only when no frame can be read.
-#[cfg(unix)]
 fn exchange(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut tendr::attach_endpoint::Stream,
     hello: &Frame,
     what: &str,
     deadline: Option<std::time::Duration>,
@@ -1033,12 +1012,14 @@ fn exchange(
     let transport = |e: std::io::Error| {
         PtyExitCode::Runtime.error(anyhow::anyhow!("{what} handshake failed: {e}"))
     };
+    let timeout = deadline.map_or(Ok(()), |deadline| stream.set_read_timeout(Some(deadline)));
     // macOS refuses SO_RCVTIMEO (EINVAL) on a socket whose peer has already
     // shut down: exactly the refusal-before-hello case. Then read without
     // blocking, so a buffered refusal is still seen and a live peer that never
-    // got a hello cannot hold the read forever.
-    let timeout = deadline.map_or(Ok(()), |deadline| stream.set_read_timeout(Some(deadline)));
+    // got a hello cannot hold the read forever. A pipe's timeout never fails.
+    #[cfg(unix)]
     let unbounded = timeout.is_err();
+    #[cfg(unix)]
     if unbounded {
         stream.set_nonblocking(true).map_err(transport)?;
     }
@@ -1046,6 +1027,7 @@ fn exchange(
     // After a failed write the peer has closed its end, so this read returns
     // at once; otherwise it waits for the answer, within the deadline if any.
     let reply = attach_proto::read_frame(stream);
+    #[cfg(unix)]
     if unbounded {
         let _ = stream.set_nonblocking(false);
     }
@@ -1174,10 +1156,9 @@ mod client;
 
 use super::terminal;
 
-#[cfg(unix)]
 impl client::Link {
-    /// A connection to the session's attach socket.
-    fn socket(stream: std::os::unix::net::UnixStream) -> anyhow::Result<Self> {
+    /// A connection to the session's attach endpoint.
+    fn socket(stream: tendr::attach_endpoint::Stream) -> anyhow::Result<Self> {
         let socket = |e| PtyExitCode::Runtime.error(anyhow::anyhow!("attach socket: {e}"));
         let shutdown = stream.try_clone().map_err(socket)?;
         Ok(Self {

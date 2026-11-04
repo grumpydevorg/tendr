@@ -38,9 +38,8 @@ use super::{
     setup_timeout, stopped_state, test_abort_point, test_fault, test_pty_read_delay,
     test_unlock_gate,
 };
-#[cfg(unix)]
 use super::{
-    AttachPools, ConnectionRegistry, RetireWaits, RunEffects, SidecarControlHooks, UnixPtyInput,
+    AttachPools, ConnectionRegistry, PtyDevice, RetireWaits, RunEffects, SidecarControlHooks,
     recorder_limits, run_attach_listener, start_pty_recording,
 };
 use crate::model::ids::{EpochTimestamp, ProcessIdentity};
@@ -121,9 +120,6 @@ struct RunCore {
 
 /// A PTY run's attach side, in two phases, so what exists together is
 /// constructed together.
-// Uninhabited off Unix, where AttachEndpoint and PtyTeardown are, so Started
-// is never built there.
-#[cfg_attr(not(unix), allow(dead_code))]
 enum PtySide {
     /// The attach socket is bound and published; nothing is running yet.
     Bound(AttachEndpoint),
@@ -131,7 +127,6 @@ enum PtySide {
     Started(StartedPty),
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
 struct StartedPty {
     /// Held for its `Drop`, which removes the socket and its breadcrumb.
     _socket: AttachSocketCleanup,
@@ -150,16 +145,10 @@ struct StartedPty {
 /// End a started attach side before the terminal record: shut its
 /// connections, record its pending effects, and fold the final owner into
 /// `meta`. Dropping it then removes the socket.
-#[cfg(unix)]
 fn end_attach_side(pty: StartedPty, meta: &mut Meta) {
     pty.teardown.run();
     // The effects thread has stopped: nothing changes the owner any more.
     meta.set_pty_control(lock(&pty.control).clone());
-}
-
-#[cfg(not(unix))]
-fn end_attach_side(pty: StartedPty, _meta: &mut Meta) {
-    match pty.teardown {}
 }
 
 impl SupervisedRun<Spawned> {
@@ -379,11 +368,10 @@ impl RunCore {
     /// PTY's write half and records applied sizes) and the attach listener on
     /// the socket bound before spawn. Every fallible step comes first, so a
     /// failure leaves nothing running.
-    #[cfg(unix)]
     fn start_pty(&mut self, endpoint: AttachEndpoint) -> io::Result<(StartedPty, PtyInput)> {
         test_fault(SidecarStep::AttachBind.as_str())?;
-        // Dup the resize fd before the write half is taken.
-        let resize = Current::pty_resize_fd(&self.child);
+        // Take the resizer before the write half is taken.
+        let resize = Current::pty_resizer(&self.child);
         let writer = self
             .child
             .take_pty_writer()
@@ -414,7 +402,7 @@ impl RunCore {
         let input = PtyInput {
             writer: crate::pty_input::InputWriter::spawn(
                 self.meta.run_id(),
-                UnixPtyInput {
+                PtyDevice {
                     writer,
                     resize,
                     recorder: recording.as_ref().map(|r| r.thread.recorder()),
@@ -454,13 +442,6 @@ impl RunCore {
             },
         };
         Ok((started, input))
-    }
-
-    /// PTY sessions are Unix-only; the PTY spawn itself fails elsewhere, so no
-    /// endpoint exists to start.
-    #[cfg(not(unix))]
-    fn start_pty(&mut self, endpoint: AttachEndpoint) -> io::Result<(StartedPty, PtyInput)> {
-        match endpoint {}
     }
 
     /// Persist meta, serialized with the sidecar's other `meta.json` writers

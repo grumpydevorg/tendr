@@ -105,6 +105,13 @@
   progress is told apart from a silent one. `live` turns false, and the values
   stop changing, once capture ends or the sidecar is gone. See `tendr guide
   pty`.
+- **Windows: `--pty` sessions and `attach` on a Windows host.** A PTY
+  session runs its child under a pseudoconsole (ConPTY), and `attach`,
+  `push` and `attach --host` reach it over an owner-only named pipe, with
+  the same frames and exit codes as on Unix. Resizes reach the child,
+  Ctrl-C reaches it as a console Ctrl-C, and a stop closes its console
+  first. The run is recorded as on Unix, and `tendr replay` reads it. Over
+  `--host` this needs the remote `tendr` at 0.8.0.
 
 ### Changed
 

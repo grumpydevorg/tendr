@@ -27,7 +27,7 @@ pub struct CliAttach {
     /// While set, the terminal stops reading the CLI's output, as a stalled
     /// terminal or SSH connection would.
     output_paused: Arc<AtomicBool>,
-    resize_fd: Option<std::fs::File>,
+    resize: Option<tendr::platform::PtyResize>,
 }
 
 #[allow(dead_code)]
@@ -53,8 +53,8 @@ impl CliAttach {
         }
         let mut child =
             Current::spawn_child_pty(argv, None, &std::collections::BTreeSet::new(), &env).unwrap();
-        // Take the resize handle before stdin takes the master's write half.
-        let resize_fd = Current::pty_resize_fd(&child);
+        // Take the resizer before stdin takes the master's write half.
+        let resize = Current::pty_resizer(&child);
         let input = Current::child_stdin(&mut child).unwrap();
         let mut reader = Current::child_stdout(&mut child).unwrap();
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -78,7 +78,7 @@ impl CliAttach {
             input: Some(input),
             output,
             output_paused,
-            resize_fd,
+            resize,
         }
     }
 
@@ -105,17 +105,12 @@ impl CliAttach {
 
     /// Resize the CLI's terminal, as a user resizing the Ghostty window would.
     pub fn resize(&self, rows: u16, cols: u16) {
-        use std::os::unix::io::AsRawFd;
-        let fd = self.resize_fd.as_ref().expect("resize handle").as_raw_fd();
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: `fd` is an open PTY master; TIOCSWINSZ takes a winsize pointer.
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
-        assert_eq!(rc, 0, "resize the CLI's terminal");
+        let size = tendr::recording::Geometry::new(rows, cols).expect("a nonzero size");
+        self.resize
+            .as_ref()
+            .expect("resize handle")
+            .apply(size)
+            .expect("resize the CLI's terminal");
     }
 
     /// Type `line` until the session's output shows it. Keystrokes typed before

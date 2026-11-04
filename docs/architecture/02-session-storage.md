@@ -133,7 +133,9 @@ once used.
 The attach socket is not in the session dir. It is
 `~/.tendr/sockets/<name>.sock`, where `<name>` is 12 hex characters of a
 SHA-256 over the session path and run ID (`src/attach_socket.rs`). The
-`sockets/` directory is owner-only (`0700`) and the socket is `0600`.
+`sockets/` directory is owner-only (`0700`) and the socket is `0600`. On
+Windows it is a named pipe, `\\.\pipe\tendr-attach-<name>`, which is not on
+disk ([attach socket](04-pty-lane.md#the-attach-socket)).
 
 One state root serves one account. `~/.tendr` must be owned by the user who
 runs tendr, and only that user may write it: binding an attach socket refuses a
