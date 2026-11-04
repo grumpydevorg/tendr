@@ -2,11 +2,16 @@ use std::collections::BTreeMap;
 
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::model::meta::Meta;
+use tendr::model::ready::ReadyState;
 use tendr::model::state::{ExitReason, RunStatus};
 use tendr::session::{self, SessionRoot};
 
 /// Poll interval for the wait loop.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `wait --ready`: a session will not become ready. Its deadline passed
+/// (`run.ready_missed`), or its run ended before it was ready.
+const NOT_READY: i32 = 43;
 
 /// Wait for one or more sessions to reach terminal state.
 ///
@@ -32,10 +37,16 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500)
 /// has not happened by then, `wait` warns on stderr and reports the session
 /// anyway. The exit code always reflects the session's outcome, and the grace
 /// is not charged against `--timeout`.
+///
+/// With `ready`, a session is done once its ready condition is decided
+/// (`meta.json` `ready`) or its run has ended, whichever is first; exit 0 if
+/// every session reported is ready, [`NOT_READY`] otherwise. A session
+/// without a ready condition is an error.
 pub fn cmd_wait(
     names: &[String],
     timeout: Option<u64>,
     any: bool,
+    ready: bool,
     namespace: &Namespace,
 ) -> anyhow::Result<()> {
     let root = SessionRoot::default_path()?;
@@ -82,7 +93,20 @@ pub fn cmd_wait(
             // exists; infers SidecarLost otherwise (spec §3.6).
             tendr::reconcile::reconcile_sidecar_gone(session_dir, &mut meta)?;
 
-            if meta.status().is_terminal() {
+            if ready {
+                if meta.launch_spec().ready.is_none() {
+                    anyhow::bail!(
+                        "{name} has no ready condition: wait --ready needs a session started \
+                         with --ready-when-output or --ready-when-port"
+                    );
+                }
+                if meta.status().is_terminal() {
+                    await_release(session_dir, name, "wait");
+                    terminal_metas.insert(name.clone(), meta);
+                } else if meta.ready().is_some() {
+                    terminal_metas.insert(name.clone(), meta);
+                }
+            } else if meta.status().is_terminal() {
                 await_release(session_dir, name, "wait");
                 terminal_metas.insert(name.clone(), meta);
             }
@@ -106,7 +130,11 @@ pub fn cmd_wait(
             outln!("{json}");
 
             // Derive exit code from the set.
-            let exit_code = derive_exit_code(&results);
+            let exit_code = if ready {
+                ready_exit_code(&results)
+            } else {
+                derive_exit_code(&results)
+            };
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
@@ -126,6 +154,19 @@ pub fn cmd_wait(
         }
 
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// `wait --ready`'s exit code: 0 if every session is ready, else
+/// [`NOT_READY`].
+fn ready_exit_code(metas: &[&Meta]) -> i32 {
+    if metas
+        .iter()
+        .all(|meta| matches!(meta.ready(), Some(ReadyState::Ready { .. })))
+    {
+        0
+    } else {
+        NOT_READY
     }
 }
 

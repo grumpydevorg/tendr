@@ -759,6 +759,7 @@ dependencies = [
  "libc",
  "predicates",
  "proptest",
+ "regex",
  "rustix",
  "serde",
  "serde_json",

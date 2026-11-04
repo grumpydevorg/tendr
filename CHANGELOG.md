@@ -58,6 +58,23 @@
   harm. This is attach protocol version 4, and needs 0.8.0 or newer on both
   hosts and a session started by 0.8.0; with an older remote or session
   the attach reconnects as before and says nothing of the input.
+- **`start` can say when a server is ready, and `wait --ready` waits for
+  it.** A server is `Running` as soon as it spawns, so agents polled
+  `tendr log` or `curl` in loops of their own, and one stuck before it
+  listened looked healthy. Give `start` one condition:
+  `--ready-when-output <regex>` (a line of its output, stdout or stderr, or
+  for a PTY session the terminal's, matches) or `--ready-when-port <port>`
+  (a TCP connection to that port on the session's host succeeds), and
+  optionally `--ready-within <duration>`. The sidecar checks it, so it works
+  detached and over `--host`, and records a `run.ready` event and
+  `meta.json` `ready` with the time; past the deadline it records
+  `run.ready_missed` and leaves the child running. `tendr wait --ready`
+  returns 0 once the sessions are ready and 43 if one missed its deadline or
+  ended first, and `start --after-ready <session>` starts a client once its
+  server is ready, failing as a failed dependency (4) if it will not be.
+  Over `--host` these need 0.8.0 on the remote host: such a request goes as
+  remote frame version 2, which an older remote refuses (exit 2) rather
+  than ignore the flags. Every other request still goes as version 1.
 
 - **`tendr events --follow` can end on a match.** `--max-count N` exits 0
   once N events are printed, `--timeout <duration>` exits 124 if it passes

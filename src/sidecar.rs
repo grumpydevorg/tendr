@@ -17,8 +17,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 
 mod output_ring;
+mod ready_check;
 mod supervised_run;
 use output_ring::OutputRing;
+use ready_check::OutputMatcher;
 use supervised_run::SupervisedRun;
 
 #[cfg(unix)]
@@ -534,14 +536,25 @@ enum DepWaitOutcome {
     KilledForced(String),
 }
 
-/// A `--after` dependency after the first scan. Only `Pending` and `Latched`
-/// coexist with continued polling; failure/timeout/kill are phase-terminal
-/// ([`FirstScanOutcome::Terminal`]) and are never represented here.
+/// A `--after` or `--after-ready` dependency after the first scan. Only
+/// `Pending` and `Latched` coexist with continued polling;
+/// failure/timeout/kill are phase-terminal ([`FirstScanOutcome::Terminal`])
+/// and are never represented here.
 enum ScannedDependency {
-    Pending(DependencyBinding),
+    Pending(DependencyBinding, Until),
     /// Satisfied at its bound run_id and never re-examined — the binding is not
     /// retained because a latched dependency is never inspected again.
     Latched,
+}
+
+/// What satisfies a dependency.
+#[derive(Clone, Copy)]
+enum Until {
+    /// `--after`: its run ended (successfully, unless `--any-exit`).
+    Exit,
+    /// `--after-ready`: its ready condition held. Its deadline passing, or
+    /// its run ending, first fails the wait.
+    Ready,
 }
 
 /// The dependency set produced by [`first_dependency_scan`]. Its private field
@@ -625,9 +638,10 @@ fn scan_iteration(
 
     let mut all_latched = true;
     for slot in scanned.0.iter_mut() {
-        let ScannedDependency::Pending(binding) = slot else {
+        let ScannedDependency::Pending(binding, until) = slot else {
             continue; // already latched — never re-polled
         };
+        let until = *until;
 
         let dep_session = match session::open(session_root, namespace, &binding.session) {
             Ok(Some(s)) => s,
@@ -667,7 +681,25 @@ fn scan_iteration(
             );
         }
 
-        if dep_meta.status().is_terminal() {
+        if let Until::Ready = until {
+            use crate::model::ready::ReadyState;
+            match dep_meta.ready() {
+                Some(ReadyState::Ready { .. }) => *slot = ScannedDependency::Latched,
+                Some(ReadyState::Missed { .. }) => {
+                    return ScanStep::Terminal(
+                        DepFailReason::Failed,
+                        format!("dependency {} missed its ready deadline", binding.session),
+                    );
+                }
+                None if dep_meta.status().is_terminal() => {
+                    return ScanStep::Terminal(
+                        DepFailReason::Failed,
+                        format!("dependency {} ended before it was ready", binding.session),
+                    );
+                }
+                None => all_latched = false,
+            }
+        } else if dep_meta.status().is_terminal() {
             if !after_any_exit {
                 use crate::model::state::{ExitReason as ER, RunStatus};
                 match dep_meta.status() {
@@ -713,8 +745,12 @@ fn first_dependency_scan(
     let mut scanned = ScannedDependencies(
         spec.after
             .iter()
-            .cloned()
-            .map(ScannedDependency::Pending)
+            .map(|binding| ScannedDependency::Pending(binding.clone(), Until::Exit))
+            .chain(
+                spec.after_ready
+                    .iter()
+                    .map(|binding| ScannedDependency::Pending(binding.clone(), Until::Ready)),
+            )
             .collect(),
     );
     match scan_iteration(
@@ -831,11 +867,10 @@ impl LifecycleEvents {
         }
     }
 
-    /// Same session and run, freshly minted writer identity — for a PTY run's
-    /// effects thread, which appends concurrently with the lifecycle writer.
-    /// The protocol is multi-writer by design: each writer keeps its own
-    /// contiguous `seq` chain (spec §1).
-    #[cfg(unix)]
+    /// Same session and run, freshly minted writer identity — for a thread
+    /// that appends concurrently with the lifecycle writer: a PTY run's
+    /// effects thread, and the ready check. The protocol is multi-writer by
+    /// design: each writer keeps its own contiguous `seq` chain (spec §1).
     fn with_fresh_writer(&self) -> Self {
         Self {
             session_dir: self.session_dir.clone(),
@@ -933,7 +968,7 @@ impl LifecycleEvents {
 }
 
 /// The non-lifecycle facts the sidecar appends. Only PTY runs (Unix) record
-/// the last three.
+/// the recording and control facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))]
 enum Fact {
@@ -941,6 +976,8 @@ enum Fact {
     RecordingStopped,
     ControlChanged,
     InputRevoked,
+    Ready,
+    ReadyMissed,
 }
 
 impl Fact {
@@ -951,6 +988,8 @@ impl Fact {
             Self::RecordingStopped => "recording.stopped",
             Self::ControlChanged => "pty.control_changed",
             Self::InputRevoked => "pty.input_revoked",
+            Self::Ready => "run.ready",
+            Self::ReadyMissed => "run.ready_missed",
         }
     }
 }
@@ -1312,8 +1351,9 @@ fn run_inner(session_dir: &Path, ready: &mut Option<ReadyWriter>) -> anyhow::Res
         effective_env.insert("TERM".to_owned(), pty_term(meta.launch_spec()));
     }
 
-    // --- Wait for --after dependencies ---
-    let has_deps = !meta.launch_spec().after.is_empty();
+    // --- Wait for --after and --after-ready dependencies ---
+    let has_deps =
+        !meta.launch_spec().after.is_empty() || !meta.launch_spec().after_ready.is_empty();
     if has_deps {
         // Persist Starting so the session is observable on disk during the scan.
         session::write_meta_atomic(&session, &meta)?;
@@ -1709,16 +1749,20 @@ fn log_write_warning(tag: char, e: &io::Error) -> String {
 }
 
 /// Read lines from a stream and write them to the shared log file. Invalid
-/// UTF-8 is logged lossily. After the first failed write, send its warning to
-/// `failed`, then drain the rest unparsed so the child never blocks.
+/// UTF-8 is logged lossily. Each line logged is then offered to `ready`, the
+/// run's output ready check, if it has one. After the first failed write,
+/// send its warning to `failed`, then read the rest unlogged so the child
+/// never blocks: unparsed, unless the ready check still needs its lines.
 fn capture_stream(
     stream: Box<dyn std::io::Read + Send>,
     tag: char,
     log: &Mutex<Box<dyn Write + Send>>,
     failed: &std::sync::mpsc::Sender<String>,
+    ready: Option<OutputMatcher>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
+    let mut logging = true;
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
@@ -1731,17 +1775,27 @@ fn capture_stream(
                 line.pop();
             }
         }
-        let text = String::from_utf8_lossy(&line).into_owned();
-        if let Err(e) = write_log_line(log, tag, text) {
-            let _ = failed.send(log_write_warning(tag, &e));
-            let _ = io::copy(&mut reader, &mut io::sink());
-            return;
+        if logging {
+            let text = String::from_utf8_lossy(&line).into_owned();
+            if let Err(e) = write_log_line(log, tag, text) {
+                let _ = failed.send(log_write_warning(tag, &e));
+                if ready.is_none() {
+                    let _ = io::copy(&mut reader, &mut io::sink());
+                    return;
+                }
+                logging = false;
+            }
+        }
+        if let Some(ready) = &ready {
+            ready.line(&line);
         }
     }
 }
 
-/// Read raw bytes from a stream, record them, write them to the log, and tee
-/// them to the attach sink. Used for PTY sessions where a human may be attached.
+/// Read raw bytes from a stream, record them, write them to the log, offer
+/// them to `ready`, the run's output ready check, and tee them to the attach
+/// sink. Used for PTY sessions where a human may be attached.
+#[allow(clippy::too_many_arguments)]
 fn capture_stream_with_tee(
     mut stream: Box<dyn std::io::Read + Send>,
     tag: char,
@@ -1749,6 +1803,7 @@ fn capture_stream_with_tee(
     failed: &std::sync::mpsc::Sender<String>,
     attach_sink: &AttachSink,
     recorder: Option<&Recorder>,
+    mut ready: Option<OutputMatcher>,
 ) {
     let mut buf = [0u8; PTY_READ_BYTES];
     let mut logging = true;
@@ -1775,6 +1830,9 @@ fn capture_stream_with_tee(
                     break;
                 }
             }
+        }
+        if let Some(ready) = ready.as_mut() {
+            ready.chunk(&buf[..n]);
         }
 
         // Append raw bytes to the ring the viewers send from; never block.
@@ -3321,9 +3379,9 @@ fn apply_pty_resize(fd: &std::fs::File, size: crate::recording::Geometry) -> io:
 }
 
 /// Serializes the sidecar's `meta.json` writes: the patches the effects thread
-/// makes ([`RunEffects`]: control changes and recording stops), and the
-/// lifecycle guard's writes, which fold in the live owner and the recording
-/// state they read under this lock.
+/// makes ([`RunEffects`]: control changes and recording stops) and the ready
+/// check's, and the lifecycle guard's writes, which fold in the live owner,
+/// the recording state and the ready outcome they read under this lock.
 static META_WRITE: Mutex<()> = Mutex::new(());
 
 /// Best-effort: patch the session's `meta.json` through a typed `Meta`
@@ -3332,7 +3390,6 @@ static META_WRITE: Mutex<()> = Mutex::new(());
 /// everywhere else — instead of hand-patching an untyped JSON value.
 /// Persistence is best-effort tmp+rename (no fsync): the durable lifecycle
 /// writes go through `write_meta_atomic` elsewhere.
-#[cfg(unix)]
 fn patch_meta_file(session_dir: &Path, patch: impl FnOnce(&mut Meta)) {
     let meta_path = session_dir.join("meta.json");
     let Ok(content) = std::fs::read_to_string(&meta_path) else {
@@ -4135,6 +4192,8 @@ mod tests {
             Fact::RecordingStopped,
             Fact::ControlChanged,
             Fact::InputRevoked,
+            Fact::Ready,
+            Fact::ReadyMissed,
         ] {
             assert!(Kind::new(fact.kind()).is_ok(), "{fact:?}");
         }

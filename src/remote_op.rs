@@ -20,11 +20,14 @@ use serde::{Deserialize, Serialize};
 use tendr::attach_escape::EscapeMode;
 use tendr::model::boundary::{Boundary, BoundaryContext};
 use tendr::model::ids::Namespace;
+use tendr::model::ready::{ReadyCheck, ReadyWhen};
 use tendr::model::spec::{ExecTarget, RecordingPolicy};
 
 use crate::{AttachEscape, Commands, commands, parse_optional_namespace, resolve_namespace};
 
-/// One remote-capable command, as typed.
+/// One remote-capable command, as typed. One request per process, so the
+/// size of its largest variant does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", content = "params", rename_all = "snake_case")]
 pub enum RemoteOperation {
@@ -40,8 +43,10 @@ pub enum RemoteOperation {
 }
 
 /// `start`: every launch input, unresolved. `env` holds the `KEY=VALUE`
-/// entries as typed (validated at launch); `after` holds session names, bound
-/// to run ids at launch.
+/// entries as typed (validated at launch); `after` and `after_ready` hold
+/// session names, bound to run ids at launch. The ready fields are left out
+/// when unset, so a request without them reads as it always has; a request
+/// with them needs frame version 2 ([`crate::remote_frame`]).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartRequest {
     pub session: String,
@@ -68,6 +73,44 @@ pub struct StartRequest {
     /// `--no-record`, likewise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_record: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_when_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_when_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_within_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after_ready: Vec<String>,
+}
+
+impl StartRequest {
+    /// The ready condition the request names, checked as `start` checks it.
+    ///
+    /// # Errors
+    /// Why the ready flags cannot be combined, or why the condition is
+    /// invalid.
+    pub fn ready_check(&self) -> Result<Option<ReadyCheck>, String> {
+        let when = match (&self.ready_when_output, self.ready_when_port) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "--ready-when-output and --ready-when-port cannot be used together".to_owned(),
+                );
+            }
+            (Some(pattern), None) => ReadyWhen::Output(pattern.clone()),
+            (None, Some(port)) => ReadyWhen::Port(port),
+            (None, None) if self.ready_within_ms.is_some() => {
+                return Err(
+                    "--ready-within requires --ready-when-output or --ready-when-port".to_owned(),
+                );
+            }
+            (None, None) => return Ok(None),
+        };
+        when.validate().map_err(|e| e.to_string())?;
+        Ok(Some(ReadyCheck {
+            when,
+            within_ms: self.ready_within_ms,
+        }))
+    }
 }
 
 /// Debug shows the shape of the payload, never its values: argv, cwd, env and
@@ -93,6 +136,10 @@ impl fmt::Debug for StartRequest {
             .field("boundary_parent", &self.boundary_parent)
             .field("record_input", &self.record_input)
             .field("no_record", &self.no_record)
+            .field("ready_when_output", &self.ready_when_output)
+            .field("ready_when_port", &self.ready_when_port)
+            .field("ready_within_ms", &self.ready_within_ms)
+            .field("after_ready", &self.after_ready)
             .finish()
     }
 }
@@ -142,12 +189,17 @@ pub struct KillRequest {
     pub force: bool,
 }
 
+/// `wait`: `ready` waits for the sessions to be ready instead of ended. Left
+/// out when false, so a request without it reads as it always has; with it,
+/// the request needs frame version 2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitRequest {
     pub sessions: Vec<String>,
     pub namespace: Option<String>,
     pub timeout: Option<u64>,
     pub any: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ready: bool,
 }
 
 /// `watch`: no namespace watches every namespace.
@@ -268,6 +320,10 @@ impl TryFrom<&Commands> for RemoteOperation {
                 on_exit,
                 after,
                 any_exit,
+                ready_when_output,
+                ready_when_port,
+                ready_within,
+                after_ready,
                 boundary,
                 boundary_parent,
                 record_input,
@@ -292,6 +348,11 @@ impl TryFrom<&Commands> for RemoteOperation {
                 boundary_parent: boundary_parent.clone(),
                 record_input: *record_input,
                 no_record: *no_record,
+                ready_when_output: ready_when_output.clone(),
+                ready_when_port: *ready_when_port,
+                ready_within_ms: ready_within
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                after_ready: after_ready.clone(),
             }),
             Commands::Status { name, namespace } => Self::Status(StatusRequest {
                 session: name.clone(),
@@ -333,11 +394,13 @@ impl TryFrom<&Commands> for RemoteOperation {
                 namespace,
                 timeout,
                 any,
+                ready,
             } => Self::Wait(WaitRequest {
                 sessions: names.clone(),
                 namespace: namespace.clone(),
                 timeout: *timeout,
                 any: *any,
+                ready: *ready,
             }),
             Commands::Watch {
                 namespace,
@@ -406,14 +469,19 @@ struct StartInputs {
     exec_target: Option<ExecTarget>,
     boundary: Option<BoundaryContext>,
     recording: RecordingPolicy,
+    ready: Option<ReadyCheck>,
+    after_ready: Vec<String>,
 }
 
-/// Resolve a start request on the host that runs it. Only the namespace can
-/// fail here, so it is still the first input checked.
+/// Resolve a start request on the host that runs it. Only the namespace and
+/// the ready flags can fail here; the namespace is still the first input
+/// checked.
 fn start_inputs(request: StartRequest) -> anyhow::Result<StartInputs> {
+    let namespace = resolve_namespace(request.namespace.clone())?;
+    let ready = request.ready_check().map_err(anyhow::Error::msg)?;
     let StartRequest {
         session,
-        namespace,
+        namespace: _,
         argv,
         cwd,
         env,
@@ -430,9 +498,13 @@ fn start_inputs(request: StartRequest) -> anyhow::Result<StartInputs> {
         boundary_parent,
         record_input,
         no_record,
+        ready_when_output: _,
+        ready_when_port: _,
+        ready_within_ms: _,
+        after_ready,
     } = request;
     Ok(StartInputs {
-        namespace: resolve_namespace(namespace)?,
+        namespace,
         name: session,
         cmd: argv,
         stdin,
@@ -457,6 +529,8 @@ fn start_inputs(request: StartRequest) -> anyhow::Result<StartInputs> {
         } else {
             RecordingPolicy::Output
         },
+        ready,
+        after_ready,
     })
 }
 
@@ -482,6 +556,8 @@ pub fn dispatch(operation: RemoteOperation) -> anyhow::Result<()> {
                 i.exec_target,
                 i.boundary,
                 i.recording,
+                i.ready,
+                &i.after_ready,
             )
         }
         RemoteOperation::Status(r) => {
@@ -502,7 +578,7 @@ pub fn dispatch(operation: RemoteOperation) -> anyhow::Result<()> {
         }
         RemoteOperation::Wait(r) => {
             let ns = resolve_namespace(r.namespace)?;
-            commands::cmd_wait(&r.sessions, r.timeout, r.any, &ns)
+            commands::cmd_wait(&r.sessions, r.timeout, r.any, r.ready, &ns)
         }
         RemoteOperation::Watch(r) => {
             let ns = parse_optional_namespace(r.namespace)?;
@@ -591,6 +667,12 @@ mod tests {
             "--after",
             "dep-2",
             "--any-exit",
+            "--ready-when-output",
+            r"^listening on \d+$",
+            "--ready-within",
+            "1m 500ms",
+            "--after-ready",
+            "db",
             "--boundary",
             "host:alpha",
             "--boundary-parent",
@@ -618,6 +700,10 @@ mod tests {
             on_exit,
             after,
             any_exit,
+            ready_when_output,
+            ready_when_port,
+            ready_within,
+            after_ready,
             boundary: parsed_boundary,
             boundary_parent,
             record_input,
@@ -650,6 +736,8 @@ mod tests {
             exec_target: in_exec_target,
             boundary: in_boundary,
             recording: in_recording,
+            ready: in_ready,
+            after_ready: in_after_ready,
         } = start_inputs(request).expect("resolves");
 
         assert_eq!(name, "x&calc");
@@ -673,6 +761,21 @@ mod tests {
         assert_eq!(after, &strings(&["dep-1", "dep-2"]));
         assert_eq!(&in_after, after);
         assert!(*any_exit && in_any_exit);
+        assert_eq!(ready_when_output.as_deref(), Some(r"^listening on \d+$"));
+        assert_eq!(*ready_when_port, None);
+        assert_eq!(
+            *ready_within,
+            Some(std::time::Duration::from_millis(60_500))
+        );
+        assert_eq!(
+            in_ready,
+            Some(ReadyCheck {
+                when: ReadyWhen::Output(r"^listening on \d+$".to_owned()),
+                within_ms: Some(60_500),
+            })
+        );
+        assert_eq!(after_ready, &strings(&["db"]));
+        assert_eq!(&in_after_ready, after_ready);
         assert_eq!(
             parsed_boundary.as_ref(),
             Some(&boundary(BoundaryKind::Host, "alpha"))
@@ -716,6 +819,48 @@ mod tests {
                 expected,
                 "{flags:?}"
             );
+        }
+    }
+
+    /// The port condition travels too, and the flags that cannot combine are
+    /// refused by the command line.
+    #[test]
+    fn the_port_condition_survives_and_conflicts_are_refused() {
+        let RemoteOperation::Start(request) = round_trip(&op(&[
+            "start",
+            "--ready-when-port",
+            "8080",
+            "s",
+            "--",
+            "srv",
+        ])) else {
+            panic!("not a start request");
+        };
+        assert_eq!(
+            start_inputs(request).expect("resolves").ready,
+            Some(ReadyCheck {
+                when: ReadyWhen::Port(8080),
+                within_ms: None,
+            })
+        );
+        for args in [
+            &[
+                "start",
+                "--ready-when-port",
+                "1",
+                "--ready-when-output",
+                "x",
+                "s",
+                "--",
+                "t",
+            ][..],
+            &["start", "--ready-within", "1s", "s", "--", "t"],
+            &["start", "--ready-when-port", "0", "s", "--", "t"],
+            &["start", "--ready-when-output", "(", "s", "--", "t"],
+        ] {
+            let mut argv = vec!["tendr"];
+            argv.extend_from_slice(args);
+            assert!(Cli::try_parse_from(argv).is_err(), "{args:?}");
         }
     }
 

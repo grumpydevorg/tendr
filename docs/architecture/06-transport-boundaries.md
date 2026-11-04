@@ -75,7 +75,8 @@ The JSON is the request under a version:
 
 - `op` is `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`
   or `attach`; `params` holds what the user typed, unresolved. Namespace
-  defaults and `--after` run IDs resolve on the remote host.
+  defaults and `--after` and `--after-ready` run IDs resolve on the remote
+  host.
 - The client refuses, with exit 2 and before ssh starts, a `--cwd` that is not
   UTF-8 (JSON carries UTF-8 only) and a header over 1 MiB.
 - The client closes ssh stdin after the header, except for `push`, which then
@@ -90,10 +91,12 @@ The JSON is the request under a version:
 - `v` is the lowest version that carries the request
   (`remote_frame::min_frame_version`). Version 2 is version 1 with options a
   0.7 remote would ignore as unknown fields: `start --record-input` and
-  `--no-record`. A request that uses one goes as version 2, which a 0.7
+  `--no-record`, and the ready check (`start --ready-when-output`,
+  `--ready-when-port`, `--ready-within`, `--after-ready`, and
+  `wait --ready`). A request that uses one goes as version 2, which a 0.7
   remote refuses (`unsupported remote request version 2`, exit 2) instead of
   running it without the option; every other request goes as version 1. A
-  0.8 remote reads both.
+  0.8 remote reads every version from 1 to its own newest.
 - Otherwise the request runs as the same command typed on the remote host:
   stdout, stderr and exit code are the local command's, and `log -f` and
   `watch` stream. `attach` is the exception: the client keeps the terminal,

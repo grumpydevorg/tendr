@@ -3,7 +3,10 @@ use std::path::Path;
 use anyhow::Context;
 use tendr::model::boundary::BoundaryContext;
 use tendr::model::ids::{Namespace, SessionName};
-use tendr::model::spec::{ExecTarget, IoMode, LaunchSpec, RecordingPolicy, StdinMode};
+use tendr::model::ready::ReadyCheck;
+use tendr::model::spec::{
+    DependencyBinding, ExecTarget, IoMode, LaunchSpec, RecordingPolicy, StdinMode,
+};
 use tendr::platform::{Current, Platform};
 use tendr::session::{self, SessionRoot};
 
@@ -25,6 +28,8 @@ pub fn cmd_start(
     exec_target: Option<ExecTarget>,
     boundary: Option<BoundaryContext>,
     recording: RecordingPolicy,
+    ready: Option<ReadyCheck>,
+    after_ready: &[String],
 ) -> anyhow::Result<()> {
     let (meta, _session) = launch_session(
         name,
@@ -43,6 +48,8 @@ pub fn cmd_start(
         exec_target,
         boundary,
         recording,
+        ready,
+        after_ready,
     )?;
 
     let json = serde_json::to_string_pretty(&meta)?;
@@ -87,6 +94,8 @@ pub(crate) fn launch_session(
     exec_target: Option<ExecTarget>,
     boundary: Option<BoundaryContext>,
     recording: RecordingPolicy,
+    ready: Option<ReadyCheck>,
+    after_ready: &[String],
 ) -> anyhow::Result<(tendr::model::meta::Meta, session::SessionDir)> {
     let session_name = SessionName::new(name)?;
     let root = SessionRoot::default_path()?;
@@ -119,27 +128,29 @@ pub(crate) fn launch_session(
     launch_spec.on_exit = on_exit.to_vec();
     launch_spec.boundary = boundary;
     launch_spec.recording = recording;
+    launch_spec.ready = ready;
     if pty {
         launch_spec.io_mode = IoMode::Pty;
     }
     launch_spec.exec_target =
         exec_target.unwrap_or_else(|| infer_exec_target(&launch_spec.argv()[0]));
 
-    // Resolve --after: capture each dependency's run_id at bind time
-    if !after.is_empty() {
-        for dep_name in after {
-            let dep_session_name = SessionName::new(dep_name)?;
-            let dep_session = session::open(&root, namespace, &dep_session_name)?
-                .ok_or_else(|| anyhow::anyhow!("--after: session not found: {dep_name}"))?;
-            let dep_meta = session::read_meta(&dep_session)?;
-            launch_spec
-                .after
-                .push(tendr::model::spec::DependencyBinding {
-                    session: dep_session_name,
-                    run_id: dep_meta.run_id(),
-                });
+    // Resolve --after and --after-ready: capture each dependency's run_id at
+    // bind time.
+    for dep_name in after {
+        let (binding, _) = bind_dependency(&root, namespace, dep_name, "--after")?;
+        launch_spec.after.push(binding);
+    }
+    launch_spec.after_any_exit = !after.is_empty() && any_exit;
+    for dep_name in after_ready {
+        let (binding, dep_meta) = bind_dependency(&root, namespace, dep_name, "--after-ready")?;
+        if dep_meta.launch_spec().ready.is_none() {
+            anyhow::bail!(
+                "--after-ready: session {dep_name} has no ready condition \
+                 (start it with --ready-when-output or --ready-when-port)"
+            );
         }
-        launch_spec.after_any_exit = any_exit;
+        launch_spec.after_ready.push(binding);
     }
 
     // Create session directory (with idempotent handling)
@@ -173,6 +184,24 @@ pub(crate) fn launch_session(
 
     let meta = spawn_and_wait_ready_inner(&session, &launch_spec)?;
     Ok((meta, session))
+}
+
+/// Bind dependency `dep_name` to its current run, for `flag`.
+fn bind_dependency(
+    root: &SessionRoot,
+    namespace: &Namespace,
+    dep_name: &str,
+    flag: &str,
+) -> anyhow::Result<(DependencyBinding, tendr::model::meta::Meta)> {
+    let session_name = SessionName::new(dep_name)?;
+    let dep_session = session::open(root, namespace, &session_name)?
+        .ok_or_else(|| anyhow::anyhow!("{flag}: session not found: {dep_name}"))?;
+    let dep_meta = session::read_meta(&dep_session)?;
+    let binding = DependencyBinding {
+        session: session_name,
+        run_id: dep_meta.run_id(),
+    };
+    Ok((binding, dep_meta))
 }
 
 /// Split a `--env` entry into its key and value. The rule `start` applies

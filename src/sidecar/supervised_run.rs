@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::ready_check::ReadyCheck;
 use super::{
     AttachEndpoint, AttachSink, AttachSocketCleanup, LifecycleEvents, META_WRITE, PtyInput,
     PtyRecordingRun, PtyTeardown, ReadyWriter, StopGate, capture_stream, capture_stream_with_tee,
@@ -114,6 +115,8 @@ struct RunCore {
     ended: bool,
     /// Released after the terminal record is written, before the hooks run.
     lock: Option<LockGuard>,
+    /// The run's ready condition, checked from `Running` until the run ends.
+    ready_check: Option<ReadyCheck>,
 }
 
 /// A PTY run's attach side, in two phases, so what exists together is
@@ -196,6 +199,7 @@ impl SupervisedRun<Spawned> {
                 step: SidecarStep::Breadcrumb,
                 ended: false,
                 lock: Some(lock),
+                ready_check: None,
             },
             _phase: PhantomData,
         }
@@ -332,6 +336,19 @@ impl RunCore {
         self.signal_readiness();
         test_abort_point("after_running");
 
+        // Recover: a ready check that cannot run is a warning, never a failed
+        // run. Started once `Running` is on disk, which its record patches,
+        // and before capture, so it sees every output line.
+        if let Some(spec) = self.meta.launch_spec().ready.clone() {
+            match ReadyCheck::start(&spec, self.lifecycle.with_fresh_writer(), dir.clone()) {
+                Ok(check) => self.ready_check = Some(check),
+                Err(warning) => {
+                    self.meta.add_warning(warning);
+                    let _ = self.write_meta();
+                }
+            }
+        }
+
         if let Some(timeout_s) = self.meta.launch_spec().timeout_s {
             self.timed_out = setup_timeout(
                 self.kill_handle.clone(),
@@ -454,6 +471,9 @@ impl RunCore {
     /// lock after this write: either way `meta.json` ends up `Stopped`.
     fn write_meta(&mut self) -> Result<(), session::SessionError> {
         let _serialized = lock(&META_WRITE);
+        if let Some(outcome) = self.ready_check.as_ref().and_then(ReadyCheck::outcome) {
+            self.meta.set_ready(outcome);
+        }
         if let Some(PtySide::Started(pty)) = &self.pty {
             self.meta.set_pty_control(lock(&pty.control).clone());
             if let Some(run) = &pty.recording {
@@ -569,6 +589,13 @@ impl RunCore {
             _ => (None, None),
         };
         let recorder = recorder.as_ref();
+        // One matcher per stream: a PTY's assembles its own lines.
+        let matcher = || {
+            self.ready_check
+                .as_ref()
+                .and_then(ReadyCheck::output_matcher)
+        };
+        let (stdout_ready, stderr_ready) = (matcher(), matcher());
 
         let log_ref = &log;
         let (failed, failures) = std::sync::mpsc::channel();
@@ -577,12 +604,23 @@ impl RunCore {
             let stdout_handle = stdout.map(|s| match attach_sink {
                 Some(sink) => scope.spawn(move || {
                     test_pty_read_delay();
-                    capture_stream_with_tee(s, 'O', log_ref, &stdout_failed, &sink, recorder);
+                    capture_stream_with_tee(
+                        s,
+                        'O',
+                        log_ref,
+                        &stdout_failed,
+                        &sink,
+                        recorder,
+                        stdout_ready,
+                    );
                 }),
-                None => scope.spawn(move || capture_stream(s, 'O', log_ref, &stdout_failed)),
+                None => scope.spawn(move || {
+                    capture_stream(s, 'O', log_ref, &stdout_failed, stdout_ready);
+                }),
             });
-            let stderr_handle =
-                stderr.map(|s| scope.spawn(move || capture_stream(s, 'E', log_ref, &failed)));
+            let stderr_handle = stderr.map(|s| {
+                scope.spawn(move || capture_stream(s, 'E', log_ref, &failed, stderr_ready))
+            });
             // Ends once both capture threads have dropped their senders.
             for warning in failures {
                 self.meta.add_warning(warning);
@@ -602,6 +640,11 @@ impl RunCore {
 
     fn finish(&mut self, how: ExitReason) -> anyhow::Result<()> {
         self.ended = true;
+        // The ready outcome is final before the terminal record: nothing is
+        // recorded after the run's end.
+        if let Some(check) = &self.ready_check {
+            check.close();
+        }
         self.watch_cancel.store(true, Ordering::Relaxed);
         // A stop under way ends every process the run started before the
         // end is recorded.
@@ -688,6 +731,9 @@ impl RunCore {
         }
         self.ended = true;
         self.step = step;
+        if let Some(check) = &self.ready_check {
+            check.close();
+        }
         self.watch_cancel.store(true, Ordering::Relaxed);
 
         let stopped = terminate_and_reap(&mut self.child, &self.kill_handle, &self.identity);

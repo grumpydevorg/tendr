@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use super::boundary::BoundaryContext;
 use super::ids::{RunId, SessionName};
+use super::ready::ReadyCheck;
 
 fn is_false(b: &bool) -> bool {
     !b
@@ -113,6 +114,14 @@ pub struct LaunchSpec {
     /// output only hash identically to pre-feature specs.
     #[serde(default, skip_serializing_if = "RecordingPolicy::is_default")]
     pub recording: RecordingPolicy,
+    /// `--ready-when-*`: when the run counts as ready. Omitted when absent so
+    /// specs without one hash as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<ReadyCheck>,
+    /// `--after-ready`: dependencies to be ready before the child starts,
+    /// bound to run ids as `after` is. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after_ready: Vec<DependencyBinding>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,6 +148,8 @@ impl LaunchSpec {
             exec_target: ExecTarget::None,
             boundary: None,
             recording: RecordingPolicy::Output,
+            ready: None,
+            after_ready: vec![],
         })
     }
 
@@ -183,6 +194,9 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             boundary: Option<BoundaryContext>,
             #[serde(default)]
             recording: RecordingPolicy,
+            ready: Option<ReadyCheck>,
+            #[serde(default)]
+            after_ready: Vec<DependencyBinding>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -204,6 +218,8 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             exec_target: raw.exec_target,
             boundary: raw.boundary,
             recording: raw.recording,
+            ready: raw.ready,
+            after_ready: raw.after_ready,
         })
     }
 }

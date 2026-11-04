@@ -96,6 +96,8 @@ pub fn cmd_run(
         Some(tendr::model::spec::ExecTarget::None),
         None,                       // `run` does not expose --boundary
         RecordingPolicy::default(), // nor recording options, which need a PTY
+        None,                       // nor a ready check: a foreground run is waited for to its end
+        &[],
     )?;
 
     // Check for spawn failure.

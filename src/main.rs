@@ -133,6 +133,33 @@ enum Commands {
         /// Proceed even if dependency exits non-zero
         #[arg(long = "any-exit", requires = "after")]
         any_exit: bool,
+        /// Count the run as ready once a line of its output matches REGEX
+        #[arg(
+            long = "ready-when-output",
+            value_name = "REGEX",
+            group = "ready_when",
+            value_parser = parse_ready_regex
+        )]
+        ready_when_output: Option<String>,
+        /// Count the run as ready once a TCP connection to PORT on localhost succeeds
+        #[arg(
+            long = "ready-when-port",
+            value_name = "PORT",
+            group = "ready_when",
+            value_parser = clap::value_parser!(u16).range(1..)
+        )]
+        ready_when_port: Option<u16>,
+        /// Record a missed deadline if not ready DURATION after the child starts (30s, 2m)
+        #[arg(
+            long = "ready-within",
+            value_name = "DURATION",
+            value_parser = parse_duration,
+            requires = "ready_when"
+        )]
+        ready_within: Option<Duration>,
+        /// Wait for session(s) to be ready before starting (repeatable)
+        #[arg(long = "after-ready", value_name = "SESSION")]
+        after_ready: Vec<String>,
         /// Declared execution boundary as KIND:LABEL (host, container, vm, pod)
         #[arg(long, value_name = "KIND:LABEL")]
         boundary: Option<tendr::model::boundary::Boundary>,
@@ -268,6 +295,9 @@ enum Commands {
         /// Return when ANY session reaches terminal state (default: wait for ALL)
         #[arg(long)]
         any: bool,
+        /// Wait until the session(s) are ready (`start --ready-when-*`) instead of ended
+        #[arg(long)]
+        ready: bool,
     },
     /// Execute a command in a running shell session
     ///
@@ -795,6 +825,11 @@ fn parse_data_match(s: &str) -> Result<(String, String), String> {
         Some((key, value)) if !key.is_empty() => Ok((key.to_owned(), value.to_owned())),
         _ => Err("expected KEY=VALUE with a non-empty KEY".to_owned()),
     }
+}
+
+/// Check a `--ready-when-output` regex, so a bad one is a usage error.
+fn parse_ready_regex(s: &str) -> Result<String, tendr::model::ready::ReadyCheckError> {
+    tendr::model::ready::output_regex(s).map(|_| s.to_owned())
 }
 
 /// Resolve an optional namespace string into a `Namespace`, defaulting to "default".

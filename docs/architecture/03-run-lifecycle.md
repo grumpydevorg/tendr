@@ -116,7 +116,7 @@ evidence. A `Starting` meta has no `transition_provenance`.
 Lifecycle events carry the same `kind` as `data.provenance` (`"direct"` or
 `"inferred"`); see [07-event-protocol.md](07-event-protocol.md).
 
-## Dependency wait (`start --after`)
+## Dependency wait (`start --after`, `--after-ready`)
 
 The dependency wait happens while the run is in `Starting`. Before it starts,
 the sidecar writes `Starting` to `meta.json`. It then scans every dependency
@@ -138,8 +138,48 @@ whole wait.
 
 Each dependency is bound to `(session, run_id)`. If a pending dependency is
 replaced with `--replace`, the waiter fails. It never follows a different
-run. By default a dependency is satisfied only by `ExitedOk`; `--any-exit`
-accepts any terminal state.
+run. By default an `--after` dependency is satisfied only by `ExitedOk`;
+`--any-exit` accepts any terminal state. An `--after-ready` dependency is
+satisfied once its meta records `ready` as `Ready` (see
+[Ready check](#ready-check)); it fails the wait, as `DependencyFailed` with
+`dep_reason` `Failed`, if it records `Missed` or reaches a terminal state
+without being ready. `start` refuses an `--after-ready` dependency that has
+no ready condition.
+
+## Ready check
+
+`start --ready-when-output <regex>` or `--ready-when-port <port>` gives a run
+one ready condition, with an optional deadline, `--ready-within`. It is in
+the launch spec as `ready` (`src/model/ready.rs`), and is not a lifecycle
+state: the run stays `Running` whatever its outcome.
+
+The sidecar checks it (`src/sidecar/ready_check.rs`), from the moment
+`Running` is on disk until the run ends:
+
+- A thread of its own decides the outcome, once. For an output condition,
+  the capture threads offer each line to a matcher after they log it: a
+  pipe session's lines as `output.log` records them, a PTY session's lines,
+  ended by `\n` or `\r`, assembled across reads, and the line not yet ended.
+  The first match wakes the thread. For a port condition, the thread
+  connects to the port on `127.0.0.1` and `::1` every 200 ms.
+- On the condition holding it records `Ready`; on the deadline passing
+  first, `Missed`, and stops checking. The child keeps running either way.
+- The record is a `run.ready` or `run.ready_missed` event, then a patch of
+  `meta.json` `ready` (`{"state":"Ready","at":…}` or `Missed`), both under
+  the sidecar's meta write lock. The guard's own meta writes fold the
+  outcome in under the same lock, so none reverts it.
+- The run's end closes the check before the terminal event, so no outcome
+  is recorded after the end, and a record under way finishes first. Capture
+  has ended by then, so every output line has been offered: a match noted
+  is recorded before the close returns (the closer waits for it, unless the
+  thread has died), and a child that prints its ready line and exits at
+  once is ready. A port is only as current as its last probe, so one open
+  for less than 200 ms before the end may be missed.
+- A condition that cannot be checked (no thread) is a meta warning, never a
+  failed run.
+
+`wait --ready` reads the outcome from meta: 0 for `Ready`, 43 for `Missed`
+or a terminal run without one.
 
 ## The lifecycle guard
 

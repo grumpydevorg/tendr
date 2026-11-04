@@ -29,9 +29,9 @@ sequenceDiagram
 
 Notes:
 
-- With `--after`, the sidecar writes `Starting`, scans every dependency once,
-  and only then signals readiness. See
-  [03-run-lifecycle.md](03-run-lifecycle.md#dependency-wait-start---after).
+- With `--after` or `--after-ready`, the sidecar writes `Starting`, scans
+  every dependency once, and only then signals readiness. See
+  [03-run-lifecycle.md](03-run-lifecycle.md#dependency-wait-start---after---after-ready).
 - If spawn fails, the sidecar sends a `SpawnFailed` snapshot over the ready
   pipe and the CLI exits non-zero.
 - On Unix, the sidecar inherits only stdio (on `/dev/null`) and the ready
