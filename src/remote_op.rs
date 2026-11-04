@@ -458,6 +458,8 @@ impl TryFrom<&Commands> for RemoteOperation {
             Commands::Skill { .. } => return local("skill"),
             Commands::Sidecar { .. } => return local("_sidecar"),
             Commands::Remote => return local("_remote"),
+            #[cfg(windows)]
+            Commands::CtrlBreak { .. } => return local("_ctrl-break"),
         })
     }
 }

@@ -5,6 +5,7 @@
 //! a child that never ends by itself within a test (cleanup kills it).
 //! After tendr start returns, runs `tendr status <session>` to read the
 //! sidecar PID and writes it to the file path given as the fourth argv.
+//! When `tendr start` fails, exits with its code instead.
 //!
 //! Usage:
 //! ```text
@@ -13,6 +14,8 @@
 //!
 //! Env:
 //!   TEST_JOB_NAME — name of the Job Object created by the parent test
+//!   TEST_RUN_SCRIPT — when set, runs `tendr run <script>` in the foreground
+//!     instead, and exits with its code (`session` and the out path unused)
 #[cfg(windows)]
 fn main() {
     use std::process::{Command, exit};
@@ -54,6 +57,15 @@ fn main() {
         ));
     }
 
+    if let Ok(script) = std::env::var("TEST_RUN_SCRIPT") {
+        let status = Command::new(&tendr_bin)
+            .env("HOME", &home)
+            .args(["run", &script])
+            .status()
+            .unwrap_or_else(|e| die(&format!("tendr run spawn failed: {e}")));
+        exit(status.code().unwrap_or(2));
+    }
+
     // Spawn `tendr start` — inherits this process's job assignment.
     let status = Command::new(&tendr_bin)
         .env("HOME", &home)
@@ -69,7 +81,9 @@ fn main() {
         .status()
         .unwrap_or_else(|e| die(&format!("tendr start spawn failed: {e}")));
     if !status.success() {
-        die(&format!("tendr start exited non-zero: {status:?}"));
+        // tendr's own stderr has already passed through; its code is the
+        // test's to check.
+        exit(status.code().unwrap_or(2));
     }
 
     // Read sidecar PID from `tendr status <session>` (JSON output).

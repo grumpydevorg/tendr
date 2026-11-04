@@ -129,9 +129,34 @@
   `"terminator": "fragment"`, cut between characters, whose contents join to
   the original; a record cut short by the stream's end is marked `"eof"`.
   Line-feed records are unchanged.
+- **Windows: `start` over SSH fails when the session could not outlive the
+  connection.** Inside a job that forbids breakaway, as an SSH connection's
+  job may, the sidecar stayed in that job and could die with the
+  connection after `start` had reported success. `start` and
+  `run --detach` now exit 1 and say why. tendr knows it runs over SSH by
+  `SSH_CONNECTION`, which every process started from an SSH login
+  inherits. A foreground `run` is not refused: it lasts as long as its
+  caller anyway. A run's own job lets nothing leave, so a `tendr start`
+  inside a run started over SSH is refused too, and says the session would
+  end with the run. Outside SSH (Cargo, an IDE, a run), the session stays
+  in such a job as before. Over `--host` this needs the remote `tendr` at
+  0.8.0; an older one starts the session inside the job.
 
 ### Fixed
 
+- **Windows: a stop reaches what a child starts at once.** The child was
+  started and then put in its Job Object, so a process it started in that
+  moment could land outside the job, where no stop reached it. The child
+  now starts suspended, is put in the job, and only then runs.
+- **Windows: `kill` without a working sidecar stops the whole run, gently
+  first.** It used to terminate the child alone. It now finds the run by
+  its Job Object (or, from another Windows session, such as an SSH login
+  for a desktop's run, by the child's process tree), sends CTRL_BREAK,
+  waits up to 5 s and ends what is left. It still refuses a PID that now
+  names another process.
+- **Windows: a batch script whose path holds `^` or `%` is refused.** cmd
+  would expand them in the script's own path, which cannot be escaped, so
+  the start fails with an error, as Rust's standard library now does too.
 - **Commands no longer miss or delete a run that is still starting, once
   its sidecar holds the session.** A sidecar holds its session before it
   records the run, until the child is spawned. The window is widest on

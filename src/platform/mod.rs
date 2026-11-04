@@ -25,6 +25,17 @@ pub type Current = unix::UnixPlatform;
 #[cfg(windows)]
 pub type Current = windows::WindowsPlatform;
 
+/// How long a session must last, against the call that starts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLifetime {
+    /// `start`, or `run --detach`: the session must outlive the call. On
+    /// Windows, over SSH, a start that cannot ensure it fails.
+    Detached,
+    /// A foreground `run`: the call waits for the run, so the session only
+    /// has to last as long as its caller does.
+    Foreground,
+}
+
 /// Start an external program tendr runs on the caller's behalf (ssh,
 /// duckdb). Windows hands a child every inheritable handle in its parent, not
 /// just the stdio it is given, and the stdin, stdout and stderr tendr
@@ -98,6 +109,7 @@ pub trait Platform {
         tendr_bin: &Path,
         session_dir: &Path,
         ready_writer: &Self::ReadyWriter,
+        lifetime: SessionLifetime,
     ) -> io::Result<u32>;
 
     // --- Readiness channel ---
@@ -241,8 +253,14 @@ pub trait Platform {
 
     /// Kill an orphaned process by persisted identity (no live handle).
     ///
-    /// Used when the sidecar has crashed and we only have ProcessIdentity
-    /// from meta.json or the child_pid breadcrumb.
+    /// Used when the sidecar has crashed or does not answer, and we only
+    /// have ProcessIdentity from meta.json or the child_pid breadcrumb. A
+    /// PID that now names another process is refused, never signalled.
+    ///
+    /// - Unix: the child's process group, SIGTERM first unless `force`.
+    /// - Windows: the run's tree, found by the run's Job Object or by
+    ///   parent links from the child; CTRL_BREAK and up to 5 s first
+    ///   unless `force`.
     fn kill_orphan(id: &ProcessIdentity, force: bool) -> io::Result<()>;
 
     // --- Process identity ---

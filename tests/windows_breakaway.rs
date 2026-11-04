@@ -20,7 +20,7 @@
 
 mod harness;
 
-use harness::{Observation, poll_until, process_alive};
+use harness::{HANG, Home, Observation, poll_until, process_alive};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 use std::time::Duration;
@@ -123,7 +123,7 @@ fn sidecar_survives_parent_job_kill() {
         "TENDR_TEST_HELPER_BIN",
         env!("CARGO_BIN_EXE_test_breakaway_parent"),
     );
-    let home = tempfile::tempdir().expect("tempdir");
+    let home = Home::new();
     let session = format!("breakaway-{}", std::process::id());
     let sidecar_pid_out = home.path().join("sidecar_pid.txt");
     let job_name = format!("tendr-test-breakaway-{}", std::process::id());
@@ -182,45 +182,156 @@ fn sidecar_survives_parent_job_kill() {
     );
 }
 
-/// Fallback path: when the parent's job forbids breakaway, `tendr start`
-/// must still succeed. Without the fallback, CreateProcessW returns
-/// ERROR_ACCESS_DENIED and `tendr start` fails outright — strictly worse
-/// than the degraded case where the sidecar inherits the parent's lifetime.
+/// Over SSH, when the parent's job forbids breakaway, the sidecar would stay
+/// in the job and could die with it when the connection closes. `tendr
+/// start` fails instead, saying so, and leaves no session behind. Inside a
+/// tendr run (`TENDR_RUN_ID` set) the job is the run's, and the message
+/// says the session would end with the run.
 #[test]
-fn sidecar_spawn_succeeds_when_parent_job_forbids_breakaway() {
+fn start_over_ssh_fails_when_parent_job_forbids_breakaway() {
     let tendr_bin = resolve_bin("TENDR_TEST_BIN", env!("CARGO_BIN_EXE_tendr"));
     let helper_bin = resolve_bin(
         "TENDR_TEST_HELPER_BIN",
         env!("CARGO_BIN_EXE_test_breakaway_parent"),
     );
-    let home = tempfile::tempdir().expect("tempdir");
+    let cases = [
+        (None, "the session could not outlive this SSH connection"),
+        (
+            Some("01a1a72d-cc15-7ee0-ab7d-1a482793efe2"),
+            "the session could not outlive the tendr run it is started from",
+        ),
+    ];
+    for (i, (run_id, expected)) in cases.into_iter().enumerate() {
+        let home = Home::new();
+        let session = format!("no-breakaway-ssh-{}-{i}", std::process::id());
+        let sidecar_pid_out = home.path().join("sidecar_pid.txt");
+        let job_name = format!("tendr-test-no-breakaway-ssh-{}-{i}", std::process::id());
+
+        // KILL_ON_JOB_CLOSE only — explicitly NO BREAKAWAY_OK.
+        let job = create_named_job_with_limits(&job_name, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+
+        let mut helper = std::process::Command::new(&helper_bin);
+        helper
+            .arg(&tendr_bin)
+            .arg(home.path())
+            .arg(&session)
+            .arg(&sidecar_pid_out)
+            .env("TEST_JOB_NAME", &job_name)
+            .env("SSH_CONNECTION", "192.0.2.1 50000 192.0.2.2 22")
+            .env_remove("TENDR_RUN_ID");
+        if let Some(run_id) = run_id {
+            helper.env("TENDR_RUN_ID", run_id);
+        }
+        let out = helper.output().expect("spawn helper");
+        // SAFETY: `job` is a valid OwnedHandle; exit code 1 is arbitrary.
+        unsafe { TerminateJobObject(job.as_raw_handle() as _, 1) };
+        drop(job);
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "tendr start: {stderr}");
+        assert!(stderr.contains(expected), "stderr: {stderr}");
+        assert!(
+            !home
+                .path()
+                .join(format!(".tendr/sessions/default/{session}"))
+                .exists(),
+            "no session is left behind"
+        );
+    }
+}
+
+/// A foreground `tendr run` lasts as long as its caller anyway, so over SSH
+/// in a job that forbids breakaway it runs, in the job, rather than fail.
+#[test]
+fn foreground_run_over_ssh_runs_in_a_job_that_forbids_breakaway() {
+    let tendr_bin = resolve_bin("TENDR_TEST_BIN", env!("CARGO_BIN_EXE_tendr"));
+    let helper_bin = resolve_bin(
+        "TENDR_TEST_HELPER_BIN",
+        env!("CARGO_BIN_EXE_test_breakaway_parent"),
+    );
+    let home = Home::new();
+    // A `.py` script, as `cli_run`'s Windows tests run: `run` hands its
+    // canonical (`\\?\`) path to `py -3`.
+    let script = home.path().join("fg-ssh.py");
+    std::fs::write(&script, "print('fg-run-ok')\n").unwrap();
+    let job_name = format!("tendr-test-no-breakaway-run-{}", std::process::id());
+
+    // KILL_ON_JOB_CLOSE only — explicitly NO BREAKAWAY_OK.
+    let job = create_named_job_with_limits(&job_name, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+
+    let out = std::process::Command::new(&helper_bin)
+        .arg(&tendr_bin)
+        .arg(home.path())
+        .arg("unused")
+        .arg("unused")
+        .env("TEST_JOB_NAME", &job_name)
+        .env("TEST_RUN_SCRIPT", &script)
+        .env("SSH_CONNECTION", "192.0.2.1 50000 192.0.2.2 22")
+        .output()
+        .expect("spawn helper");
+    drop(job);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "tendr run: {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("fg-run-ok"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// Outside SSH, a job that forbids breakaway is its owner's choice (Cargo
+/// runs every test in one): `tendr start` succeeds and the session stays in
+/// the job.
+#[test]
+fn start_stays_in_a_job_that_forbids_breakaway_outside_ssh() {
+    let tendr_bin = resolve_bin("TENDR_TEST_BIN", env!("CARGO_BIN_EXE_tendr"));
+    let helper_bin = resolve_bin(
+        "TENDR_TEST_HELPER_BIN",
+        env!("CARGO_BIN_EXE_test_breakaway_parent"),
+    );
+    let home = Home::new();
     let session = format!("no-breakaway-{}", std::process::id());
     let sidecar_pid_out = home.path().join("sidecar_pid.txt");
     let job_name = format!("tendr-test-no-breakaway-{}", std::process::id());
 
     // KILL_ON_JOB_CLOSE only — explicitly NO BREAKAWAY_OK.
     let job = create_named_job_with_limits(&job_name, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+    let _session = KillSessionOnDrop {
+        tendr_bin: &tendr_bin,
+        home: home.path(),
+        session: &session,
+    };
 
-    let status = std::process::Command::new(&helper_bin)
+    let out = std::process::Command::new(&helper_bin)
         .arg(&tendr_bin)
         .arg(home.path())
         .arg(&session)
         .arg(&sidecar_pid_out)
         .env("TEST_JOB_NAME", &job_name)
-        .status()
+        .env_remove("SSH_CONNECTION")
+        .output()
         .expect("spawn helper");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "tendr start: {stderr}");
 
-    let succeeded = status.success();
-
-    // Cleanup before asserting.
-    force_kill_session(&tendr_bin, home.path(), &session);
+    let pid_str =
+        std::fs::read_to_string(&sidecar_pid_out).expect("read sidecar_pid_out from helper");
+    let sidecar_pid: u32 = pid_str.trim().parse().expect("parse sidecar pid");
     // SAFETY: `job` is a valid OwnedHandle; exit code 1 is arbitrary.
-    unsafe { TerminateJobObject(job.as_raw_handle() as _, 1) };
-    drop(job); // close job handle (Drop would do this anyway).
-
+    let ret = unsafe { TerminateJobObject(job.as_raw_handle() as _, 1) };
     assert!(
-        succeeded,
-        "tendr start should fall back to non-breakaway spawn when the \
-         parent's job forbids breakaway. Helper exit: {status:?}"
+        ret != 0,
+        "TerminateJobObject failed: {}",
+        std::io::Error::last_os_error()
+    );
+    drop(job);
+    assert!(
+        process_dies_within(sidecar_pid, HANG),
+        "sidecar pid {sidecar_pid} stayed in the job and ends with it"
     );
 }

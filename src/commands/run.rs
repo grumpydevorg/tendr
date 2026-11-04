@@ -99,6 +99,13 @@ pub fn cmd_run(
         None,                       // nor a ready check: a foreground run is waited for to its end
         &[],
         tendr::model::spec::LogDelimiter::Newline, // nor --log-delimiter
+        // A foreground run waits for its run, so the session need not
+        // outlive this call.
+        if effective_detach {
+            tendr::platform::SessionLifetime::Detached
+        } else {
+            tendr::platform::SessionLifetime::Foreground
+        },
     )?;
 
     // Check for spawn failure.
