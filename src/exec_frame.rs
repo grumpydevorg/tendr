@@ -59,10 +59,20 @@ pub fn unix_frame(argv: &[String], token: &str, block_id: &str) -> String {
 /// (especially Windows paths containing `\t`, `\U`, etc.) and in the user
 /// payload (single quotes, here-strings, etc.).
 ///
-/// The frame runs the decoded code via `[scriptblock]::Create($code)` (which
-/// makes arbitrary expressions / pipelines / multi-statement snippets work),
-/// partitions the merged success+error stream by object type to separate
-/// stderr from stdout, and writes a JSON result file atomically (tmp + Move).
+/// The frame dot-sources the decoded code via `. ([scriptblock]::Create(..))`
+/// (which makes arbitrary expressions / pipelines / multi-statement snippets
+/// work) in the REPL's own scope, so assignments and functions persist
+/// between calls as they would at the prompt. It partitions the merged
+/// success+error stream by object type to separate stderr from stdout, and
+/// writes a JSON result file atomically (tmp + Move).
+///
+/// Because the payload shares the frame's scope, the frame keeps its own
+/// state in one read-only variable, `$__tendr_frame`, and removes it when
+/// done: a payload that assigns or removes it gets an error (exit 1) rather
+/// than breaking every later exec. The dot-source sits in a one-pass
+/// `do {} while ($false)`, so a stray `break` or `continue` in the payload
+/// ends the payload, not the frame. `TENDR_BLOCK_ID` is set in the
+/// environment for the payload's duration only, as in [`unix_frame`].
 ///
 /// `result_path` is the absolute path to `{session_dir}/exec-results/{token}.json`.
 ///
@@ -73,11 +83,15 @@ pub fn unix_frame(argv: &[String], token: &str, block_id: &str) -> String {
 /// even when the syntax is already complete. With a single `\n` the line is
 /// echoed but never runs. See PowerShell/PowerShell#3223 for the upstream
 /// discussion of this pseudo-interactive behavior.
-pub fn powershell_frame(code: &str, result_path: &str) -> String {
+pub fn powershell_frame(code: &str, result_path: &str, block_id: &str) -> String {
+    debug_assert!(
+        block_id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
+        "block_id must be a uuid, got: {block_id}"
+    );
     let encoded_code = base64::engine::general_purpose::STANDARD.encode(code);
     let encoded_path = base64::engine::general_purpose::STANDARD.encode(result_path);
     format!(
-        "$_b = [Convert]::FromBase64String('{encoded_code}'); $_code = [System.Text.Encoding]::UTF8.GetString($_b); $_rp = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_path}')); $_tmp = \"$_rp.tmp\"; $_outBuf = New-Object System.Text.StringBuilder; $_errBuf = New-Object System.Text.StringBuilder; $_exit = 0; $LASTEXITCODE = $null; try {{ & ([scriptblock]::Create($_code)) 2>&1 | ForEach-Object {{ if ($_ -is [System.Management.Automation.ErrorRecord]) {{ [void]$_errBuf.AppendLine($_.ToString()) }} else {{ [void]$_outBuf.AppendLine(($_ | Out-String).TrimEnd()) }} }}; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ $_exit = $LASTEXITCODE }} elseif ($_errBuf.Length -gt 0) {{ $_exit = 1 }} }} catch {{ [void]$_errBuf.AppendLine($_.Exception.Message); $_exit = 1 }}; $_payload = @{{ exit_code = $_exit; cwd = (Get-Location).Path; stdout = $_outBuf.ToString(); stderr = $_errBuf.ToString() }} | ConvertTo-Json -Compress; [System.IO.File]::WriteAllText($_tmp, $_payload); [System.IO.File]::Move($_tmp, $_rp)\n\n"
+        "New-Variable -Name __tendr_frame -Option ReadOnly -Force -Value @{{ rp = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_path}')); out = New-Object System.Text.StringBuilder; err = New-Object System.Text.StringBuilder; rc = 0 }}; $env:TENDR_BLOCK_ID = '{block_id}'; $LASTEXITCODE = $null; try {{ do {{ . ([scriptblock]::Create([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_code}')))) 2>&1 | ForEach-Object {{ if ($_ -is [System.Management.Automation.ErrorRecord]) {{ [void]$__tendr_frame.err.AppendLine($_.ToString()) }} else {{ [void]$__tendr_frame.out.AppendLine(($_ | Out-String).TrimEnd()) }} }} }} while ($false); if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ $__tendr_frame.rc = $LASTEXITCODE }} elseif ($__tendr_frame.err.Length -gt 0) {{ $__tendr_frame.rc = 1 }} }} catch {{ [void]$__tendr_frame.err.AppendLine($_.Exception.Message); $__tendr_frame.rc = 1 }} finally {{ $env:TENDR_BLOCK_ID = $null }}; [System.IO.File]::WriteAllText(\"$($__tendr_frame.rp).tmp\", (@{{ exit_code = $__tendr_frame.rc; cwd = (Get-Location).Path; stdout = $__tendr_frame.out.ToString(); stderr = $__tendr_frame.err.ToString() }} | ConvertTo-Json -Compress)); [System.IO.File]::Move(\"$($__tendr_frame.rp).tmp\", $__tendr_frame.rp); Remove-Variable __tendr_frame -Force\n\n"
     )
 }
 
@@ -346,7 +360,7 @@ mod tests {
 
     #[test]
     fn powershell_side_channel_frame_encodes_code_and_path() {
-        let frame = powershell_frame("$x = 1; $x + 1", "/tmp/result.json");
+        let frame = powershell_frame("$x = 1; $x + 1", "/tmp/result.json", BLOCK);
         assert!(frame.contains("FromBase64String"));
         // Both code and path are base64-encoded — neither appears raw
         assert!(!frame.contains("$x = 1; $x + 1"));
@@ -362,7 +376,7 @@ mod tests {
         // Code with quotes, here-strings, backticks, $variables, multiline —
         // all handled by base64.
         let code = "$x = 'hello'; @\"\nvalue: $x\n\"@; `n";
-        let frame = powershell_frame(code, "/tmp/result.json");
+        let frame = powershell_frame(code, "/tmp/result.json", BLOCK);
         assert!(frame.contains("FromBase64String"));
         // Raw payload must not leak — these chars would break single-quoted PS strings.
         assert!(!frame.contains("@\""));
@@ -373,7 +387,7 @@ mod tests {
     fn powershell_side_channel_frame_handles_windows_paths() {
         // Windows path with backslashes and `\U` (which Python r-strings hate)
         // round-trips because we base64-encode the path.
-        let frame = powershell_frame("$x + 1", r"C:\Users\rick\exec-results\abc.json");
+        let frame = powershell_frame("$x + 1", r"C:\Users\rick\exec-results\abc.json", BLOCK);
         assert!(!frame.contains(r"C:\Users")); // path must not appear raw
         assert!(frame.contains("FromBase64String"));
         let encoded_path = base64::engine::general_purpose::STANDARD
@@ -386,8 +400,27 @@ mod tests {
         // The frame MUST end with `\n\n`. A single `\n` leaves the PS REPL
         // waiting for more input; the blank line forces it to flush the
         // parser and execute. See PowerShell/PowerShell#3223.
-        let frame = powershell_frame("$x + 1", "/tmp/r.json");
+        let frame = powershell_frame("$x + 1", "/tmp/r.json", BLOCK);
         assert!(frame.ends_with("\n\n"), "frame must end with two newlines");
+    }
+
+    #[test]
+    fn powershell_frame_exports_block_id_around_payload() {
+        // Set before the payload runs, cleared in `finally` after it (even
+        // when it throws), and before the result file is written.
+        let frame = powershell_frame("$x + 1", "/tmp/r.json", BLOCK);
+        let encoded_code = base64::engine::general_purpose::STANDARD.encode("$x + 1");
+        let set = frame
+            .find(&format!("$env:TENDR_BLOCK_ID = '{BLOCK}'"))
+            .expect("set present");
+        let payload = frame.find(&encoded_code).expect("payload present");
+        let clear = frame
+            .find("finally { $env:TENDR_BLOCK_ID = $null }")
+            .expect("clear in finally");
+        let result = frame.find("WriteAllText").expect("result write present");
+        assert!(set < payload, "set precedes payload");
+        assert!(payload < clear, "cleared after payload");
+        assert!(clear < result, "cleared before the result is written");
     }
 
     #[test]

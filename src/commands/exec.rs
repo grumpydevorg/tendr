@@ -592,9 +592,8 @@ fn run_exec(
     }
 
     let (framed, wait_mode) = match meta.launch_spec().exec_target {
-        // PosixShell is the only target that exports TENDR_BLOCK_ID; the
-        // REPL and PowerShell frames do not yet, and will when a consumer
-        // needs it.
+        // The shell frames export TENDR_BLOCK_ID; the REPL frames do not
+        // yet, and will when a consumer needs it.
         ExecTarget::PosixShell => (
             exec_frame::unix_frame(cmd, token, &block_id.to_string()),
             WaitMode::Sentinel,
@@ -608,7 +607,7 @@ fn run_exec(
                 .ok_or_else(|| anyhow::anyhow!("session path is not valid UTF-8"))?;
             let code = cmd.join("\n");
             (
-                exec_frame::powershell_frame(&code, result_path_str),
+                exec_frame::powershell_frame(&code, result_path_str, &block_id.to_string()),
                 WaitMode::SideChannel,
             )
         }

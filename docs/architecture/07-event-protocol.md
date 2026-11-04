@@ -67,6 +67,7 @@ dot, no empty segments, at most 128 bytes.
 | `pty.control_changed` | sidecar | PTY sessions ([04-pty-lane.md](04-pty-lane.md)). `data`: `control` (`HumanControl` or `AgentControl`), `trigger` and `epoch`, the controller epoch granted, or the one a detach released. `trigger` is `attach` (a human claimed a terminal nobody held), `takeover` (a human retired whoever held it), `resume` (a client whose connection was lost regained the control it held, at the next epoch; it may retire that client's own stale connection, but it is never a takeover) or `detach` (a human let go). |
 | `pty.input_revoked`, `recording.stopped` | sidecar | PTY sessions ([04-pty-lane.md](04-pty-lane.md)). CLI reconciliation also logs `recording.stopped` (reason `sidecar_lost`) for a lost sidecar. |
 | `exec.started`, `exec.result` | `exec` (`source: tendr.exec`) | `exec.result` holds the `ExecResult` fields. |
+| `segment.opened` | the writer whose append starts a new segment (`source: tendr.events`) | Written into every segment after the first, as its first record on Unix; on Windows usually first, see §3.3. `data`: `segment` (this segment's file name), `previous` (the full segment's file name) and `previous_bytes` (its size). It takes that writer's next `seq` and the `ts` of the event that follows it. |
 | `log.stdout`, `log.stderr` | `events --include-logs` | Derived at read time, never stored (§5.1). |
 | `cursor.bookmark` | `events --cursors` | Derived at read time, never stored (§5.2). |
 
@@ -114,12 +115,11 @@ Two environment variables chain events across processes:
 
 | Variable | Set by | Value |
 |---|---|---|
-| `TENDR_BLOCK_ID` | `exec` (POSIX shell target only, for the command's duration); `wrap` (valid `--event` kind only) | The call's fresh `block_id`. |
+| `TENDR_BLOCK_ID` | `exec` (POSIX shell and PowerShell targets, for the command's duration); `wrap` (valid `--event` kind only) | The call's fresh `block_id`. |
 | `TENDR_PARENT_EVENT_ID` | `wrap` (valid `--event` kind only) | The `id` of the event `wrap` will write after the child exits. |
 
 So a `tendr emit` run from a hook or an exec command chains to that block.
-Python REPL, PowerShell, DuckDB and NDJSON exec frames do not set
-`TENDR_BLOCK_ID`.
+Python REPL, DuckDB and NDJSON exec frames do not set `TENDR_BLOCK_ID`.
 A malformed value in either variable prints a warning on stderr and is
 ignored; it never fails the producer.
 
@@ -144,14 +144,15 @@ time from each session's segments.
 
 ### 3.2 Append protocol
 
-Every writer appends the same way (`append_line` in `src/events.rs`):
+Every writer appends the same way (`EventWriter::append` in `src/events.rs`):
 
-1. Pick the greatest `events/*.jsonl` by name. UUIDv7 names sort by creation
-   time, so that is the newest. If there is none, create one with
-   `create_new`; a writer that loses the race opens the winner's file.
-2. Open it with `append(true)`.
-3. On Unix, take `flock(LOCK_EX)` on `events/append.lock`, a separate lock
+1. On Unix, take `flock(LOCK_EX)` on `events/append.lock`, a separate lock
    file. Readers never take it. On Windows, take no lock.
+2. Pick the greatest `events/*.jsonl` by name. UUIDv7 names sort by creation
+   time, so that is the newest. Open it with `append(true)`.
+3. If there is none, or the newest has reached 64 MiB, create a new segment
+   with `create_new` (§3.3); a writer that loses the race opens the winner's
+   file. A new segment after a full one gets `segment.opened` first.
 4. Serialize the whole line and write it with one `write_all`. Sync it if
    the write is durable (§3.5). Release the lock.
 
@@ -163,8 +164,8 @@ Why each platform is safe:
   makes it a rule among tendr's own writers, and readers are never blocked.
 - On Windows, Rust's `OpenOptions::append` removes `FILE_WRITE_DATA`. That
   gives a documented atomic append per `WriteFile` across processes on NTFS.
-  `LockFileEx` would be mandatory and would block readers, so tendr does not
-  take it.
+  `LockFileEx` on a segment would be mandatory and would block readers, and
+  the append contract needs no lock, so session appends take none.
 - Session roots on NFS or SMB are not supported. `O_APPEND` is a documented
   race on NFS. The same applies to `output.log`.
 
@@ -175,8 +176,30 @@ silent loss into a visible gap.
 ### 3.3 Segments
 
 Segment files are never renamed. A segment's name is its permanent identity,
-so cursors (§5.2) need no inode or rename handling. Writers append to the
-newest segment and create one only when `events/` has none.
+so cursors (§5.2) need no inode or rename handling.
+
+- A segment is full at 64 MiB (`SEGMENT_ROTATE_BYTES`). The next append, by
+  whichever writer makes it, creates a new segment and writes
+  `segment.opened` (§1) into it, then its own event. A line is never split,
+  so a segment ends a little past 64 MiB.
+- The new segment's name sorts after the full one's. After a backwards clock
+  step (NTP, a restored snapshot) a fresh UUIDv7 would sort first, so the
+  name is then a UUIDv7 1 ms after the full segment's timestamp.
+- `segment.opened` uses the rotating writer's identity and next `seq`, so
+  per-writer `seq` stays contiguous, and the following event's `ts`, so the
+  merge (§4) keeps it first.
+- On Unix the lock makes one writer start each segment, and
+  `segment.opened` is always its first line. Windows takes no lock, so
+  `segment.opened` is the first line only in the common case: another writer
+  can append to the new segment between its creation and the
+  `segment.opened` write, and two writers can rotate at once and start two
+  segments, each with its own `segment.opened`. Readers merge every segment
+  by `(ts, writer, seq)`, so nothing is lost; later appends go to the
+  greater name.
+- Every segment is kept until the session is pruned or replaced (§3.7).
+  Blobs are not rotated.
+- Debug builds read `TENDR_TEST_EVENT_SEGMENT_BYTES` instead of 64 MiB, so
+  tests can cross the limit. Release builds read no variable.
 
 ### 3.4 Oversize spill
 
@@ -223,10 +246,18 @@ with `event_log_terminal` evidence
 
 ### 3.7 Retention
 
-`prune` deletes the session dir, and the events and blobs go with it.
-`--replace` also replaces the session dir, so a new generation starts a new
-event log. `prune` does not touch `~/.tendr/lost+found/` or
-`~/.tendr/callbacks/`.
+`prune` deletes the session dir, and every segment and blob goes with it.
+Until then a session keeps all its segments: nothing drops old segments, so
+nothing but a prune or replace invalidates a cursor (§5.2). `--replace` also
+replaces the session dir, so a new generation starts a new event log.
+
+`prune --older-than <duration>` also removes, with the same age:
+
+- lost+found events stamped (`ts`) before the cutoff (§7)
+- `~/.tendr/callbacks/<run_id>.json` files last written before it
+
+With `--namespace`, only that namespace's entries go. `prune --all` and
+`prune <name>` sweep neither.
 
 ## 4. Ordering and timestamps
 
@@ -277,7 +308,9 @@ tendr events [--namespace ns] [--session ns/name]... [--kind prefix]... \
 A cursor is an opaque URL-safe base64 token. Inside it is
 `{"v":1,"s":[["<ns>/<session>/events/<seg>.jsonl", offset], …]}`: a byte
 offset after the last fully read line of each segment. Segments are never
-renamed, so a cursor stays valid as long as its files exist.
+renamed, so a cursor stays valid as long as its files exist. A segment
+created after the cursor, such as one a rotation started, is not in it and
+is read from its start.
 
 - `--cursors` interleaves `cursor.bookmark` records into the output, every
   100 events or after 5 s idle.
@@ -364,15 +397,24 @@ attributable.
 The sidecar also uses lost+found when its own event log is unwritable
 (§3.6).
 
+`prune --older-than` removes lost+found events stamped before its cutoff
+(§3.7). It rewrites the file to `events.jsonl.tmp` and renames that over
+`events.jsonl`, or removes the file when nothing is left. Lines it cannot
+date or attribute, and an unfinished last line, are kept. Appenders and
+the sweep take `lost+found/append.lock` on every platform, and an appender
+takes it before it opens the file, so an append lands either before the
+sweep reads the file or in the new file; none is lost.
+
 ## 8. Remote and Windows
 
 - `events` and `emit` are local-only. `--host` rejects them. Merging several
   hosts' streams by `ts` is up to the consumer and is best-effort.
 - `emit`, `wrap` and `exec` run on the session's host, because the children
   run that host's tendr binary.
-- Windows uses the append contract in §3.2: `CREATE_NEW` races, no renames,
-  no lock. A PowerShell exec still uses its side-channel file; the CLI
-  writes `exec.result` after reading it.
+- Windows uses the append contract in §3.2 for session segments:
+  `CREATE_NEW` races, no renames, no lock. lost+found takes `LockFileEx` on
+  its separate `append.lock` (§7). A PowerShell exec still uses its
+  side-channel file; the CLI writes `exec.result` after reading it.
 
 ## 9. Failure modes
 
@@ -380,7 +422,7 @@ The sidecar also uses lost+found when its own event log is unwritable
 |---|---|
 | Torn line | Skipped and counted; `--strict` exits 65. The writer's `seq` shows a gap. |
 | Sidecar crash between event and meta write | Terminal transitions: the synced event survives and reconciliation heals meta (§3.6). A non-terminal event may exist without its meta update. |
-| Reader during a new segment | No race: segments are never renamed. |
+| Reader during a new segment | No race: segments are never renamed. A follower picks up a new segment at its next poll and reads it from the start. |
 | Clock step | `seq` keeps per-writer order. |
 | Slow consumer | No backpressure: the disk is the buffer, and writers never wait for readers. |
 | Follower whose segment is gone | Exit 44 with recovery advice (§5.2). |

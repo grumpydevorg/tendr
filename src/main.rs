@@ -428,13 +428,16 @@ enum Commands {
     ///
     /// Also removes attach sockets that sidecars killed outright left in
     /// ~/.tendr/sockets (counted as `sockets_removed`): only sockets no session
-    /// names, nothing listens on, and older than a minute.
+    /// names, nothing listens on, and older than a minute. With --older-than it
+    /// also removes ~/.tendr/lost+found events and ~/.tendr/callbacks results
+    /// older than DURATION (`lost_found_removed`, `callbacks_removed`).
     Prune {
         /// Sessions to delete, by name. They resolve in --namespace, or in
         /// `default`; a name that doesn't exist is reported and fails the command
         #[arg(conflicts_with_all = ["older_than", "all"])]
         names: Vec<String>,
-        /// Delete sessions ended more than DURATION ago (e.g. 7d, 24h, 30m)
+        /// Delete sessions ended more than DURATION ago (e.g. 7d, 24h, 30m),
+        /// and lost+found events and --on-exit results older than DURATION
         #[arg(long, value_parser = parse_duration, conflicts_with = "all")]
         older_than: Option<Duration>,
         /// Delete all terminal sessions regardless of age

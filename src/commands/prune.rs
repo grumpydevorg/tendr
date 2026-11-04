@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 
+use tendr::events::{self, LostFoundSweep};
+use tendr::model::event::EventTimestamp;
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::model::state::{ExitReason, RunStatus};
 use tendr::session::{self, SessionRoot};
@@ -20,8 +22,7 @@ pub fn cmd_prune(
 
     let root = SessionRoot::default_path()?;
     let sessions = session::list(&root, namespace)?;
-    let threshold_secs = older_than.map(|d| d.as_secs());
-    prune_sessions(&root, &sessions, threshold_secs, namespace, dry_run)?;
+    prune_sessions(&root, &sessions, older_than, namespace, dry_run)?;
     Ok(())
 }
 
@@ -55,18 +56,21 @@ pub fn cmd_prune_named(
 
 /// Apply prune's checks to each session, delete the eligible ones (unless
 /// `dry_run`), print one NDJSON line per session and a summary line, and return
-/// the names that did not exist.
+/// the names that did not exist. With `older_than`, also sweep lost+found
+/// events and `--on-exit` results older than that.
 fn prune_sessions(
     root: &SessionRoot,
     sessions: &[(Namespace, SessionName)],
-    threshold_secs: Option<u64>,
+    older_than: Option<Duration>,
     namespace: Option<&Namespace>,
     dry_run: bool,
 ) -> anyhow::Result<Vec<String>> {
-    let now_secs = std::time::SystemTime::now()
+    let now = SystemTime::now();
+    let now_secs = now
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let threshold_secs = older_than.map(|d| d.as_secs());
 
     let mut deleted: u64 = 0;
     let mut skipped: u64 = 0;
@@ -176,18 +180,101 @@ fn prune_sessions(
     // socket, so a dead sidecar's socket goes in the same run.
     let sockets_removed = sweep_attach_sockets(root, dry_run);
 
+    let mut lost_found = LostFoundSweep::default();
+    let mut callbacks = FileSweep::default();
+    if let (Some(older_than), Some(state_root)) = (older_than, root.state_root()) {
+        let cutoff = now.checked_sub(older_than).unwrap_or(std::time::UNIX_EPOCH);
+        lost_found = sweep_lost_found(state_root, cutoff, namespace, dry_run);
+        callbacks = sweep_callbacks(&state_root.join("callbacks"), cutoff, namespace, dry_run);
+    }
+    bytes_reclaimed += lost_found.bytes + callbacks.bytes;
+
     let summary = PruneOutput::Summary {
         deleted,
         skipped,
         failed,
         bytes_reclaimed,
         sockets_removed,
+        lost_found_removed: lost_found.events,
+        callbacks_removed: callbacks.files,
         dry_run,
         namespace: namespace.map(|ns| ns.as_str().to_owned()),
     };
     outln!("{}", serde_json::to_string(&summary).unwrap());
 
     Ok(not_found)
+}
+
+/// Remove (or with `dry_run`, count) lost+found events stamped before
+/// `cutoff`. A sweep that fails removes nothing and warns on stderr.
+fn sweep_lost_found(
+    state_root: &Path,
+    cutoff: SystemTime,
+    namespace: Option<&Namespace>,
+    dry_run: bool,
+) -> LostFoundSweep {
+    let since_epoch = cutoff
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let cutoff = EventTimestamp::from_parts(since_epoch.as_secs(), since_epoch.subsec_micros());
+    events::sweep_lost_found(state_root, cutoff, namespace, dry_run).unwrap_or_else(|e| {
+        eprintln!("tendr: lost+found not swept: {e}");
+        LostFoundSweep::default()
+    })
+}
+
+/// What [`sweep_callbacks`] removed, or in a dry run would remove.
+#[derive(Default)]
+struct FileSweep {
+    files: u64,
+    bytes: u64,
+}
+
+/// Remove (or with `dry_run`, count) the `--on-exit` results in `dir` last
+/// written before `cutoff`, only those of `namespace` when it is given. The
+/// sidecar writes each file once, after the run's hooks, so its age is the
+/// age of the result. A file that cannot be removed is left and named on
+/// stderr.
+fn sweep_callbacks(
+    dir: &Path,
+    cutoff: SystemTime,
+    namespace: Option<&Namespace>,
+    dry_run: bool,
+) -> FileSweep {
+    let mut swept = FileSweep::default();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return swept;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || !metadata.modified().is_ok_and(|m| m < cutoff) {
+            continue;
+        }
+        if let Some(namespace) = namespace {
+            let file_namespace = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|record| record["namespace"].as_str().map(str::to_owned));
+            if file_namespace.as_deref() != Some(namespace.as_str()) {
+                continue;
+            }
+        }
+        if !dry_run {
+            if let Err(e) = fs::remove_file(&path) {
+                eprintln!("tendr: {} not removed: {e}", path.display());
+                continue;
+            }
+        }
+        swept.files += 1;
+        swept.bytes += metadata.len();
+    }
+    swept
 }
 
 /// Remove (or with `dry_run`, count) attach sockets that sidecars killed
@@ -330,9 +417,15 @@ enum PruneOutput {
         deleted: u64,
         skipped: u64,
         failed: u64,
+        /// Bytes of the deleted sessions, lost+found events and `--on-exit`
+        /// results.
         bytes_reclaimed: u64,
         /// Orphaned attach sockets removed (or, in a dry run, found).
         sockets_removed: u64,
+        /// lost+found events removed (only with `--older-than`).
+        lost_found_removed: u64,
+        /// `--on-exit` result files removed (only with `--older-than`).
+        callbacks_removed: u64,
         dry_run: bool,
         namespace: Option<String>,
     },
