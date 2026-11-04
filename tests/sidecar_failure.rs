@@ -852,6 +852,42 @@ fn readiness_write_to_a_closed_reader_fails() {
     );
 }
 
+/// Neither end of a readiness channel can be inherited by a process this one
+/// starts: the sidecar spawn hands the sidecar its own copy of the write
+/// end. A stray copy of the read end held by a child another thread starts
+/// makes the write above succeed; a stray write end keeps the reader from
+/// seeing the sidecar die. On Windows the ends were once created inheritable
+/// and only the read end flagged after, so a concurrent spawn could take
+/// either. Checking the flags is deterministic where provoking that window
+/// is not.
+#[test]
+fn readiness_channel_ends_are_not_inheritable() {
+    let (reader, writer) = Current::ready_channel().expect("ready channel");
+    for (end, file) in [("read", &reader), ("write", &writer)] {
+        assert!(!inheritable(file), "the {end} end is inheritable");
+    }
+}
+
+#[cfg(unix)]
+fn inheritable(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: F_GETFD only reads the flags of a descriptor we hold.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    assert_ne!(flags, -1, "{}", std::io::Error::last_os_error());
+    flags & libc::FD_CLOEXEC == 0
+}
+
+#[cfg(windows)]
+fn inheritable(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+    let mut flags = 0;
+    // SAFETY: GetHandleInformation only reads the flags of a handle we hold.
+    let ok = unsafe { GetHandleInformation(file.as_raw_handle() as _, &mut flags) };
+    assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+    flags & HANDLE_FLAG_INHERIT != 0
+}
+
 /// The platform kill path the guard uses (`kill_child`, here driven by
 /// `--timeout`) reaches a PTY child, which is a session leader, and its group.
 #[cfg(unix)]
