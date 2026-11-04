@@ -729,9 +729,11 @@ enum ErrFence {
     /// on a PTY writes both streams as one.
     AnyStream,
     /// The stderr end marker on stderr: DuckDB's frame (DuckDB runs on pipes
-    /// only). A marker on stdout means DuckDB was put in safe mode, which
-    /// refuses the `.output stderr` before it; it fences nothing, so the
-    /// exec waits [`ERR_MARKER_GRACE`].
+    /// only). No SQL can redirect DuckDB's stderr, so the marker always
+    /// comes, and the exec waits for it however long it takes, up to its
+    /// deadline. A marker on stdout instead means DuckDB was put in safe
+    /// mode, which refuses the `.output stderr` before it; it fences nothing,
+    /// so the exec waits [`ERR_MARKER_GRACE`].
     Stderr,
     /// No marker: a DuckDB started in safe mode, whose frame has none. The
     /// exec waits [`ERR_MARKER_GRACE`].
@@ -750,9 +752,9 @@ impl ErrFence {
 }
 
 /// How long exec keeps reading after the stdout sentinel for stderr when no
-/// stderr end marker comes: when the session's stderr no longer reaches the
-/// sidecar (e.g. an earlier `push 'exec 2>/dev/null'`), and for a DuckDB in
-/// safe mode, which cannot print one to stderr.
+/// stderr end marker can be counted on: a shell's, whose stderr may no
+/// longer reach the sidecar (e.g. an earlier `push 'exec 2>/dev/null'`), and
+/// a DuckDB's in safe mode, which cannot print one to stderr.
 const ERR_MARKER_GRACE: Duration = Duration::from_secs(1);
 
 /// [`ERR_MARKER_GRACE`]. Debug builds accept `TENDR_TEST_ERR_MARKER_GRACE_MS`
@@ -768,9 +770,10 @@ fn err_marker_grace() -> Duration {
 /// interleave in no fixed order. The exec is complete once both the stdout
 /// sentinel and a stderr end marker that `fence` counts are logged; each pipe
 /// is logged in order, so nothing of the command's output can still be in
-/// flight (#92). Without such a marker, the exec is complete
-/// [`ERR_MARKER_GRACE`] after the sentinel; only a marker that should have
-/// come and did not draws a warning.
+/// flight (#92). DuckDB's marker is waited for up to the exec's deadline
+/// ([`ErrFence::Stderr`]); otherwise, without such a marker, the exec is
+/// complete [`ERR_MARKER_GRACE`] after the sentinel, and a shell's missing
+/// marker draws a warning.
 fn wait_sentinel_result(
     session: &SessionDir,
     session_name: &str,
@@ -842,18 +845,37 @@ fn wait_sentinel_result(
         let bytes = reader.read_line(&mut buf)?;
         if bytes == 0 {
             if let Some((code, cwd, seen_at)) = &sentinel {
+                let done = Some((*code, cwd.clone()));
+                if fence == ErrFence::Stderr && !unfenced_marker {
+                    // DuckDB always prints the marker on stderr here (no SQL
+                    // can redirect its stderr), so it is on its way: wait for
+                    // it, not for a while. Only the exec's deadline, or the
+                    // run ending (by then capture has logged both pipes),
+                    // ends the wait first.
+                    let ended = !matches!(
+                        session::read_meta(session)?.status(),
+                        RunStatus::Running { .. }
+                    );
+                    if deadline.is_some_and(|dl| Instant::now() >= dl) || ended {
+                        if !ended {
+                            eprintln!(
+                                "tendr exec: stderr end marker not seen by the deadline, \
+                                 so stderr may be incomplete"
+                            );
+                        }
+                        return Ok(result(&stdout_lines, &stderr_lines, done));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 if seen_at.elapsed() >= err_marker_grace() {
-                    if fence != ErrFence::None && !unfenced_marker {
+                    if fence == ErrFence::AnyStream {
                         eprintln!(
                             "tendr exec: stderr end marker not seen; the session's stderr \
                              may be redirected, so stderr may be incomplete"
                         );
                     }
-                    return Ok(result(
-                        &stdout_lines,
-                        &stderr_lines,
-                        Some((*code, cwd.clone())),
-                    ));
+                    return Ok(result(&stdout_lines, &stderr_lines, done));
                 }
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
