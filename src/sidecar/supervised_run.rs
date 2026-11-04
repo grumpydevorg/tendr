@@ -20,8 +20,7 @@
 //! runtime-validated (`transition.rs`), because a type parameter does not
 //! survive serialization.
 
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io;
 use std::marker::PhantomData;
 use std::num::NonZeroI32;
 use std::panic::AssertUnwindSafe;
@@ -529,10 +528,9 @@ impl RunCore {
         // recording, but the child's output must still be read, or it blocks
         // on a full pipe. Drain it.
         self.step = SidecarStep::OutputLog;
-        let log_path = self.session_dir().join("output.log");
         let opened = test_fault(SidecarStep::OutputLog.as_str())
-            .and_then(|()| OpenOptions::new().create(true).append(true).open(&log_path));
-        let log: Box<dyn Write + Send> = match opened {
+            .and_then(|()| crate::log_files::LogWriter::open(self.session_dir()));
+        let log: Box<dyn crate::log_files::LogSink> = match opened {
             Ok(file) => Box::new(file),
             Err(e) => {
                 self.meta.add_warning(format!(
@@ -578,7 +576,7 @@ impl RunCore {
     /// errors never fail supervision: the child's exit status is still
     /// meaningful. A failed `output.log` write becomes a meta warning while the
     /// run is live, once per stream.
-    fn capture_output(&mut self, log: Box<dyn Write + Send>) {
+    fn capture_output(&mut self, log: Box<dyn crate::log_files::LogSink>) {
         let log = Mutex::new(log);
         let stdout = Current::child_stdout(&mut self.child);
         let stderr = Current::child_stderr(&mut self.child); // None for PTY sessions
