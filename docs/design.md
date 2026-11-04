@@ -159,6 +159,34 @@ each was written and set aside; both are in Git at `83f83ab`
 (`docs/plans/backlog/content-addressable-storage.md` and
 `sidecar-control-protocol.md`).
 
+### Event logs rotate but keep every segment; `prune` owns retention
+
+*2026-11-04.* An event segment is full at 64 MiB and the next append starts a
+new one ([event protocol §3.3](architecture/07-event-protocol.md#33-segments)).
+Segments are never renamed, because cursors name them, and they are kept until
+the session is pruned: dropping old segments is the only operation that
+would invalidate a live cursor or lose history the log is the authority for
+(rule 4). So rotation bounds the size of each file, not of the session; a
+session that must stay small is pruned or replaced. The spec's option to keep
+only the newest N segments was not built. Source:
+`docs/plans/specs/event-protocol.md` §3.3 and §3.7.
+
+Any writer rotates, not only the sidecar as the spec proposed: a session's
+sidecar writes only at lifecycle transitions, while hooks and `emit` may
+append for weeks, so a sidecar-only rule would leave such a session in one
+growing segment. 64 MiB matches the PTY recording's segments. No long-running
+session data existed to measure. A synthetic one (`wrap --event hook.*` with
+a 1.8 KB hook payload writes about 4 KB per event) puts an agent session with
+pre- and post-tool hooks at about 29 MB per 10-hour day at one tool call
+every 10 s, and 230 MB per day at one every 3 s around the clock: a segment
+lasts from about 7 hours to a few days.
+
+`prune --older-than` sweeps `~/.tendr/lost+found` by each event's own `ts`,
+rewriting the one file under the lock its appenders take, rather than
+rotating it into dated files: the path stays the documented one, removal
+follows event time rather than file time, and nothing has to guess when a
+dated file is no longer being written.
+
 ### No platform supervisor
 
 *2026-03.* Tendr does not use systemd, launchd, Windows services or Task

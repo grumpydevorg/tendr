@@ -65,8 +65,8 @@ pub struct EventDraft {
 /// Appends events to one session's `events/` dir with a stable writer
 /// identity and per-writer contiguous `seq` starting at 1.
 ///
-/// `seq` is consumed even if an append fails: a gap in the log is honest
-/// (readers detect loss); a reused `seq` would be a lie.
+/// `seq` is consumed by every write attempt, even one that fails: a gap in
+/// the log is honest (readers detect loss); a reused `seq` would be a lie.
 #[derive(Debug)]
 pub struct EventWriter {
     session_dir: PathBuf,
@@ -100,25 +100,63 @@ impl EventWriter {
     /// `durable` forces the segment to stable storage before returning
     /// (`fdatasync`; `F_FULLFSYNC` on macOS via std).
     ///
+    /// When the append starts a new segment (spec §3.3), this writer first
+    /// writes the new segment's `segment.opened`, with the same `ts` and the
+    /// previous `seq`, so the merge order keeps it first.
+    ///
     /// # Errors
     /// Returns the underlying IO error; the payload is never silently dropped
     /// short of the append itself failing (blob failure degrades inline, §3.4).
     pub fn append(&mut self, draft: EventDraft, durable: bool) -> io::Result<Event> {
-        let seq = self.next_seq;
-        self.next_seq += 1;
         let (data, data_ref, truncated) =
             prepare_data(&self.session_dir, draft.data, draft.preview);
+        let events_dir = self.session_dir.join("events");
+        std::fs::create_dir_all(&events_dir)?;
+
+        // Picking, rotating and writing happen under one lock, so on Unix
+        // exactly one writer starts each new segment.
+        #[cfg(unix)]
+        let _lock = AppendLock::acquire(&events_dir)?;
+        let (mut file, rotation) = open_segment(&events_dir, segment_rotate_bytes())?;
+        let ts = EventTimestamp::now();
+
+        if let Some(rotation) = rotation {
+            let opened = Event {
+                v: ENVELOPE_VERSION,
+                id: Uuid7::new(),
+                ts,
+                kind: Kind::new(SEGMENT_OPENED).expect("segment.opened is grammatical"),
+                namespace: draft.namespace.clone(),
+                session: draft.session.clone(),
+                run_id: draft.run_id,
+                generation: draft.generation,
+                writer: self.writer,
+                seq: self.take_seq(),
+                source: Source::trusted(SEGMENT_SOURCE).expect("tendr.events is grammatical"),
+                block_id: None,
+                parent_id: None,
+                data: Some(serde_json::json!({
+                    "segment": rotation.segment,
+                    "previous": rotation.previous,
+                    "previous_bytes": rotation.previous_bytes,
+                })),
+                data_ref: None,
+                truncated: None,
+            };
+            write_line(&mut file, &opened)?;
+        }
+
         let event = Event {
             v: ENVELOPE_VERSION,
             id: draft.id.unwrap_or_default(), // Default mints a fresh v7
-            ts: EventTimestamp::now(),
+            ts,
             kind: draft.kind,
             namespace: draft.namespace,
             session: draft.session,
             run_id: draft.run_id,
             generation: draft.generation,
             writer: self.writer,
-            seq,
+            seq: self.take_seq(),
             source: draft.source,
             block_id: draft.block_id,
             parent_id: draft.parent_id,
@@ -126,8 +164,17 @@ impl EventWriter {
             data_ref,
             truncated,
         };
-        append_line(&self.session_dir, &event, durable)?;
+        write_line(&mut file, &event)?;
+        if durable {
+            file.sync_data()?;
+        }
         Ok(event)
+    }
+
+    fn take_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
     }
 }
 
@@ -270,45 +317,75 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Append one serialized event line — the whole spec §3.2 protocol:
-/// newest-segment pick / `create_new` race handling, `append(true)` open,
-/// advisory flock on `events/append.lock` (POSIX only; Windows relies on
-/// the documented `FILE_APPEND_DATA` atomic-append contract), single
-/// `write_all`, optional fdatasync.
-fn append_line(session_dir: &Path, event: &Event, durable: bool) -> io::Result<()> {
-    let events_dir = session_dir.join("events");
-    std::fs::create_dir_all(&events_dir)?;
+/// A writer starts a new segment once the newest one has reached this many
+/// bytes (spec §3.3). Every segment is kept until the session is pruned.
+pub const SEGMENT_ROTATE_BYTES: u64 = 64 << 20;
 
-    let mut line = serde_json::to_string(event).map_err(io::Error::other)?;
-    line.push('\n');
+/// The kind of the first record in every segment after the first (spec §3.3).
+pub const SEGMENT_OPENED: &str = "segment.opened";
 
-    let mut file = open_segment(&events_dir)?;
-    let _lock = SegmentLock::acquire(&events_dir)?;
-    file.write_all(line.as_bytes())?;
-    if durable {
-        file.sync_data()?;
-    }
-    Ok(())
+/// The source stamped on `segment.opened`: the event-log layer itself, not
+/// the producer whose append happened to start the segment.
+const SEGMENT_SOURCE: &str = "tendr.events";
+
+/// [`SEGMENT_ROTATE_BYTES`]. Debug builds accept
+/// `TENDR_TEST_EVENT_SEGMENT_BYTES`, so a test crosses the limit without
+/// writing 64 MiB.
+fn segment_rotate_bytes() -> u64 {
+    crate::test_timer::bytes_or_env("TENDR_TEST_EVENT_SEGMENT_BYTES", SEGMENT_ROTATE_BYTES)
 }
 
-/// Open the newest segment, creating the first one on demand.
-/// `create_new` losers re-list and open the winner's segment.
-fn open_segment(events_dir: &Path) -> io::Result<File> {
+/// Serialize one event and write it with a single `write_all` (spec §3.2).
+fn write_line(file: &mut File, event: &Event) -> io::Result<()> {
+    let mut line = serde_json::to_string(event).map_err(io::Error::other)?;
+    line.push('\n');
+    file.write_all(line.as_bytes())
+}
+
+/// A segment this append started because the newest one was full.
+struct Rotation {
+    segment: String,
+    previous: String,
+    previous_bytes: u64,
+}
+
+/// Open the newest segment for appending, or create one: the first segment
+/// when `events/` has none, or a new one when the newest has reached
+/// `rotate_at` bytes. Segments are never renamed (spec §3.3). `create_new`
+/// losers re-list and open the winner's segment.
+fn open_segment(events_dir: &Path, rotate_at: u64) -> io::Result<(File, Option<Rotation>)> {
     for _ in 0..8 {
+        let mut full: Option<(String, u64)> = None;
         if let Some(newest) = newest_segment(events_dir)? {
             match OpenOptions::new().append(true).open(&newest) {
-                Ok(f) => return Ok(f),
+                Ok(f) => {
+                    // By path: on Windows an append-only handle lacks
+                    // FILE_READ_ATTRIBUTES, which File::metadata needs.
+                    let bytes = std::fs::metadata(&newest)?.len();
+                    if bytes < rotate_at {
+                        return Ok((f, None));
+                    }
+                    full = Some((file_name(&newest), bytes));
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // pruned mid-pick
                 Err(e) => return Err(e),
             }
         }
-        let candidate = events_dir.join(format!("{}.jsonl", Uuid7::new()));
+        let name = segment_name_after(full.as_ref().map(|(previous, _)| previous.as_str()));
+        let candidate = events_dir.join(name);
         match OpenOptions::new()
             .create_new(true)
             .append(true)
             .open(&candidate)
         {
-            Ok(f) => return Ok(f),
+            Ok(f) => {
+                let rotation = full.map(|(previous, previous_bytes)| Rotation {
+                    segment: file_name(&candidate),
+                    previous,
+                    previous_bytes,
+                });
+                return Ok((f, rotation));
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue, // race loser
             Err(e) => return Err(e),
         }
@@ -316,6 +393,37 @@ fn open_segment(events_dir: &Path) -> io::Result<File> {
     Err(io::Error::other(
         "could not open an event segment after repeated races",
     ))
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// A file name for a new segment that sorts after `full`, the segment it
+/// replaces as the newest. Normally a fresh UUIDv7; after a backwards clock
+/// step (NTP, a restored snapshot) a fresh one would sort first, so every
+/// later append would find the full segment newest and rotate again. Then
+/// the name is a UUIDv7 1 ms after `full`'s timestamp.
+fn segment_name_after(full: Option<&str>) -> String {
+    let now = uuid::Uuid::now_v7();
+    let floor = full
+        .and_then(|name| name.strip_suffix(".jsonl"))
+        .and_then(|stem| uuid::Uuid::parse_str(stem).ok());
+    let id = match floor.and_then(|floor| floor.get_timestamp().filter(|_| now <= floor)) {
+        Some(ts) => {
+            let (secs, nanos) = ts.to_unix();
+            let millis = secs * 1_000 + u64::from(nanos / 1_000_000) + 1;
+            uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
+                uuid::NoContext,
+                millis / 1_000,
+                (millis % 1_000) as u32 * 1_000_000,
+            ))
+        }
+        None => now,
+    };
+    format!("{id}.jsonl")
 }
 
 /// The lexicographically greatest `events/*.jsonl` — UUIDv7 names sort by
@@ -333,23 +441,24 @@ fn newest_segment(events_dir: &Path) -> io::Result<Option<PathBuf>> {
     Ok(newest)
 }
 
-/// Advisory exclusive lock on `events/append.lock` for the duration of one
-/// append. A dedicated lock file, never the data file — readers never take
-/// it and are never blocked. POSIX only: on Windows `OpenOptions::append`
-/// strips `FILE_WRITE_DATA`, which gives a documented per-WriteFile
-/// atomic-append contract across processes; taking `LockFileEx` there would
-/// be mandatory and block tailers (spec §3.2).
-struct SegmentLock {
-    #[cfg(unix)]
+/// Exclusive lock on `<dir>/append.lock`, held until dropped. A dedicated
+/// lock file, never the data file, so readers never take it and are never
+/// blocked.
+///
+/// Session event appends take it on Unix only (spec §3.2): on Windows
+/// `OpenOptions::append` strips `FILE_WRITE_DATA`, which gives a documented
+/// per-`WriteFile` atomic-append contract across processes. lost+found takes
+/// it everywhere, because `prune` rewrites that file (spec §7).
+struct AppendLock {
     _file: File,
 }
 
-impl SegmentLock {
+impl AppendLock {
     #[cfg(unix)]
-    fn acquire(events_dir: &Path) -> io::Result<Self> {
+    fn acquire(dir: &Path) -> io::Result<Self> {
         use std::os::unix::io::AsRawFd;
 
-        let file = File::create(events_dir.join("append.lock"))?;
+        let file = File::create(dir.join("append.lock"))?;
         // SAFETY: file is an open File, so as_raw_fd() returns a valid fd.
         // LOCK_EX is a valid blocking-exclusive flock operation.
         let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -361,8 +470,22 @@ impl SegmentLock {
     }
 
     #[cfg(windows)]
-    fn acquire(_events_dir: &Path) -> io::Result<Self> {
-        Ok(Self {})
+    fn acquire(dir: &Path) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+
+        let file = File::create(dir.join("append.lock"))?;
+        let handle = file.as_raw_handle() as _;
+        // SAFETY: an all-zero OVERLAPPED is valid: it locks from offset 0.
+        let mut overlapped = unsafe { std::mem::zeroed() };
+        // SAFETY: handle is the open file's handle and overlapped outlives the
+        // call; a blocking exclusive lock of one byte.
+        let ret = unsafe { LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &mut overlapped) };
+        if ret == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Closing the handle releases the lock.
+        Ok(Self { _file: file })
     }
 }
 
@@ -657,8 +780,10 @@ pub fn project_log_line(
 
 /// Append a fully-addressed event to `<tendr-root>/lost+found/events.jsonl`
 /// (spec §7): emits from a process whose session dir was pruned or replaced
-/// keep their data without resurrecting the session dir. Nothing removes it
-/// yet (docs/plans/backlog/log-retention.md).
+/// keep their data without resurrecting the session dir.
+///
+/// The lock is taken before the file is opened, so a line never goes to a
+/// file that [`sweep_lost_found`] has just replaced.
 ///
 /// # Errors
 /// Returns IO errors from creating or appending to the lost+found log.
@@ -669,10 +794,158 @@ pub fn append_lost_found(tendr_root: &Path, event: &Event) -> io::Result<()> {
     let mut line = serde_json::to_string(event).map_err(io::Error::other)?;
     line.push('\n');
 
+    let _lock = AppendLock::acquire(&dir)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("events.jsonl"))?;
-    let _lock = SegmentLock::acquire(&dir)?;
+        .open(dir.join(LOST_FOUND_FILE))?;
     file.write_all(line.as_bytes())
+}
+
+const LOST_FOUND_FILE: &str = "events.jsonl";
+
+/// What [`sweep_lost_found`] removed, or in a dry run would remove.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LostFoundSweep {
+    /// Events removed.
+    pub events: u64,
+    /// Bytes of the removed lines.
+    pub bytes: u64,
+}
+
+/// The fields a sweep needs from a lost+found line; the rest is ignored.
+#[derive(Deserialize)]
+struct DatedLine {
+    ts: EventTimestamp,
+    namespace: String,
+}
+
+/// Remove the lost+found events stamped before `cutoff` (spec §7), only
+/// those of `namespace` when it is given. A line the sweep cannot date or
+/// attribute, and an unfinished last line, are kept.
+///
+/// The file is streamed twice under the lock appenders take before they
+/// open it: once to count, then, when something expires, into a temporary
+/// file that is renamed over the original. So an append either lands before
+/// the sweep reads the file or goes to the new file, and memory stays at
+/// one line. Nothing is written when nothing is removed or `dry_run` is set.
+///
+/// # Errors
+/// Returns IO errors from locking, reading or replacing the file.
+pub fn sweep_lost_found(
+    tendr_root: &Path,
+    cutoff: EventTimestamp,
+    namespace: Option<&Namespace>,
+    dry_run: bool,
+) -> io::Result<LostFoundSweep> {
+    let dir = tendr_root.join("lost+found");
+    let path = dir.join(LOST_FOUND_FILE);
+    if !path.is_file() {
+        return Ok(LostFoundSweep::default());
+    }
+    let _lock = AppendLock::acquire(&dir)?;
+    let expired = |line: &[u8]| {
+        line.ends_with(b"\n")
+            && serde_json::from_slice::<DatedLine>(line).is_ok_and(|dated| {
+                dated.ts < cutoff
+                    && namespace.is_none_or(|namespace| dated.namespace == namespace.as_str())
+            })
+    };
+
+    let mut swept = LostFoundSweep::default();
+    let mut kept_any = false;
+    let counted = for_each_line(&path, |line| {
+        if expired(line) {
+            swept.events += 1;
+            swept.bytes += line.len() as u64;
+        } else {
+            kept_any = true;
+        }
+        Ok(())
+    });
+    match counted {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(LostFoundSweep::default()),
+        Err(e) => return Err(e),
+    }
+
+    if swept.events == 0 || dry_run {
+        return Ok(swept);
+    }
+    if !kept_any {
+        std::fs::remove_file(&path)?;
+        return Ok(swept);
+    }
+    let tmp = dir.join(format!("{LOST_FOUND_FILE}.tmp"));
+    let mut out = io::BufWriter::new(File::create(&tmp)?);
+    for_each_line(&path, |line| {
+        if expired(line) {
+            Ok(())
+        } else {
+            out.write_all(line)
+        }
+    })?;
+    let file = out.into_inner().map_err(io::IntoInnerError::into_error)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, &path)?;
+    Ok(swept)
+}
+
+/// Call `f` with each line of `path`, its `\n` included; an unfinished last
+/// line comes without one.
+fn for_each_line(path: &Path, mut f: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+    use std::io::BufRead;
+
+    let mut reader = io::BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        f(&line)?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After a backwards clock step the full segment's name is in the future.
+    /// The segment that replaces it must still sort after it, or every later
+    /// append finds the full one newest and rotates again.
+    #[test]
+    fn rotation_after_a_backwards_clock_step_sorts_after_the_full_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let events_dir = tmp.path();
+        let day_ahead = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86_400;
+        let future = uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, day_ahead, 0));
+        let full = events_dir.join(format!("{future}.jsonl"));
+        std::fs::write(&full, vec![b'x'; 1_000]).unwrap();
+
+        let mut rotations = 0;
+        for _ in 0..3 {
+            let (mut file, rotation) = open_segment(events_dir, 1_000).unwrap();
+            rotations += usize::from(rotation.is_some());
+            file.write_all(b"{}\n").unwrap();
+        }
+
+        assert_eq!(
+            rotations, 1,
+            "one rotation, then appends to the new segment"
+        );
+        let newest = newest_segment(events_dir).unwrap().unwrap();
+        assert!(
+            newest > full,
+            "{} sorts after {}",
+            newest.display(),
+            full.display()
+        );
+        assert_eq!(std::fs::read(&newest).unwrap(), b"{}\n{}\n{}\n");
+    }
 }

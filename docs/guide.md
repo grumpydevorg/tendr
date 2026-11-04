@@ -517,7 +517,13 @@ sidecar still holds it after 2 s, they return anyway with a warning on stderr.
 
 **Pruning.** `prune` deletes only finished sessions. Names resolve in
 `--namespace`, or in `default`. `--dry-run` shows what it would delete. It also
-removes stale attach sockets in `~/.tendr/sockets`.
+removes stale attach sockets in `~/.tendr/sockets`. With `--older-than`, it
+also removes events in `~/.tendr/lost+found` stamped longer ago than that, and
+`--on-exit` results in `~/.tendr/callbacks` written longer ago; the summary
+line counts them as `lost_found_removed` and `callbacks_removed`, and their
+bytes in `bytes_reclaimed`. A session's event log starts a new segment file
+every 64 MiB and keeps them all until the session is pruned
+([session storage](architecture/02-session-storage.md#limits)).
 
 **Hooks.** `--on-exit` splits its command into argv like a shell would, but
 runs no shell: no variable expansion, pipes or `&&`. Put that logic in a
