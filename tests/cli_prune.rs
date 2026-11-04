@@ -545,6 +545,139 @@ fn prune_names_conflict_with_all_and_older_than() {
     }
 }
 
+// ── PTY recordings (`--recordings-older-than`, `--recordings-max`) ──────
+
+/// A PTY session's recording directory, from its metadata.
+#[cfg(unix)]
+fn recording_dir(root: &Home, name: &str) -> std::path::PathBuf {
+    let dir = session_dir(root, "default", name);
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+    dir.join(meta["pty"]["recording"]["dir"].as_str().unwrap())
+}
+
+/// Finished runs lose their recordings, those past `--recordings-older-than`
+/// first and then, oldest first, those over `--recordings-max`; their
+/// sessions stay, and metadata says when the recording went. A running
+/// run's recording is never deleted, though it counts toward the cap.
+#[cfg(unix)]
+#[test]
+fn prune_recordings_deletes_only_finished_runs_recordings() {
+    use harness::{HANG, Observation, poll_until};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    for name in ["rec-old", "rec-new"] {
+        let out = tendr(&root)
+            .args(["start", name, "--pty", "--", "sh", "-c", "printf finished"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        drop(harness::wait_terminal_quiescent_ns(&root, "default", name));
+    }
+    backdate_ended_at(&root, "default", "rec-old", 10 * 86_400);
+    backdate_ended_at(&root, "default", "rec-new", 3_600);
+    tendr(&root)
+        .args([
+            "start",
+            "rec-live",
+            "--pty",
+            "--",
+            "sh",
+            "-c",
+            "printf live; exec cat",
+        ])
+        .output()
+        .unwrap();
+    wait_running(&root, "rec-live");
+    let live = poll_until(HANG, std::time::Duration::from_millis(20), || {
+        let dir = session_dir(&root, "default", "rec-live").join("recording");
+        match std::fs::read_dir(&dir).ok().and_then(|mut d| d.next()) {
+            Some(_) => Observation::Ready(recording_dir(&root, "rec-live")),
+            None => Observation::Pending(format!("{} is empty", dir.display())),
+        }
+    })
+    .unwrap();
+    let (old, new) = (
+        recording_dir(&root, "rec-old"),
+        recording_dir(&root, "rec-new"),
+    );
+
+    let prune = |args: &[&str]| {
+        let out = tendr(&root).arg("prune").args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        parse_ndjson(&out.stdout)
+    };
+    let deleted = |lines: &[serde_json::Value]| -> Vec<(String, String)> {
+        lines
+            .iter()
+            .filter(|l| l["type"] == "recording" && l["action"] == "delete")
+            .map(|l| {
+                (
+                    l["session"].as_str().unwrap().to_owned(),
+                    l["reason"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let running = |lines: &[serde_json::Value]| {
+        lines
+            .iter()
+            .any(|l| l["session"] == "rec-live" && l["skip_reason"] == "running")
+    };
+
+    let dry = prune(&["--recordings-older-than", "7d", "--dry-run"]);
+    assert_eq!(
+        deleted(&dry),
+        [("rec-old".to_owned(), "older_than".to_owned())]
+    );
+    assert!(old.exists(), "a dry run deletes nothing");
+
+    let lines = prune(&["--recordings-older-than", "7d"]);
+    assert_eq!(
+        deleted(&lines),
+        [("rec-old".to_owned(), "older_than".to_owned())]
+    );
+    assert!(running(&lines), "{lines:?}");
+    assert!(!old.exists() && new.exists() && live.exists());
+    let status = tendr(&root).args(["status", "rec-old"]).output().unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    // Unix seconds, written like `ended_at`.
+    let deleted_at = status["pty"]["recording"]["deleted_at"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(deleted_at.parse::<u64>().is_ok(), "{status}");
+
+    let lines = prune(&["--recordings-max", "0"]);
+    assert_eq!(
+        deleted(&lines),
+        [("rec-new".to_owned(), "over_max".to_owned())]
+    );
+    assert!(running(&lines), "{lines:?}");
+    assert!(!new.exists() && live.exists());
+    let summary = lines.last().unwrap();
+    assert_eq!(summary["type"], "recording_summary");
+    assert!(summary["bytes_kept"].as_u64().unwrap() > 0, "{summary}");
+    for name in ["rec-old", "rec-new"] {
+        assert!(
+            session_dir(&root, "default", name)
+                .join("meta.json")
+                .exists()
+        );
+    }
+    tendr(&root)
+        .args(["kill", "rec-live", "--force"])
+        .output()
+        .unwrap();
+}
+
 // ── orphaned attach sockets (PR #68 review, finding 5) ─────────────────
 
 /// Make an attach-socket file at `path` with no listener, as a SIGKILLed

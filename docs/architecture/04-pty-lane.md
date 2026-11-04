@@ -802,7 +802,11 @@ tendr that bridges them to the session's socket
 
 Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
 (`0700` directories, `0600` segments). The byte format is in
-[08-pty-recording-format.md](08-pty-recording-format.md).
+[08-pty-recording-format.md](08-pty-recording-format.md). The launch spec's
+`recording` field chooses what: output and window sizes (the default, left
+out of the spec), those and input (`start --record-input`), or nothing
+(`start --no-record`, which starts no recorder and leaves `pty.recording`
+out of `meta.json`).
 
 - Capture offers every output chunk to the recorder.
 - The input writer applies each resize while holding the recorder's
@@ -820,7 +824,11 @@ Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
   on SIGWINCH at an unchanged size, but redraws fully on each of the pair
   ([measured](../../scripts/pty-vm/README.md#claude-code-in-a-tendr-pty) on
   an exe.dev VM). A sidecar that predates the frame ignores it.
-- Input is not recorded.
+- With `--record-input`, the input writer writes input while holding the
+  recorder's sequencer too, and records the bytes the terminal accepted as
+  `INPUT`: whatever reaches the child from an attach, a takeover or a `push`.
+  So the child's echo is always recorded after the input it answers. Input
+  the writer drops (revoked, or never written) is not recorded.
 - Sequencing never waits for storage. One recorder thread appends, rotates
   segments at 64 MiB, publishes each segment atomically, and syncs at most
   one second apart and on close.
@@ -851,12 +859,37 @@ Each PTY run is recorded exactly, under `<session>/recording/<run_id>/`
   follow the run's terminal event. The segments on disk hold the complete
   recording.
 
-`cargo run --example dump-recording -- <path>` prints a recording as text.
+`tendr replay <path>` plays a recording in the user's terminal, and
+`tendr replay --export asciicast <path>` writes it as asciicast v2
+(`src/commands/replay.rs`; [guide](../guide.md#replay-a-recording)).
 `<path>` is a segment file, a run's recording directory, or a session
-directory. It prints one line per record with output bytes escaped, and flags
-terminal queries and mode changes, including ones split across records. It is
-a development tool over the library's `recording::dump`, not part of the
-`tendr` binary. Its layout is not a stable interface.
+directory. Both decode the whole recording with `recording::decode_recording`
+first, so a damaged one is refused with its file and byte offset before
+anything is shown, and a final segment cut off inside a record ends at its
+last complete record. Playback writes only `OUTPUT` records, paced by their
+`elapsed_ns` (scaled by `--speed`, or not at all with `--no-delay`), in raw
+mode through the attach client's terminal layer (`commands::terminal`), and
+reads and drops whatever the terminal sends: query replies, and keys other
+than Ctrl-C (the byte, or kitty's or `modifyOtherKeys`' encoding of it, which
+a recorded program may have switched the terminal to). After the last record
+it drains the keyboard until it has been quiet for 100 ms (at most 1 s), so
+replies to the last queries do not reach the shell, then writes the
+`TermModes` reset for what it played, and restores the terminal. Geometry
+follows `USER` resizes only; `REPAINT` records play nothing. The export
+decodes output and input as UTF-8 incrementally, each stream on its own, and
+writes every applied resize as an `r` event, repaints included.
+
+`cargo run --example dump-recording -- <path>` prints a recording as text,
+for the same paths. It prints one line per record with output bytes escaped,
+and flags terminal queries and mode changes, including ones split across
+records. It is a development tool over the library's `recording::dump`, not
+part of the `tendr` binary. Its layout is not a stable interface.
+
+`tendr prune --recordings-older-than <duration>` and `--recordings-max
+<size>` delete finished runs' segment directories, oldest run end first for
+the cap, and set `pty.recording.deleted_at` in `meta.json` while holding the
+session's lock. A session that is locked or not terminal keeps its
+recording, which still counts toward the cap.
 
 ## Exec on a PTY session
 

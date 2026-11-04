@@ -1,7 +1,7 @@
-//! The user's terminal as the attach client drives it: the platform layer
-//! under the client core ([`super::client`]). The core touches no file
-//! descriptor, signal or console API; everything it needs from the terminal
-//! goes through these traits.
+//! The user's terminal as the attach client and `replay` drive it: the
+//! platform layer under the attach client core (`attach::client`) and the
+//! player (`replay`). They touch no file descriptor, signal or console API;
+//! everything they need from the terminal goes through these traits.
 //!
 //! - [`Terminal`]: the terminal's state, taken by [`open`] before anything
 //!   that may change it starts (ssh shares the terminal), and turned into
@@ -101,18 +101,18 @@ pub(super) trait Raw {
     fn output(&self) -> Arc<dyn Output>;
 }
 
-/// The terminal an attach drives, its state taken now: the user's, whose
+/// The terminal `command` drives, its state taken now: the user's, whose
 /// stdin must be a terminal, or in debug builds the test terminal that
 /// `TENDR_TEST_ATTACH_TERMINAL` selects ([`pipe`]). Called before anything
 /// with a side effect, a takeover or ssh included.
 ///
 /// # Errors
 /// When stdin is not a terminal, or the terminal's state cannot be read.
-pub(super) fn open() -> anyhow::Result<Box<dyn Terminal>> {
+pub(super) fn open(command: &str) -> anyhow::Result<Box<dyn Terminal>> {
     if let Some(pipe) = pipe::from_env()? {
         return Ok(Box::new(pipe));
     }
-    require_terminal()?;
+    require_terminal(command)?;
     #[cfg(unix)]
     let terminal = unix::UnixTerminal::open()?;
     #[cfg(windows)]
@@ -141,12 +141,12 @@ pub(super) fn none() -> Box<dyn Terminal> {
     Box::new(unix::Absent)
 }
 
-/// An attach drives the terminal on stdin.
-fn require_terminal() -> anyhow::Result<()> {
+/// `command` drives the terminal on stdin.
+fn require_terminal(command: &str) -> anyhow::Result<()> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
         Ok(())
     } else {
-        anyhow::bail!("attach requires an interactive terminal on stdin")
+        anyhow::bail!("{command} requires an interactive terminal on stdin")
     }
 }

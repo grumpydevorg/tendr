@@ -43,6 +43,9 @@ pub struct PtyRecording {
     pub input_recorded: bool,
     #[serde(flatten)]
     pub state: RecordingState,
+    /// When `tendr prune --recordings-…` deleted the segments, if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<super::ids::EpochTimestamp>,
 }
 
 /// Where a recording stands. Sequences are recording sequence numbers.
@@ -112,6 +115,7 @@ mod tests {
                 last_synced_sequence: None,
                 reason,
             },
+            deleted_at: None,
         }
     }
 

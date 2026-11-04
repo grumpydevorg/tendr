@@ -242,7 +242,8 @@ fn host_start_records_every_field_and_hostile_value_exactly() {
         "pod:C:\\x",
     ];
     if cfg!(unix) {
-        args.push("--pty");
+        // A version 2 request: the remote must read it, not drop the option.
+        args.extend(["--pty", "--record-input"]);
     }
     args.extend([name, "--"]);
     args.extend(argv);
@@ -262,6 +263,9 @@ fn host_start_records_every_field_and_hostile_value_exactly() {
     assert_eq!(spec["namespace"], ns);
     assert_eq!(spec["stdin_mode"], "Pipe");
     assert_eq!(spec["io_mode"], if cfg!(unix) { "Pty" } else { "Pipe" });
+    if cfg!(unix) {
+        assert_eq!(spec["recording"], "output_and_input");
+    }
     assert_eq!(spec["exec_target"], "PowerShell");
     assert_eq!(spec["timeout_s"], 600);
     assert_eq!(spec["cwd"], cwd_str);
@@ -707,8 +711,8 @@ fn remote_entry_refuses_bad_requests_without_side_effects() {
         ("not an object", frame(b"[1,2]"), "invalid remote request"),
         (
             "unknown version",
-            frame(br#"{"v":2,"op":"list","params":{"namespace":null}}"#),
-            "unsupported remote request version 2",
+            frame(br#"{"v":3,"op":"list","params":{"namespace":null}}"#),
+            "unsupported remote request version 3",
         ),
         (
             "unknown operation",

@@ -5,6 +5,7 @@ use anyhow::Context;
 use tendr::directive::{self, Directives};
 use tendr::log::{LogQuery, follow_log};
 use tendr::model::ids::Namespace;
+use tendr::model::spec::RecordingPolicy;
 use tendr::model::state::{ExitReason, RunStatus};
 use tendr::session;
 
@@ -93,7 +94,8 @@ pub fn cmd_run(
         &effective.namespace,
         false, // pty not supported via `run`
         Some(tendr::model::spec::ExecTarget::None),
-        None, // `run` does not expose --boundary
+        None,                       // `run` does not expose --boundary
+        RecordingPolicy::default(), // nor recording options, which need a PTY
     )?;
 
     // Check for spawn failure.

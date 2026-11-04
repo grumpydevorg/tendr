@@ -150,3 +150,27 @@ fn launch_spec_unset_env_round_trips_and_changes_the_hash() {
     assert_eq!(back, spec);
     assert_ne!(spec.canonical_hash(), plain.canonical_hash());
 }
+
+// --- recording policy ---
+
+#[test]
+fn launch_spec_recording_policy_round_trips_and_changes_the_hash() {
+    use tendr::model::spec::{LaunchSpec, RecordingPolicy};
+
+    let plain = LaunchSpec::new(vec!["bash".into()]).unwrap();
+    for (policy, wire) in [
+        (RecordingPolicy::OutputAndInput, "output_and_input"),
+        (RecordingPolicy::Off, "off"),
+    ] {
+        let mut spec = plain.clone();
+        spec.recording = policy;
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            json.contains(&format!(r#""recording":"{wire}""#)),
+            "json: {json}"
+        );
+        let back: LaunchSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec);
+        assert_ne!(spec.canonical_hash(), plain.canonical_hash());
+    }
+}

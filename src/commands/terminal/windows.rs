@@ -50,12 +50,12 @@ use super::{Input, Output, Raw, Terminal};
 const CP_UTF8: u32 = 65001;
 
 /// What a console that cannot take virtual terminal modes is told.
-const NO_VIRTUAL_TERMINAL: &str = "attach needs a console that understands virtual terminal \
+const NO_VIRTUAL_TERMINAL: &str = "tendr needs a console that understands virtual terminal \
      sequences: Windows 10 1809 or later, in Windows Terminal or a conhost window, with the \
      console's \"Use legacy console\" setting off";
 
 /// What stdin that is a terminal but not a console (mintty's pipes) is told.
-const NOT_A_CONSOLE: &str = "attach needs a Windows console on stdin: run it in Windows \
+const NOT_A_CONSOLE: &str = "tendr needs a Windows console on stdin: run it in Windows \
      Terminal or a conhost window (mintty, Git Bash's terminal, gives programs pipes, not a \
      console)";
 
