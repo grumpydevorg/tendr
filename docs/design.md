@@ -140,6 +140,15 @@ stores and orders these events. It does not decide what they mean (rule 1):
 tool with lifecycle hooks can report its state without tendr carrying
 tool-specific code. Source: `docs/plans/specs/tender-as-block-runtime.md`.
 
+*2026-11-04.* A caller waits for one such event with `tendr events --follow
+--max-count N`, narrowed by `--data key=value` and bounded by `--timeout`. The
+match is generic: stored fields, no agent knowledge. It lives in tendr because
+a follow piped into `grep -m1` or `jq` does not end while the producer is
+silent: the follower notices the closed pipe only at its next write. `--data`
+reads only the stored `data`, never a spilled payload's blob, so matching
+stays a read of the log line; callers project payloads under the 16 KiB cap.
+Source: PR #217, measured with Claude Code in 2026-10 and 2026-11.
+
 ### No daemon: one sidecar per run, and files are the truth
 
 *2026-03, confirmed for the event log 2026-07-06.* Each run has its own

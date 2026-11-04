@@ -377,6 +377,17 @@ enum Commands {
         /// established and initial replay is flushed (requires --follow)
         #[arg(long = "ready-file", requires = "follow")]
         ready_file: Option<PathBuf>,
+        /// Print only events whose data has this top-level field equal to
+        /// VALUE (a string, or a number as JSON writes it); repeatable, all
+        /// must match
+        #[arg(long = "data", value_name = "KEY=VALUE", value_parser = parse_data_match)]
+        data: Vec<(String, String)>,
+        /// Exit 0 after printing N matching events (requires --follow)
+        #[arg(long = "max-count", value_name = "N", requires = "follow")]
+        max_count: Option<std::num::NonZeroUsize>,
+        /// Exit 124 if this passes first, e.g. 30s or 10m (requires --follow)
+        #[arg(long, value_parser = parse_duration, requires = "follow")]
+        timeout: Option<Duration>,
     },
     /// Query the event log with DuckDB SQL (analytical surface)
     ///
@@ -778,6 +789,14 @@ fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
     humantime::parse_duration(s)
 }
 
+/// Parse `--data KEY=VALUE`, splitting at the first `=`.
+fn parse_data_match(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.to_owned(), value.to_owned())),
+        _ => Err("expected KEY=VALUE with a non-empty KEY".to_owned()),
+    }
+}
+
 /// Resolve an optional namespace string into a `Namespace`, defaulting to "default".
 /// Used by commands that always operate in exactly one namespace.
 fn resolve_namespace(namespace: Option<String>) -> anyhow::Result<Namespace> {
@@ -1099,6 +1118,9 @@ fn main() {
             include_logs,
             strict,
             ready_file,
+            data,
+            max_count,
+            timeout,
         } => commands::cmd_events(commands::EventsOptions {
             namespace,
             sessions,
@@ -1113,6 +1135,9 @@ fn main() {
             include_logs,
             strict,
             ready_file,
+            data,
+            max_count,
+            timeout,
         }),
         Commands::Query {
             sql,

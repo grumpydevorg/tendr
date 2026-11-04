@@ -59,6 +59,19 @@
   hosts and a session started by 0.8.0; with an older remote or session
   the attach reconnects as before and says nothing of the input.
 
+- **`tendr events --follow` can end on a match.** `--max-count N` exits 0
+  once N events are printed, `--timeout <duration>` exits 124 if it passes
+  first, and `--data key=value` keeps only events whose data has that
+  top-level field. A caller can now push a prompt to an agent and block until
+  its turn ends with one command and a deadline, where a follow piped into
+  `grep -m1` never ended while the agent was silent. `--data` cannot match
+  the fields of a payload over 16 KiB: project payloads with `jq` first.
+- **`tendr guide agent-turns`** shows how to drive an interactive agent such
+  as Claude Code under tendr: hooks that `emit` into the event log, the
+  submit rule, the permission signals, reading the result, and what the
+  events cannot prove. The herdr guide no longer says every agent belongs
+  outside tendr: that holds for agents a person watches.
+
 ### Changed
 
 - **PowerShell `exec` keeps variables and functions between calls.** Each

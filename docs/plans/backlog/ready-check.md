@@ -38,7 +38,7 @@ deadline passes first.
 - Whether a missed deadline stops the child, and with what end reason, or only
   records the miss.
 - How callers wait: `start` blocks until ready, `wait` gets an option, or both.
-  The [interactive agent turns](interactive-agent-turns.md) plan proposes a way
-  for `events --follow` to exit on its first matching event, which would also
-  wait for a `run.ready` event.
+  `tendr events --follow --max-count 1` (see the guide's agent-turn section)
+  already exits on its first matching event, so it can wait for a `run.ready`
+  event.
 - How `--after` chooses between "exited" and "ready" for a dependency.

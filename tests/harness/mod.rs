@@ -976,15 +976,15 @@ impl ReadyFollower {
             }))
         };
 
-        // `Ready(Some(status))` is an exit before readiness.
-        let ready = poll_until(HANG, Duration::from_millis(10), || {
-            if ready_path.exists() {
-                return Observation::Ready(None);
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => Observation::Ready(Some(status)),
-                _ => Observation::Pending(format!("ready-file {} absent", ready_path.display())),
-            }
+        // `Ready(Some(status))` is an exit before readiness. The exit is
+        // checked first and the file after it, so a follower that publishes
+        // its ready-file and then exits at once (`--max-count`, `--timeout`)
+        // is never mistaken for one that exited before readiness.
+        let ready = poll_until(HANG, Duration::from_millis(10), || match child.try_wait() {
+            Ok(Some(_)) if ready_path.exists() => Observation::Ready(None),
+            Ok(Some(status)) => Observation::Ready(Some(status)),
+            _ if ready_path.exists() => Observation::Ready(None),
+            _ => Observation::Pending(format!("ready-file {} absent", ready_path.display())),
         });
         let failure = match ready {
             Ok(None) => None,
@@ -1049,6 +1049,24 @@ impl ReadyFollower {
     /// stream reached the point you care about.
     pub fn records(&self) -> Vec<serde_json::Value> {
         self.records.lock().unwrap().clone()
+    }
+
+    /// Wait for a follower that ends by itself (`--max-count`, `--timeout`)
+    /// to exit, then return its exit code and every record it printed.
+    /// Panics at [`HANG`].
+    pub fn wait_exit(mut self) -> (Option<i32>, Vec<serde_json::Value>) {
+        let status = poll_until(HANG, Duration::from_millis(10), || {
+            match self.child.try_wait() {
+                Ok(Some(status)) => Observation::Ready(status),
+                _ => Observation::Pending("still following".to_owned()),
+            }
+        })
+        .unwrap_or_else(|e| panic!("follower `{}` did not exit: {e}", self.label));
+        // The pipes reach EOF with the child gone: every record is in.
+        if let Some(handle) = self.stdout_reader.take() {
+            let _ = handle.join();
+        }
+        (status.code(), self.records())
     }
 
     /// Kill and reap the follower, consuming the handle.

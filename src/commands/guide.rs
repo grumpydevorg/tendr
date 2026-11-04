@@ -27,6 +27,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("cgroup", "Cap a session's memory"),
     ("herdr", "inside herdr"),
     ("replay", "Replay a recording"),
+    ("agent-turns", "Drive an agent turn"),
 ];
 
 pub fn cmd_guide(topic: Option<&str>) -> anyhow::Result<()> {
@@ -80,7 +81,8 @@ fn available_topics() -> String {
 /// Parse an ATX Markdown heading line into `(level, text)`. A heading is a line
 /// with 0–3 leading spaces, then 1–6 `#` characters, then a space. This rejects
 /// `#` glued to text (a shell comment like `#foo`) and 4-space-indented lines
-/// (Markdown code blocks), so `#` characters inside code fences never slice.
+/// (Markdown code blocks). Lines inside code fences are never headings either;
+/// [`headings`] skips them, since a shell comment like `# step 1` parses here.
 fn parse_heading(line: &str) -> Option<(usize, &str)> {
     let indent = line.bytes().take_while(|&b| b == b' ').count();
     if indent > 3 {
@@ -98,23 +100,40 @@ fn parse_heading(line: &str) -> Option<(usize, &str)> {
     Some((level, after.trim()))
 }
 
+/// Each line's heading, if it is one outside a ``` or ~~~ code fence.
+fn headings<'a>(lines: &[&'a str]) -> Vec<Option<(usize, &'a str)>> {
+    let mut in_fence = false;
+    lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+                return None;
+            }
+            if in_fence { None } else { parse_heading(line) }
+        })
+        .collect()
+}
+
 /// Slice the section beginning at the first heading whose text contains `needle`
 /// (case-insensitive), running to the next heading of the same or higher level
 /// (or end of document). Returns `None` when no heading matches.
 fn slice_section(guide: &str, needle: &str) -> Option<String> {
     let needle = needle.to_lowercase();
     let lines: Vec<&str> = guide.lines().collect();
+    let headings = headings(&lines);
 
-    let (start, level) = lines.iter().enumerate().find_map(|(i, line)| {
-        let (level, text) = parse_heading(line)?;
+    let (start, level) = headings.iter().enumerate().find_map(|(i, heading)| {
+        let (level, text) = (*heading)?;
         text.to_lowercase().contains(&needle).then_some((i, level))
     })?;
 
-    let end = lines
+    let end = headings
         .iter()
         .enumerate()
         .skip(start + 1)
-        .find(|(_, line)| parse_heading(line).is_some_and(|(lvl, _)| lvl <= level))
+        .find(|(_, heading)| heading.is_some_and(|(lvl, _)| lvl <= level))
         .map_or(lines.len(), |(i, _)| i);
 
     Some(lines[start..end].join("\n").trim_end().to_string())
@@ -146,9 +165,10 @@ mod tests {
     fn each_needle_matches_exactly_one_heading() {
         for (topic, needle) in TOPICS {
             let needle_lc = needle.to_lowercase();
-            let matches = GUIDE
-                .lines()
-                .filter_map(parse_heading)
+            let lines: Vec<&str> = GUIDE.lines().collect();
+            let matches = headings(&lines)
+                .into_iter()
+                .flatten()
                 .filter(|(_, text)| text.to_lowercase().contains(&needle_lc))
                 .count();
             assert_eq!(
@@ -156,6 +176,15 @@ mod tests {
                 "topic '{topic}' needle '{needle}' must match exactly one heading, matched {matches}"
             );
         }
+    }
+
+    /// A shell comment such as `# 1. Wait …` inside a code fence must not end
+    /// the section it sits in.
+    #[test]
+    fn comment_in_a_code_fence_does_not_slice() {
+        let guide = "## A\n\n```bash\n# 1. step\nrun\n```\n\nafter\n\n## B\n\nb\n";
+        let section = slice_section(guide, "A").unwrap();
+        assert!(section.ends_with("after"), "section: {section}");
     }
 
     #[test]
