@@ -112,7 +112,8 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
     without the warning: such an exec takes a second longer. Each refusal
     (`.output/.once/.excel cannot be used in -safe mode`), which is what a
     session put in safe mode with `.safe_mode` prints for the frame's
-    `.output`, is dropped from stderr; there the marker comes on stdout.
+    `.output`, is dropped from stderr. There the marker comes on stdout,
+    where it says nothing about stderr, so `exec` waits the second too.
   - Either marker may end a line rather than start one, when the command's
     last output has no newline. The bytes before the marker are command
     output.
