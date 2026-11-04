@@ -1,11 +1,18 @@
 mod harness;
 
-use harness::{tendr, wait_running, wait_terminal};
+use harness::{HANG, SessionGuard, tendr, wait_running, wait_terminal};
 use predicates::prelude::*;
 use std::sync::Mutex;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// `kill` waits this long (ms) for the sidecar to record the kill before it
+/// kills the child itself; the tests below that expect the sidecar's record
+/// raise it from 11 s to the hang deadline, so load cannot send them there.
+fn kill_wait_ms() -> String {
+    HANG.as_millis().to_string()
+}
 
 #[test]
 fn kill_running_process() {
@@ -13,12 +20,14 @@ fn kill_running_process() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "kill-job", "sleep", "60"])
+        .args(["start", "kill-job", "sleep", "3600"])
         .assert()
         .success();
+    let _session = SessionGuard::new(&root, "kill-job");
     wait_running(&root, "kill-job");
 
     tendr(&root)
+        .env("TENDR_TEST_KILL_WAIT_MS", kill_wait_ms())
         .args(["kill", "kill-job"])
         .assert()
         .success()
@@ -32,12 +41,14 @@ fn kill_force() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "force-job", "sleep", "60"])
+        .args(["start", "force-job", "sleep", "3600"])
         .assert()
         .success();
+    let _session = SessionGuard::new(&root, "force-job");
     wait_running(&root, "force-job");
 
     tendr(&root)
+        .env("TENDR_TEST_KILL_WAIT_MS", kill_wait_ms())
         .args(["kill", "--force", "force-job"])
         .assert()
         .success();
@@ -83,15 +94,17 @@ fn kill_preserves_child_identity() {
     let root = TempDir::new().unwrap();
 
     let start_out = tendr(&root)
-        .args(["start", "preserve-kill", "sleep", "60"])
+        .args(["start", "preserve-kill", "sleep", "3600"])
         .output()
         .unwrap();
     let start_meta: serde_json::Value =
         serde_json::from_slice(&start_out.stdout).expect("not JSON");
     let start_pid = start_meta["child"]["pid"].as_u64().unwrap();
+    let _session = SessionGuard::new(&root, "preserve-kill");
     wait_running(&root, "preserve-kill");
 
     let kill_out = tendr(&root)
+        .env("TENDR_TEST_KILL_WAIT_MS", kill_wait_ms())
         .args(["kill", "preserve-kill"])
         .output()
         .unwrap();
@@ -107,12 +120,14 @@ fn status_shows_killed_after_kill() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "status-kill", "sleep", "60"])
+        .args(["start", "status-kill", "sleep", "3600"])
         .assert()
         .success();
+    let _session = SessionGuard::new(&root, "status-kill");
     wait_running(&root, "status-kill");
 
     tendr(&root)
+        .env("TENDR_TEST_KILL_WAIT_MS", kill_wait_ms())
         .args(["kill", "status-kill"])
         .assert()
         .success();
@@ -125,11 +140,11 @@ fn status_shows_killed_after_kill() {
         .stdout(predicate::str::contains(r#""reason": "Killed"#));
 }
 
-/// Start `sleep 60` as `name` and return the pids of its sidecar and child.
+/// Start `sleep 3600` as `name` and return the pids of its sidecar and child.
 #[cfg(unix)]
 fn start_sleeper(root: &TempDir, name: &str) -> (libc::pid_t, libc::pid_t) {
     let out = tendr(root)
-        .args(["start", name, "sleep", "60"])
+        .args(["start", name, "sleep", "3600"])
         .output()
         .unwrap();
     let meta: serde_json::Value = serde_json::from_slice(&out.stdout).expect("not JSON");
@@ -160,11 +175,13 @@ fn kill_fails_when_the_run_does_not_end() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let (sidecar, _) = start_sleeper(&root, "stuck-kill");
-    let _session = harness::SessionGuard::new(&root, "stuck-kill");
+    let _session = SessionGuard::new(&root, "stuck-kill");
     // SAFETY: the pid is the test's own sidecar.
     unsafe { libc::kill(sidecar, libc::SIGSTOP) };
     let _resume = ResumeOnDrop(sidecar);
 
+    // A timer that fires: the stopped sidecar never records the end, so
+    // `kill`'s own waits are its only way out (no TENDR_TEST_KILL_WAIT_MS).
     let out = tendr(&root).args(["kill", "stuck-kill"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -183,7 +200,7 @@ fn kill_records_the_end_of_a_run_whose_sidecar_is_gone() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let (sidecar, child) = start_sleeper(&root, "lost-kill");
-    let _session = harness::SessionGuard::new(&root, "lost-kill");
+    let _session = SessionGuard::new(&root, "lost-kill");
     // SAFETY: the pid is the test's own sidecar.
     unsafe { libc::kill(sidecar, libc::SIGKILL) };
     harness::wait_pid_dead(sidecar);
@@ -208,7 +225,7 @@ fn kill_records_the_end_of_a_starting_run_whose_sidecar_is_gone() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     start_sleeper(&root, "lost-dep");
-    let _dep = harness::SessionGuard::new(&root, "lost-dep");
+    let _dep = SessionGuard::new(&root, "lost-dep");
     tendr(&root)
         .args([
             "start",
@@ -220,7 +237,7 @@ fn kill_records_the_end_of_a_starting_run_whose_sidecar_is_gone() {
         ])
         .assert()
         .success();
-    let _session = harness::SessionGuard::new(&root, "lost-starting");
+    let _session = SessionGuard::new(&root, "lost-starting");
     let meta_path = root
         .path()
         .join(".tendr/sessions/default/lost-starting/meta.json");

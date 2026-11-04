@@ -12,15 +12,20 @@ fn start_returns_promptly_not_blocked_by_child() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    // Returning at all — under the shared hang deadline, well before the 60s
-    // child exits — proves `start` did not block on the child, i.e. the ready
+    // Returning at all — under the shared hang deadline, which the child
+    // outlives — proves `start` did not block on the child, i.e. the ready
     // pipe fd was not leaked into it. No fragile wall-clock upper bound needed.
     tendr(&root)
-        .args(["start", "prompt-test", "sleep", "60"])
+        .args(["start", "prompt-test", "sleep", "3600"])
         .assert_within_deadline()
         .success();
+    let _session = harness::SessionGuard::new(&root, "prompt-test");
 
     tendr(&root)
+        .env(
+            "TENDR_TEST_KILL_WAIT_MS",
+            harness::HANG.as_millis().to_string(),
+        )
         .args(["kill", "--force", "prompt-test"])
         .assert()
         .success();

@@ -998,17 +998,27 @@ fn test_fault(point: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Wait until the file named by env var `var` exists, if it is set. Bounded,
-/// so a failed test cannot strand the sidecar.
+/// Wait until the file named by env var `var` exists, if it is set. Bounded
+/// by [`gate_bound`], so a failed test cannot strand the sidecar.
 fn wait_for_gate_file(var: &str) {
     let Some(gate) = std::env::var_os(var) else {
         return;
     };
     let gate = PathBuf::from(gate);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + gate_bound();
     while !gate.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// How long a test gate holds the sidecar at most: 30 s, or
+/// `TENDR_TEST_GATE_BOUND_MS` milliseconds, so a test can hold it however
+/// slow the machine. Only gates use it.
+fn gate_bound() -> std::time::Duration {
+    crate::test_timer::or_env(
+        "TENDR_TEST_GATE_BOUND_MS",
+        std::time::Duration::from_secs(30),
+    )
 }
 
 /// Test-only gate before the readiness write, so a test can kill the `start`
@@ -1025,11 +1035,16 @@ fn test_ready_gate() {
 /// Test-only stall of a PTY session's output reader: before its first read it
 /// sleeps for `TENDR_TEST_PTY_READ_DELAY_MS` milliseconds, as a reader starved
 /// of CPU would, so a test can let a short-lived child write and exit before
-/// anything reads the PTY. Compiled into debug builds only; release sidecars
-/// ignore the variable entirely.
+/// anything reads the PTY. If `TENDR_TEST_PTY_READ_STALLED` names a path, that
+/// file is created first, so a test knows the reader is held from then on.
+/// Compiled into debug builds only; release sidecars ignore both variables
+/// entirely.
 fn test_pty_read_delay() {
     if !cfg!(debug_assertions) {
         return;
+    }
+    if let Some(path) = std::env::var_os("TENDR_TEST_PTY_READ_STALLED") {
+        let _ = std::fs::File::create(path);
     }
     if let Some(ms) = std::env::var("TENDR_TEST_PTY_READ_DELAY_MS")
         .ok()
@@ -1919,7 +1934,7 @@ struct PtyTeardown {
 #[cfg(unix)]
 impl PtyTeardown {
     fn run(&self) {
-        flush_viewers(&self.sink, RUN_END_FLUSH);
+        flush_viewers(&self.sink, run_end_flush());
         self.registry.close();
         self.effects.flush_and_stop();
     }
@@ -1932,6 +1947,14 @@ type PtyTeardown = std::convert::Infallible;
 /// is cut off then, and gets no more.
 #[cfg(unix)]
 const RUN_END_FLUSH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`RUN_END_FLUSH`]. Debug builds accept `TENDR_TEST_RUN_END_FLUSH_MS` so
+/// tests whose viewers must get the run's last output are not cut off by a
+/// loaded machine.
+#[cfg(unix)]
+fn run_end_flush() -> std::time::Duration {
+    crate::test_timer::or_env("TENDR_TEST_RUN_END_FLUSH_MS", RUN_END_FLUSH)
+}
 
 /// At the run's end, once capture has appended its last output: finish the
 /// ring, so each viewer's sender ends once it has sent everything, and wait
@@ -2242,6 +2265,7 @@ struct SidecarControlHooks {
     effects: std::sync::mpsc::Sender<RunEffect>,
     registry: ConnectionRegistry,
     attach_sink: AttachSink,
+    retire_waits: RetireWaits,
 }
 
 #[cfg(unix)]
@@ -2302,8 +2326,9 @@ impl crate::pty_input::ControlHooks for SidecarControlHooks {
                 // never block the writer with that.
                 let sink = Arc::clone(&self.attach_sink);
                 let control = entry.control;
+                let waits = self.retire_waits.clone();
                 std::thread::spawn(move || {
-                    retire_connection(holder, epoch, &conn, &control, &sink, &recorded)
+                    retire_connection(holder, epoch, &conn, &control, &sink, &recorded, &waits)
                 });
             }
         }
@@ -2327,6 +2352,33 @@ impl crate::pty_input::ControlHooks for SidecarControlHooks {
 /// takeover to reach the event log before ending its connection.
 #[cfg(unix)]
 const TAKEOVER_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How [`retire_connection`] waits: for the framed writer, then for the
+/// takeover's record. Always the default outside tests; a test lengthens
+/// them so that load cannot end either wait.
+#[cfg(unix)]
+#[derive(Clone)]
+struct RetireWaits {
+    /// Attempts to take the framed writer, 10 ms apart.
+    lock_attempts: u32,
+    /// How long to wait for the record: [`TAKEOVER_RECORD_GRACE`].
+    record_grace: std::time::Duration,
+    /// Told of each attempt that finds the writer busy.
+    #[cfg(test)]
+    contended: Option<std::sync::mpsc::Sender<()>>,
+}
+
+#[cfg(unix)]
+impl Default for RetireWaits {
+    fn default() -> Self {
+        Self {
+            lock_attempts: 20,
+            record_grace: TAKEOVER_RECORD_GRACE,
+            #[cfg(test)]
+            contended: None,
+        }
+    }
+}
 
 /// Finish retiring a connection the takeover hook has already removed from the
 /// registry: tell it, shut the socket down (which also unblocks any output
@@ -2361,23 +2413,28 @@ fn retire_connection(
     control: &std::os::unix::net::UnixStream,
     sink: &AttachSink,
     recorded: &std::sync::mpsc::Receiver<()>,
+    waits: &RetireWaits,
 ) {
     use crate::attach_proto::{Frame, write_frame};
 
     let _ = control.set_write_timeout(Some(std::time::Duration::from_millis(200)));
     let mut told = false;
     let mut contended = false;
-    for _ in 0..20 {
+    for _ in 0..waits.lock_attempts {
         if let Ok(mut conn) = conn.try_lock() {
             told = write_frame(&mut *conn, &Frame::Retired(epoch)).is_ok();
             break;
         }
         contended = true;
+        #[cfg(test)]
+        if let Some(contended) = &waits.contended {
+            let _ = contended.send(());
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if contended || !told {
         // Returns at once if the effects thread has stopped: the run ended.
-        let _ = recorded.recv_timeout(TAKEOVER_RECORD_GRACE);
+        let _ = recorded.recv_timeout(waits.record_grace);
     }
     let _ = control.shutdown(std::net::Shutdown::Both);
     lock(sink).forget(holder);
@@ -2775,7 +2832,7 @@ fn handle_attach_connection(
     pools: &AttachPools,
 ) {
     use crate::attach_proto::{
-        self, Frame, FrameError, Mode, ProtocolError, ResumePoint, Version, read_frame, write_frame,
+        Frame, FrameError, Mode, ProtocolError, ResumePoint, Version, read_frame, write_frame,
     };
     use crate::model::pty_control::ControllerKind;
 
@@ -2783,7 +2840,7 @@ fn handle_attach_connection(
     // hold a connection slot open by keeping each individual read short.
     let hello = read_frame(&mut crate::attach_socket::DeadlineReader {
         stream: &stream,
-        deadline: std::time::Instant::now() + attach_proto::HELLO_TIMEOUT,
+        deadline: std::time::Instant::now() + hello_timeout(),
     });
     // The first frame is read: the pending slot is free for the next arrival
     // before this connection takes any slot of its own.
@@ -3008,6 +3065,17 @@ fn handle_attach_connection(
     }
 }
 
+/// [`crate::attach_proto::HELLO_TIMEOUT`]. Debug builds accept
+/// `TENDR_TEST_HELLO_TIMEOUT_MS` so tests can hold hello-less connections
+/// pending however slow the machine.
+#[cfg(unix)]
+fn hello_timeout() -> std::time::Duration {
+    crate::test_timer::or_env(
+        "TENDR_TEST_HELLO_TIMEOUT_MS",
+        crate::attach_proto::HELLO_TIMEOUT,
+    )
+}
+
 /// How long a detaching controller's queued keystrokes may take to be
 /// written before the rest is revoked and control released.
 #[cfg(unix)]
@@ -3144,13 +3212,26 @@ fn wait_for_quiet_output(sink: &AttachSink, quiet: std::time::Duration, max: std
     let start = Instant::now();
     loop {
         let now = Instant::now();
-        let last = lock(sink).last_output.map_or(start, |t| t.max(start));
-        let silent = now.saturating_duration_since(last);
-        if silent >= quiet || now.saturating_duration_since(start) >= max {
+        let deadline = quiet_output_deadline(start, lock(sink).last_output, quiet, max);
+        if now >= deadline {
             return;
         }
-        std::thread::sleep((quiet - silent).min(Duration::from_millis(10)));
+        std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
     }
+}
+
+/// When a wait for quiet output that began at `start` ends, given the last
+/// output so far: `quiet` after that output (output from before `start`
+/// counts as at `start`), but never later than `max` after `start`.
+#[cfg(unix)]
+fn quiet_output_deadline(
+    start: std::time::Instant,
+    last_output: Option<std::time::Instant>,
+    quiet: std::time::Duration,
+    max: std::time::Duration,
+) -> std::time::Instant {
+    let last = last_output.map_or(start, |t| t.max(start));
+    (last + quiet).min(start + max)
 }
 
 #[cfg(unix)]
@@ -3262,7 +3343,7 @@ fn start_pty_recording(
 }
 
 /// Recording limits. Debug builds accept `TENDR_TEST_RECORDING_MAX_BYTES` so
-/// tests can reach the size limit; release sidecars ignore it.
+/// tests can reach the size limit.
 #[cfg(unix)]
 fn recorder_limits() -> crate::recorder::RecorderLimits {
     let mut limits = crate::recorder::RecorderLimits::default();
@@ -3370,35 +3451,50 @@ mod tests {
     #[test]
     fn a_repaint_waits_for_quiet_output_but_not_past_its_bound() {
         use std::time::{Duration, Instant};
-        // Wide margins: the writer below must not miss a whole `quiet` window
-        // on a busy runner.
         let quiet = Duration::from_millis(100);
         let max = Duration::from_millis(300);
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
 
         // Nothing written: done once `quiet` has passed.
+        assert_eq!(quiet_output_deadline(start, None, quiet, max), at(100));
+        // Output from before the wait counts as at its start.
+        let before = start.checked_sub(Duration::from_millis(50));
+        if let Some(before) = before {
+            assert_eq!(
+                quiet_output_deadline(start, Some(before), quiet, max),
+                at(100)
+            );
+        }
+        // Output at t: not done before t + quiet.
+        for (t, done) in [(40, 140), (199, 299)] {
+            assert_eq!(
+                quiet_output_deadline(start, Some(at(t)), quiet, max),
+                at(done),
+                "output at {t} ms"
+            );
+        }
+        // Output that keeps arriving: never past start + max.
+        for t in [200, 250, 299, 300, 1_000] {
+            assert_eq!(
+                quiet_output_deadline(start, Some(at(t)), quiet, max),
+                at(300),
+                "output at {t} ms"
+            );
+        }
+    }
+
+    /// The loop around the policy returns once it says so: with nothing
+    /// written, after `quiet` at the earliest.
+    #[test]
+    fn a_repaint_wait_with_no_output_returns_after_quiet() {
+        use std::time::{Duration, Instant};
+        let quiet = Duration::from_millis(20);
         let sink: AttachSink = Arc::default();
         let start = Instant::now();
-        wait_for_quiet_output(&sink, quiet, max);
-        let waited = start.elapsed();
-        assert!(waited >= quiet && waited < max, "{waited:?}");
-
-        // Output that never stops: done at `max`.
-        let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let writer = {
-            let (sink, writing) = (Arc::clone(&sink), Arc::clone(&writing));
-            std::thread::spawn(move || {
-                while writing.load(std::sync::atomic::Ordering::SeqCst) {
-                    lock(&sink).last_output = Some(Instant::now());
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            })
-        };
-        let start = Instant::now();
-        wait_for_quiet_output(&sink, quiet, max);
-        let waited = start.elapsed();
-        writing.store(false, std::sync::atomic::Ordering::SeqCst);
-        writer.join().unwrap();
-        assert!(waited >= max, "{waited:?}");
+        // `max` long enough that only quiet can end the wait; a lower bound.
+        wait_for_quiet_output(&sink, quiet, Duration::from_secs(3600));
+        assert!(start.elapsed() >= quiet);
     }
 
     #[test]
@@ -3550,7 +3646,7 @@ mod tests {
     /// connection. So the end must not come before the takeover is recorded.
     #[test]
     fn a_stalled_client_is_cut_off_only_once_the_takeover_is_recorded() {
-        retire_behind_a_busy_writer(None);
+        retire_behind_a_busy_writer(false);
     }
 
     /// An output write in flight at the takeover may end part-way through a
@@ -3558,16 +3654,22 @@ mod tests {
     /// client too is cut off only once the takeover is recorded.
     #[test]
     fn a_client_told_after_a_busy_write_is_cut_off_only_once_recorded() {
-        retire_behind_a_busy_writer(Some(std::time::Duration::from_millis(150)));
+        retire_behind_a_busy_writer(true);
     }
 
-    /// Retire a viewer whose output sender holds the framed writer for `busy`
-    /// after the retirement starts (`None`: throughout), while the state root
-    /// stalls the takeover's record. The connection must stay open until the
-    /// record is made, and end promptly once it is.
-    fn retire_behind_a_busy_writer(busy: Option<std::time::Duration>) {
+    /// Retire a viewer whose output sender holds the framed writer, while the
+    /// state root stalls the takeover's record. With `busy`, the writer is
+    /// freed once a retirement attempt has found it held; otherwise it is
+    /// held throughout. The connection must stay open until the record is
+    /// made, and end once it is.
+    ///
+    /// The record wait outlasts [`crate::test_support::HANG`], so only the
+    /// record can end the connection within the test; with `busy` the lock
+    /// attempts never run out, so only the freed writer ends them.
+    fn retire_behind_a_busy_writer(busy: bool) {
         use crate::model::pty_control::{ControllerEpoch, ControllerKind, HolderId};
         use crate::pty_input::{ControlHooks, Trigger};
+        use crate::test_support::HANG;
         use std::io::Read;
         use std::os::unix::net::UnixStream;
 
@@ -3586,6 +3688,12 @@ mod tests {
         });
         writer_busy.recv().unwrap();
         let (mut hooks, _control, teardown) = hooks_for(dir.path());
+        let (contended, found_busy) = std::sync::mpsc::channel();
+        hooks.retire_waits = RetireWaits {
+            lock_attempts: if busy { u32::MAX } else { 20 },
+            record_grace: std::time::Duration::from_secs(3600),
+            contended: Some(contended),
+        };
         let old = HolderId::new(1);
         assert!(hooks.registry.insert(
             old,
@@ -3599,36 +3707,44 @@ mod tests {
 
         hooks.human_control(Trigger::Takeover, ControllerEpoch::new(2));
         hooks.retire(old, ControllerKind::Human, ControllerEpoch::new(2));
-        if let Some(busy) = busy {
-            std::thread::sleep(busy);
-            let _ = release.send(());
-        }
-
-        // Well past the attempts to send MSG_RETIRED: whatever was sent can
-        // be read, but the connection is still open.
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        client.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 64];
         let mut told = 0;
-        let early = loop {
+        let mut early = None;
+        if busy {
+            // An attempt found the writer held: free it, and MSG_RETIRED
+            // follows.
+            found_busy
+                .recv_timeout(HANG)
+                .expect("the retirement tried the writer");
+            let _ = release.send(());
+            client.set_read_timeout(Some(HANG)).unwrap();
             match client.read(&mut buf) {
-                Ok(0) => break Some("end of stream".to_owned()),
+                Ok(0) => early = Some("end of stream".to_owned()),
                 Ok(n) => told += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break None,
-                Err(e) => break Some(e.to_string()),
+                Err(e) => early = Some(e.to_string()),
             }
-        };
+        }
+
+        // Waits out a premature end of the connection; under load it may
+        // come too late to be seen, never too early.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        client.set_nonblocking(true).unwrap();
+        while early.is_none() {
+            match client.read(&mut buf) {
+                Ok(0) => early = Some("end of stream".to_owned()),
+                Ok(n) => told += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => early = Some(e.to_string()),
+            }
+        }
 
         // Unstall before asserting anything: the stalled record holds the
         // process-wide meta lock, which would hang every later test.
-        // The record's acknowledgement ends it, not the grace: that starts
-        // when the lock attempts end (at 150 or 200 ms) and lasts
-        // TAKEOVER_RECORD_GRACE (2 s), so it expires at least 1.4 s from here.
         unstall_meta_json(dir.path(), &meta);
         client.set_nonblocking(false).unwrap();
         // EINVAL on macOS once the peer has shut the socket down; a read then
         // returns end of stream at once, so it cannot hang.
-        let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+        let _ = client.set_read_timeout(Some(HANG));
         let end = client.read(&mut buf);
         let _ = release.send(());
         sender.join().unwrap();
@@ -3640,12 +3756,12 @@ mod tests {
         );
         assert_eq!(
             told > 0,
-            busy.is_some(),
+            busy,
             "MSG_RETIRED is sent once the writer is free"
         );
         assert!(
             matches!(end, Ok(0)),
-            "the connection did not end within 1 s of the record: {end:?}"
+            "the connection did not end once the takeover was recorded: {end:?}"
         );
     }
 
@@ -3670,6 +3786,7 @@ mod tests {
             effects: effects.sender(),
             registry: registry.clone(),
             attach_sink: Arc::clone(&sink),
+            retire_waits: RetireWaits::default(),
         };
         let teardown = PtyTeardown {
             registry,
@@ -3721,9 +3838,10 @@ mod tests {
             let _ = done.send(());
             hooks
         });
-        let prompt = returned
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .is_ok();
+        // meta.json stays stalled until after this wait, so a hook that
+        // waited for it could not return within it: its returning is the
+        // proof, however long that takes.
+        let prompt = returned.recv_timeout(crate::test_support::HANG).is_ok();
         // Unblock whoever reads meta.json, so neither outcome hangs the test.
         unstall_meta_json(dir.path(), &meta);
         let _hooks = writer_thread.join().unwrap();
@@ -3776,6 +3894,7 @@ mod tests {
 
         hooks.human_released(crate::model::pty_control::ControllerEpoch::new(1));
         hooks.input_revoked(ControllerKind::Human, 0, 1);
+        // Waits out a late record; under load it can only miss one.
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(control_facts(dir.path()).len(), 2, "nothing after the end");
         let on_disk: Meta =
@@ -3850,7 +3969,7 @@ mod tests {
             limits,
             hooks.effects.clone(),
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::test_support::HANG;
         while recording.thread.recorder().stopped().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -3868,9 +3987,9 @@ mod tests {
             state
         });
 
-        // The run's end must wait for the report. A 50 ms close timeout
-        // against a 2 s window leaves a 40x margin, so a run end that returns
-        // early fails here rather than slipping past on a slow runner.
+        // The run's end must wait for the report. This waits out an early
+        // end (the 50 ms close timeout is far inside it): under load it can
+        // only miss one, never report one wrongly.
         assert!(
             ended
                 .recv_timeout(std::time::Duration::from_secs(2))
@@ -3880,7 +3999,7 @@ mod tests {
         // Let the state root recover with this run's own meta; the end completes.
         unstall_meta_json(dir.path(), &meta_a);
         ended
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANG)
             .expect("the run ends once the state root recovers");
         let final_state = run_end.join().unwrap();
         assert!(matches!(final_state, RecordingState::Stopped { .. }));
@@ -3908,6 +4027,7 @@ mod tests {
         .unwrap();
         let events_at_end = event_kinds(dir.path());
 
+        // Waits out a late report; under load it can only miss one.
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert_eq!(
             serde_json::to_value(read_meta(dir.path())).unwrap(),
@@ -4078,7 +4198,7 @@ mod tests {
     ) -> (std::os::unix::net::UnixStream, crate::attach_proto::Frame) {
         use crate::attach_proto::{read_frame, write_frame};
         let mut conn = std::os::unix::net::UnixStream::connect(path).unwrap();
-        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        conn.set_read_timeout(Some(crate::test_support::HANG))
             .unwrap();
         write_frame(&mut conn, first).unwrap();
         let answer = read_frame(&mut conn).expect("the sidecar answers");
@@ -4115,6 +4235,8 @@ mod tests {
 
         // A connection still waiting for its hello is admitted, not refused.
         let mut waiting = std::os::unix::net::UnixStream::connect(&served.path).unwrap();
+        // Waits out an answer before the hello; under load it can only miss
+        // one (the 5 s hello timeout is far beyond it).
         waiting
             .set_read_timeout(Some(std::time::Duration::from_millis(300)))
             .unwrap();
@@ -4139,7 +4261,29 @@ mod tests {
         let rounds = 3 * CONTROLLER_CONNECTIONS
             .max(PENDING_CONNECTIONS)
             .max(WATCH_CONNECTIONS);
+        let in_use = || {
+            (
+                served.pools.pending.in_use.load(Ordering::SeqCst),
+                served.pools.controllers.in_use.load(Ordering::SeqCst),
+                served.pools.watchers.in_use.load(Ordering::SeqCst),
+            )
+        };
+        // The sidecar returns a slot once it sees its connection end, which
+        // load can delay: each round starts once the last one's are back, so
+        // a late return is never taken for a lost one.
+        let all_returned = || {
+            let deadline = std::time::Instant::now() + crate::test_support::HANG;
+            while in_use() != (0, 0, 0) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "slots still taken: {:?}",
+                    in_use()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
         for round in 0..rounds {
+            all_returned();
             // A malformed first frame.
             let (_conn, answer) = ask(&served.path, &Frame::Detach);
             assert!(
@@ -4207,22 +4351,7 @@ mod tests {
                 "round {round}: {answer:?}"
             );
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let in_use = || {
-            (
-                served.pools.pending.in_use.load(Ordering::SeqCst),
-                served.pools.controllers.in_use.load(Ordering::SeqCst),
-                served.pools.watchers.in_use.load(Ordering::SeqCst),
-            )
-        };
-        while in_use() != (0, 0, 0) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "slots still taken: {:?}",
-                in_use()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        all_returned();
     }
 
     fn watch_hello() -> crate::attach_proto::Frame {
@@ -4280,7 +4409,7 @@ mod tests {
         ));
 
         write_frame(&mut client, &Frame::Data(b"abc".to_vec())).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::test_support::HANG;
         while lock(&pty.0).len() < 3 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -4392,7 +4521,7 @@ mod tests {
         ));
 
         write_frame(&mut client, &Frame::Data(b"abc".to_vec())).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::test_support::HANG;
         while lock(&pty.written).len() < 3 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -4407,8 +4536,10 @@ mod tests {
         writer.write_nowait(&successor, b"xyz".to_vec());
         write_frame(&mut client, &Frame::Detach).unwrap();
 
+        // The PTY stays stalled until the answer is read, so an answer that
+        // waited behind the successor could not come at all.
         client
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .set_read_timeout(Some(crate::test_support::HANG))
             .unwrap();
         let answer = read_frame(&mut client);
         pty.stalled.store(false, Ordering::SeqCst);
@@ -4420,7 +4551,7 @@ mod tests {
         handler.join().unwrap();
         // The disconnect cancelled nothing of the successor's: its input is
         // written once the PTY takes input again.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::test_support::HANG;
         while lock(&pty.written).len() < 6 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

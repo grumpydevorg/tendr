@@ -5,7 +5,7 @@
 
 mod harness;
 
-use harness::{Observation, SessionGuard, poll_until, read_events, tendr};
+use harness::{HANG, Observation, SessionGuard, poll_until, read_events, tendr};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -66,12 +66,14 @@ fn touch(root: &TempDir, name: &str) {
 
 fn socket(root: &TempDir, session: &str) -> PathBuf {
     let dir = session_dir(root, session);
-    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
-        match tendr::attach_proto::read_sock_path(&dir) {
+    poll_until(
+        HANG,
+        Duration::from_millis(50),
+        || match tendr::attach_proto::read_sock_path(&dir) {
             Some(path) => Observation::Ready(path),
             None => Observation::Pending("no attach socket yet".to_owned()),
-        }
-    })
+        },
+    )
     .unwrap()
 }
 
@@ -79,9 +81,7 @@ fn socket(root: &TempDir, session: &str) -> PathBuf {
 fn open(root: &TempDir, session: &str, first: &Frame) -> (UnixStream, Frame) {
     let mut stream = UnixStream::connect(socket(root, session)).unwrap();
     write_frame(&mut stream, first).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
+    stream.set_read_timeout(Some(HANG)).unwrap();
     let reply = read_frame(&mut stream).expect("the sidecar answers");
     (stream, reply)
 }
@@ -147,7 +147,7 @@ fn read_stamped(stream: &mut UnixStream, from: u64, marker: &[u8], len: usize) -
 
 /// Read until the sidecar closes the connection.
 fn drain(stream: &mut UnixStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_read_timeout(Some(HANG));
     while read_frame(stream).is_ok() {}
 }
 
@@ -159,21 +159,19 @@ fn control(root: &TempDir, session: &str) -> Option<String> {
 }
 
 fn wait_control(root: &TempDir, session: &str, expected: &str) {
-    poll_until(
-        Duration::from_secs(30),
-        Duration::from_millis(50),
-        || match control(root, session) {
+    poll_until(HANG, Duration::from_millis(50), || {
+        match control(root, session) {
             Some(c) if c == expected => Observation::Ready(()),
             other => Observation::Pending(format!("pty.control={other:?}")),
-        },
-    )
+        }
+    })
     .unwrap_or_else(|e| panic!("{session} never reached {expected}: {e}"));
 }
 
 /// Wait until the run's `pty.control_changed` events, `(trigger, epoch)` in
 /// order, are `expected`: the sidecar records them on their own thread.
 fn assert_control_changes(root: &TempDir, session: &str, expected: &[(&str, u64)]) {
-    poll_until(Duration::from_secs(15), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         let changes: Vec<(String, u64)> = read_events(root, session)
             .into_iter()
             .filter(|e| e["kind"] == "pty.control_changed")
@@ -215,7 +213,7 @@ fn log_tail(root: &TempDir, session: &str) -> String {
 
 /// Wait until capture has written `marker` to output.log.
 fn wait_captured(root: &TempDir, session: &str, marker: &str) {
-    poll_until(Duration::from_secs(60), Duration::from_millis(100), || {
+    poll_until(HANG, Duration::from_millis(100), || {
         let text = log_tail(root, session);
         if text.contains(marker) {
             Observation::Ready(())
@@ -251,10 +249,16 @@ fn a_half_open_resume_under_a_running_flood_has_no_gap_and_no_duplicate() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "resume-flood");
-    // About 3 MB over at least 3 s.
+    // About 3 MB over at least 3 s. Half way it ticks until the test has
+    // resumed, so output is still being appended when the resume is
+    // answered however long load makes the test take to get there.
+    let resumed = root.path().join("resumed");
     let flood = format!(
-        "i=0; while [ $i -lt 300 ]; do yes {} | head -n 10; sleep 0.01; i=$((i+1)); done; echo FLOOD-DONE",
-        line()
+        "i=0; while [ $i -lt 300 ]; do yes {} | head -n 10; sleep 0.01; i=$((i+1)); \
+         if [ $i -eq 150 ]; then while [ ! -f '{}' ]; do echo tick; sleep 0.05; done; fi; \
+         done; echo FLOOD-DONE",
+        line(),
+        resumed.display()
     );
     start(&root, "resume-flood", &gated(&flood), &[]);
 
@@ -286,6 +290,7 @@ fn a_half_open_resume_under_a_running_flood_has_no_gap_and_no_duplicate() {
         !log_tail(&root, "resume-flood").contains("FLOOD-DONE"),
         "the flood was still running when the resume was answered"
     );
+    touch(&root, "resumed");
     let after = read_stamped(&mut new, reached, b"FLOOD-DONE\r\n", 0);
     // The old connection was retired.
     drain(&mut old);
@@ -341,24 +346,22 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
     // answer, until the head is the whole output.
     let total = (b"\x1b[?2004h".len() + 2000 * (line().len() + 2) + b"ALL-DONE\r\n".len()) as u64;
     let mut asked = accepted;
-    let (mut gone, point, oldest) = (0..100)
-        .find_map(|_| {
-            let (stream, reply) = resume(&root, "resume-gone", asked);
-            let Frame::Gone { point, oldest } = reply else {
-                panic!("expected gone, got {reply:?}");
-            };
-            assert_eq!(
-                (point.run_id, point.epoch),
-                (asked.run_id, asked.epoch.next().unwrap())
-            );
-            if point.offset == total {
-                return Some((stream, point, oldest));
-            }
-            asked = ResumePoint { offset: 0, ..point };
-            std::thread::sleep(Duration::from_millis(20));
-            None
-        })
-        .expect("the ring never held the whole output");
+    let (mut gone, point, oldest) = poll_until(HANG, Duration::from_millis(20), || {
+        let (stream, reply) = resume(&root, "resume-gone", asked);
+        let Frame::Gone { point, oldest } = reply else {
+            panic!("expected gone, got {reply:?}");
+        };
+        assert_eq!(
+            (point.run_id, point.epoch),
+            (asked.run_id, asked.epoch.next().unwrap())
+        );
+        if point.offset == total {
+            return Observation::Ready((stream, point, oldest));
+        }
+        asked = ResumePoint { offset: 0, ..point };
+        Observation::Pending(format!("the head at {} of {total}", point.offset))
+    })
+    .unwrap_or_else(|e| panic!("the ring never held the whole output: {e}"));
     let head = point.offset;
     assert_eq!(head - oldest, RING, "a full ring");
     assert_eq!(

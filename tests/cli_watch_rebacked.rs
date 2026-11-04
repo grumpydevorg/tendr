@@ -8,7 +8,7 @@ mod harness;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use harness::{tendr, wait_terminal};
+use harness::{HANG, tendr, wait_terminal};
 use tempfile::TempDir;
 use tendr::model::event::EventTimestamp;
 
@@ -36,9 +36,7 @@ fn fast_exit_session_shows_all_three_transitions_uncollapsed() {
         .assert()
         .success();
     wait_terminal(&root, "fast");
-    follower.read_until(Duration::from_secs(10), |r| {
-        r["session"] == "fast" && r["name"] == "run.exited"
-    });
+    follower.read_until(|r| r["session"] == "fast" && r["name"] == "run.exited");
     let records = follower.records();
     follower.stop();
 
@@ -72,9 +70,7 @@ fn preexisting_session_still_gets_current_state_snapshot_only() {
     wait_terminal(&root, "done");
 
     let follower = harness::ReadyFollower::spawn(&root, "watch", &["--events"]);
-    follower.read_until(Duration::from_secs(10), |r| {
-        r["session"] == "done" && r["name"] == "run.exited"
-    });
+    follower.read_until(|r| r["session"] == "done" && r["name"] == "run.exited");
     let records = follower.records();
     follower.stop();
 
@@ -117,9 +113,7 @@ fn rebacked_snapshot_carries_the_true_timestamp() {
     // Watch starts later; its snapshot must carry the occurrence time, not
     // poll-detection time.
     let follower = harness::ReadyFollower::spawn(&root, "watch", &["--events"]);
-    let snapshot = follower.read_until(Duration::from_secs(10), |r| {
-        r["kind"] == "run" && r["session"] == "stamped"
-    });
+    let snapshot = follower.read_until(|r| r["kind"] == "run" && r["session"] == "stamped");
     follower.stop();
 
     let watch_micros = (snapshot["ts"].as_f64().unwrap() * 1e6).round() as u64;
@@ -145,9 +139,7 @@ fn session_without_events_dir_keeps_legacy_meta_diff_synthesis() {
     std::fs::remove_dir_all(&events_dir).unwrap();
 
     let follower = harness::ReadyFollower::spawn(&root, "watch", &["--events"]);
-    follower.read_until(Duration::from_secs(10), |r| {
-        r["session"] == "legacy" && r["name"] == "run.exited"
-    });
+    follower.read_until(|r| r["session"] == "legacy" && r["name"] == "run.exited");
     let records = follower.records();
     follower.stop();
 
@@ -180,9 +172,7 @@ fn from_now_skips_existing_but_streams_new_sessions_uncollapsed() {
         .assert()
         .success();
     wait_terminal(&root, "fresh");
-    follower.read_until(Duration::from_secs(10), |r| {
-        r["session"] == "fresh" && r["name"] == "run.exited"
-    });
+    follower.read_until(|r| r["session"] == "fresh" && r["name"] == "run.exited");
     let records = follower.records();
     follower.stop();
 
@@ -210,7 +200,9 @@ fn replaced_session_streams_the_new_generation_uncollapsed() {
     // gen-1's snapshot (run.exited) is flushed before readiness.
     let follower = harness::ReadyFollower::spawn(&root, "watch", &["--events"]);
 
+    // Waits for the old run to release its session up to the hang deadline.
     tendr(&root)
+        .env("TENDR_TEST_REPLACE_WAIT_MS", HANG.as_millis().to_string())
         .args(["start", "swap", "--replace", "--", "echo", "second"])
         .assert()
         .success();
@@ -218,7 +210,7 @@ fn replaced_session_streams_the_new_generation_uncollapsed() {
 
     // Two run.exited events occur (gen-1 snapshot, gen-2 exit), so wait on the
     // full count rather than a single terminal marker.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + HANG;
     let names = loop {
         let names = run_names(&follower.records(), "swap");
         if names.len() >= 4 {

@@ -12,7 +12,7 @@
 
 mod harness;
 
-use harness::{Observation, poll_until, read_events, tendr, touch_cmd};
+use harness::{HANG, Observation, poll_until, read_events, tendr, touch_cmd};
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::Mutex;
@@ -30,13 +30,15 @@ fn meta_path(root: &TempDir, session: &str) -> PathBuf {
         .join(format!(".tendr/sessions/default/{session}/meta.json"))
 }
 
-/// Spawn `tendr start <args>` with the readiness gate closed.
+/// Spawn `tendr start <args>` with the readiness gate closed. The gate's own
+/// bound is put off, so the sidecar holds until the test opens the gate.
 fn spawn_gated_start(root: &TempDir, gate: &std::path::Path, args: &[&str]) -> Child {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"));
     cmd.arg("start")
         .args(args)
         .env("HOME", root.path())
         .env("TENDR_TEST_READY_GATE", gate)
+        .env("TENDR_TEST_GATE_BOUND_MS", "3600000")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -58,11 +60,12 @@ fn spawn_gated_start(root: &TempDir, gate: &std::path::Path, args: &[&str]) -> C
 /// opens, so the sidecar's readiness write has no reader.
 fn start_and_lose_client(root: &TempDir, session: &str, rest: &[&str]) {
     let gate = root.path().join(format!("ready-gate-{session}"));
+    let _open = harness::OpenGate(gate.clone());
     let mut args = vec![session];
     args.extend_from_slice(rest);
     let mut client = spawn_gated_start(root, &gate, &args);
 
-    poll_until(Duration::from_secs(10), Duration::from_millis(10), || {
+    poll_until(HANG, Duration::from_millis(10), || {
         if meta_path(root, session).exists() {
             return Observation::Ready(());
         }
@@ -96,7 +99,7 @@ fn wait_sidecar_gone(root: &TempDir, session: &str) -> (serde_json::Value, LockG
         .expect("open session")
         .expect("session exists");
     poll_until(
-        Duration::from_secs(15),
+        HANG,
         Duration::from_millis(10),
         || match LockGuard::try_acquire(&dir) {
             Ok(lock) => {
@@ -173,7 +176,7 @@ fn client_lost_after_spawn_still_runs_on_exit_hook() {
     drop(lock);
 
     // Hooks run after the sidecar releases the lock.
-    harness::poll_path_exists(&marker, Duration::from_secs(10), Duration::from_millis(10))
+    harness::poll_path_exists(&marker, HANG, Duration::from_millis(10))
         .unwrap_or_else(|e| panic!("the --on-exit hook never ran: {marker:?} missing ({e})"));
 }
 

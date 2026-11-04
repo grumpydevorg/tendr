@@ -78,12 +78,24 @@ fn main() {
 /// cmd>}`, plus the request's `error` member if it has one. Before answering,
 /// a request's members act: `stderr` (string) is written to stderr, `push`
 /// (string) is written to stdout as a line of its own, `sleep_ms` (number)
-/// delays, and `exit` (number) exits with that code without answering.
+/// delays, `wait_path` (string) blocks until that path exists (no deadline:
+/// the test creates it), `hold_for_next` (true) reads the next request line
+/// first, answering this one only then and handling that one after (ending
+/// at end of input), and `exit` (number) exits with that code without
+/// answering.
 fn ndjson_echo() {
     use std::io::{BufRead, Write};
     let mut out = std::io::stdout().lock();
-    for line in std::io::stdin().lock().lines() {
-        let Ok(line) = line else { return };
+    let mut lines = std::io::stdin().lock().lines();
+    let mut held = None;
+    loop {
+        let line = match held.take() {
+            Some(line) => line,
+            None => match lines.next() {
+                Some(Ok(line)) => line,
+                _ => return,
+            },
+        };
         let request: serde_json::Value = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(e) => {
@@ -102,6 +114,17 @@ fn ndjson_echo() {
         }
         if let Some(ms) = request["sleep_ms"].as_u64() {
             std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        if let Some(path) = request["wait_path"].as_str() {
+            while !std::path::Path::new(path).exists() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        if request["hold_for_next"].as_bool() == Some(true) {
+            match lines.next() {
+                Some(Ok(next)) => held = Some(next),
+                _ => return,
+            }
         }
         if let Some(code) = request["exit"].as_i64() {
             std::process::exit(code as i32);

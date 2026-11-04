@@ -321,6 +321,7 @@ mod tests {
     use super::*;
     use crate::model::ids::{Generation, RunId, SessionName};
     use crate::model::spec::LaunchSpec;
+    use crate::test_support::HANG;
     use std::num::NonZeroU32;
 
     fn running_meta(child: ProcessIdentity) -> Meta {
@@ -379,27 +380,30 @@ mod tests {
     struct LiveChild(std::process::Child);
 
     impl LiveChild {
+        /// A child that never ends by itself (an hour), so only a kill ends
+        /// it within the test.
         fn spawn() -> Self {
             #[cfg(unix)]
             let child = {
                 use std::os::unix::process::CommandExt;
                 std::process::Command::new("sleep")
-                    .arg("60")
+                    .arg("3600")
                     .process_group(0)
                     .spawn()
             };
             #[cfg(windows)]
             let child = std::process::Command::new("ping")
-                .args(["-n", "60", "127.0.0.1"])
+                .args(["-n", "3600", "127.0.0.1"])
                 .stdout(std::process::Stdio::null())
                 .spawn();
             Self(child.unwrap())
         }
 
-        /// Whether it exits within `timeout`. Reaping it, rather than
-        /// probing, is the proof: a Linux zombie still reads `AliveVerified`.
-        fn exits_within(&mut self, timeout: std::time::Duration) -> bool {
-            let deadline = std::time::Instant::now() + timeout;
+        /// Whether it exits, waiting up to [`HANG`]. Reaping it, rather
+        /// than probing, is the proof: a Linux zombie still reads
+        /// `AliveVerified`.
+        fn exits(&mut self) -> bool {
+            let deadline = std::time::Instant::now() + HANG;
             while std::time::Instant::now() < deadline {
                 if self.0.try_wait().unwrap().is_some() {
                     return true;
@@ -511,10 +515,7 @@ mod tests {
             meta.transition_provenance(),
             "the kill is in the record on disk"
         );
-        assert!(
-            child.exits_within(std::time::Duration::from_secs(10)),
-            "the reconciler killed the child"
-        );
+        assert!(child.exits(), "the reconciler killed the child");
     }
 
     /// Every terminal `Exited` shape the sidecar writes must parse back, or a

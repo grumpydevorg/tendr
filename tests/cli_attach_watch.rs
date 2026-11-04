@@ -5,7 +5,7 @@
 
 mod harness;
 
-use harness::{Observation, SessionGuard, poll_until, read_events, tendr};
+use harness::{HANG, Observation, SessionGuard, poll_until, read_events, tendr};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -44,12 +44,14 @@ fn start(root: &TempDir, session: &str, script: &str, env: &[(&str, &str)]) {
 
 fn socket(root: &TempDir, session: &str) -> PathBuf {
     let dir = session_dir(root, session);
-    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
-        match tendr::attach_proto::read_sock_path(&dir) {
+    poll_until(
+        HANG,
+        Duration::from_millis(50),
+        || match tendr::attach_proto::read_sock_path(&dir) {
             Some(path) => Observation::Ready(path),
             None => Observation::Pending("no attach socket yet".to_owned()),
-        }
-    })
+        },
+    )
     .unwrap()
 }
 
@@ -61,9 +63,7 @@ fn touch(path: &Path) {
 fn hello(root: &TempDir, session: &str, version: Version, mode: Mode) -> (UnixStream, Frame) {
     let mut stream = UnixStream::connect(socket(root, session)).unwrap();
     write_frame(&mut stream, &Frame::Hello { version, mode }).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
+    stream.set_read_timeout(Some(HANG)).unwrap();
     let reply = read_frame(&mut stream).expect("the sidecar answers");
     (stream, reply)
 }
@@ -100,12 +100,12 @@ fn read_until(stream: &mut UnixStream, marker: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Read `len` bytes of stamped output from `from`, checking each frame
-/// starts where the last ended; the mode replay (unstamped) is read past.
-fn read_stamped(mut stream: UnixStream, from: u64, len: u64) -> (UnixStream, Vec<u8>) {
-    let mut out = Vec::new();
-    while (out.len() as u64) < len {
-        match read_frame(&mut stream) {
+/// Read stamped output into `out`, which holds what was read from offset
+/// `from` on, until it reaches offset `until`, checking each frame starts
+/// where the last ended; the mode replay (unstamped) is read past.
+fn read_stamped(stream: &mut UnixStream, from: u64, out: &mut Vec<u8>, until: u64) {
+    while from + (out.len() as u64) < until {
+        match read_frame(stream) {
             Ok(Frame::Output { offset, bytes }) => {
                 assert_eq!(
                     offset,
@@ -118,7 +118,6 @@ fn read_stamped(mut stream: UnixStream, from: u64, len: u64) -> (UnixStream, Vec
             other => panic!("after {} bytes: {other:?}", out.len()),
         }
     }
-    (stream, out)
 }
 
 /// Read until the sidecar ends the connection, and fail if it does not: a
@@ -150,14 +149,10 @@ fn wait_control(root: &TempDir, session: &str, expected: &str) {
         .ok()?;
         meta["pty"]["control"].as_str().map(str::to_owned)
     };
-    poll_until(
-        Duration::from_secs(15),
-        Duration::from_millis(50),
-        || match control() {
-            Some(c) if c == expected => Observation::Ready(()),
-            other => Observation::Pending(format!("pty.control={other:?}")),
-        },
-    )
+    poll_until(HANG, Duration::from_millis(50), || match control() {
+        Some(c) if c == expected => Observation::Ready(()),
+        other => Observation::Pending(format!("pty.control={other:?}")),
+    })
     .unwrap_or_else(|e| panic!("{session} never reached {expected}: {e}"));
 }
 
@@ -178,7 +173,7 @@ fn control_changes(root: &TempDir, session: &str) -> Vec<(String, u64)> {
 /// Wait until the run's control changes are `expected`: the sidecar records
 /// them on their own thread.
 fn assert_control_changes(root: &TempDir, session: &str, expected: &[(&str, u64)]) {
-    poll_until(Duration::from_secs(15), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         let changes = control_changes(root, session);
         let matches = changes.len() == expected.len()
             && changes
@@ -310,7 +305,7 @@ fn a_watchers_input_resize_and_repaint_never_reach_the_child() {
         1,
         "the controller's size request was answered once: {shown:?}"
     );
-    let logged = poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+    let logged = poll_until(HANG, Duration::from_millis(50), || {
         let logged = std::fs::read_to_string(&input).unwrap_or_default();
         if logged.contains("typed-by-controller") {
             Observation::Ready(logged)
@@ -337,19 +332,29 @@ fn read_until_line_end(stream: &mut UnixStream, mut shown: String) -> String {
 #[test]
 fn a_watcher_a_ring_behind_is_cut_off_and_nothing_else_is() {
     // Far smaller than the flood, so the stalled watcher falls behind it,
-    // and roomy enough that a reader briefly descheduled does not.
+    // and over twice a phase of it (below), so the readers, never more
+    // than a phase behind, never fall a ring behind.
     const RING: u64 = 1024 * 1024;
+    const PHASES: u64 = 6;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "watch-evict");
     let (go, end) = (root.path().join("go"), root.path().join("end"));
     let line = "0123456789abcdef".repeat(62);
-    // About 3 MB, paced so a reader that keeps reading stays within the ring.
+    // About 3 MB in six phases of about 500 KB. After each phase the run
+    // waits for `read-<phase>`, which the test writes once the reading
+    // watcher and the controller have read all of it: however load
+    // schedules them, they are never more than a phase behind, while the
+    // stalled watcher falls ever further behind.
+    let read = root.path().join("read-");
     let script = format!(
         "while [ ! -f '{go}' ]; do sleep 0.05; done; \
-         i=0; while [ $i -lt 300 ]; do yes {line} | head -n 10; sleep 0.01; i=$((i+1)); done; \
+         p=0; while [ $p -lt {PHASES} ]; do \
+         i=0; while [ $i -lt 50 ]; do yes {line} | head -n 10; i=$((i+1)); done; \
+         while [ ! -f '{read}'$p ]; do sleep 0.05; done; p=$((p+1)); done; \
          echo ALL-DONE; while [ ! -f '{end}' ]; do sleep 0.05; done",
         go = go.display(),
+        read = read.display(),
         end = end.display()
     );
     start(
@@ -360,18 +365,22 @@ fn a_watcher_a_ring_behind_is_cut_off_and_nothing_else_is() {
     );
 
     let (mut stalled, _) = watch(&root, "watch-evict");
-    let (reader, reader_at) = watch(&root, "watch-evict");
-    let (controller, accepted) = control(&root, "watch-evict", Mode::Attach);
-    let total = (300 * 10 * (line.len() + 2) + "ALL-DONE\r\n".len()) as u64;
-    let reading = std::thread::spawn(move || {
-        read_stamped(reader, reader_at.offset, total - reader_at.offset)
-    });
-    let controlling = std::thread::spawn(move || {
-        read_stamped(controller, accepted.offset, total - accepted.offset)
-    });
+    let (mut reader, reader_at) = watch(&root, "watch-evict");
+    let (mut controller, accepted) = control(&root, "watch-evict", Mode::Attach);
+    let phase = 50 * 10 * (line.len() as u64 + 2);
+    let total = PHASES * phase + "ALL-DONE\r\n".len() as u64;
+    let (mut read_out, mut controlled) = (Vec::new(), Vec::new());
     touch(&go);
+    for p in 0..PHASES {
+        let until = (p + 1) * phase;
+        read_stamped(&mut reader, reader_at.offset, &mut read_out, until);
+        read_stamped(&mut controller, accepted.offset, &mut controlled, until);
+        touch(&root.path().join(format!("read-{p}")));
+    }
+    read_stamped(&mut reader, reader_at.offset, &mut read_out, total);
+    read_stamped(&mut controller, accepted.offset, &mut controlled, total);
 
-    poll_until(Duration::from_secs(60), Duration::from_millis(100), || {
+    poll_until(HANG, Duration::from_millis(100), || {
         if harness::logged_output(&root, "watch-evict").contains("ALL-DONE") {
             Observation::Ready(())
         } else {
@@ -382,8 +391,6 @@ fn a_watcher_a_ring_behind_is_cut_off_and_nothing_else_is() {
     // Cut off while the run goes on: a connection the sidecar ended, not
     // one still waiting for output.
     assert_ended(&mut stalled, "the stalled watcher");
-    let (_reader, read) = reading.join().unwrap();
-    let (mut controller, controlled) = controlling.join().unwrap();
     wait_control(&root, "watch-evict", "HumanControl");
     write_frame(&mut controller, &Frame::Detach).unwrap();
     touch(&end);
@@ -392,7 +399,7 @@ fn a_watcher_a_ring_behind_is_cut_off_and_nothing_else_is() {
 
     assert_eq!(recording.len() as u64, total, "capture recorded every byte");
     assert!(
-        read == recording[reader_at.offset as usize..],
+        read_out == recording[reader_at.offset as usize..],
         "the reading watcher's bytes are not the recording's"
     );
     assert!(

@@ -5,12 +5,31 @@
 
 mod harness;
 
-use harness::{fake_ssh, shim_path_env};
+use harness::{HANG, Observation, fake_ssh, poll_child_exit, poll_until, shim_path_env};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// The connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, seconds) of a call
+/// whose ssh is expected to answer or end by itself: far past anything load
+/// can do to it, so it never fires in a test that is not about it, while
+/// still on (the remote is asked for its hello).
+const CONNECTS: &str = "600";
+
+/// How long a call whose ssh exited without a hello waits for the rest of
+/// ssh's stderr when something else still holds it: long enough for a relay
+/// thread starved by load to pass on what ssh wrote before it exited, and
+/// still the only way out while a leftover holds the pipe.
+///
+/// This bound is the one clock in
+/// `host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process`,
+/// accepted because no other test proves that what ssh wrote before exiting
+/// without a hello reaches the caller, and with a leftover holding the pipe
+/// there is no event to wait for instead: 10 s of starvation would be needed
+/// to fail it wrongly.
+const PRE_HELLO_RELAY: (&str, &str) = ("TENDR_TEST_PRE_HELLO_RELAY_MS", "10000");
 
 /// A fake ssh that prints each of its args as `ARG:<value>` on stdout.
 fn fake_ssh_echo() -> TempDir {
@@ -226,7 +245,7 @@ fn every_host_operation_sends_the_same_constant_argv() {
             .args(["--host", "box"])
             .args(args)
             .env("PATH", tmp.path())
-            .env_remove("TENDR_SSH_CONNECT_TIMEOUT")
+            .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
@@ -258,7 +277,7 @@ fn every_host_operation_sends_the_same_constant_argv() {
             h,
         ])
         .env("PATH", tmp.path())
-        .env("TENDR_SSH_CONNECT_TIMEOUT", "30")
+        .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
         .env("TENDR_TEST_ATTACH_TERMINAL", "24x80")
         .stdin(std::process::Stdio::null())
         .output()
@@ -317,6 +336,7 @@ fn host_request_travels_on_stdin_as_a_length_prefixed_frame() {
             .args(["--host", "box"])
             .args(args)
             .env("PATH", tmp.path())
+            .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
             .write_stdin(body)
             .output()
             .unwrap();
@@ -381,7 +401,8 @@ fn host_call(tmp: &TempDir, deadline: &str, args: &[&str]) -> std::process::Outp
 /// An ssh that never reaches the remote tendr (a Tailscale SSH check-mode
 /// approval that lapsed stalls like this for about 30 minutes) is killed at
 /// the deadline with exit 82 and a message naming the host, for ordinary
-/// commands and for exec's frame transport alike.
+/// commands and for exec's frame transport alike. The fake ssh stalls for
+/// longer than any test waits, so the deadline is the only way out.
 #[test]
 fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -396,9 +417,11 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
         let pid_file = TempDir::new().unwrap();
         let pid_file = pid_file.path().join("ssh.pid");
         let close = if close_stderr { "close-stderr\n" } else { "" };
-        let tmp = fake_ssh(&format!("pidfile {}\n{close}sleep 30", pid_file.display()));
-        let started = Instant::now();
-        let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        let tmp = fake_ssh(&format!(
+            "pidfile {}\n{close}sleep 3600",
+            pid_file.display()
+        ));
+        let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
             .args(["--host", "box"])
             .args(args)
             .env("PATH", tmp.path())
@@ -409,22 +432,26 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
             .spawn()
             .unwrap();
         // The fake ssh writes its pidfile atomically before it stalls.
-        let ssh = loop {
-            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-                break ProcessWatch::new(pid.trim().parse().unwrap());
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "{args:?}: the fake ssh never started"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let ssh = poll_until(
+            HANG,
+            Duration::from_millis(10),
+            || match std::fs::read_to_string(&pid_file) {
+                Ok(pid) => Observation::Ready(ProcessWatch::new(pid.trim().parse().unwrap())),
+                Err(e) => Observation::Pending(format!("no pidfile: {e}")),
+            },
+        )
+        .unwrap_or_else(|e| {
+            let _ = child.kill();
+            panic!("{args:?}: the fake ssh never started: {e}")
+        });
+        if let Err(e) = poll_child_exit(&mut child, HANG, Duration::from_millis(20)) {
+            let _ = child.kill();
+            panic!("{args:?}: the deadline never stopped the call: {e}");
+        }
         let output = child.wait_with_output().unwrap();
-        let took = started.elapsed();
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert_eq!(output.status.code(), Some(82), "{args:?}: {stderr}");
-        assert!(took < Duration::from_secs(10), "{args:?} took {took:?}");
         assert!(
             stderr.contains("box") && stderr.contains("did not reach"),
             "{args:?}: the error names the host: {stderr}"
@@ -434,14 +461,16 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
 }
 
 /// An ssh that exits without a hello while something it started lingers (a
-/// ProxyCommand that ignores the hangup) does not keep the call open past the
-/// deadline: the exit status is reported, and the caller's stderr reaches end
-/// of file when tendr exits. tendr does not give ssh its stderr, so nothing
-/// ssh starts may hold it; on Windows, where a child is handed every
+/// ProxyCommand that ignores the hangup) does not keep the call open: the
+/// exit status is reported, and the caller's stderr reaches end of file
+/// when tendr exits. tendr does not give ssh its stderr, so nothing ssh
+/// starts may hold it; on Windows, where a child is handed every
 /// inheritable handle and not just the stdio it is given, that takes tendr
-/// keeping its own stdio from being inherited.
+/// keeping its own stdio from being inherited. The leftover outlives the
+/// test's hang detector, so the call returning at all is the proof.
 #[test]
 fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
+    use std::io::Read;
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     for args in [&["status", "job"][..], &["exec", "shell", "--", "true"][..]] {
@@ -450,34 +479,45 @@ fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
         // The leftover runs from the built fake, not the linked `ssh` copy, so
         // it does not keep that copy (and its temp dir) in use on Windows.
         let tmp = fake_ssh(&format!(
-            "leftover 30 {}\nerr ssh: connection closed\\n\nexit 255",
+            "leftover {} {}\nerr ssh: connection closed\\n\nexit 255",
+            2 * HANG.as_secs(),
             assert_cmd::cargo::cargo_bin("fake_ssh").display()
         ));
         // tendr gives ssh its stdout, for remote output to stream straight
         // through, and the fake ssh, like an ssh without a handle allow-list,
         // lets the leftover inherit it: stdout goes to a file. Stderr is
-        // piped, so `took` is when the last holder of the caller's stderr
-        // lets go.
+        // piped and read to its end, which comes when the last holder of
+        // the caller's stderr lets go. The connect deadline is far off: the
+        // call must end on ssh's exit, not on a timer.
         let out_dir = TempDir::new().unwrap();
-        let started = Instant::now();
-        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
             .args(["--host", "box"])
             .args(args)
             .env("PATH", tmp.path())
-            .env("TENDR_SSH_CONNECT_TIMEOUT", "1")
+            .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
+            .env(PRE_HELLO_RELAY.0, PRE_HELLO_RELAY.1)
             .stdin(std::process::Stdio::null())
             .stdout(std::fs::File::create(out_dir.path().join("stdout")).unwrap())
             .stderr(std::process::Stdio::piped())
-            .output()
+            .spawn()
             .unwrap();
-        let took = started.elapsed();
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut caller_stderr = child.stderr.take().unwrap();
+        let (read, stderr_read) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stderr = String::new();
+            let _ = caller_stderr.read_to_string(&mut stderr);
+            let _ = read.send(stderr);
+        });
+        let status =
+            poll_child_exit(&mut child, HANG, Duration::from_millis(20)).unwrap_or_else(|e| {
+                let _ = child.kill();
+                panic!("{args:?}: the call was held open: {e}")
+            });
+        let stderr = stderr_read
+            .recv_timeout(HANG)
+            .unwrap_or_else(|e| panic!("{args:?}: the caller's stderr was held open: {e}"));
 
-        assert!(
-            took < Duration::from_secs(10),
-            "{args:?} took {took:?}: {stderr}"
-        );
-        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert_eq!(status.code(), Some(1), "{args:?}: {stderr}");
         assert!(
             stderr.contains("ssh: connection closed"),
             "{args:?}: {stderr}"
@@ -565,7 +605,7 @@ fn host_call_to_a_tendr_without_hello_or_trailer_says_to_upgrade_it() {
             "err error: unexpected argument '{flag}' found\\n\nexit {ssh_exit}"
         ));
         for args in [&["exec", "shell", "--", "true"][..], &["list"][..]] {
-            for deadline in ["5", "0"] {
+            for deadline in [CONNECTS, "0"] {
                 let output = host_call(&tmp, deadline, args);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let what = format!("{flag} {ssh_exit} {args:?} {deadline}");
@@ -591,7 +631,7 @@ fn host_call_to_a_tendr_without_hello_or_trailer_says_to_upgrade_it() {
 fn host_call_exits_with_the_trailer_code_and_hides_it() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    for deadline in ["5", "0"] {
+    for deadline in [CONNECTS, "0"] {
         let hello = if deadline == "0" {
             String::new()
         } else {
@@ -625,7 +665,7 @@ fn host_call_passes_on_a_trailer_shaped_line_mid_stream() {
         "err {}\\n\nerr tendr-exit 3\\n\nerr later\\n\nexit 7",
         tendr::ssh::HELLO_LINE
     ));
-    let output = host_call(&tmp, "5", &["status", "job"]);
+    let output = host_call(&tmp, CONNECTS, &["status", "job"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(7), "{stderr}");
     assert_eq!(stderr, "tendr-exit 3\nlater\n");
@@ -641,13 +681,13 @@ fn host_call_trailer_255_is_a_remote_exit() {
         "err {}\\n\nerr tendr-exit 255\\n\nexit 255",
         tendr::ssh::HELLO_LINE
     ));
-    let output = host_call(&tmp, "5", &["status", "job"]);
+    let output = host_call(&tmp, CONNECTS, &["status", "job"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(255), "{stderr}");
     assert!(!stderr.contains("transport"), "{stderr}");
 
     let tmp = fake_ssh(&format!("err {}\\n\nexit 255", tendr::ssh::HELLO_LINE));
-    let output = host_call(&tmp, "5", &["status", "job"]);
+    let output = host_call(&tmp, CONNECTS, &["status", "job"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("transport"), "{stderr}");
@@ -666,7 +706,7 @@ fn host_call_to_a_tendr_without_the_frame_entry_says_to_upgrade_it() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let tmp = fake_ssh(&format!("err {NO_REMOTE_ENTRY}\nexit 2"));
-    for deadline in ["5", "0"] {
+    for deadline in [CONNECTS, "0"] {
         let output = host_call(&tmp, deadline, &["status", "job"]);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -690,7 +730,7 @@ fn host_refusal_quoting_hello_is_not_upgrade_advice() {
         "err tendr _remote: invalid remote request: session name '--hello' and \
          unrecognized subcommand '_remote'\\n\nexit 2",
     );
-    for deadline in ["0", "5"] {
+    for deadline in ["0", CONNECTS] {
         let output = host_call(&tmp, deadline, &["status", "job"]);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -1196,6 +1236,7 @@ fn host_exec_frame_end_to_end() {
         .args(["--host", "box", "exec", "shell", "--"])
         .args(native_echo("remote hi"))
         .env("PATH", shim_path_env(&tmp))
+        .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
         .env(
             "TENDR_TEST_BIN",
             assert_cmd::cargo::cargo_bin("tendr").to_str().unwrap(),
@@ -1226,6 +1267,7 @@ fn host_exec_inner_exit_code_propagates() {
         .args(["--host", "box", "exec", "shell", "--"])
         .args(native_exit(7))
         .env("PATH", shim_path_env(&tmp))
+        .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
         .env(
             "TENDR_TEST_BIN",
             assert_cmd::cargo::cargo_bin("tendr").to_str().unwrap(),
@@ -1247,8 +1289,10 @@ fn host_exec_timeout_propagates() {
     let tmp = fake_ssh_frame_shim();
     let output = harness::tendr(&root)
         .args(["--host", "box", "exec", "shell", "--timeout", "1", "--"])
-        .args(native_sleep(3))
+        // Never ends by itself: the exec timeout is the only way out.
+        .args(native_sleep(3600))
         .env("PATH", shim_path_env(&tmp))
+        .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
         .env(
             "TENDR_TEST_BIN",
             assert_cmd::cargo::cargo_bin("tendr").to_str().unwrap(),
@@ -1275,7 +1319,7 @@ fn host_exec_torture_payload_matches_local() {
     let argv = native_echo(torture);
 
     let local = harness::tendr(&root)
-        .args(["exec", "shell", "--timeout", "30", "--"])
+        .args(["exec", "shell", "--timeout", "600", "--"])
         .args(&argv)
         .output()
         .unwrap();
@@ -1283,9 +1327,10 @@ fn host_exec_torture_payload_matches_local() {
 
     let tmp = fake_ssh_frame_shim();
     let remote = harness::tendr(&root)
-        .args(["--host", "box", "exec", "shell", "--timeout", "30", "--"])
+        .args(["--host", "box", "exec", "shell", "--timeout", "600", "--"])
         .args(&argv)
         .env("PATH", shim_path_env(&tmp))
+        .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
         .env(
             "TENDR_TEST_BIN",
             assert_cmd::cargo::cargo_bin("tendr").to_str().unwrap(),
@@ -1369,6 +1414,7 @@ fn host_exec_frame_stdin_passes_through() {
     let output = harness::tendr(&root)
         .args(["--host", "box", "exec", "--frame-from-stdin"])
         .env("PATH", shim_path_env(&tmp))
+        .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
         .env(
             "TENDR_TEST_BIN",
             assert_cmd::cargo::cargo_bin("tendr").to_str().unwrap(),

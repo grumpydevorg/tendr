@@ -19,7 +19,7 @@ fn run(root: &TempDir, args: &[&str]) -> (i32, String, String) {
     let out = tendr(root)
         .args(args)
         .write_stdin("")
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(harness::HANG)
         .output()
         .expect("run tendr");
     (
@@ -116,7 +116,8 @@ fn start_carries_every_launch_field_into_meta() {
             "--exec-target",
             "python-repl",
             "--timeout",
-            "60",
+            // Long enough that the run timeout cannot end `dep` mid-test.
+            "3600",
             "--cwd",
             cwd_str,
             "--env",
@@ -134,20 +135,21 @@ fn start_carries_every_launch_field_into_meta() {
             "dep",
             "--",
             "sleep",
-            "30",
+            // Never ends by itself while the test runs: it must be Running below.
+            "3600",
         ],
     );
-    let _dep = SessionGuard::new(&root, "dep");
+    let _dep = SessionGuard::new_ns(&root, "golden", "dep");
     assert_eq!(code, 0, "{stderr}");
     let meta: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let spec = &meta["launch_spec"];
     assert_eq!(meta["session"], "dep");
-    assert_eq!(spec["argv"], serde_json::json!(["sleep", "30"]));
+    assert_eq!(spec["argv"], serde_json::json!(["sleep", "3600"]));
     assert_eq!(spec["namespace"], "golden");
     assert_eq!(spec["stdin_mode"], "Pipe");
     assert_eq!(spec["io_mode"], "Pipe");
     assert_eq!(spec["exec_target"], "PythonRepl");
-    assert_eq!(spec["timeout_s"], 60);
+    assert_eq!(spec["timeout_s"], 3600);
     assert_eq!(spec["cwd"], cwd_str);
     assert_eq!(spec["env"], serde_json::json!({"K": "V=W"}));
     assert_eq!(spec["unset_env"], serde_json::json!(["DROP_ME"]));
@@ -179,7 +181,7 @@ fn start_carries_every_launch_field_into_meta() {
             "true",
         ],
     );
-    let _next = SessionGuard::new(&root, "next");
+    let _next = SessionGuard::new_ns(&root, "golden", "next");
     assert_eq!(code, 0, "{stderr}");
     let next: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(

@@ -103,6 +103,19 @@ fn force_kill_session(tendr_bin: &str, home: &std::path::Path, session: &str) {
         .status();
 }
 
+/// Runs [`force_kill_session`] on drop.
+struct KillSessionOnDrop<'a> {
+    tendr_bin: &'a str,
+    home: &'a std::path::Path,
+    session: &'a str,
+}
+
+impl Drop for KillSessionOnDrop<'_> {
+    fn drop(&mut self) {
+        force_kill_session(self.tendr_bin, self.home, self.session);
+    }
+}
+
 #[test]
 fn sidecar_survives_parent_job_kill() {
     let tendr_bin = resolve_bin("TENDR_TEST_BIN", env!("CARGO_BIN_EXE_tendr"));
@@ -119,6 +132,13 @@ fn sidecar_survives_parent_job_kill() {
         &job_name,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     );
+    // Kills the session on drop, so a failed check below still tears it
+    // (and its `Start-Sleep 3600`) down.
+    let _session = KillSessionOnDrop {
+        tendr_bin: &tendr_bin,
+        home: home.path(),
+        session: &session,
+    };
 
     let status = std::process::Command::new(&helper_bin)
         .arg(&tendr_bin)
@@ -148,11 +168,11 @@ fn sidecar_survives_parent_job_kill() {
         std::io::Error::last_os_error()
     );
 
-    // Poll for kernel termination propagation; surfaces a regression early.
+    // An absence wait: how long the kernel may take to propagate the job kill
+    // to a sidecar that is (wrongly) in the job. Load can only make it pass
+    // wrongly, never fail wrongly.
     let died = process_dies_within(sidecar_pid, Duration::from_secs(2));
 
-    // Cleanup before asserting (so a failure still tears the session down).
-    force_kill_session(&tendr_bin, home.path(), &session);
     drop(job); // close job handle explicitly for clarity (Drop would do this anyway)
 
     assert!(

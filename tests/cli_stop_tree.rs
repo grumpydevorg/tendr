@@ -9,13 +9,17 @@
 
 mod harness;
 
-use harness::{Observation, SessionGuard, poll_until, tendr};
+use harness::{HANG, Observation, SessionGuard, poll_until, tendr};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// A product timer lengthened past anything load can do, for a test where it
+/// must not fire.
+const FOREVER_MS: &str = "3600000";
 
 /// Writes its own pid to the file `$1` (atomically, so a reader never sees
 /// it empty), then becomes `sleep 300`, keeping the pid.
@@ -109,8 +113,27 @@ impl Kinds {
 
     fn await_file(&self, name: &str) {
         let path = self.0.join(name);
-        harness::poll_path_exists(&path, Duration::from_secs(10), Duration::from_millis(20))
+        harness::poll_path_exists(&path, HANG, Duration::from_millis(20))
             .unwrap_or_else(|e| panic!("{name} never appeared: {e}"));
+    }
+
+    /// Wait until every kind has started (`ready`: true), or until `session`
+    /// ended before that (false).
+    fn await_ready(&self, root: &TempDir, session: &str) -> bool {
+        let ready = self.0.join("ready");
+        poll_until(HANG, Duration::from_millis(20), || {
+            if ready.exists() {
+                return Observation::Ready(true);
+            }
+            match read_meta(root, "default", session) {
+                Some(meta) if ended(&meta) => Observation::Ready(ready.exists()),
+                other => Observation::Pending(format!(
+                    "no ready yet, status {:?}",
+                    other.map(|m| m["status"].clone())
+                )),
+            }
+        })
+        .unwrap_or_else(|e| panic!("every kind never started: {e}"))
     }
 }
 
@@ -142,28 +165,33 @@ fn read_meta(root: &TempDir, namespace: &str, session: &str) -> Option<serde_jso
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
+/// Whether a run's meta records its end.
+fn ended(meta: &serde_json::Value) -> bool {
+    !matches!(meta["status"].as_str(), Some("Starting" | "Running"))
+}
+
 /// Stop a run with `stop` and return its terminal meta. `kill` returns once
-/// the run's end is recorded; a timed-out run is waited for.
+/// the run's end is recorded, however long its sidecar takes (the kill's own
+/// wait for that is put off); a timed-out run is waited for.
 fn stop_run(root: &TempDir, session: &str, stop: Stop) -> serde_json::Value {
-    let args: &[&str] =
-        match stop {
-            Stop::Kill => &["kill", session],
-            Stop::Force => &["kill", "--force", session],
-            Stop::Timeout => {
-                return poll_until(Duration::from_secs(20), Duration::from_millis(50), || {
-                    match read_meta(root, "default", session) {
-                        Some(meta)
-                            if !matches!(meta["status"].as_str(), Some("Starting" | "Running")) =>
-                        {
-                            Observation::Ready(meta)
-                        }
-                        other => Observation::Pending(format!("{other:?}")),
-                    }
-                })
-                .unwrap_or_else(|e| panic!("{session} did not time out: {e}"));
-            }
-        };
-    let out = tendr(root).args(args).output().unwrap();
+    let args: &[&str] = match stop {
+        Stop::Kill => &["kill", session],
+        Stop::Force => &["kill", "--force", session],
+        Stop::Timeout => {
+            return poll_until(HANG, Duration::from_millis(50), || {
+                match read_meta(root, "default", session) {
+                    Some(meta) if ended(&meta) => Observation::Ready(meta),
+                    other => Observation::Pending(format!("{other:?}")),
+                }
+            })
+            .unwrap_or_else(|e| panic!("{session} did not time out: {e}"));
+        }
+    };
+    let out = tendr(root)
+        .env("TENDR_TEST_KILL_WAIT_MS", FOREVER_MS)
+        .args(args)
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -175,12 +203,36 @@ fn stop_run(root: &TempDir, session: &str, stop: Stop) -> serde_json::Value {
 
 /// Start [`PTY_RUN`], wait until every kind has started, stop the run with
 /// `stop`, and check that no kind's process outlived the run's end.
+///
+/// A run's 8 s timeout can pass before every kind has started on a loaded
+/// machine, which fails the premise, not the stop: such a run is discarded
+/// and the scenario run again, until [`HANG`].
 fn every_kind_ends_with_the_run(stop: Stop, session: &str, reason: &str) {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut attempt = 0;
+    poll_until(HANG, Duration::from_millis(10), || {
+        attempt += 1;
+        if one_run_ends_every_kind(stop, session, reason) {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!(
+                "attempt {attempt}: timed out before every kind had started"
+            ))
+        }
+    })
+    .unwrap_or_else(|e| panic!("no run had every kind started before it timed out: {e}"));
+}
+
+/// One run of [`every_kind_ends_with_the_run`]: false if the run ended
+/// before every kind had started, which only its timeout may do.
+fn one_run_ends_every_kind(stop: Stop, session: &str, reason: &str) -> bool {
     let root = TempDir::new().unwrap();
     let kinds = Kinds::new(&root);
 
     let mut start = tendr(&root);
+    // The stop's give-up bound must not cut it short however loaded: it
+    // would leave a "stopping the run" warning.
+    start.env("TENDR_TEST_TREE_STOP_LIMIT_MS", FOREVER_MS);
     start.args(["start", session, "--pty"]);
     if let Stop::Timeout = stop {
         start.args(["--timeout", "8"]);
@@ -191,7 +243,14 @@ fn every_kind_ends_with_the_run(stop: Stop, session: &str, reason: &str) {
         .assert()
         .success();
     let _session = SessionGuard::new(&root, session);
-    kinds.await_file("ready");
+    if !kinds.await_ready(&root, session) {
+        assert!(
+            matches!(stop, Stop::Timeout),
+            "the run ended before every kind had started: {:?}",
+            read_meta(&root, "default", session)
+        );
+        return false;
+    }
 
     let meta = stop_run(&root, session, stop);
     assert_eq!(meta["status"], "Exited", "{meta}");
@@ -209,6 +268,7 @@ fn every_kind_ends_with_the_run(stop: Stop, session: &str, reason: &str) {
         })
     });
     assert!(!warned, "a stop that ended everything warned: {meta}");
+    true
 }
 
 #[test]
@@ -275,7 +335,10 @@ fn kill_lets_every_process_clean_up_on_sigterm_first() {
 sh "$1/setsid.sh" sh "$1/cleans-up.sh" "$1/escapee" "$1/escapee.cleaned" &
 while [ ! -e "$1/member" ] || [ ! -e "$1/escapee" ]; do sleep 0.05; done
 wait"#;
+    // The cleanups must finish before any SIGKILL however loaded: the
+    // stop's SIGTERM grace is put off.
     tendr(&root)
+        .env("TENDR_TEST_TREE_TERM_GRACE_MS", FOREVER_MS)
         .args(["start", "cleans-up", "--", "sh", "-c", script, "sh"])
         .arg(&kinds.0)
         .assert()
@@ -303,7 +366,7 @@ impl Drop for InnerSession<'_> {
     fn drop(&mut self) {
         let _ = tendr(self.0)
             .args(["kill", "--force", "--namespace", "nest", "inner"])
-            .timeout(harness::CMD_DEADLINE)
+            .timeout(HANG)
             .output();
     }
 }
@@ -329,7 +392,7 @@ exec sleep 600"#;
         .success();
     let _outer = SessionGuard::new(&root, "outer");
     let _inner = InnerSession(&root);
-    harness::poll_path_exists(&started, Duration::from_secs(10), Duration::from_millis(20))
+    harness::poll_path_exists(&started, HANG, Duration::from_millis(20))
         .unwrap_or_else(|e| panic!("the inner session never started: {e}"));
     harness::wait_running_ns(&root, "nest", "inner");
     let before = read_meta(&root, "nest", "inner").expect("inner meta");
@@ -337,7 +400,8 @@ exec sleep 600"#;
 
     let meta = stop_run(&root, "outer", Stop::Kill);
     assert_eq!(meta["reason"], "Killed", "{meta}");
-    // Long enough for a dying sidecar to be noticed.
+    // Waits out a dying sidecar, which the status below would then see; under
+    // load it can only pass wrongly, never fail wrongly.
     std::thread::sleep(Duration::from_millis(500));
     let out = tendr(&root)
         .args(["status", "--namespace", "nest", "inner"])
@@ -371,12 +435,7 @@ touch "$1/orphaned"; exec sleep 600"#;
         .assert()
         .success();
     let _session = SessionGuard::new(&root, "orphans");
-    harness::poll_path_exists(
-        &dir.join("orphaned"),
-        Duration::from_secs(10),
-        Duration::from_millis(20),
-    )
-    .unwrap();
+    harness::poll_path_exists(&dir.join("orphaned"), HANG, Duration::from_millis(20)).unwrap();
     let orphans: Vec<i32> = (1..=3)
         .map(|i| {
             let pid = std::fs::read_to_string(dir.join(format!("orphan.{i}"))).unwrap();
@@ -385,7 +444,7 @@ touch "$1/orphaned"; exec sleep 600"#;
         .collect();
 
     // Reaped means gone from /proc; an unreaped zombie stays listed.
-    poll_until(Duration::from_secs(5), Duration::from_millis(100), || {
+    poll_until(HANG, Duration::from_millis(100), || {
         let left: Vec<String> = orphans
             .iter()
             .filter(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())

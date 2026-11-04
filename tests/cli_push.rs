@@ -1,11 +1,23 @@
 mod harness;
 
-use harness::{DeadlineAssertExt, tendr, wait_running, wait_terminal};
+use harness::{
+    DeadlineAssertExt, HANG, SessionGuard, tendr, wait_log_tail, wait_running, wait_terminal,
+};
 use predicates::prelude::*;
 use std::sync::Mutex;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Kill `session` once the sidecar records it, waiting for that up to the hang
+/// deadline rather than kill's 11 s before it kills the child itself.
+fn kill(root: &TempDir, session: &str) {
+    tendr(root)
+        .env("TENDR_TEST_KILL_WAIT_MS", HANG.as_millis().to_string())
+        .args(["kill", session])
+        .assert()
+        .success();
+}
 
 fn tendr_with_stdin(root: &TempDir, args: &[&str], input: &[u8]) -> std::process::Output {
     use std::io::Write;
@@ -43,7 +55,10 @@ fn push_delivers_stdin_to_child() {
     let push_out = tendr_with_stdin(&root, &["push", "push-echo"], b"hello from push\n");
     assert!(push_out.status.success());
 
-    tendr(&root).args(["kill", "push-echo"]).assert().success();
+    // push returns once the bytes reach cat's stdin, not once cat has echoed
+    // them: wait for the echo before the kill can cut it off.
+    wait_log_tail(&root, "push-echo", "hello from push");
+    kill(&root, "push-echo");
     wait_terminal(&root, "push-echo");
 
     tendr(&root)
@@ -70,7 +85,9 @@ fn push_multiple_sequential() {
     let out2 = tendr_with_stdin(&root, &["push", "push-multi"], b"second line\n");
     assert!(out2.status.success());
 
-    tendr(&root).args(["kill", "push-multi"]).assert().success();
+    // cat echoes in order: the second line logged means both were.
+    wait_log_tail(&root, "push-multi", "second line");
+    kill(&root, "push-multi");
     wait_terminal(&root, "push-multi");
 
     tendr(&root)
@@ -87,9 +104,10 @@ fn push_to_session_without_stdin_fails() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "nostdin-job", "sleep", "60"])
+        .args(["start", "nostdin-job", "sleep", "3600"])
         .assert()
         .success();
+    let _session = SessionGuard::new(&root, "nostdin-job");
     wait_running(&root, "nostdin-job");
 
     let push_out = tendr_with_stdin(&root, &["push", "nostdin-job"], b"nope\n");
@@ -97,10 +115,7 @@ fn push_to_session_without_stdin_fails() {
     let stderr = String::from_utf8_lossy(&push_out.stderr);
     assert!(stderr.contains("not started with --stdin"));
 
-    tendr(&root)
-        .args(["kill", "nostdin-job"])
-        .assert()
-        .success();
+    kill(&root, "nostdin-job");
     wait_terminal(&root, "nostdin-job");
 }
 
@@ -163,7 +178,8 @@ fn push_immediately_after_start() {
     let push_out = tendr_with_stdin(&root, &["push", "imm-push"], b"immediate data\n");
     assert!(push_out.status.success());
 
-    tendr(&root).args(["kill", "imm-push"]).assert().success();
+    wait_log_tail(&root, "imm-push", "immediate data");
+    kill(&root, "imm-push");
     wait_terminal(&root, "imm-push");
 
     tendr(&root)

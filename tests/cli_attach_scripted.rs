@@ -19,7 +19,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use harness::{Observation, fake_ssh, poll_until, shim_path_env};
+use harness::{HANG, Observation, fake_ssh, poll_until, shim_path_env};
 use tempfile::TempDir;
 use tendr::attach_proto::{Frame, Mode, Version};
 use tendr::recording::Geometry;
@@ -29,7 +29,18 @@ const ROWS: u16 = 24;
 const COLS: u16 = 80;
 /// The default detach escape: `Ctrl-\` then `d`.
 const DETACH: &[u8] = b"\x1cd";
-const WAIT: Duration = Duration::from_secs(15);
+
+/// The client's environment that makes a detach wait for its detach frame
+/// to be sent for as long as load can delay the sender, in place of the
+/// 200 ms grace after which the client gives up on it. For tests that
+/// assert the detach frame went out; the remote here always takes it at
+/// once, so the wait ends as soon as it is sent.
+fn detach_grace_outlasting_load() -> (String, String) {
+    (
+        "TENDR_TEST_DETACH_GRACE_MS".to_owned(),
+        HANG.as_millis().to_string(),
+    )
+}
 
 /// `tendr` with `args` on the test terminal, its screen and stderr
 /// collected as they arrive.
@@ -43,19 +54,26 @@ struct Client {
 }
 
 impl Client {
-    fn spawn(root: &TempDir, path: &std::ffi::OsStr, args: &[&str]) -> Self {
-        Self::spawn_on(root, path, args, true, None)
+    fn spawn(
+        root: &TempDir,
+        path: &std::ffi::OsStr,
+        args: &[&str],
+        env: &[(String, String)],
+    ) -> Self {
+        Self::spawn_on(root, path, args, true, None, env)
     }
 
     /// `tendr` with `args`, on the test terminal if `terminal`, or else with
     /// no terminal at all: stdin closed, stdout a pipe. With a `hold`, the
-    /// test terminal takes no writes while that file exists.
+    /// test terminal takes no writes while that file exists. `env` is set
+    /// for the client.
     fn spawn_on(
         root: &TempDir,
         path: &std::ffi::OsStr,
         args: &[&str],
         terminal: bool,
         hold: Option<&Path>,
+        env: &[(String, String)],
     ) -> Self {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("tendr"));
         command
@@ -63,6 +81,19 @@ impl Client {
             .env("HOME", root.path())
             .env("PATH", path)
             .env_remove("TENDR_TEST_ATTACH_SCREEN_HOLD")
+            // Every remote here exits once it has closed its output, so the
+            // wait for ssh's exit code (5 s, after which a still-running
+            // ssh is a lost link) is stretched past anything load can do;
+            // it ends as soon as ssh exits.
+            .env(
+                "TENDR_TEST_SSH_CLOSE_GRACE_MS",
+                HANG.as_millis().to_string(),
+            )
+            // Leaving writes the mode resets and erases the status rows on a
+            // writer thread it waits for only 1 s; tests read that last
+            // screen, so the wait is stretched too. A held screen is always
+            // released before the client is expected to exit.
+            .env("TENDR_TEST_MODES_GRACE_MS", HANG.as_millis().to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if terminal {
@@ -77,6 +108,7 @@ impl Client {
         if let Some(hold) = hold {
             command.env("TENDR_TEST_ATTACH_SCREEN_HOLD", hold);
         }
+        command.envs(env.iter().map(|(k, v)| (k, v)));
         let mut child = command.spawn().unwrap();
         let mut collectors = Vec::new();
         let mut collect = |mut from: Box<dyn Read + Send>| {
@@ -117,7 +149,7 @@ impl Client {
 
     /// Wait until the screen shows each of `needles`, in order.
     fn wait_screen(&self, needles: &[&str]) {
-        poll_until(WAIT, Duration::from_millis(20), || {
+        poll_until(HANG, Duration::from_millis(20), || {
             let screen = self.screen();
             let mut rest = screen.as_str();
             for needle in needles {
@@ -134,7 +166,7 @@ impl Client {
     /// Wait for the client to exit, and for what it wrote before exiting
     /// to be collected: the pipes may still hold it when it has exited.
     fn wait_exit(&mut self) -> i32 {
-        let status = poll_until(WAIT, Duration::from_millis(20), || {
+        let status = poll_until(HANG, Duration::from_millis(20), || {
             match self.child.try_wait().unwrap() {
                 Some(status) => Observation::Ready(status),
                 None => Observation::Pending("still running".into()),
@@ -144,7 +176,7 @@ impl Client {
             let _ = self.child.kill();
             panic!("the client never exited: {e}; stderr: {}", self.stderr())
         });
-        poll_until(WAIT, Duration::from_millis(20), || {
+        poll_until(HANG, Duration::from_millis(20), || {
             if self
                 .collectors
                 .iter()
@@ -173,6 +205,8 @@ struct Remote {
     ssh: TempDir,
     _dir: TempDir,
     frames: PathBuf,
+    /// Set for every client run against it.
+    env: Vec<(String, String)>,
 }
 
 impl Remote {
@@ -194,7 +228,15 @@ impl Remote {
             ssh: fake_ssh(&format!("{actions}\nscript\n{script}")),
             _dir: dir,
             frames,
+            env: Vec::new(),
         }
+    }
+
+    /// This remote, with its clients' detach frames sure to go out: see
+    /// [`detach_grace_outlasting_load`].
+    fn sends_its_detach(mut self) -> Self {
+        self.env.push(detach_grace_outlasting_load());
+        self
     }
 
     /// Lose the link of a remote made [`Remote::after`] `give-up-if {drop}`:
@@ -209,6 +251,7 @@ impl Remote {
             root,
             &shim_path_env(&self.ssh),
             &["--host", "box", "attach", "s"],
+            &self.env,
         )
     }
 
@@ -221,6 +264,7 @@ impl Remote {
             &["--host", "box", "attach", "s"],
             true,
             Some(hold),
+            &self.env,
         )
     }
 
@@ -233,6 +277,7 @@ impl Remote {
             &["--host", "box", "attach", "--read-only", "s"],
             terminal,
             None,
+            &self.env,
         )
     }
 
@@ -244,7 +289,7 @@ impl Remote {
     /// Wait until the client has sent `frame`.
     fn wait_frame(&self, frame: &Frame) {
         let line = format!("{frame:?}");
-        poll_until(WAIT, Duration::from_millis(20), || {
+        poll_until(HANG, Duration::from_millis(20), || {
             let frames = self.frames();
             if frames.contains(&line) {
                 Observation::Ready(())
@@ -286,7 +331,8 @@ fn a_scripted_attach_greets_shows_output_types_and_detaches() {
          hello answer\n\
          hello output scripted-output\n\
          hello drain",
-    );
+    )
+    .sends_its_detach();
     let mut client = remote.attach(&root);
     client.wait_screen(&["scripted-output"]);
     client.type_bytes(b"ab");
@@ -320,7 +366,8 @@ fn keystrokes_typed_with_the_escape_go_out_before_the_detach() {
          hello answer\n\
          hello output scripted-output\n\
          hello drain",
-    );
+    )
+    .sends_its_detach();
     let mut client = remote.attach(&root);
     client.wait_screen(&["scripted-output"]);
     let mut typed = b"typed-before".to_vec();
@@ -376,7 +423,8 @@ fn a_scripted_drop_resumes_where_the_screen_stopped() {
          resume answer\n\
          resume output two\n\
          resume drain",
-    );
+    )
+    .sends_its_detach();
     let mut client = remote.attach(&root);
     client.wait_screen(&["one", "two"]);
     client.type_bytes(DETACH);
@@ -503,7 +551,7 @@ fn a_controller_shows_all_output_before_the_remote_s_exit() {
         hung_up.display()
     ));
     let mut client = remote.attach_held(&root, &hold);
-    poll_until(WAIT, Duration::from_millis(20), || {
+    poll_until(HANG, Duration::from_millis(20), || {
         if hung_up.exists() {
             Observation::Ready(())
         } else {
@@ -512,8 +560,11 @@ fn a_controller_shows_all_output_before_the_remote_s_exit() {
     })
     .unwrap();
     client.type_bytes(b"k");
-    // Time for the failed write to end the attach early, as it would without
-    // the drain: the relay looks for a connection's end every 100 ms.
+    // Waits out the bug, a failed write ending the attach early as it would
+    // without the drain: the relay looks for a connection's end every
+    // 100 ms. Under load the bug may not have shown by the time the hold
+    // goes, which only lets the test pass without proving the drain; it
+    // cannot fail a correct client.
     std::thread::sleep(Duration::from_millis(500));
     std::fs::remove_file(&hold).unwrap();
     assert_eq!(client.wait_exit(), 3, "{}", client.stderr());
@@ -542,7 +593,8 @@ fn a_read_only_attach_says_typing_is_dropped() {
          watch answer\n\
          watch output watched\n\
          watch drain",
-    );
+    )
+    .sends_its_detach();
     let mut client = remote.watch(&root, true);
     client.wait_screen(&["watched"]);
     client.type_bytes(b"x");
@@ -623,7 +675,8 @@ fn a_scripted_watcher_resumes_with_a_watch_resume_and_never_sizes() {
          watch-resume answer\n\
          watch-resume output two\n\
          watch-resume drain",
-    );
+    )
+    .sends_its_detach();
     let mut client = remote.watch(&root, true);
     client.wait_screen(&["one"]);
     remote.drop_link();
@@ -656,7 +709,8 @@ fn a_scripted_watcher_resume_that_is_gone_says_what_was_missed() {
          watch-resume gone 5\n\
          watch-resume output two\n\
          watch-resume drain",
-    );
+    )
+    .sends_its_detach();
     let mut client = remote.watch(&root, true);
     client.wait_screen(&["one"]);
     remote.drop_link();
@@ -694,7 +748,7 @@ fn a_scripted_watcher_without_a_terminal_keeps_stdout_to_the_output() {
             ),
         );
         let mut client = remote.watch(&root, false);
-        poll_until(WAIT, Duration::from_millis(20), || {
+        poll_until(HANG, Duration::from_millis(20), || {
             if client.screen().ends_with("one") {
                 Observation::Ready(())
             } else {

@@ -18,7 +18,7 @@ fn signal_kill_request(
     std::fs::write(&kill_request_tmp, request.to_string())?;
     std::fs::rename(&kill_request_tmp, &kill_request_path)?;
 
-    for _ in 0..poll_iterations {
+    for _ in 0..kill_wait_polls(poll_iterations) {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Ok(m) = session::read_meta(session) {
             if m.status().is_terminal() {
@@ -28,6 +28,22 @@ fn signal_kill_request(
         }
     }
     Ok(None)
+}
+
+/// How many 100 ms polls [`signal_kill_request`] makes: `default`, or in
+/// debug builds `TENDR_TEST_KILL_WAIT_MS` worth, so tests whose sidecar must
+/// record the kill itself are not sent to the direct kill by a loaded
+/// machine; release builds ignore it.
+fn kill_wait_polls(default: u32) -> u32 {
+    if cfg!(debug_assertions) {
+        if let Some(ms) = std::env::var("TENDR_TEST_KILL_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            return ms.div_ceil(100);
+        }
+    }
+    default
 }
 
 pub fn cmd_kill(name: &str, force: bool, namespace: &Namespace) -> anyhow::Result<()> {

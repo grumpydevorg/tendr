@@ -710,6 +710,7 @@ mod tests {
     use super::*;
     use crate::model::ids::RunId;
     use crate::recording::{DecodedRecording, SegmentEnd, TermName, decode_recording};
+    use crate::test_support::HANG;
 
     fn header() -> SegmentHeader {
         SegmentHeader {
@@ -895,6 +896,10 @@ mod tests {
                 // redraws; capture offers that output before this call returns.
                 let producer = recorder.clone();
                 responder = Some(std::thread::spawn(move || producer.output(b"redraw")));
+                // Gives the responder a chance to offer its output while the
+                // resize is applied. If load delays it past this, it offers
+                // after the resize anyway: the order still holds, so this
+                // can only make the test pass without exercising the race.
                 std::thread::sleep(Duration::from_millis(100));
                 Ok(())
             })
@@ -1033,28 +1038,25 @@ mod tests {
         });
         let recorder = thread.recorder();
 
-        // Hold the first record's write in flight at the gate.
+        // Hold the first record's write in flight at the gate, which stays
+        // shut until the end: storage makes no progress meanwhile, so if
+        // offering output waited for storage the loop below would never end.
         recorder.output(b"in flight");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG;
         while store.at_gate.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             assert!(Instant::now() < deadline, "the first write never started");
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        let started = Instant::now();
         for _ in 0..1000 {
             recorder.output(&[b'z'; 512]);
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "offering output must not wait for storage"
-        );
         let stop = recorder
             .stopped()
             .expect("stopped while storage is stalled");
         assert_eq!(stop.reason, StopReason::BacklogFull);
         assert_eq!(stop.last_recorded, None, "nothing had been appended");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG;
         while stops.lock().unwrap().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1090,12 +1092,9 @@ mod tests {
         let thread = RecorderThread::start(header(), store, limits, |_| {});
         thread.recorder().output(b"never lands");
 
-        let started = Instant::now();
+        // The gate stays shut until after `finish`, so only the close
+        // timeout can end it: its returning is the proof close is bounded.
         let summary = thread.finish();
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "close is bounded"
-        );
         assert_eq!(
             summary.stopped,
             Some(Stopped {

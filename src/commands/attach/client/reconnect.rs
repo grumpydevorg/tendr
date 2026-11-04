@@ -39,7 +39,7 @@ use super::super::Point;
 use tendr::ssh::SshError;
 use tendr::term_modes::TermModes;
 
-use super::super::{HostEnd, Resumption, SSH_CLOSE_GRACE};
+use super::super::{HostEnd, Resumption, ssh_close_grace};
 use super::{Link, Screen};
 
 /// The longest pause between two failed attempts.
@@ -135,7 +135,7 @@ impl Job {
 
 /// The reconnect's thread: `None` once cancelled.
 fn reconnect(end: &mut HostEnd, screen: &Arc<Screen>, status: &Arc<Status>) -> Option<Outcome> {
-    match end.finish(SSH_CLOSE_GRACE) {
+    match end.finish(ssh_close_grace()) {
         Some(Ok(code)) => return Some(Outcome::Ended(Ok(code))),
         Some(Err(e)) if !lost_link(&e) => return Some(Outcome::Ended(Err(e))),
         _ => {}

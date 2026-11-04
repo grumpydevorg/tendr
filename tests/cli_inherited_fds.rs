@@ -43,8 +43,10 @@ fn open_paths(pid: u64) -> Vec<PathBuf> {
 /// exe-init does with its terminals.
 fn start_with_leaked_fd(root: &TempDir, session: &str, pty: bool, marker: &Path) {
     let mode = if pty { "--pty" } else { "" };
-    let script =
-        format!("exec {LEAKED_FD}<\"$MARKER\"; exec \"$TENDR\" start {session} {mode} -- sleep 60");
+    // The child never ends by itself: it must still be there to inspect.
+    let script = format!(
+        "exec {LEAKED_FD}<\"$MARKER\"; exec \"$TENDR\" start {session} {mode} -- sleep 3600"
+    );
     // bash, not sh: dash cannot redirect an fd above 9.
     let status = std::process::Command::new("bash")
         .args(["-c", &script])

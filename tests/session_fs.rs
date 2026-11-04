@@ -278,14 +278,18 @@ fn lock_exclusivity_across_processes() {
 
     let lock_path = session.lock_path();
 
-    // Hold lock via perl (available on macOS and Linux, unlike flock CLI)
+    // Hold lock via perl (available on macOS and Linux, unlike flock CLI).
+    // It holds it until its stdin closes, never by itself, so however long
+    // the test takes to probe, the lock is still held; dropping the `Child`
+    // on a panic closes the pipe and ends it.
     let mut child = Command::new("perl")
         .arg("-e")
         .arg(format!(
             "use Fcntl qw(:flock); $| = 1; open(my $fh, '>', '{}') or die; \
-             flock($fh, LOCK_EX) or die; print \"R\"; sleep 10;",
+             flock($fh, LOCK_EX) or die; print \"R\"; my $gate = <STDIN>;",
             lock_path.display()
         ))
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();

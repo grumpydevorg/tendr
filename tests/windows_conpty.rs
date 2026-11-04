@@ -7,14 +7,11 @@
 mod harness;
 
 use harness::conpty::{ConPty, ConmodeReport, conmode_bin, strip_escapes};
-use harness::{Observation, poll_until};
+use harness::{HANG, Observation, poll_until};
 use std::time::Duration;
 
-/// Hang detector for one observation. Each normally takes milliseconds.
-const WAIT: Duration = Duration::from_secs(20);
-
 fn report_tagged(pty: &ConPty, tag: &str) -> ConmodeReport {
-    pty.wait_for(&format!("conmode report tagged {tag:?}"), WAIT, |text| {
+    pty.wait_for(&format!("conmode report tagged {tag:?}"), HANG, |text| {
         ConmodeReport::find(text, tag)
     })
 }
@@ -36,7 +33,7 @@ fn conmode_reports_the_pseudo_console_it_runs_in() {
 
     // The report is drawn before conmode has finished exiting; wait for the
     // exit so close() doesn't terminate it.
-    assert_eq!(pty.wait_exit(WAIT), Some(0), "{}", pty.text());
+    assert_eq!(pty.wait_exit(HANG), Some(0), "{}", pty.text());
     let closed = pty.close();
     assert_eq!(closed.exit_code, 0, "{}", closed.text());
 }
@@ -51,7 +48,7 @@ fn typed_line_is_echoed_by_the_child() {
     assert_eq!(echoed.window, "80x25", "{echoed:?}");
 
     pty.write(b"quit\r");
-    assert_eq!(pty.wait_exit(WAIT), Some(0), "{}", pty.text());
+    assert_eq!(pty.wait_exit(HANG), Some(0), "{}", pty.text());
     let closed = pty.close();
     assert_eq!(closed.exit_code, 0);
 }
@@ -70,7 +67,7 @@ fn resize_is_seen_by_the_child() {
         // conhost applies a resize asynchronously, so ask until a report shows
         // it. Each request waits for its own tagged answer.
         let first = asked + 1;
-        poll_until(WAIT, Duration::from_millis(50), || {
+        poll_until(HANG, Duration::from_millis(50), || {
             asked += 1;
             let tag = format!("r{asked}");
             pty.write(format!("{tag}\r").as_bytes());
@@ -89,7 +86,7 @@ fn resize_is_seen_by_the_child() {
     }
 
     pty.write(b"quit\r");
-    assert_eq!(pty.wait_exit(WAIT), Some(0), "{}", pty.text());
+    assert_eq!(pty.wait_exit(HANG), Some(0), "{}", pty.text());
     pty.close();
 }
 

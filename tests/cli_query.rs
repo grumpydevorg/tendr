@@ -237,12 +237,84 @@ fn query_tolerates_a_malformed_line() {
         .stdout(predicate::str::contains("2"));
 }
 
+/// What is left in `pipe`, read to its end, once every process that wrote to
+/// it has exited; `None` if it has no end yet because some other process
+/// still holds it open. Never blocks.
+#[cfg(unix)]
+fn read_to_closed_end(mut pipe: impl std::io::Read + std::os::fd::AsRawFd) -> Option<Vec<u8>> {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl on a pipe fd owned by `pipe` for the whole call.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        assert!(flags >= 0, "F_GETFL: {}", std::io::Error::last_os_error());
+        assert!(
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0,
+            "F_SETFL: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => return Some(out),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => panic!("reading the pipe: {e}"),
+        }
+    }
+}
+
+/// What is left in `pipe`, read to its end, once every process that wrote to
+/// it has exited; `None` if it has no end yet because some other process
+/// still holds it open. Never blocks.
+#[cfg(windows)]
+fn read_to_closed_end(
+    mut pipe: impl std::io::Read + std::os::windows::io::AsRawHandle,
+) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, GetLastError};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let mut out = Vec::new();
+    loop {
+        let mut available: u32 = 0;
+        // SAFETY: the handle is owned by `pipe` for the whole call; only the
+        // byte count is written.
+        let ok = unsafe {
+            PeekNamedPipe(
+                pipe.as_raw_handle() as _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            // SAFETY: plain FFI call.
+            let error = unsafe { GetLastError() };
+            assert_eq!(error, ERROR_BROKEN_PIPE, "PeekNamedPipe failed: {error}");
+            return Some(out);
+        }
+        if available == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; available as usize];
+        let n = pipe.read(&mut buf).expect("reading the pipe");
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
 /// A duckdb that leaves something running (a process it started that does not
 /// get its stdio) does not keep the caller's stdin, stdout or stderr open once
 /// tendr exits. tendr gives duckdb a pipe for `--version`'s output and for the
 /// SQL, not the caller's handles. On Windows, where a child is handed every
 /// inheritable handle and not just the stdio it is given, that takes tendr
 /// keeping its own stdio from being inherited.
+///
+/// Once tendr has exited, its stdout and stderr must be at their end at once,
+/// while the orphan still runs: a pipe still held open has no end yet. No
+/// clock decides it.
 #[test]
 fn query_is_not_held_open_by_what_duckdb_leaves_running() {
     let root = TempDir::new().unwrap();
@@ -260,7 +332,6 @@ fn query_is_not_held_open_by_what_duckdb_leaves_running() {
                 fake_dir.path().join("script").display()
             ),
         );
-        let started = std::time::Instant::now();
         let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
             .args(args)
             .env("HOME", root.path())
@@ -271,15 +342,25 @@ fn query_is_not_held_open_by_what_duckdb_leaves_running() {
             .spawn()
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
-        let output = child.wait_with_output().unwrap();
-        let took = started.elapsed();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let status = harness::poll_child_exit(
+            &mut child,
+            harness::HANG,
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap_or_else(|e| panic!("{args:?}: tendr did not exit: {e}"));
+        let stderr = read_to_closed_end(stderr);
+        let stderr_text = String::from_utf8_lossy(stderr.as_deref().unwrap_or_default());
         assert!(
-            took < std::time::Duration::from_secs(10),
-            "{args:?} took {took:?}: {stderr}"
+            stderr.is_some(),
+            "{args:?}: the caller's stderr is still held open"
         );
-        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(
+            read_to_closed_end(stdout).is_some(),
+            "{args:?}: the caller's stdout is still held open: {stderr_text}"
+        );
+        assert!(status.success(), "{args:?}: {stderr_text}");
         // Nothing reads the caller's stdin any more: a write to it fails.
         use std::io::Write;
         assert!(

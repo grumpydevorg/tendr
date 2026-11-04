@@ -9,7 +9,7 @@
 mod harness;
 
 use harness::terminal::{WrappedAttach, tendr_bin};
-use harness::{Observation, SessionGuard, fake_ssh, poll_until, shim_path_env, tendr};
+use harness::{HANG, Observation, SessionGuard, fake_ssh, poll_until, shim_path_env, tendr};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -41,6 +41,32 @@ const ATTACH_ARGV: [&str; 16] = [
 /// A session name with shell metacharacters: no plain-name rule applies.
 const HOSTILE_NAME: &str = "x&calc;$(id)`'\u{e9}";
 
+/// The connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, seconds) of a call
+/// that is expected to connect: far past anything load can do to a remote
+/// tendr's start, so it never fires in a test that is not about it.
+const CONNECTS: &str = "600";
+
+/// A product grace, in milliseconds, that must not fire in the tests that
+/// set it: far past anything load can do to the party it waits for.
+const NEVER_MS: &str = "600000";
+
+/// For a run whose end must not cut a reading viewer off: the sidecar waits
+/// for its viewers to be sent the last of its output (`RUN_END_FLUSH`) for
+/// longer than load can hold up a viewer that is reading.
+const FLUSH_ALL: (&str, &str) = ("TENDR_TEST_RUN_END_FLUSH_MS", NEVER_MS);
+
+/// For a watcher whose remote goes by `meta.json` once the session closed
+/// its connection (a sidecar from before the end of output): the remote
+/// waits for the run to record its end (`RUN_END_GRACE`) for longer than
+/// load can delay that record.
+const RECORDED_END: (&str, &str) = ("TENDR_TEST_RUN_END_GRACE_MS", NEVER_MS);
+
+/// For every `--host` attach client: once the session has closed the
+/// connection, ssh's exit (the remote's verdict) is waited for
+/// (`SSH_CLOSE_GRACE`) longer than load can delay it, so a slow remote is
+/// never taken for a lost link and reconnected.
+const SSH_CLOSES: (&str, &str) = ("TENDR_TEST_SSH_CLOSE_GRACE_MS", NEVER_MS);
+
 /// A fake ssh that records its argv, then forwards to the real tendr.
 struct Remote {
     ssh: TempDir,
@@ -62,7 +88,7 @@ impl Remote {
 
     /// `tendr --host box attach <args>` in a fresh terminal.
     fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
-        attach_through(&self.ssh, "30", root, label, args, &[])
+        attach_through(&self.ssh, CONNECTS, root, label, args, &[])
     }
 }
 
@@ -86,6 +112,7 @@ fn attach_through(
         ("PATH", path.to_str().unwrap()),
         ("TENDR_TEST_BIN", tendr.as_str()),
         ("TENDR_SSH_CONNECT_TIMEOUT", deadline),
+        SSH_CLOSES,
     ];
     all.extend_from_slice(env);
     WrappedAttach::spawn_argv_env(root, label, &argv, &all)
@@ -122,16 +149,44 @@ fn control(root: &TempDir, session: &str) -> Option<String> {
 }
 
 fn wait_control(root: &TempDir, session: &str, expected: &str) {
-    poll_until(
-        Duration::from_secs(15),
-        Duration::from_millis(50),
-        || match control(root, session) {
+    poll_until(HANG, Duration::from_millis(50), || {
+        match control(root, session) {
             Some(c) if c == expected => Observation::Ready(()),
             other => Observation::Pending(format!("pty.control={other:?}")),
-        },
-    )
+        }
+    })
     .unwrap_or_else(|e| panic!("{session} never reached pty.control={expected}: {e}"));
 }
+
+/// Wait until `session`'s recording (`output.log`) has grown by `bytes`
+/// from now. Beside a terminal that stopped reading, output that far past
+/// what it was sent has filled every buffer on the way (the terminal's,
+/// ssh's pipe, the remote side's socket) and waits in the sidecar's ring,
+/// so the sidecar's write to this client is blocked. Waiting on the bytes,
+/// not a time, keeps that true however slowly the flood runs.
+fn wait_recorded_past(root: &TempDir, session: &str, bytes: u64) {
+    let log = root
+        .path()
+        .join(format!(".tendr/sessions/default/{session}/output.log"));
+    let size = || std::fs::metadata(&log).map_or(0, |m| m.len());
+    let from = size();
+    poll_until(HANG, Duration::from_millis(50), || {
+        let now = size();
+        if now >= from + bytes {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!(
+                "{} of {bytes} bytes recorded",
+                now.saturating_sub(from)
+            ))
+        }
+    })
+    .unwrap_or_else(|e| panic!("{session} never recorded {bytes} more bytes: {e}"));
+}
+
+/// Output past every buffer between the sidecar and a stalled terminal: a
+/// few hundred KiB at most, and far inside the sidecar's 32 MiB ring.
+const BACKLOG: u64 = 2 << 20;
 
 /// Type into the session and see its output, resize it, then detach with the
 /// escape: the terminal comes back as it was and the session keeps running
@@ -154,7 +209,7 @@ fn host_attach_types_sees_output_resizes_and_detaches() {
 
     // SIGWINCH on this side becomes a resize frame on the remote side.
     wrapped.cli.resize(33, 111);
-    poll_until(Duration::from_secs(15), Duration::from_millis(300), || {
+    poll_until(HANG, Duration::from_millis(300), || {
         wrapped.cli.type_bytes(b"stty size\n");
         if wrapped.cli.output().contains("33 111") {
             Observation::Ready(())
@@ -165,19 +220,14 @@ fn host_attach_types_sees_output_resizes_and_detaches() {
     .unwrap_or_else(|e| panic!("the resize never arrived ({e}): {}", wrapped.cli.output()));
 
     wrapped.cli.type_bytes(b"\x1cd");
-    assert_eq!(
-        wrapped.wait_exit(Duration::from_secs(15)),
-        0,
-        "{}",
-        wrapped.cli.output()
-    );
+    assert_eq!(wrapped.wait_exit(), 0, "{}", wrapped.cli.output());
     wrapped.assert_terminal_restored();
     wait_control(&root, HOSTILE_NAME, "AgentControl");
 }
 
-/// A paced flood: at most 800 KB/s, so a few seconds of stall stay well
+/// A paced flood: at most 800 KB/s, so a stall's [`BACKLOG`] stays well
 /// inside the sidecar's 32 MiB output ring and the client is never dropped
-/// for falling behind, yet fill every buffer between the sidecar and a
+/// for falling behind, yet fills every buffer between the sidecar and a
 /// terminal that stopped reading.
 const PACED_FLOOD: &str = "stty raw -echo; line=$(printf '%01000d' 0); \
      while :; do i=0; while [ $i -lt 8 ]; do printf '%s' \"$line\"; i=$((i+1)); done; sleep 0.01; done";
@@ -196,7 +246,7 @@ fn host_detach_is_not_held_up_by_unread_output() {
     wrapped.wait_output_contains("0000000000");
     wait_control(&root, "host-stall-detach", "HumanControl");
     wrapped.cli.pause_output();
-    std::thread::sleep(Duration::from_secs(2));
+    wait_recorded_past(&root, "host-stall-detach", BACKLOG);
     assert_eq!(
         control(&root, "host-stall-detach").as_deref(),
         Some("HumanControl"),
@@ -205,7 +255,7 @@ fn host_detach_is_not_held_up_by_unread_output() {
 
     wrapped.cli.type_bytes(b"\x1cd");
     wait_control(&root, "host-stall-detach", "AgentControl");
-    let code = wrapped.wait_exit(Duration::from_secs(15));
+    let code = wrapped.wait_exit();
     wrapped.cli.resume_output();
     assert_eq!(code, 0);
     wrapped.assert_terminal_restored();
@@ -232,7 +282,7 @@ fn host_takeover_while_the_first_client_is_stalled() {
     // The terminal stops reading; the flood fills its buffer, ssh's pipe,
     // the remote side's socket and the sidecar's write to it.
     first.cli.pause_output();
-    std::thread::sleep(Duration::from_secs(3));
+    wait_recorded_past(&root, "host-take", BACKLOG);
     assert_eq!(
         control(&root, "host-take").as_deref(),
         Some("HumanControl"),
@@ -249,16 +299,12 @@ fn host_takeover_while_the_first_client_is_stalled() {
     );
 
     first.cli.resume_output();
-    assert_eq!(
-        first.wait_exit(Duration::from_secs(30)),
-        81,
-        "the stalled client was taken over"
-    );
+    assert_eq!(first.wait_exit(), 81, "the stalled client was taken over");
     first.assert_terminal_restored();
     first.wait_output_contains("another client took over this session");
 
     second.cli.type_bytes(b"\x1cd");
-    assert_eq!(second.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(second.wait_exit(), 0);
     second.assert_terminal_restored();
     wait_control(&root, "host-take", "AgentControl");
 }
@@ -281,7 +327,7 @@ fn fake_sidecar(root: &TempDir, session: &str, label: &str, when: FakeReply, rep
     std::thread::spawn(move || {
         for mut stream in listener.incoming().map_while(Result::ok) {
             if matches!(when, FakeReply::AfterHello) {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let _ = stream.set_read_timeout(Some(HANG));
                 if tendr::attach_proto::read_msg(&mut stream).is_err() {
                     continue;
                 }
@@ -306,7 +352,7 @@ fn point_breadcrumb_at(root: &TempDir, session: &str, sock: &std::path::Path) {
 /// terminal showed; the terminal is checked restored.
 fn host_attach_exit(root: &TempDir, remote: &Remote, label: &str, args: &[&str]) -> (i32, String) {
     let wrapped = remote.attach(root, label, args);
-    let code = wrapped.wait_exit(Duration::from_secs(30));
+    let code = wrapped.wait_exit();
     wrapped.assert_terminal_restored();
     (code, wrapped.cli.output())
 }
@@ -327,7 +373,7 @@ fn host_attach_keeps_the_exit_codes() {
 
     let _pipe = SessionGuard::new(&root, "host-pipe");
     tendr(&root)
-        .args(["start", "host-pipe", "--", "sleep", "30"])
+        .args(["start", "host-pipe", "--", "sleep", "3600"])
         .output()
         .unwrap();
     harness::wait_running(&root, "host-pipe");
@@ -354,7 +400,7 @@ fn host_attach_keeps_the_exit_codes() {
     assert!(out.contains("human control"), "{out}");
     // A signal ends a bridged attach as it ends a local one: exit 1.
     holder.signal(libc::SIGTERM);
-    assert_eq!(holder.wait_exit(Duration::from_secs(15)), 1);
+    assert_eq!(holder.wait_exit(), 1);
     holder.assert_terminal_restored();
     wait_control(&root, "host-held", "AgentControl");
 
@@ -429,7 +475,7 @@ fn remote_attach_requires_its_hello() {
         let output = tendr(&root)
             .arg("_remote")
             .write_stdin(stdin)
-            .timeout(Duration::from_secs(30))
+            .timeout(HANG)
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(80), "{what}: {output:?}");
@@ -449,15 +495,16 @@ fn host_attach_ssh_failures_keep_their_codes() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    let silent = fake_ssh("sleep 30");
+    // The fake ssh never says hello by itself: only the deadline ends it.
+    let silent = fake_ssh("sleep 3600");
     let wrapped = attach_through(&silent, "1", &root, "deadline", &["s"], &[]);
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 82);
+    assert_eq!(wrapped.wait_exit(), 82);
     wrapped.assert_terminal_restored();
     wrapped.wait_output_contains("did not reach the remote tendr");
 
     let lost = fake_ssh(&format!("err {}\\n\nexit 255", tendr::ssh::HELLO_LINE));
-    let wrapped = attach_through(&lost, "30", &root, "lost", &["s"], &[]);
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 1);
+    let wrapped = attach_through(&lost, CONNECTS, &root, "lost", &["s"], &[]);
+    assert_eq!(wrapped.wait_exit(), 1);
     wrapped.assert_terminal_restored();
     wrapped.wait_output_contains("ssh transport failed");
 }
@@ -499,7 +546,7 @@ fn fake_listener(
     let seen = std::sync::Arc::clone(&hellos);
     std::thread::spawn(move || {
         for mut stream in listener.incoming().map_while(Result::ok) {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = stream.set_read_timeout(Some(HANG));
             let Ok((_, hello)) = tendr::attach_proto::read_msg(&mut stream) else {
                 continue;
             };
@@ -572,12 +619,7 @@ fn host_attach_falls_back_to_v1_for_an_old_sidecar() {
     wrapped.wait_output_contains("old-42");
     wait_control(&root, "host-old-sidecar", "HumanControl");
     wrapped.cli.type_bytes(b"\x1cd");
-    assert_eq!(
-        wrapped.wait_exit(Duration::from_secs(15)),
-        0,
-        "{}",
-        wrapped.cli.output()
-    );
+    assert_eq!(wrapped.wait_exit(), 0, "{}", wrapped.cli.output());
     wrapped.assert_terminal_restored();
     wait_control(&root, "host-old-sidecar", "AgentControl");
     assert_eq!(
@@ -622,7 +664,7 @@ fn host_attach_tracks_offsets_and_refuses_output_that_skips() {
     let remote = Remote::new();
 
     let wrapped = remote.attach(&root, "skip", &["host-skip"]);
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 80);
+    assert_eq!(wrapped.wait_exit(), 80);
     wrapped.assert_terminal_restored();
     let output = wrapped.cli.output();
     assert!(output.contains("first-second-"), "{output}");
@@ -653,13 +695,17 @@ impl FrameClient {
         )
     }
 
-    /// [`FrameClient::start`], with `first` in place of the hello.
+    /// [`FrameClient::start`], with `first` in place of the hello. A
+    /// watcher's remote that goes by `meta.json` waits for the run's end
+    /// longer than load can delay it ([`RECORDED_END`]); no test here
+    /// cuts a watcher off through this client.
     fn start_with(root: &TempDir, json: &str, first: &tendr::attach_proto::Frame) -> Self {
         use std::io::Write;
         use std::process::Stdio;
         let mut child = std::process::Command::new(tendr_bin())
             .arg("_remote")
             .env("HOME", root.path())
+            .env(RECORDED_END.0, RECORDED_END.1)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -698,7 +744,8 @@ impl FrameClient {
 
 /// A PTY session that prints `marker` once `go` exists, then waits.
 fn start_marker(root: &TempDir, session: &str, go: &std::path::Path, marker: &str) {
-    let script = format!("while [ ! -f \"$GO\" ]; do sleep 0.05; done; printf {marker}; sleep 60");
+    let script =
+        format!("while [ ! -f \"$GO\" ]; do sleep 0.05; done; printf {marker}; sleep 3600");
     let output = tendr(root)
         .args(["start", session, "--pty"])
         .arg("--env")
@@ -739,6 +786,7 @@ fn remote_attach_passes_v2_through() {
     assert_eq!(run_id.to_string(), meta["run_id"].as_str().unwrap());
     let head = u64::from_be_bytes(accept[24..32].try_into().unwrap());
     assert_eq!(head, 0, "nothing was written before the attach");
+    wait_control(&root, "host-v2", "HumanControl");
 
     std::fs::write(&go, b"").unwrap();
     let mut next = head;
@@ -773,6 +821,7 @@ fn remote_attach_answers_an_old_client_in_v1() {
         r#"{"v":1,"op":"attach","params":{"session":"host-v1","namespace":null,"takeover":false,"escape":"ctrl-backslash"}}"#,
     );
     assert_eq!(client.read(), (MSG_ACCEPTED, 1u64.to_be_bytes().to_vec()));
+    wait_control(&root, "host-v1", "HumanControl");
     std::fs::write(&go, b"").unwrap();
     let mut shown = Vec::new();
     while !shown.ends_with(b"v1-marker") {
@@ -795,9 +844,47 @@ fn host_attach_sends_what_an_old_remote_reads() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let sent = root.path().join("sent");
-    let ssh = fake_ssh(&format!("stdin {}", sent.display()));
-    let wrapped = attach_through(&ssh, "1", &root, "old-remote", &["s", "--takeover"], &[]);
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(20)), 82);
+    let pid = root.path().join("ssh-pid");
+    let ssh = fake_ssh(&format!(
+        "pidfile {}\nstdin {}",
+        pid.display(),
+        sent.display()
+    ));
+    let wrapped = attach_through(
+        &ssh,
+        CONNECTS,
+        &root,
+        "old-remote",
+        &["s", "--takeover"],
+        &[],
+    );
+    // The fake ssh never answers. Once it has written down the request and
+    // the hello that follows it (7 bytes), the test ends it, not a deadline
+    // that could stop it before it had read them: ssh killed before any
+    // hello is a failed connection (1).
+    poll_until(HANG, Duration::from_millis(20), || {
+        let got = std::fs::read(&sent).unwrap_or_default();
+        let want = got
+            .get(..4)
+            .map(|len| 4 + u32::from_be_bytes(len.try_into().unwrap()) as usize + 7);
+        match want {
+            Some(want) if got.len() >= want => Observation::Ready(()),
+            _ => Observation::Pending(format!("{} bytes sent", got.len())),
+        }
+    })
+    .unwrap_or_else(|e| panic!("the request and hello never reached ssh: {e}"));
+    let pid: libc::pid_t = std::fs::read_to_string(&pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: kill(2) takes a pid and a signal number.
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGKILL) },
+        0,
+        "kill ssh {pid}"
+    );
+    assert_eq!(wrapped.wait_exit(), 1);
     wrapped.assert_terminal_restored();
 
     /// 0.5.0's attach request, field for field.
@@ -936,7 +1023,7 @@ fn remote_resume_with_a_sidecar_that_cannot_resume_is_refused() {
     let output = tendr(&root)
         .arg("_remote")
         .write_stdin(stdin)
-        .timeout(Duration::from_secs(30))
+        .timeout(HANG)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(80), "{output:?}");
@@ -988,7 +1075,7 @@ impl Flaky {
 
     /// `tendr --host box attach <args>` in a fresh terminal.
     fn attach(&self, root: &TempDir, label: &str, args: &[&str]) -> WrappedAttach {
-        self.attach_with_deadline("30", root, label, args)
+        self.attach_with_deadline(CONNECTS, root, label, args)
     }
 
     /// [`Flaky::attach`] with a connect deadline of `deadline` seconds; `0`
@@ -1054,7 +1141,7 @@ impl Flaky {
 
     /// Wait until `n` calls have started.
     fn wait_calls(&self, n: usize) -> Vec<(u128, String)> {
-        poll_until(Duration::from_secs(60), Duration::from_millis(50), || {
+        poll_until(HANG, Duration::from_millis(50), || {
             let calls = self.calls();
             if calls.len() >= n {
                 Observation::Ready(calls)
@@ -1067,15 +1154,17 @@ impl Flaky {
 
     /// Wait for a call whose ssh is not `old`, and return its pid.
     fn wait_new_pid(&self, old: libc::pid_t) -> libc::pid_t {
-        poll_until(Duration::from_secs(30), Duration::from_millis(20), || {
-            match std::fs::read_to_string(self.files.path().join("pid"))
+        poll_until(
+            HANG,
+            Duration::from_millis(20),
+            || match std::fs::read_to_string(self.files.path().join("pid"))
                 .ok()
                 .and_then(|p| p.trim().parse().ok())
             {
                 Some(pid) if pid != old => Observation::Ready(pid),
                 other => Observation::Pending(format!("pid {other:?}")),
-            }
-        })
+            },
+        )
         .unwrap_or_else(|e| panic!("no ssh call after {old}: {e}"))
     }
 }
@@ -1105,7 +1194,7 @@ fn touch(root: &TempDir, name: &str) {
 
 /// Wait until the run has granted control to `n` resumes.
 fn wait_resumes(root: &TempDir, session: &str, n: usize) {
-    poll_until(Duration::from_secs(60), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         let resumes = harness::read_events(root, session)
             .into_iter()
             .filter(|e| e["kind"] == "pty.control_changed" && e["data"]["trigger"] == "resume")
@@ -1167,7 +1256,7 @@ fn host_attach_reconnects_when_ssh_dies_mid_flood_with_no_gap_or_duplicate() {
     wait_resumes(&root, "host-cut", 1);
     // The flood goes on over the new connection.
     let resumed = wrapped.cli.output().len();
-    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         if wrapped.cli.output().len() > resumed + 20_000 {
             Observation::Ready(())
         } else {
@@ -1178,7 +1267,7 @@ fn host_attach_reconnects_when_ssh_dies_mid_flood_with_no_gap_or_duplicate() {
     touch(&root, "STOP");
     wrapped.wait_output_contains("FLOOD-END");
     wrapped.cli.type_bytes(b"\x1cd");
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(wrapped.wait_exit(), 0);
     wrapped.assert_terminal_restored();
 
     touch(&root, "END");
@@ -1241,7 +1330,7 @@ fn host_attach_keeps_what_ssh_says_off_the_sessions_screen() {
     touch(&root, "STOP");
     wrapped.wait_output_contains("FLOOD-END");
     wrapped.cli.type_bytes(b"\x1cd");
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(wrapped.wait_exit(), 0);
 
     touch(&root, "END");
     harness::wait_terminal(&root, "host-quiet");
@@ -1302,7 +1391,7 @@ fn host_reconnect_fails_fast_backs_off_and_discards_typing() {
         "input typed while reconnecting reached the session"
     );
     wrapped.cli.type_bytes(b"\x1cd");
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(wrapped.wait_exit(), 0);
     wrapped.assert_terminal_restored();
     let calls = link.calls();
     assert!(
@@ -1345,13 +1434,13 @@ fn host_reconnect_after_a_takeover_in_the_gap_exits_81() {
 
     let before = wrapped.cli.output().len();
     link.set("prompt", false);
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(30)), 81);
+    assert_eq!(wrapped.wait_exit(), 81);
     wrapped.assert_terminal_restored();
     let said = without_status_line(&wrapped.cli.output()[before..]);
     assert!(!said.trim().is_empty(), "the refusal says why");
 
     taker.cli.type_bytes(b"\x1cd");
-    assert_eq!(taker.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(taker.wait_exit(), 0);
     taker.assert_terminal_restored();
 }
 
@@ -1378,7 +1467,7 @@ fn host_reconnect_after_the_run_ended_exits_81() {
     harness::wait_terminal(&root, "host-gap-end");
 
     link.set("prompt", false);
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(30)), 81);
+    assert_eq!(wrapped.wait_exit(), 81);
     wrapped.assert_terminal_restored();
 }
 
@@ -1393,9 +1482,19 @@ fn host_escape_or_signal_while_reconnecting_leaves_and_stops_ssh() {
     let _kill = SessionGuard::new(&root, "host-gap-leave");
     start_pty(&root, "host-gap-leave", &["cat"]);
     let link = Flaky::new();
+    // Leaving waits for the reconnect to stop its ssh
+    // (`RECONNECT_STOP_GRACE`) longer than load can delay that.
+    let stops = [("TENDR_TEST_RECONNECT_STOP_GRACE_MS", NEVER_MS)];
 
     // The escape: exit 0.
-    let mut wrapped = link.attach_with_deadline("0", &root, "gap-escape", &["host-gap-leave"]);
+    let mut wrapped = attach_through(
+        &link.ssh,
+        "0",
+        &root,
+        "gap-escape",
+        &["host-gap-leave"],
+        &stops,
+    );
     wrapped
         .cli
         .type_until_logged(&root, "host-gap-leave", "escape-client\n");
@@ -1403,14 +1502,21 @@ fn host_escape_or_signal_while_reconnecting_leaves_and_stops_ssh() {
     let cut = link.cut();
     let stalled = link.wait_new_pid(cut);
     wrapped.cli.type_bytes(b"\x1cd");
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(wrapped.wait_exit(), 0);
     wrapped.assert_terminal_restored();
     harness::wait_pid_dead(stalled);
     link.set("stall", false);
 
     // SIGTERM: exit 1. The old remote side, still open, holds the session,
     // so this attach takes it over.
-    let mut wrapped = link.attach(&root, "gap-term", &["host-gap-leave", "--takeover"]);
+    let mut wrapped = attach_through(
+        &link.ssh,
+        CONNECTS,
+        &root,
+        "gap-term",
+        &["host-gap-leave", "--takeover"],
+        &stops,
+    );
     wrapped
         .cli
         .type_until_logged(&root, "host-gap-leave", "term-client\n");
@@ -1418,7 +1524,7 @@ fn host_escape_or_signal_while_reconnecting_leaves_and_stops_ssh() {
     let cut = link.cut();
     let stalled = link.wait_new_pid(cut);
     wrapped.signal(libc::SIGTERM);
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 1);
+    assert_eq!(wrapped.wait_exit(), 1);
     wrapped.assert_terminal_restored();
     harness::wait_pid_dead(stalled);
 }
@@ -1432,21 +1538,23 @@ fn host_reconnect_past_the_ring_resets_the_modes_and_says_what_was_missed() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "host-gone");
-    // About 2 MB of `x` lines, far past a 64 KiB ring, then a marker. The
-    // pause keeps the flood out of the marker's chunk: capture logs a chunk
-    // just before it adds it to the ring, so only that chunk can lag.
+    // About 2 MB of `x` lines, far past a 64 KiB ring, then markers. Capture
+    // logs a chunk just before it adds it to the ring, so only the last
+    // chunk logged can lag the ring: FLOOD-END is written only once
+    // FLOOD-DONE, and with it the flood's tail, has been logged, so the
+    // flood is in a chunk of its own, whatever the chunks' timing.
     let script = format!(
         "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; printf '\\033[?2004h'; printf first-part; \
          while [ ! -f \"$GO2\" ]; do sleep 0.05; done; yes {} | head -n 20000; \
-         sleep 0.5; echo FLOOD-END; \
-         while [ ! -f \"$GO3\" ]; do sleep 0.05; done; printf after-the-gap; sleep 60",
+         echo FLOOD-DONE; while [ ! -f \"$FLOODED\" ]; do sleep 0.05; done; echo FLOOD-END; \
+         while [ ! -f \"$GO3\" ]; do sleep 0.05; done; printf after-the-gap; sleep 3600",
         "x".repeat(100)
     );
     start_script(
         &root,
         "host-gone",
         &script,
-        &["GO1", "GO2", "GO3"],
+        &["GO1", "GO2", "FLOODED", "GO3"],
         &[("TENDR_TEST_OUTPUT_RING_BYTES", "65536")],
     );
     let link = Flaky::new();
@@ -1458,6 +1566,8 @@ fn host_reconnect_past_the_ring_resets_the_modes_and_says_what_was_missed() {
     hold_in_reconnect(&link);
     touch(&root, "GO2");
     // The flood has all been captured.
+    harness::wait_log_tail(&root, "host-gone", "FLOOD-DONE");
+    touch(&root, "FLOODED");
     harness::wait_log_tail(&root, "host-gone", "FLOOD-END");
 
     link.set("prompt", false);
@@ -1465,7 +1575,7 @@ fn host_reconnect_past_the_ring_resets_the_modes_and_says_what_was_missed() {
     touch(&root, "GO3");
     wrapped.wait_output_contains("after-the-gap");
     wrapped.cli.type_bytes(b"\x1cd");
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(wrapped.wait_exit(), 0);
     wrapped.assert_terminal_restored();
 
     let killed = tendr(&root)
@@ -1521,7 +1631,7 @@ fn host_reconnected_attach_taken_over_while_stalled_exits_81() {
     link.cut();
     wait_resumes(&root, "host-resume-take", 1);
     first.cli.pause_output();
-    std::thread::sleep(Duration::from_secs(3));
+    wait_recorded_past(&root, "host-resume-take", BACKLOG);
 
     let remote = Remote::new();
     let mut second = remote.attach(&root, "take-2", &["host-resume-take", "--takeover"]);
@@ -1535,7 +1645,7 @@ fn host_reconnected_attach_taken_over_while_stalled_exits_81() {
 
     first.cli.resume_output();
     assert_eq!(
-        first.wait_exit(Duration::from_secs(30)),
+        first.wait_exit(),
         81,
         "the stalled reconnected client was taken over"
     );
@@ -1543,7 +1653,7 @@ fn host_reconnected_attach_taken_over_while_stalled_exits_81() {
     first.wait_output_contains("another client took over this session");
 
     second.cli.type_bytes(b"\x1cd");
-    assert_eq!(second.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(second.wait_exit(), 0);
     second.assert_terminal_restored();
 }
 
@@ -1590,7 +1700,7 @@ fn host_read_only_attach_resumes_beside_a_controller_with_no_gap_or_duplicate() 
     link.cut();
     link.wait_calls(2);
     let resumed = watcher.cli.output().len();
-    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         if watcher.cli.output().len() > resumed + 20_000 {
             Observation::Ready(())
         } else {
@@ -1601,7 +1711,7 @@ fn host_read_only_attach_resumes_beside_a_controller_with_no_gap_or_duplicate() 
     touch(&root, "STOP");
     watcher.wait_output_contains("FLOOD-END");
     watcher.cli.type_bytes(b"\x1cd");
-    assert_eq!(watcher.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(watcher.wait_exit(), 0);
     watcher.assert_terminal_restored();
 
     assert_eq!(
@@ -1614,7 +1724,7 @@ fn host_read_only_attach_resumes_beside_a_controller_with_no_gap_or_duplicate() 
         "the watcher changed control"
     );
     controller.cli.type_bytes(b"\x1cd");
-    assert_eq!(controller.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(controller.wait_exit(), 0);
     controller.assert_terminal_restored();
     wait_control(&root, "host-ro-cut", "AgentControl");
 
@@ -1676,22 +1786,21 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "host-ro-resume");
-    // The flood passes the 4 KiB ring, but fits the pipes of the controller,
-    // which does not read, so its sender never blocks. Capture never waits
-    // for a sender, though: it comes in 1200-byte steps (ONLCR), so a sender
-    // briefly descheduled still copies each one before the ring drops it,
-    // and the controller is never evicted.
+    // The flood passes the 4 KiB ring in 1200-byte steps (ONLCR). Each step
+    // is let out only once the controller has been sent the one before, so
+    // it is never a whole ring behind and never evicted, however slowly
+    // load runs its sender.
     start_script(
         &root,
         "host-ro-resume",
         "while [ ! -f \"$GO1\" ]; do sleep 0.05; done; printf abc; \
-         while [ ! -f \"$GO2\" ]; do sleep 0.05; done; \
-         i=0; while [ $i -lt 6 ]; do yes xxxxxxxxxx | head -n 100; sleep 0.1; i=$((i+1)); done; \
-         printf FLOOD-END; sleep 60",
+         i=0; while [ $i -lt 6 ]; do while [ ! -f \"$GO2.$i\" ]; do sleep 0.05; done; \
+         yes xxxxxxxxxx | head -n 100; i=$((i+1)); done; \
+         printf FLOOD-END; sleep 3600",
         &["GO1", "GO2"],
         &[("TENDR_TEST_OUTPUT_RING_BYTES", "4096")],
     );
-    let (controller, _) = attach_v2(&root, "host-ro-resume");
+    let (mut controller, _) = attach_v2(&root, "host-ro-resume");
     wait_control(&root, "host-ro-resume", "HumanControl");
 
     let mut watcher = FrameClient::start_with(
@@ -1735,7 +1844,20 @@ fn remote_watch_resume_is_answered_at_epoch_zero_and_never_touches_control() {
     );
     assert_eq!(resumed.detach(), Some(0));
 
-    touch(&root, "GO2");
+    let mut to_controller = Vec::new();
+    for step in 0..6 {
+        touch(&root, &format!("GO2.{step}"));
+        let lines = (step + 1) * 100;
+        while String::from_utf8_lossy(&to_controller)
+            .matches("xxxxxxxxxx")
+            .count()
+            < lines
+        {
+            if let Frame::Output { bytes, .. } = controller.frame() {
+                to_controller.extend_from_slice(&bytes);
+            }
+        }
+    }
     harness::wait_log_tail(&root, "host-ro-resume", "FLOOD-END");
     let mut gone = watch_resume(&root, "host-ro-resume", asked, &watch_resume_frame);
     match gone.frame() {
@@ -1816,7 +1938,7 @@ fn remote_watch_resume_in_version_3_is_told_where_the_output_ends() {
         "host-ro-end",
         "while [ ! -f \"$GO\" ]; do sleep 0.05; done; printf xyz",
         &["GO"],
-        &[],
+        &[FLUSH_ALL],
     );
     let json = |protocol: u8, resume: Option<WatchPoint>| {
         watch_json("host-ro-end", resume)
@@ -1877,15 +1999,23 @@ fn remote_watch_resume_in_version_3_is_told_where_the_output_ends() {
 }
 
 /// `tendr --host box attach --read-only <session>` through the fake ssh in
-/// `ssh`, with no terminal: stdin closed, stdout and stderr piped.
-fn watch_without_terminal(ssh: &TempDir, root: &TempDir, session: &str) -> std::process::Child {
+/// `ssh`, with no terminal: stdin closed, stdout and stderr piped, and `env`
+/// added (the fake ssh passes it on to the remote tendr).
+fn watch_without_terminal(
+    ssh: &TempDir,
+    root: &TempDir,
+    session: &str,
+    env: &[(&str, &str)],
+) -> std::process::Child {
     use std::process::Stdio;
     std::process::Command::new(tendr_bin())
         .args(["--host", "box", "attach", "--read-only", session])
         .env("HOME", root.path())
         .env("PATH", shim_path_env(ssh))
         .env("TENDR_TEST_BIN", tendr_bin())
-        .env("TENDR_SSH_CONNECT_TIMEOUT", "30")
+        .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
+        .env(SSH_CLOSES.0, SSH_CLOSES.1)
+        .envs(env.iter().copied())
         .env_remove("TENDR_TEST_ATTACH_TERMINAL")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1907,18 +2037,16 @@ fn read_until(stdout: &mut std::process::ChildStdout, marker: &str) -> Vec<u8> {
     read
 }
 
-/// Wait for `child` to exit, killing it after a minute, and return its code
-/// and stderr.
+/// Wait for `child` to exit, killing it if it hangs ([`HANG`]), and return
+/// its code and stderr.
 fn finish(mut child: std::process::Child) -> (Option<i32>, String) {
     use std::io::Read;
-    let status = poll_until(
-        Duration::from_secs(60),
-        Duration::from_millis(20),
-        || match child.try_wait().unwrap() {
+    let status = poll_until(HANG, Duration::from_millis(20), || {
+        match child.try_wait().unwrap() {
             Some(status) => Observation::Ready(status),
             None => Observation::Pending("attach still running".to_owned()),
-        },
-    )
+        }
+    })
     .unwrap_or_else(|e| {
         let _ = child.kill();
         panic!("attach did not exit: {e}");
@@ -1955,11 +2083,11 @@ fn host_read_only_without_a_terminal_writes_the_runs_output_and_exits_0() {
             "i=0; while [ $i -lt 200 ]; do echo line-$i; i=$((i+1)); done; echo ALL-DONE",
         ),
         &["GO"],
-        &[],
+        &[FLUSH_ALL],
     );
     let remote = Remote::new();
 
-    let mut child = watch_without_terminal(&remote.ssh, &root, "host-ro-out");
+    let mut child = watch_without_terminal(&remote.ssh, &root, "host-ro-out", &[]);
     let mut stdout = child.stdout.take().unwrap();
     let mut out = read_until(&mut stdout, "tick");
     touch(&root, "GO");
@@ -1999,7 +2127,9 @@ fn host_read_only_without_a_terminal_cut_off_exits_84() {
     );
     let remote = Remote::new();
 
-    let mut child = watch_without_terminal(&remote.ssh, &root, "host-ro-cutoff");
+    // The run does not end before the verdict (it waits for END), so the
+    // cut-off, however late load makes it, is the only end the attach sees.
+    let mut child = watch_without_terminal(&remote.ssh, &root, "host-ro-cutoff", &[]);
     let mut stdout = child.stdout.take().unwrap();
     read_until(&mut stdout, "tick");
     // Stall: read nothing while the run floods past the ring.
@@ -2025,8 +2155,8 @@ fn host_read_only_without_a_terminal_cut_off_exits_84() {
 
 /// The run's last bytes reach a watcher over `--host` that was behind when
 /// the run ended: the session sends a viewer everything up to the run's
-/// final offset before it closes the connection, waiting a moment for one
-/// that is slow to read.
+/// final offset before it closes the connection, waiting for one that is
+/// slow to read (here for longer than load can hold it up).
 #[test]
 fn host_read_only_gets_the_runs_last_bytes_at_its_end() {
     use std::io::Read;
@@ -2041,15 +2171,17 @@ fn host_read_only_gets_the_runs_last_bytes_at_its_end() {
             "y".repeat(62)
         )),
         &["GO"],
-        &[],
+        &[FLUSH_ALL],
     );
     let remote = Remote::new();
 
-    let mut child = watch_without_terminal(&remote.ssh, &root, "host-ro-flush");
+    let mut child = watch_without_terminal(&remote.ssh, &root, "host-ro-flush", &[]);
     let mut stdout = child.stdout.take().unwrap();
     let mut out = read_until(&mut stdout, "tick");
     // Behind at the end: nothing read until the run has written its last
-    // bytes and ended, then a moment more, well within the session's wait.
+    // bytes, then a moment more for it to end. This sleep only waits out
+    // the run's exit; under load the watcher may start reading before the
+    // run has ended, which can only weaken the test, never fail it.
     touch(&root, "GO");
     harness::wait_log_tail(&root, "host-ro-flush", "LAST-BYTES");
     std::thread::sleep(Duration::from_millis(500));
@@ -2083,11 +2215,11 @@ fn host_read_only_gets_a_burst_as_the_run_ends_through_its_marker() {
         "host-ro-burst",
         &ticking_then(harness::BURST),
         &["GO"],
-        &[],
+        &[FLUSH_ALL],
     );
     let ssh = fake_ssh("pump");
 
-    let mut child = watch_without_terminal(&ssh, &root, "host-ro-burst");
+    let mut child = watch_without_terminal(&ssh, &root, "host-ro-burst", &[]);
     let mut stdout = child.stdout.take().unwrap();
     let mut out = read_until(&mut stdout, "tick");
     touch(&root, "GO");
@@ -2126,7 +2258,9 @@ fn host_read_only_stalled_past_the_run_end_flush_exits_84() {
     );
     let ssh = fake_ssh("pump");
 
-    let mut child = watch_without_terminal(&ssh, &root, "host-ro-stall");
+    // The session's run-end flush (`RUN_END_FLUSH`) is the only way out:
+    // this consumer reads nothing until the run's end is recorded.
+    let mut child = watch_without_terminal(&ssh, &root, "host-ro-stall", &[]);
     let mut stdout = child.stdout.take().unwrap();
     let mut out = read_until(&mut stdout, "tick");
     touch(&root, "GO");
@@ -2162,7 +2296,7 @@ fn host_read_only_with_a_sidecar_from_before_the_end_of_output_exits_0() {
         "host-ro-old-end",
         &ticking_then("echo ALL-DONE"),
         &["GO"],
-        &[],
+        &[FLUSH_ALL],
     );
     let seen = old_sidecar(
         &root,
@@ -2172,7 +2306,7 @@ fn host_read_only_with_a_sidecar_from_before_the_end_of_output_exits_0() {
     );
     let ssh = fake_ssh("pump");
 
-    let mut child = watch_without_terminal(&ssh, &root, "host-ro-old-end");
+    let mut child = watch_without_terminal(&ssh, &root, "host-ro-old-end", &[RECORDED_END]);
     let mut stdout = child.stdout.take().unwrap();
     let mut out = read_until(&mut stdout, "tick");
     touch(&root, "GO");
@@ -2219,7 +2353,7 @@ fn old_sidecar(
     let frames = std::sync::Arc::clone(&seen);
     std::thread::spawn(move || {
         for mut client in listener.incoming().map_while(Result::ok) {
-            let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = client.set_read_timeout(Some(HANG));
             let Ok((msg_type, payload)) = read_msg(&mut client) else {
                 continue;
             };
@@ -2301,7 +2435,7 @@ fn host_watch_resume_to_a_sidecar_from_before_the_end_of_output_says_it_in_versi
         "host-ro-old-end-resume",
         &ticking_then("echo ALL-DONE"),
         &["GO"],
-        &[],
+        &[FLUSH_ALL],
     );
     let seen = old_sidecar(
         &root,
@@ -2311,14 +2445,17 @@ fn host_watch_resume_to_a_sidecar_from_before_the_end_of_output_says_it_in_versi
     );
     let link = Flaky::new();
 
-    let watcher = link.attach(
+    let watcher = attach_through(
+        &link.ssh,
+        CONNECTS,
         &root,
         "old-end-resume",
         &["host-ro-old-end-resume", "--read-only"],
+        &[RECORDED_END],
     );
     watcher.wait_output_contains("tick");
     link.cut();
-    poll_until(Duration::from_secs(30), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         let seen = seen.lock().unwrap().clone();
         if seen.len() >= 4 {
             Observation::Ready(())
@@ -2329,7 +2466,7 @@ fn host_watch_resume_to_a_sidecar_from_before_the_end_of_output_says_it_in_versi
     .unwrap();
     touch(&root, "GO");
     watcher.wait_output_contains("ALL-DONE");
-    assert_eq!(watcher.wait_exit(Duration::from_secs(30)), 0);
+    assert_eq!(watcher.wait_exit(), 0);
     watcher.assert_terminal_restored();
     let seen = seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 4, "{seen:?}");
@@ -2369,7 +2506,7 @@ fn host_watch_hello_to_a_sidecar_from_before_watchers_exits_80() {
     );
 
     controller.cli.type_bytes(b"\x1cd");
-    assert_eq!(controller.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(controller.wait_exit(), 0);
     wait_control(&root, "host-ro-old", "AgentControl");
 }
 
@@ -2402,7 +2539,7 @@ fn host_watch_resume_to_a_sidecar_from_before_it_exits_80() {
     let watcher = link.attach(&root, "old-resume", &["host-ro-old-resume", "--read-only"]);
     watcher.wait_output_contains("tick");
     link.cut();
-    assert_eq!(watcher.wait_exit(Duration::from_secs(30)), 80);
+    assert_eq!(watcher.wait_exit(), 80);
     watcher.assert_terminal_restored();
     watcher.wait_output_contains("cannot resume a read-only attach");
     let seen = seen.lock().unwrap().clone();
@@ -2417,7 +2554,7 @@ fn host_watch_resume_to_a_sidecar_from_before_it_exits_80() {
     );
 
     controller.cli.type_bytes(b"\x1cd");
-    assert_eq!(controller.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(controller.wait_exit(), 0);
     wait_control(&root, "host-ro-old-resume", "AgentControl");
 }
 
@@ -2491,7 +2628,7 @@ fn a_watch_hello_and_watch_resume_are_refused_by_an_old_remote() {
     ));
     let watcher = attach_through(
         &ssh,
-        "30",
+        CONNECTS,
         &root,
         "old-remote-ro",
         &["s", "--read-only"],
@@ -2499,7 +2636,7 @@ fn a_watch_hello_and_watch_resume_are_refused_by_an_old_remote() {
     );
     watcher.wait_output_contains("one");
     std::fs::write(path("drop"), b"").unwrap();
-    assert_eq!(watcher.wait_exit(Duration::from_secs(30)), 80);
+    assert_eq!(watcher.wait_exit(), 80);
     watcher.assert_terminal_restored();
 
     let fresh = std::fs::read(path("fresh")).unwrap();

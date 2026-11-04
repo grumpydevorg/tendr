@@ -893,6 +893,8 @@ mod tests {
         let mut forward = Vec::new();
         parser.feed(b"\x1b", &mut forward);
         let due = parser.partial_deadline().unwrap();
+        // Lets the clock move on, so a restarted deadline would differ; load
+        // only lengthens it.
         std::thread::sleep(Duration::from_millis(2));
         parser.feed(b"[9", &mut forward);
         assert_eq!(parser.partial_deadline(), Some(due));

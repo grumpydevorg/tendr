@@ -227,7 +227,8 @@ fn handle_replace(
             // also when meta is already terminal: the sidecar writes it just
             // before releasing, and on Windows a directory it still holds open
             // cannot be removed (#91).
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let within = replace_wait();
+            let deadline = std::time::Instant::now() + within;
             let name = session_name.as_str();
             loop {
                 if let Ok(m) = session::read_meta(&existing) {
@@ -237,7 +238,8 @@ fn handle_replace(
                 }
                 if std::time::Instant::now() >= deadline {
                     anyhow::bail!(
-                        "replace timed out: old sidecar for {name} did not exit within 10s"
+                        "replace timed out: old sidecar for {name} did not exit within {}s",
+                        within.as_secs()
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -248,6 +250,16 @@ fn handle_replace(
         }
     }
     Ok(None)
+}
+
+/// How long `start --replace` waits for the old sidecar to record its end
+/// and release the session.
+const REPLACE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`REPLACE_WAIT`]. Debug builds accept `TENDR_TEST_REPLACE_WAIT_MS` so
+/// tests can hold the old session past it however slow the machine.
+fn replace_wait() -> std::time::Duration {
+    tendr::test_timer::or_env("TENDR_TEST_REPLACE_WAIT_MS", REPLACE_WAIT)
 }
 
 /// Handle `AlreadyExists` when creating a session.

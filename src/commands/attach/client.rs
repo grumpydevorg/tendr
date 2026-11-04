@@ -58,7 +58,7 @@ const POLL: Duration = Duration::from_millis(100);
 /// How often the terminal size is checked.
 const SIZE_POLL: Duration = Duration::from_millis(100);
 /// How long a detach waits for the detach message to be sent.
-pub(super) const DETACH_GRACE: Duration = Duration::from_millis(200);
+const DETACH_GRACE: Duration = Duration::from_millis(200);
 /// How long leaving on a signal waits for its report to be written to a
 /// terminal that may be gone or not reading.
 const REPORT_GRACE: Duration = Duration::from_millis(200);
@@ -423,7 +423,7 @@ pub(super) fn relay(
                 ending,
                 Ending::Detached | Ending::Left(_) | Ending::OutputGone
             ) {
-                outgoing.outbox.detach(DETACH_GRACE);
+                outgoing.outbox.detach(detach_grace());
             }
             // Unblocks the sender and reader, which are not waited for.
             outgoing.close();
@@ -431,16 +431,16 @@ pub(super) fn relay(
         }
         // Leaving while reconnecting: stop it, and its ssh. A connection it
         // resumed just now ends as it is dropped, which closes ssh's stdin.
-        Held::Reconnecting(job) => job.stop(RECONNECT_STOP_GRACE).and_then(|(host, _)| host),
+        Held::Reconnecting(job) => job.stop(reconnect_stop_grace()).and_then(|(host, _)| host),
         Held::Host(host) => host,
     };
     turn_off_modes(
         &screen,
         &status,
         if matches!(ending, Ending::Left(_)) {
-            REPORT_GRACE
+            report_grace()
         } else {
-            MODES_GRACE
+            modes_grace()
         },
     );
     drop(terminal);
@@ -485,7 +485,7 @@ pub(super) fn relay(
     }
     let finished = host.as_mut().and_then(|end| {
         end.finish(if ending.by_session() {
-            super::SSH_CLOSE_GRACE
+            super::ssh_close_grace()
         } else {
             super::SSH_LEAVE_GRACE
         })
@@ -805,7 +805,7 @@ fn exit_left(notes: Vec<String>) -> ! {
         }
         let _ = done.send(());
     });
-    let _ = written.recv_timeout(REPORT_GRACE);
+    let _ = written.recv_timeout(report_grace());
     std::process::exit(1);
 }
 
@@ -1138,18 +1138,35 @@ fn end_output(screen: &Screen, offset: u64) -> ReaderEnd {
 
 /// How often the terminal size is checked. Debug builds accept
 /// `TENDR_TEST_ATTACH_SIZE_POLL_MS` so tests can tell a size change
-/// forwarded on SIGWINCH from one found by this poll; release builds ignore
-/// it.
+/// forwarded on SIGWINCH from one found by this poll.
 fn size_poll_interval() -> Duration {
-    if cfg!(debug_assertions) {
-        if let Some(ms) = std::env::var("TENDR_TEST_ATTACH_SIZE_POLL_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
-            return Duration::from_millis(ms);
-        }
-    }
-    SIZE_POLL
+    tendr::test_timer::or_env("TENDR_TEST_ATTACH_SIZE_POLL_MS", SIZE_POLL)
+}
+
+/// [`DETACH_GRACE`]. Debug builds accept `TENDR_TEST_DETACH_GRACE_MS` so
+/// tests whose detach message must go out are not cut short by a loaded
+/// machine.
+pub(super) fn detach_grace() -> Duration {
+    tendr::test_timer::or_env("TENDR_TEST_DETACH_GRACE_MS", DETACH_GRACE)
+}
+
+/// [`REPORT_GRACE`]. Debug builds accept `TENDR_TEST_REPORT_GRACE_MS` so
+/// tests that read the report are not cut short by a loaded machine.
+fn report_grace() -> Duration {
+    tendr::test_timer::or_env("TENDR_TEST_REPORT_GRACE_MS", REPORT_GRACE)
+}
+
+/// [`MODES_GRACE`]. Debug builds accept `TENDR_TEST_MODES_GRACE_MS` so
+/// tests that read the mode resets are not cut short by a loaded machine.
+fn modes_grace() -> Duration {
+    tendr::test_timer::or_env("TENDR_TEST_MODES_GRACE_MS", MODES_GRACE)
+}
+
+/// [`RECONNECT_STOP_GRACE`]. Debug builds accept
+/// `TENDR_TEST_RECONNECT_STOP_GRACE_MS` so tests whose reconnect's ssh must
+/// be stopped are not cut short by a loaded machine.
+fn reconnect_stop_grace() -> Duration {
+    tendr::test_timer::or_env("TENDR_TEST_RECONNECT_STOP_GRACE_MS", RECONNECT_STOP_GRACE)
 }
 
 #[cfg(test)]

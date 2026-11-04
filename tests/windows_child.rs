@@ -49,7 +49,8 @@ fn windows_spawn_captures_stdout() {
 /// try_wait returns None while child is running, Some after exit.
 #[test]
 fn windows_try_wait_while_running() {
-    let argv = vec!["cmd".into(), "/C".into(), "timeout /t 10 /nobreak".into()];
+    // Never ends by itself: only the kill below can end it.
+    let argv = vec!["cmd".into(), "/C".into(), "timeout /t 3600 /nobreak".into()];
     let mut child =
         WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
             .expect("spawn_child should succeed");
@@ -73,7 +74,7 @@ fn windows_try_wait_while_running() {
 /// Force kill terminates the child immediately.
 #[test]
 fn windows_force_kill() {
-    let argv = vec!["cmd".into(), "/C".into(), "timeout /t 60 /nobreak".into()];
+    let argv = vec!["cmd".into(), "/C".into(), "timeout /t 3600 /nobreak".into()];
     let mut child =
         WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
             .expect("spawn_child should succeed");
@@ -103,14 +104,15 @@ fn windows_force_kill_idempotent() {
 /// Graceful kill sends CTRL_BREAK, escalates to force after timeout.
 #[test]
 fn windows_kill_graceful_escalates() {
-    let argv = vec!["cmd".into(), "/C".into(), "timeout /t 60 /nobreak".into()];
+    // Ignores CTRL_BREAK and never ends by itself: escalation is the only way out.
+    let argv = vec!["cmd".into(), "/C".into(), "timeout /t 3600 /nobreak".into()];
     let mut child =
         WindowsPlatform::spawn_child(&argv, false, None, &BTreeSet::new(), &BTreeMap::new())
             .expect("spawn_child should succeed");
 
     let handle = WindowsPlatform::child_kill_handle(&child);
 
-    // Graceful kill — timeout /t 60 /nobreak ignores CTRL_BREAK,
+    // Graceful kill — timeout /t 3600 /nobreak ignores CTRL_BREAK,
     // so this should escalate to TerminateJobObject after ~5s.
     WindowsPlatform::kill_child(&handle, false).expect("graceful kill should succeed");
 
@@ -184,8 +186,8 @@ fn windows_kill_graceful_cooperative() {
 
     // The helper prints READY once its console control handler is installed, so a
     // CTRL_BREAK sent after this line is guaranteed to be caught — replacing a
-    // fixed sleep. Read it on a thread with a deadline so a silent helper fails
-    // fast with a clear message instead of hanging on a blocking read.
+    // fixed sleep. Read it on a thread up to the hang deadline so a silent helper
+    // fails with a clear message instead of hanging on a blocking read.
     let stdout = WindowsPlatform::child_stdout(&mut child).expect("stdout should be available");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -196,7 +198,7 @@ fn windows_kill_graceful_cooperative() {
     // The responder exits(1) if SetConsoleCtrlHandler fails, so READY is only ever
     // published by a process whose handler is genuinely installed.
     let ready = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
+        .recv_timeout(harness::HANG)
         .expect("ctrl_break_responder never printed READY (control handler not installed?)");
     assert_eq!(
         ready.trim(),

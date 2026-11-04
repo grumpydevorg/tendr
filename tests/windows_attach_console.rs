@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use harness::conpty::{ConPty, ConmodeReport, conmode_bin};
-use harness::{Observation, fake_ssh, poll_until, process_alive, shim_path_env};
+use harness::{HANG, Observation, fake_ssh, poll_until, process_alive, shim_path_env};
 use tempfile::TempDir;
 use tendr::attach_proto::{Frame, Mode, Version};
 use tendr::recording::Geometry;
@@ -25,8 +25,15 @@ const COLS: i16 = 80;
 const ROWS: i16 = 25;
 /// The default detach escape: `Ctrl-\` then `d`.
 const DETACH: &[u8] = b"\x1cd";
-/// Hang detector for one observation. Each normally takes milliseconds.
-const WAIT: Duration = Duration::from_secs(20);
+
+/// A `conmode --run` option that makes the client's detach wait for its
+/// detach frame to be sent for as long as load can delay the sender, in
+/// place of the 200 ms grace after which the client gives up on it. For
+/// tests that assert the detach frame went out; the remote here always
+/// takes it at once, so the wait ends as soon as it is sent.
+fn detach_grace_outlasting_load() -> String {
+    format!("TENDR_TEST_DETACH_GRACE_MS={}", HANG.as_millis())
+}
 
 /// `tendr --host box attach s` in a pseudo console against a scripted
 /// remote, run by `conmode --run`.
@@ -54,8 +61,26 @@ impl Attach {
             script.replace("{log}", frames.to_str().unwrap())
         ));
         let path = format!("PATH={}", shim_path_env(&ssh).to_str().unwrap());
+        // Every remote here exits once it has closed its output, so the wait
+        // for ssh's exit code (5 s, after which a still-running ssh is a
+        // lost link) is stretched past anything load can do; it ends as
+        // soon as ssh exits.
+        let close_grace = format!("TENDR_TEST_SSH_CLOSE_GRACE_MS={}", HANG.as_millis());
+        // Leaving puts the modes back and erases the status rows on a writer
+        // thread it waits for only 1 s; stretched so the console is always
+        // put back before the `after` report.
+        let modes_grace = format!("TENDR_TEST_MODES_GRACE_MS={}", HANG.as_millis());
         let conmode_bin = conmode_bin();
-        let mut argv = vec![conmode_bin.as_str(), "--run", "--env", &path];
+        let mut argv = vec![
+            conmode_bin.as_str(),
+            "--run",
+            "--env",
+            &path,
+            "--env",
+            &close_grace,
+            "--env",
+            &modes_grace,
+        ];
         argv.extend(conmode);
         argv.extend([
             "--",
@@ -78,7 +103,7 @@ impl Attach {
 
     fn report(&self, tag: &str) -> ConmodeReport {
         self.pty
-            .wait_for(&format!("conmode report tagged {tag:?}"), WAIT, |text| {
+            .wait_for(&format!("conmode report tagged {tag:?}"), HANG, |text| {
                 ConmodeReport::find(text, tag)
             })
     }
@@ -86,7 +111,7 @@ impl Attach {
     /// Wait until the client has drawn `needle`.
     fn wait_text(&self, needle: &str) {
         self.pty
-            .wait_for(needle, WAIT, |text| text.contains(needle).then_some(()));
+            .wait_for(needle, HANG, |text| text.contains(needle).then_some(()));
     }
 
     /// The frames the client sent so far, `{:?}` one per line.
@@ -100,7 +125,7 @@ impl Attach {
 
     /// Wait until the frames sent satisfy `done`.
     fn wait_frames(&self, what: &str, done: impl Fn(&[String]) -> bool) {
-        poll_until(WAIT, Duration::from_millis(20), || {
+        poll_until(HANG, Duration::from_millis(20), || {
             let frames = self.frames();
             if done(&frames) {
                 Observation::Ready(())
@@ -116,7 +141,7 @@ impl Attach {
     fn finish(self) -> u32 {
         let code = self
             .pty
-            .wait_exit(WAIT)
+            .wait_exit(HANG)
             .unwrap_or_else(|| panic!("the client never exited\ndrawn: {:?}", self.pty.text()));
         let (before, after) = (self.report("before"), self.report("after"));
         assert_eq!(
@@ -153,12 +178,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// console is put back.
 #[test]
 fn a_console_attach_types_shows_resizes_and_detaches() {
+    let grace = detach_grace_outlasting_load();
     let mut attach = Attach::start(
         "hello log {log}\n\
          hello answer\n\
          hello output scripted-output\n\
          hello drain",
-        &[],
+        &["--env", &grace],
     );
     attach.wait_text("scripted-output");
 
@@ -277,6 +303,7 @@ fn resumed_from(frames: &[String], offset: usize) -> bool {
 #[test]
 fn a_reconnect_shows_its_status_and_backoff_and_discards_typing() {
     let dir = TempDir::new().unwrap();
+    let grace = detach_grace_outlasting_load();
     let prompt = dir.path().join("prompt");
     let mut attach = Attach::start_after(
         &format!("needs-prompt {}", prompt.to_str().unwrap()),
@@ -289,7 +316,7 @@ fn a_reconnect_shows_its_status_and_backoff_and_discards_typing() {
          resume answer\n\
          resume output after-resume\n\
          resume drain",
-        &[],
+        &["--env", &grace],
     );
     attach.wait_text("before-drop");
     // From now on a login needs a prompt, which a reconnect never answers:
@@ -326,6 +353,7 @@ fn a_reconnect_shows_its_status_and_backoff_and_discards_typing() {
 /// shows what follows.
 #[test]
 fn an_ntstatus_drop_resumes_where_the_console_stopped() {
+    let grace = detach_grace_outlasting_load();
     let mut attach = Attach::start(
         "hello answer\n\
          hello await Repaint\n\
@@ -335,7 +363,7 @@ fn an_ntstatus_drop_resumes_where_the_console_stopped() {
          resume answer\n\
          resume output after-resume\n\
          resume drain",
-        &[],
+        &["--env", &grace],
     );
     attach.wait_text("before-drop");
     attach.wait_text("after-resume");
@@ -368,6 +396,7 @@ fn an_ntstatus_drop_resumes_where_the_console_stopped() {
 #[test]
 fn a_gone_resume_says_what_was_missed_and_resets_the_modes() {
     const PASTE_START: &[u8] = b"\x1b[200~";
+    let grace = detach_grace_outlasting_load();
     let mut attach = Attach::start(
         "hello log {log}\n\
          hello answer\n\
@@ -380,7 +409,7 @@ fn a_gone_resume_says_what_was_missed_and_resets_the_modes() {
          resume gone 5\n\
          resume output after-gone\n\
          resume drain",
-        &[],
+        &["--env", &grace],
     );
     attach.wait_text("bracketed-paste-on");
     attach
@@ -428,7 +457,7 @@ fn the_escape_during_a_reconnect_exits_0_and_stops_ssh() {
     std::fs::write(&stall, b"").unwrap();
     attach.pty.write(b"x");
     attach.wait_text("tendr: connection lost, reconnecting (attempt 1)");
-    let attempt = poll_until(WAIT, Duration::from_millis(20), || match pid() {
+    let attempt = poll_until(HANG, Duration::from_millis(20), || match pid() {
         Some(pid) if pid != first => Observation::Ready(pid),
         other => Observation::Pending(format!("pid file holds {other:?}")),
     })
@@ -436,7 +465,7 @@ fn the_escape_during_a_reconnect_exits_0_and_stops_ssh() {
 
     attach.pty.write(DETACH);
     assert_eq!(attach.finish(), 0);
-    poll_until(WAIT, Duration::from_millis(20), || {
+    poll_until(HANG, Duration::from_millis(20), || {
         if process_alive(attempt) {
             Observation::Pending(format!("the reconnect's ssh (pid {attempt}) runs"))
         } else {

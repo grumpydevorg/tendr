@@ -5,7 +5,9 @@
 
 mod harness;
 
-use harness::{BURST, Observation, SessionGuard, assert_prefix_of_the_burst, poll_until, tendr};
+use harness::{
+    BURST, HANG, Observation, SessionGuard, assert_prefix_of_the_burst, poll_until, tendr,
+};
 use std::io::{Read, Seek, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,21 @@ use tempfile::TempDir;
 use tendr::attach_proto::{Frame, Mode, Version, read_frame, write_frame};
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// The sidecar's environment that makes the run's end wait for its viewers
+/// to be sent the last of its output for as long as load can delay them,
+/// in place of the 2 s after which it cuts a viewer off (exit 84). For
+/// tests whose viewers read all along and must get every byte; the wait
+/// ends as soon as they have. Tests of that cut-off keep the default.
+fn run_end_flush_outlasting_load() -> (&'static str, String) {
+    ("TENDR_TEST_RUN_END_FLUSH_MS", HANG.as_millis().to_string())
+}
+
+/// [`start`] with [`run_end_flush_outlasting_load`].
+fn start_flushing_all(root: &TempDir, session: &str, script: &str) {
+    let (key, value) = run_end_flush_outlasting_load();
+    start(root, session, script, &[(key, &value)]);
+}
 
 fn session_dir(root: &TempDir, session: &str) -> PathBuf {
     root.path()
@@ -40,12 +57,14 @@ fn start(root: &TempDir, session: &str, script: &str, env: &[(&str, &str)]) {
 
 fn socket(root: &TempDir, session: &str) -> PathBuf {
     let dir = session_dir(root, session);
-    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
-        match tendr::attach_proto::read_sock_path(&dir) {
+    poll_until(
+        HANG,
+        Duration::from_millis(50),
+        || match tendr::attach_proto::read_sock_path(&dir) {
             Some(path) => Observation::Ready(path),
             None => Observation::Pending("no attach socket yet".to_owned()),
-        }
-    })
+        },
+    )
     .unwrap()
 }
 
@@ -81,17 +100,15 @@ fn read_until(stdout: &mut ChildStdout, marker: &str) -> Vec<u8> {
     read
 }
 
-/// Wait for `child` to exit, killing it after a minute, and return its code
+/// Wait for `child` to exit, killing it at [`HANG`], and return its code
 /// and stderr.
 fn finish(mut child: Child) -> (Option<i32>, String) {
-    let status = poll_until(
-        Duration::from_secs(60),
-        Duration::from_millis(20),
-        || match child.try_wait().unwrap() {
+    let status = poll_until(HANG, Duration::from_millis(20), || {
+        match child.try_wait().unwrap() {
             Some(status) => Observation::Ready(status),
             None => Observation::Pending("attach still running".to_owned()),
-        },
-    )
+        }
+    })
     .unwrap_or_else(|e| {
         let _ = child.kill();
         panic!("attach did not exit: {e}");
@@ -121,14 +138,13 @@ fn stdout_is_exactly_the_runs_output_and_stdin_is_never_read() {
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "ro-out");
     let go = root.path().join("go");
-    start(
+    start_flushing_all(
         &root,
         "ro-out",
         &ticking_then(
             &go,
             "i=0; while [ $i -lt 200 ]; do echo line-$i; i=$((i+1)); done; echo ALL-DONE",
         ),
-        &[],
     );
     // Typed-ahead data a reader of stdin would consume: its shared file
     // offset shows whether anything read it.
@@ -170,7 +186,7 @@ fn stdout_gets_the_mode_replay_but_no_resets_when_leaving() {
         "printf '\\033[?2004h'; {}",
         ticking_then(&go, "echo ALL-DONE")
     );
-    start(&root, "ro-modes", &script, &[]);
+    start_flushing_all(&root, "ro-modes", &script);
 
     let mut child = attach(&root, "ro-modes", Stdio::null(), &[]);
     let mut stdout = child.stdout.take().unwrap();
@@ -218,7 +234,7 @@ fn a_watcher_cut_off_while_its_consumer_stalls_exits_84() {
     read_until(&mut stdout, "tick");
     // Stall: read nothing while the run floods past the ring.
     touch(&go);
-    poll_until(Duration::from_secs(60), Duration::from_millis(100), || {
+    poll_until(HANG, Duration::from_millis(100), || {
         if harness::logged_output(&root, "ro-cut").contains("ALL-DONE") {
             Observation::Ready(())
         } else {
@@ -285,15 +301,12 @@ fn a_consumer_that_closes_early_detaches_the_watcher_and_exits_1() {
 
     assert_eq!(code, Some(1), "stderr: {stderr}");
     // The sidecar let the attach go: its slot takes a new watcher.
-    let freed =
-        poll_until(
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-            || match watcher_admitted(&root, "ro-pipe") {
-                Some(stream) => Observation::Ready(stream),
-                None => Observation::Pending("the attach's slot is still held".to_owned()),
-            },
-        );
+    let freed = poll_until(HANG, Duration::from_millis(50), || {
+        match watcher_admitted(&root, "ro-pipe") {
+            Some(stream) => Observation::Ready(stream),
+            None => Observation::Pending("the attach's slot is still held".to_owned()),
+        }
+    });
     touch(&end);
     harness::wait_terminal(&root, "ro-pipe");
     drop(others);
@@ -344,14 +357,13 @@ fn every_viewer_behind_at_the_runs_end_gets_its_last_bytes() {
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "ro-flush");
     let go = root.path().join("go");
-    start(
+    start_flushing_all(
         &root,
         "ro-flush",
         &ticking_then(
             &go,
             &format!("yes {} | head -n 40000; printf LAST-BYTES", "y".repeat(62)),
         ),
-        &[],
     );
     // A version 2 controller that reads nothing until the run has ended.
     let mut controller = UnixStream::connect(socket(&root, "ro-flush")).unwrap();
@@ -372,7 +384,11 @@ fn every_viewer_behind_at_the_runs_end_gets_its_last_bytes() {
     let mut stdout = child.stdout.take().unwrap();
     let mut out = read_until(&mut stdout, "tick");
     // Behind at the end: nothing read until the run has written its last
-    // bytes and ended, then a moment more, well within the session's wait.
+    // bytes and ended, well within the session's wait for its viewers
+    // (stretched past anything load can do). The sleep waits out the run's
+    // end after its last bytes; under load reading may start before it,
+    // which only lets the test pass without the viewers being behind at
+    // the end, never fail.
     touch(&go);
     harness::wait_log_tail(&root, "ro-flush", "LAST-BYTES");
     std::thread::sleep(Duration::from_millis(500));
@@ -414,7 +430,7 @@ fn a_burst_as_the_run_ends_reaches_a_piped_watcher_through_its_marker() {
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "ro-burst");
     let go = root.path().join("go");
-    start(&root, "ro-burst", &ticking_then(&go, BURST), &[]);
+    start_flushing_all(&root, "ro-burst", &ticking_then(&go, BURST));
 
     let mut child = attach(&root, "ro-burst", Stdio::null(), &[]);
     let mut stdout = child.stdout.take().unwrap();
@@ -527,10 +543,20 @@ fn a_sidecar_from_before_the_end_of_output_keeps_the_run_end_verdict() {
     let root = TempDir::new().unwrap();
     let _kill = SessionGuard::new(&root, "ro-old");
     let go = root.path().join("go");
-    start(&root, "ro-old", &ticking_then(&go, "echo ALL-DONE"), &[]);
+    start_flushing_all(&root, "ro-old", &ticking_then(&go, "echo ALL-DONE"));
     let hellos = sidecar_before_output_end(&root, "ro-old");
 
-    let mut child = attach(&root, "ro-old", Stdio::null(), &[]);
+    // Going by `meta.json`, the attach counts the close as a cut-off (84)
+    // if the run's end is not recorded within 2 s while the socket is still
+    // published; stretched past anything load can do to the sidecar, it
+    // ends as soon as the end is recorded.
+    let run_end_grace = HANG.as_millis().to_string();
+    let mut child = attach(
+        &root,
+        "ro-old",
+        Stdio::null(),
+        &[("TENDR_TEST_RUN_END_GRACE_MS", &run_end_grace)],
+    );
     let mut stdout = child.stdout.take().unwrap();
     let mut out = read_until(&mut stdout, "tick");
     touch(&go);
