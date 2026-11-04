@@ -29,7 +29,9 @@
   waited only 100 ms past the sentinel for the error, so on a busy machine
   a failed statement could be reported as a success. The DuckDB frame now
   ends its stderr with a marker, as the shell frame does, and `exec` waits
-  for both.
+  for both. A DuckDB started with `-safe` cannot print the marker: there
+  `exec` waits a second after the sentinel instead, so each exec takes a
+  second longer.
 - **A slow session no longer fails an attach or push with exit 80.** The
   client gave a session 10 s to answer its hello, so a sidecar slowed by
   load could fail it as if it spoke another protocol. Now only a session

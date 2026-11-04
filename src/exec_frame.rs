@@ -92,22 +92,40 @@ pub fn powershell_frame(code: &str, result_path: &str) -> String {
 /// the output log. The sentinel always fires with exit code 0; the caller
 /// must check stderr to detect failures.
 ///
-/// As in [`unix_frame`], the [`EXEC_ERR_MARKER`] goes to stderr after the SQL
-/// and before the stdout sentinel, so once both are logged every error the
-/// SQL wrote is too. `.output stderr` names the stream, not a file (DuckDB's
-/// shell, like SQLite's, takes `stdout` and `stderr` as stream names), and
-/// `.output` sends output back to stdout for the sentinel.
+/// With `stderr_marker`, as in [`unix_frame`], the [`EXEC_ERR_MARKER`] goes to
+/// stderr after the SQL and before the stdout sentinel, so once both are
+/// logged every error the SQL wrote is too. `.output stderr` names the
+/// stream, not a file (DuckDB's shell, like SQLite's, takes `stdout` and
+/// `stderr` as stream names), and `.output` sends output back to stdout for
+/// the sentinel. A DuckDB in safe mode refuses `.output`, and has no other
+/// way to write to stderr, so its frame has no marker
+/// ([`duckdb_safe_mode`]).
 ///
 /// Token must be hex-only (as produced by `generate_token`).
-pub fn duckdb_frame(sql: &str, token: &str) -> String {
+pub fn duckdb_frame(sql: &str, token: &str, stderr_marker: bool) -> String {
     debug_assert!(
         token.bytes().all(|b| b.is_ascii_hexdigit()),
         "token must be hex-only, got: {token}"
     );
-    format!(
-        ".mode json\n.nullvalue null\n{sql}\n.output stderr\n.print {EXEC_ERR_MARKER} {token}\n.output\n.print __TENDR_EXEC__ {token} 0 .\n"
-    )
+    let marker = if stderr_marker {
+        format!(".output stderr\n.print {EXEC_ERR_MARKER} {token}\n.output\n")
+    } else {
+        String::new()
+    };
+    format!(".mode json\n.nullvalue null\n{sql}\n{marker}.print __TENDR_EXEC__ {token} 0 .\n")
 }
+
+/// Whether a DuckDB session's command starts it in safe mode (`-safe` or
+/// `--safe`), in which DuckDB refuses `.output`.
+pub fn duckdb_safe_mode(argv: &[String]) -> bool {
+    argv.iter().any(|arg| arg == "-safe" || arg == "--safe")
+}
+
+/// What a DuckDB in safe mode prints to stderr for each `.output` it refuses:
+/// the frame's doing, not the SQL's, so never an error of the exec. Safe
+/// mode switched on with `.safe_mode` in a session started without it gets
+/// these for the frame's marker.
+pub const DUCKDB_SAFE_MODE_REFUSAL: &str = ".output/.once/.excel cannot be used in -safe mode";
 
 /// Parse a sentinel line into `(residual, exit code, cwd)`.
 ///
@@ -405,7 +423,7 @@ mod tests {
 
     #[test]
     fn duckdb_frame_basic_query() {
-        let frame = duckdb_frame("SELECT 42 as answer;", "abc123");
+        let frame = duckdb_frame("SELECT 42 as answer;", "abc123", true);
         assert!(frame.starts_with(".mode json\n"));
         assert!(
             !frame.contains(".bail on"),
@@ -420,7 +438,7 @@ mod tests {
     #[test]
     fn duckdb_frame_multi_statement() {
         let sql = "SELECT 1;\nSELECT 2;";
-        let frame = duckdb_frame(sql, "def456");
+        let frame = duckdb_frame(sql, "def456", true);
         assert!(frame.contains("SELECT 1;\nSELECT 2;\n"));
         assert!(frame.contains("__TENDR_EXEC__ def456 0 ."));
     }

@@ -99,12 +99,20 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
   - The sidecar logs stdout and stderr from separate threads. So `exec`
     waits for both markers: each pipe is logged in order, so once both are
     in, so is everything the command wrote before them. If the stderr
-    marker never comes (for example, the shell's stderr was redirected, or
-    a DuckDB cannot print to `stderr`), it gives up waiting one second after
-    the sentinel and says stderr may be incomplete.
+    marker never comes (for example, the shell's stderr was redirected), it
+    gives up waiting one second after the sentinel and says stderr may be
+    incomplete.
   - The DuckDB frame prints its stderr marker with `.output stderr`, which
     names the stream, not a file, then `.output` to print the sentinel on
-    stdout again.
+    stdout again. This also undoes a `.output` to a file in the SQL, which
+    used to send the sentinel there and leave the exec waiting.
+  - DuckDB in safe mode refuses `.output`, and has no other way to write to
+    stderr. A session started with DuckDB's `-safe` option (one dash or two) gets a frame without
+    the marker, and `exec` waits one second after the sentinel for stderr,
+    without the warning: such an exec takes a second longer. Each refusal
+    (`.output/.once/.excel cannot be used in -safe mode`), which is what a
+    session put in safe mode with `.safe_mode` prints for the frame's
+    `.output`, is dropped from stderr; there the marker comes on stdout.
   - Either marker may end a line rather than start one, when the command's
     last output has no newline. The bytes before the marker are command
     output.

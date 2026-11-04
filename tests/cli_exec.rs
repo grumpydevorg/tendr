@@ -1167,6 +1167,68 @@ done"#,
     );
 }
 
+/// A `tendr exec` in DuckDB session `name`, as its parsed result.
+fn duckdb_exec(root: &tempfile::TempDir, name: &str, sql: &str) -> serde_json::Value {
+    let output = harness::tendr(root)
+        .args(["exec", name, "--timeout", EXEC_TIMEOUT, "--", sql])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+/// DuckDB in safe mode refuses the `.output` that puts the frame's stderr
+/// marker on stderr: started with `-safe`, whose frame has no marker, and
+/// switched on with `.safe_mode`, whose refusals of the marker's `.output`
+/// are the frame's own. Neither fails a statement that succeeded, and an
+/// error still fails the exec.
+#[test]
+fn exec_duckdb_in_safe_mode_keeps_its_exit_codes() {
+    if !harness::duckdb_or_skip() {
+        return;
+    }
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    for (name, argv) in [
+        ("safe", &["duckdb", "-safe"][..]),
+        ("toggled", &["duckdb"][..]),
+    ] {
+        harness::tendr(&root)
+            .args(["start", name, "--stdin", "--exec-target", "duckdb", "--"])
+            .args(argv)
+            .assert()
+            .success();
+        let _session = harness::SessionGuard::new(&root, name);
+        harness::wait_running(&root, name);
+        if name == "toggled" {
+            duckdb_exec(&root, name, ".safe_mode");
+        }
+
+        let ok = duckdb_exec(&root, name, "SELECT 1 AS ok;");
+        assert_eq!(ok["exit_code"], 0, "{name}: {ok}");
+        assert_eq!(ok["stderr"], "", "{name}: {ok}");
+        assert!(
+            ok["stdout"].as_str().unwrap().contains("\"ok\":1"),
+            "{name}: {ok}"
+        );
+
+        let failed = duckdb_exec(&root, name, "SELECT * FROM nonexistent_table_xyz;");
+        assert_eq!(failed["exit_code"], 1, "{name}: {failed}");
+        assert!(
+            failed["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("nonexistent_table_xyz"),
+            "{name}: {failed}"
+        );
+    }
+}
+
 /// DuckDB exec: paths with spaces work correctly (no .output path escaping needed).
 #[test]
 fn exec_duckdb_path_with_spaces() {

@@ -576,11 +576,11 @@ fn run_exec(
     enum WaitMode {
         /// Shell-style: sentinel in stdout, results in stdout/stderr log lines.
         Sentinel,
-        /// Like Sentinel, but after finding the sentinel, drain trailing stderr
-        /// and set exit_code=1 if any stderr was captured. DuckDB's sentinel
-        /// hardcodes exit code 0 (SQL has no $?), so errors must be detected
-        /// from stderr presence.
-        SentinelWithStderrCheck,
+        /// Like Sentinel, and set exit_code=1 if any stderr was captured.
+        /// DuckDB's sentinel hardcodes exit code 0 (SQL has no $?), so errors
+        /// must be detected from stderr presence. Without `marker` (safe
+        /// mode) no stderr end marker comes.
+        SentinelWithStderrCheck { marker: bool },
         /// Python-style: poll for a result file written atomically by the frame.
         SideChannel,
         /// NDJSON: the stdout line whose `id` is the token is the reply.
@@ -624,9 +624,10 @@ fn run_exec(
         }
         ExecTarget::DuckDb => {
             let sql = cmd.join("\n");
+            let marker = !exec_frame::duckdb_safe_mode(meta.launch_spec().argv());
             (
-                exec_frame::duckdb_frame(&sql, token),
-                WaitMode::SentinelWithStderrCheck,
+                exec_frame::duckdb_frame(&sql, token, marker),
+                WaitMode::SentinelWithStderrCheck { marker },
             )
         }
         ExecTarget::Ndjson => (
@@ -675,9 +676,18 @@ fn run_exec(
     match wait_mode {
         WaitMode::SideChannel => wait_side_channel_result(session, &session_name, token, deadline),
         WaitMode::Ndjson => wait_ndjson_result(session, &session_name, token, cursor, deadline),
-        WaitMode::Sentinel => wait_sentinel_result(session, &session_name, token, cursor, deadline),
-        WaitMode::SentinelWithStderrCheck => {
-            let mut result = wait_sentinel_result(session, &session_name, token, cursor, deadline)?;
+        WaitMode::Sentinel => {
+            wait_sentinel_result(session, &session_name, token, cursor, deadline, true)
+        }
+        WaitMode::SentinelWithStderrCheck { marker } => {
+            let mut result =
+                wait_sentinel_result(session, &session_name, token, cursor, deadline, marker)?;
+            result.stderr = result
+                .stderr
+                .lines()
+                .filter(|line| *line != exec_frame::DUCKDB_SAFE_MODE_REFUSAL)
+                .collect::<Vec<_>>()
+                .join("\n");
             // DuckDB's sentinel hardcodes exit code 0 (SQL has no $?), so an
             // error is told by stderr, all of which is in by the end marker,
             // including a partial success ("SELECT 1; SELECT * FROM bad;").
@@ -689,10 +699,10 @@ fn run_exec(
     }
 }
 
-/// How long exec keeps reading after the stdout sentinel for the stderr end
-/// marker. Only reached when the session's stderr no longer reaches the
-/// sidecar (e.g. an earlier `push 'exec 2>/dev/null'`), or a DuckDB that
-/// cannot print to stderr.
+/// How long exec keeps reading after the stdout sentinel for stderr when no
+/// stderr end marker comes: when the session's stderr no longer reaches the
+/// sidecar (e.g. an earlier `push 'exec 2>/dev/null'`), and for a DuckDB in
+/// safe mode, which cannot print one.
 const ERR_MARKER_GRACE: Duration = Duration::from_secs(1);
 
 /// [`ERR_MARKER_GRACE`]. Debug builds accept `TENDR_TEST_ERR_MARKER_GRACE_MS`
@@ -705,16 +715,18 @@ fn err_marker_grace() -> Duration {
 /// Scan output.log for the result of one framed exec (PosixShell, DuckDB).
 ///
 /// The sidecar logs stdout and stderr from separate threads, so their lines
-/// interleave in no fixed order. Both frames print a stderr end marker, so the
-/// exec is complete only once both the stdout sentinel and that marker are
-/// logged; each pipe is logged in order, so nothing of the command's output
-/// can still be in flight (#92).
+/// interleave in no fixed order. With `marker` (every frame but a DuckDB's in
+/// safe mode) the exec is complete only once both the stdout sentinel and the
+/// stderr end marker are logged; each pipe is logged in order, so nothing of
+/// the command's output can still be in flight (#92). Without one, or when it
+/// never comes, the exec is complete [`ERR_MARKER_GRACE`] after the sentinel.
 fn wait_sentinel_result(
     session: &SessionDir,
     session_name: &str,
     token: &str,
     cursor: u64,
     deadline: Option<Instant>,
+    marker: bool,
 ) -> anyhow::Result<ExecResult> {
     let log_path = session.path().join("output.log");
 
@@ -778,10 +790,12 @@ fn wait_sentinel_result(
         if bytes == 0 {
             if let Some((code, cwd, seen_at)) = &sentinel {
                 if seen_at.elapsed() >= err_marker_grace() {
-                    eprintln!(
-                        "tendr exec: stderr end marker not seen; the session's stderr \
-                         may be redirected, so stderr may be incomplete"
-                    );
+                    if marker {
+                        eprintln!(
+                            "tendr exec: stderr end marker not seen; the session's stderr \
+                             may be redirected, so stderr may be incomplete"
+                        );
+                    }
                     return Ok(result(
                         &stdout_lines,
                         &stderr_lines,
@@ -1164,7 +1178,7 @@ mod tests {
                 ("E", "__TENDR_EXEC_ERR__ tok"),
             ],
         );
-        let result = wait_sentinel_result(&dir, "s", "tok", 0, None).unwrap();
+        let result = wait_sentinel_result(&dir, "s", "tok", 0, None, true).unwrap();
         assert_eq!(result.stderr, "late");
         assert_eq!(result.exit_code, 0);
         assert!(!result.timed_out);
@@ -1181,7 +1195,7 @@ mod tests {
                 ("O", "foo__TENDR_EXEC__ tok 3 /tmp"),
             ],
         );
-        let result = wait_sentinel_result(&dir, "s", "tok", 0, None).unwrap();
+        let result = wait_sentinel_result(&dir, "s", "tok", 0, None, true).unwrap();
         assert_eq!(result.stdout, "foo");
         assert_eq!(result.stderr, "y");
         assert_eq!(result.exit_code, 3);
