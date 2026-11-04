@@ -388,9 +388,14 @@ before, with ssh's exit.
 - Output the session wrote meanwhile arrives in full, once, as if the
   connection had never dropped; then the program is asked to redraw at your
   terminal's size (not for `--read-only`, which never sizes the session).
-  Input is never resent: what you typed before the drop and
-  had not reached the session is lost, and what you type while it reconnects
-  is discarded, with a note in the status line.
+  Input is never resent: what you typed before the drop and had not reached
+  the session is lost, and what you type while it reconnects is discarded,
+  with a note in the status line. Where both hosts and the session are new
+  enough ([versions](#reach-remote-hosts-with---host)), tendr says as it
+  reconnects how many of the bytes it sent before the drop reached the
+  session and how many did not, and repeats it when the attach ends. It
+  counts the bytes it sent after the detach escape: a doubled `Ctrl-\` is
+  one byte, and a `Ctrl-\` still waiting for its next key was not sent.
 - The session keeps the last 32 MiB of output. If more than that was written
   while you were away, tendr says how many bytes you missed and how many the
   session no longer held, turns off the terminal modes the program had set,
@@ -595,7 +600,7 @@ Start work under `--host`, disconnect, and come back later to `log`, `status`,
 
 **Versions.** The remote `tendr` must be 0.5.0 or newer for every command,
 `exec` included. An older one fails at once, and tendr says to upgrade it.
-Three features need more:
+These features need more:
 
 - Reconnecting a dropped `attach --host` needs 0.6.0 or newer on the remote
   host, and a session started by 0.6.0 or newer. Otherwise the attach ends
@@ -610,6 +615,9 @@ Three features need more:
   [PowerShell](#powershell)) needs 0.8.0 or newer on the remote host. An
   older remote runs each `exec` in a scope of its own, where only `$global:`
   variables persist.
+- Saying how much of what you typed before a drop reached the session needs
+  0.8.0 or newer on both hosts, and a session started by 0.8.0 or newer.
+  Otherwise the attach reconnects as before and says nothing of it.
 
 An older client still works against a newer remote.
 
@@ -833,7 +841,7 @@ or an I/O error.
 |`wrap`|the child's|The wrapped command's code; 6 for an `--event` with a reserved prefix|
 |`query`|DuckDB's|DuckDB's exit code|
 |`guide`, `skill install`|2|Unknown topic; refusing to overwrite a modified skill file|
-|`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not at all from a session started by a `tendr` older than 0.4.0 (within 10 s; any later session is waited for until it answers or closes the connection), an `attach --host` got output that does not follow on from the last, or its reconnect reached a session that cannot resume, or an `attach --read-only` reached a session started by a `tendr` without read-only viewers, or, over `--host`, a remote `tendr` older than 0.7.0 (tendr adds a line saying so)|
+|`attach`, `push` to a PTY session|80|Protocol: the session answered the hello outside this attach protocol, or not at all from a session started by a `tendr` older than 0.4.0 (within 10 s; any later session is waited for until it answers or closes the connection), an `attach --host` got output that does not follow on from the last, or its reconnect reached a session that cannot resume or that claims more of its input written than it sent, or an `attach --read-only` reached a session started by a `tendr` without read-only viewers, or, over `--host`, a remote `tendr` older than 0.7.0 (tendr adds a line saying so)|
 |`attach`, `push` to a PTY session|81|Control conflict: another client holds the terminal (a plain `attach` while a human is attached, or a `push` while anyone is), another client's `--takeover` took the attach (also when the attach had stopped reading its output and learns of it only later), or the session's run has ended. An `attach --host` whose reconnect is refused exits 81 too: someone took the terminal while it was disconnected (an attach, a takeover, or an agent's `push` still running), or the run ended meanwhile (`not running`). So does an `attach --read-only --host` whose remote `tendr`, older than 0.7.0, finds a human attached; tendr adds a line saying the remote is too old, and that the `--takeover` it suggests would take the terminal from that human|
 |`attach`, `push` to a PTY session|82, 83|Reserved, not used yet|
 |`attach`, `push` to a PTY session|84|Runtime or transport: the attach socket is missing or unreachable, the connection fails, the session already serves as many connections of that kind as it admits (eight read-only viewers, or eight attaches, takeovers, resumes and pushes), an `attach --read-only` was cut off short of the run's output (at the run's end too, when it was not reading its last bytes within 2 s; with a session started by an older `tendr`, only without a terminal or over `--host`, and only while the run went on), or a push ended revoked or stopped with bytes unwritten (stderr gives the byte counts)|

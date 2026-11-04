@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::Duration;
 
 use super::super::Point;
+use tendr::pty_exit::PtyExitCode;
 use tendr::ssh::SshError;
 use tendr::term_modes::TermModes;
 
@@ -81,17 +82,19 @@ pub(in crate::commands::attach) struct Job {
 
 impl Job {
     /// Reconnect through `end` after its connection ended, once that
-    /// connection's reader is done.
+    /// connection's reader is done. `sent` is how many keystroke bytes that
+    /// connection was given to send, for the report of how many arrived.
     pub(in crate::commands::attach) fn start(
         end: HostEnd,
         screen: Arc<Screen>,
         status: Arc<Status>,
+        sent: u64,
     ) -> Self {
         let cancel = Arc::clone(&end.cancel);
         let (send, done) = mpsc::channel();
         std::thread::spawn(move || {
             let mut end = end;
-            let outcome = reconnect(&mut end, &screen, &status);
+            let outcome = reconnect(&mut end, &screen, &status, sent);
             let _ = send.send((end, outcome));
         });
         Self { done, cancel }
@@ -133,8 +136,16 @@ impl Job {
     }
 }
 
-/// The reconnect's thread: `None` once cancelled.
-fn reconnect(end: &mut HostEnd, screen: &Arc<Screen>, status: &Arc<Status>) -> Option<Outcome> {
+/// The reconnect's thread: `None` once cancelled. A session that reports
+/// more of the lost connection's input written than it was given (`sent`)
+/// has a broken count: a protocol failure (80), as a resume past the head
+/// is.
+fn reconnect(
+    end: &mut HostEnd,
+    screen: &Arc<Screen>,
+    status: &Arc<Status>,
+    sent: u64,
+) -> Option<Outcome> {
     match end.finish(ssh_close_grace()) {
         Some(Ok(code)) => return Some(Outcome::Ended(Ok(code))),
         Some(Err(e)) if !lost_link(&e) => return Some(Outcome::Ended(Err(e))),
@@ -154,8 +165,21 @@ fn reconnect(end: &mut HostEnd, screen: &Arc<Screen>, status: &Arc<Status>) -> O
             return None;
         }
         match attempt {
+            Ok(Attempt::Resumed(_, resumption))
+                if resumption
+                    .input_written()
+                    .is_some_and(|written| written > sent) =>
+            {
+                status.end(screen);
+                return Some(Outcome::Ended(Err(PtyExitCode::Protocol.error(
+                    anyhow::anyhow!(
+                        "the session reports {} bytes of input written from a connection that sent {sent}",
+                        resumption.input_written().unwrap_or_default()
+                    ),
+                ))));
+            }
             Ok(Attempt::Resumed(link, resumption)) => {
-                status.resumed(screen, asked, resumption);
+                status.resumed(screen, asked, resumption, sent);
                 return Some(Outcome::Resumed(link));
             }
             Ok(Attempt::Ended(code)) => {
@@ -394,29 +418,41 @@ impl Status {
     /// is the reset of the modes tracked so far (the replay that follows only
     /// turns modes on) and a notice of what was lost; without a terminal,
     /// the notice goes to stderr and stdout gets no reset, as when leaving.
-    /// A read-only attach's note, whose row the status took, is drawn
-    /// again. Then the resume point becomes the new connection's.
-    fn resumed(&self, screen: &Screen, asked: Point, resumption: Resumption) {
+    /// When the session says how much of the `sent` keystroke bytes of the
+    /// lost connection it wrote (version 4), and there were any, a notice
+    /// says how many arrived and how many did not, the same way. A read-only
+    /// attach's note, whose row the status took, is drawn again. Then the
+    /// resume point becomes the new connection's.
+    fn resumed(&self, screen: &Screen, asked: Point, resumption: Resumption, sent: u64) {
         let mut state = self.lock();
         let mut shown = screen.lock();
         let mut out = self.erase(&mut state, screen);
         // The connection is up: what its attempts said is no longer news.
         self.lines().clear();
+        let mut notices = Vec::new();
         if let Resumption::Gone {
             point: head,
             oldest,
+            ..
         } = resumption
         {
-            let notice = gone_notice(asked.offset(), oldest, head.offset);
             if screen.is_terminal() {
                 out.extend(shown.modes.reset());
+            }
+            notices.push(gone_notice(asked.offset(), oldest, head.offset));
+            shown.modes = TermModes::default();
+            screen.bracketed_paste.store(false, Ordering::SeqCst);
+        }
+        if let Some(written) = resumption.input_written().filter(|_| sent > 0) {
+            notices.push(input_notice(sent, written));
+        }
+        for notice in notices {
+            if screen.is_terminal() {
                 out.extend(notice.as_bytes());
                 self.notices().push(notice.trim().to_owned());
             } else {
                 eprintln!("{}", notice.trim());
             }
-            shown.modes = TermModes::default();
-            screen.bracketed_paste.store(false, Ordering::SeqCst);
         }
         out.extend(Self::note(&mut state, screen));
         shown.resume = Some(asked.resumed(resumption.point()));
@@ -515,6 +551,17 @@ fn gone_notice(asked: u64, oldest: u64, head: u64) -> String {
          and the session no longer held {} of them, so none are shown\r\n",
         head - asked,
         oldest - asked
+    )
+}
+
+/// The notice for a resume whose session wrote `written` of the `sent`
+/// keystroke bytes the lost connection was given. The rest are never sent
+/// again: keystrokes that arrive late can do harm.
+fn input_notice(sent: u64, written: u64) -> String {
+    format!(
+        "\r\ntendr: reconnected; of the {sent} bytes of input sent before the connection was lost, \
+         {written} reached the session and {} did not\r\n",
+        sent - written
     )
 }
 

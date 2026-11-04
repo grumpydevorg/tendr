@@ -25,7 +25,10 @@ use tendr::model::ids::Namespace;
 /// too; this end speaks the agreed version to the sidecar, or the newest a
 /// sidecar started by an older tendr speaks ([`super::connect`]). The
 /// answer's type tells the client which, up to version 2; version 3 only
-/// adds the end of output, which this end judges by.
+/// adds the end of output, which this end judges by, and version 4 only a
+/// resume answer's report on the lost connection's input, which names its
+/// version. A watcher speaks at most version 3
+/// ([`Version::WATCH_LATEST`]).
 ///
 /// A request with `resume` is followed by the same resume frame in place of
 /// the hello, which this end passes on to the sidecar. It skips the
@@ -84,6 +87,12 @@ pub fn cmd_attach_bridge(
         use tendr::pty_exit::PtyExitCode;
 
         let first = attach_proto::read_frame(&mut std::io::stdin().lock());
+        // A watcher sends no input, so what version 4 adds is not for it.
+        let version = if read_only {
+            version.min(Version::WATCH_LATEST)
+        } else {
+            version
+        };
         let resume = resume.map(|point| {
             if read_only {
                 Point::Watch(WatchPoint {

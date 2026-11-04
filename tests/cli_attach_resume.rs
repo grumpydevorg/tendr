@@ -279,11 +279,14 @@ fn a_half_open_resume_under_a_running_flood_has_no_gap_and_no_duplicate() {
     );
     assert_eq!(
         reply,
-        Frame::Resumed(ResumePoint {
-            run_id: accepted.run_id,
-            epoch: epoch(2),
-            offset: reached,
-        })
+        Frame::Resumed {
+            point: ResumePoint {
+                run_id: accepted.run_id,
+                epoch: epoch(2),
+                offset: reached,
+            },
+            input_written: None,
+        }
     );
     assert!(
         !log_tail(&root, "resume-flood").contains("FLOOD-DONE"),
@@ -349,7 +352,7 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
     let mut asked = accepted;
     let (mut gone, point, oldest) = poll_until(HANG, Duration::from_millis(20), || {
         let (stream, reply) = resume(&root, "resume-gone", asked);
-        let Frame::Gone { point, oldest } = reply else {
+        let Frame::Gone { point, oldest, .. } = reply else {
             panic!("expected gone, got {reply:?}");
         };
         assert_eq!(
@@ -381,11 +384,14 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
     );
     assert_eq!(
         reply,
-        Frame::Resumed(ResumePoint {
-            epoch: point.epoch.next().unwrap(),
-            offset: oldest,
-            ..point
-        })
+        Frame::Resumed {
+            point: ResumePoint {
+                epoch: point.epoch.next().unwrap(),
+                offset: oldest,
+                ..point
+            },
+            input_written: None,
+        }
     );
     let held = read_stamped(&mut edge, oldest, b"", RING as usize);
 
@@ -405,7 +411,8 @@ fn gone_at_the_ring_edge_names_the_exact_span() {
                 epoch: point.epoch.next().unwrap().next().unwrap(),
                 ..point
             },
-            oldest
+            oldest,
+            input_written: None,
         }
     );
 
@@ -462,7 +469,7 @@ fn a_finished_push_lets_the_resume_through_and_a_running_one_does_not() {
     ));
     let (mut resumed, reply) = resume(&root, "resume-push", accepted);
     assert!(
-        matches!(reply, Frame::Resumed(p) if p.epoch == epoch(3)),
+        matches!(reply, Frame::Resumed { point: p, .. } if p.epoch == epoch(3)),
         "{reply:?}"
     );
     wait_control(&root, "resume-push", "HumanControl");
@@ -501,7 +508,7 @@ fn a_resumed_client_taken_over_is_retired_as_by_any_takeover() {
 
     let (_lost, accepted) = attach_v2(&root, "resume-retire");
     let (mut resumed, reply) = resume(&root, "resume-retire", accepted);
-    assert!(matches!(reply, Frame::Resumed(p) if p.epoch == epoch(2)));
+    assert!(matches!(reply, Frame::Resumed { point: p, .. } if p.epoch == epoch(2)));
     let (_taker, reply) = hello(&root, "resume-retire", Version::V2, Mode::Takeover);
     assert!(matches!(reply, Frame::AcceptedV2(p) if p.epoch == epoch(3)));
 

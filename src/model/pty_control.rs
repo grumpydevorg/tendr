@@ -258,6 +258,11 @@ pub struct Takeover {
     /// The superseded controller, which the caller must retire (close its
     /// connection and drop its queued input). `None` if the PTY was unowned.
     pub retired: Option<(HolderId, ControllerKind)>,
+    /// For a resume, the bytes of input written to the PTY under the epoch
+    /// it resumes, by every connection that held it, a half-open one still
+    /// writing included: final, since that epoch can write no more. Zero
+    /// for a takeover.
+    pub written: u64,
 }
 
 /// One nonblocking write attempt to the PTY input.
@@ -428,6 +433,10 @@ pub struct InputArbiter {
     /// The last epoch granted to a human, by a claim, a takeover or a
     /// resume. Only the holder of this epoch may resume.
     last_human: Option<ControllerEpoch>,
+    /// Bytes of input written to the PTY under `last_human`, kept until a
+    /// later human grant, so a resume can say how much of its lost
+    /// connection's input reached the PTY.
+    last_human_written: u64,
 }
 
 impl InputArbiter {
@@ -458,6 +467,7 @@ impl InputArbiter {
             run_id,
             state,
             last_human,
+            last_human_written: 0,
         }
     }
 
@@ -511,7 +521,11 @@ impl InputArbiter {
             } => Some((owner, kind)),
         };
         let handle = self.own(next, holder, ControllerKind::Human);
-        Ok(Takeover { handle, retired })
+        Ok(Takeover {
+            handle,
+            retired,
+            written: 0,
+        })
     }
 
     /// A human regains the control it held at `epoch`, after its connection
@@ -522,7 +536,8 @@ impl InputArbiter {
     /// released) and nobody else holds control now. An agent push that has
     /// finished does not block it; one still running does. If the holder of
     /// `epoch` is still connected (its connection half-open), it is returned
-    /// for retirement, as a takeover returns the holder it supersedes.
+    /// for retirement, as a takeover returns the holder it supersedes. The
+    /// grant says how many bytes of input `epoch` wrote ([`Takeover::written`]).
     ///
     /// # Errors
     ///
@@ -560,8 +575,13 @@ impl InputArbiter {
             }
         };
         let next = self.state.epoch().next()?;
+        let written = self.last_human_written;
         let handle = self.own(next, holder, ControllerKind::Human);
-        Ok(Takeover { handle, retired })
+        Ok(Takeover {
+            handle,
+            retired,
+            written,
+        })
     }
 
     /// Give up ownership. Only the current handle releases.
@@ -633,6 +653,9 @@ impl InputArbiter {
             ),
             Ok(n) => {
                 pending.record_written(n);
+                if self.last_human == Some(pending.key.epoch) {
+                    self.last_human_written += n as u64;
+                }
                 pending.outcome.map_or(WriteStep::Pending, WriteStep::Done)
             }
             Err(e)
@@ -663,6 +686,7 @@ impl InputArbiter {
         };
         if kind == ControllerKind::Human {
             self.last_human = Some(epoch);
+            self.last_human_written = 0;
         }
         ControllerHandle {
             key: HandleKey {

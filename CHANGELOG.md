@@ -22,6 +22,15 @@
   `bytes_reclaimed`). The lost+found rewrite holds the lock appenders now
   take before opening the file, so a concurrent `emit` never loses an event;
   an `emit` from an older `tendr` takes the lock after opening and can.
+- **A reconnected `attach --host` says how much of your typing arrived.**
+  After a dropped link you could not tell whether the last thing you typed
+  reached the program. As it reconnects, tendr now says how many of the
+  bytes it sent before the drop reached the session and how many did not,
+  and repeats it when the attach ends. Those that did not are never sent
+  again: keystrokes that arrive late to a program that has moved on can do
+  harm. This is attach protocol version 4, and needs 0.8.0 or newer on both
+  hosts and a session started by 0.8.0; with an older remote or session
+  the attach reconnects as before and says nothing of the input.
 
 ### Changed
 

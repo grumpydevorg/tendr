@@ -348,6 +348,46 @@ fn a_resumed_epoch_is_the_only_one_left_to_resume() {
     assert_eq!(again.retired, Some((H2, ControllerKind::Human)));
 }
 
+/// A resume says how much input the epoch it resumes wrote: every byte its
+/// connection had written, a half-open one's late writes included, and
+/// none of a push's in between, nor of a request revoked part-way. The
+/// resumed epoch counts afresh.
+#[test]
+fn a_resume_reports_the_input_its_epoch_wrote() {
+    let mut arbiter = InputArbiter::new(RunId::new());
+    let lost = arbiter.claim(H1, ControllerKind::Human).unwrap();
+    let mut sink = ScriptedSink::default();
+    let mut typed = PendingInput::new(RequestId::new(1), &lost, b"abc".to_vec()).unwrap();
+    run_until_done(&mut arbiter, &mut typed, &mut sink);
+    // The half-open connection goes on writing; its last request gets two
+    // bytes of five in before the resume revokes the rest.
+    let mut late = PendingInput::new(RequestId::new(2), &lost, b"defgh".to_vec()).unwrap();
+    let mut short = ScriptedSink::with([Attempt::Accept(2), Attempt::WouldBlock]);
+    assert_eq!(
+        arbiter.write_step(&mut late, &mut short),
+        WriteStep::Pending
+    );
+    assert_eq!(
+        arbiter.write_step(&mut late, &mut short),
+        WriteStep::Pending
+    );
+
+    let resumed = arbiter.resume(H2, epoch(1)).unwrap();
+    assert_eq!(resumed.written, 5);
+    assert!(matches!(
+        arbiter.write_step(&mut late, &mut short),
+        WriteStep::Done(InputOutcome::Incomplete { accepted: 2, .. })
+    ));
+
+    // A push between losing the link and resuming is not the human's.
+    arbiter.release(&resumed.handle).unwrap();
+    let push = arbiter.claim(H3, ControllerKind::Agent).unwrap();
+    let mut pushed = PendingInput::new(RequestId::new(3), &push, b"pushed".to_vec()).unwrap();
+    run_until_done(&mut arbiter, &mut pushed, &mut sink);
+    arbiter.release(&push).unwrap();
+    assert_eq!(arbiter.resume(H1, epoch(2)).unwrap().written, 0);
+}
+
 #[test]
 fn resume_at_exhausted_epoch_fails_without_changing_state() {
     let mut arbiter = InputArbiter::from_state(
