@@ -73,6 +73,7 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 base64 = "0.22.1"
 crc32c = "0.6.8"
+regex = "1"
 
 [dev-dependencies]
 assert_cmd = "2.2.0"

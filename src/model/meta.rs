@@ -3,6 +3,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::ids::{EpochTimestamp, Generation, ProcessIdentity, RunId, SessionName};
 use super::provenance::TransitionProvenance;
 use super::pty::{PtyControl, PtyMeta, PtyRecording, RecordingState, RecordingStopReason};
+use super::ready::ReadyState;
 use super::spec::LaunchSpec;
 use super::state::RunStatus;
 
@@ -29,6 +30,9 @@ pub struct Meta {
     pty: Option<PtyMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transition_provenance: Option<TransitionProvenance>,
+    /// What the sidecar observed of the run's ready condition, once it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ready: Option<ReadyState>,
 }
 
 impl Meta {
@@ -56,6 +60,7 @@ impl Meta {
             warnings: vec![],
             pty: None,
             transition_provenance: None,
+            ready: None,
         }
     }
 
@@ -167,6 +172,18 @@ impl Meta {
         self.transition_provenance.as_ref()
     }
 
+    /// The ready condition's outcome: `Ready` or `Missed`, or `None` while
+    /// it is undecided or the run has no condition.
+    #[must_use]
+    pub fn ready(&self) -> Option<ReadyState> {
+        self.ready
+    }
+
+    /// Record the ready condition's outcome. Written by the sidecar only.
+    pub fn set_ready(&mut self, state: ReadyState) {
+        self.ready = Some(state);
+    }
+
     // --- Mutable access for transition module only ---
 
     pub(super) fn status_mut(&mut self) -> &mut RunStatus {
@@ -198,6 +215,8 @@ impl<'de> Deserialize<'de> for Meta {
             pty: Option<PtyMeta>,
             #[serde(default)]
             transition_provenance: Option<TransitionProvenance>,
+            #[serde(default)]
+            ready: Option<ReadyState>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -221,6 +240,7 @@ impl<'de> Deserialize<'de> for Meta {
             warnings: raw.warnings,
             pty: raw.pty,
             transition_provenance: raw.transition_provenance,
+            ready: raw.ready,
         })
     }
 }

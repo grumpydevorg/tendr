@@ -174,3 +174,46 @@ fn launch_spec_recording_policy_round_trips_and_changes_the_hash() {
         assert_ne!(spec.canonical_hash(), plain.canonical_hash());
     }
 }
+
+// --- ready check ---
+
+#[test]
+fn a_spec_without_a_ready_check_keeps_its_canonical_hash() {
+    // The hash of the spec pinned above: a session started without
+    // --ready-when-* or --after-ready matches runs started before them.
+    let spec = tendr::model::spec::LaunchSpec::new(vec!["echo".into()]).unwrap();
+    assert_eq!(
+        spec.canonical_hash(),
+        "sha256:a5476d48c83d85eb046134cb748c36b994b5697bd79dc8a786d2b7094d41da54"
+    );
+}
+
+#[test]
+fn launch_spec_ready_check_round_trips_and_changes_the_hash() {
+    use tendr::model::ready::{ReadyCheck, ReadyWhen};
+    use tendr::model::spec::DependencyBinding;
+    let plain = tendr::model::spec::LaunchSpec::new(vec!["srv".into()]).unwrap();
+    let mut spec = plain.clone();
+    spec.ready = Some(ReadyCheck {
+        when: ReadyWhen::Output("listening".to_owned()),
+        within_ms: Some(500),
+    });
+    let json = serde_json::to_string(&spec).unwrap();
+    assert!(
+        json.contains(r#""ready":{"when":{"output":"listening"},"within_ms":500}"#),
+        "json: {json}"
+    );
+    let back: tendr::model::spec::LaunchSpec = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, spec);
+    assert_ne!(spec.canonical_hash(), plain.canonical_hash());
+
+    let mut after = plain.clone();
+    after.after_ready.push(DependencyBinding {
+        session: tendr::model::ids::SessionName::new("db").unwrap(),
+        run_id: tendr::model::ids::RunId::new(),
+    });
+    let back: tendr::model::spec::LaunchSpec =
+        serde_json::from_str(&serde_json::to_string(&after).unwrap()).unwrap();
+    assert_eq!(back, after);
+    assert_ne!(after.canonical_hash(), plain.canonical_hash());
+}

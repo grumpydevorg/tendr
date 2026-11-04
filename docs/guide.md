@@ -76,6 +76,9 @@ flags:
 |`--after <session>`|Wait for that session to exit before starting. Repeatable.|
 |`--any-exit`|With `--after`, start even if the dependency exited non-zero.|
 |`--on-exit <command>`|Run a command after the child exits. Repeatable.|
+|`--ready-when-output <regex>`, `--ready-when-port <port>`|Say when the run is ready: a line of its output matches, or a TCP port on its host accepts connections (`start` only). See [Wait until a server is ready](#wait-until-a-server-is-ready).|
+|`--ready-within <duration>`|Record a miss if the run is not ready this long after it starts, such as `30s` or `2m` (`start` only).|
+|`--after-ready <session>`|Wait for that session to be ready before starting. Repeatable (`start` only).|
 
 The sidecar and the child get no descriptor above stderr from the shell that
 ran `start` or `run`. A descriptor left open there, such as a terminal leaked by a
@@ -90,6 +93,52 @@ inference fails:
 ```bash
 tendr start --stdin py --exec-target python-repl -- ipython --no-banner --no-confirm-exit
 ```
+
+## Wait until a server is ready
+
+A server started with `tendr start` is `Running` as soon as it spawns, before
+it listens. Tell `start` what ready means for it, and tendr checks it:
+
+```bash
+tendr start api --ready-when-output 'listening on :\d+' --ready-within 30s -- ./api
+tendr start db --ready-when-port 5432 -- postgres -D data
+tendr wait --ready api db           # 0 once both are ready
+tendr start tests --after-ready api -- ./run-tests
+```
+
+- `--ready-when-output <regex>` holds once a line of the child's output,
+  stdout or stderr, matches the regular expression (Rust `regex` syntax,
+  unanchored). Lines are matched as `output.log` records them. A PTY
+  session's output is matched as the terminal shows it, escape sequences
+  included: a line ends at `\n` or `\r`, and the line still being written
+  counts too, so a prompt such as `^ready> $` matches. So a `$`-anchored
+  pattern can also match a line written in pieces before it is complete.
+  A child that prints its ready line and exits at once was ready.
+- `--ready-when-port <port>` holds once a TCP connection to that port on
+  the session's host (`127.0.0.1` or `::1`) succeeds. Any listener counts,
+  not only the child, so choose a port nothing else holds. The port is
+  tried every 200 ms while the run lasts, so one open only briefly before
+  the run ends may be missed.
+- Give one condition per session. `--ready-within <duration>` sets a
+  deadline counted from when the run is `Running`; without it, there is no
+  deadline. Past it, tendr records the miss and leaves the child running.
+  The condition is then no longer checked, so a session that misses its
+  deadline never becomes ready.
+- The sidecar checks the condition, so it works for detached and `--host`
+  sessions alike. It records `run.ready` (or `run.ready_missed`) in the event
+  log, and in `meta.json` `ready`: `{"state":"Ready","at":"<epoch s>"}` or
+  `{"state":"Missed","at":…}`. `tendr events --follow --kind run.ready`
+  streams it.
+- `tendr wait --ready <session>…` returns 0 once every session is ready,
+  and 43 if one missed its deadline or its run ended before it was ready.
+  `--any` returns at the first session decided either way, and `--timeout`
+  works as it does for exits. It fails with 1 for a session that has no
+  ready condition.
+- `start --after-ready <session>` starts the child once that session is
+  ready, as `--after` does once a session exits. If the dependency misses
+  its deadline or ends before it is ready, the waiting session ends as
+  `DependencyFailed`, and `wait` on it exits 4. `--timeout` bounds the wait
+  for both kinds of dependency. The dependency must have a ready condition.
 
 ## Drive it with `exec`
 
@@ -514,6 +563,8 @@ tendr watch --namespace nightly --events --logs
 
 - `wait` takes one or more session names. It waits for all of them, or for the
   first with `--any`. See [Exit codes](#exit-codes) for what it returns.
+  `--ready` waits until they are ready instead
+  ([Wait until a server is ready](#wait-until-a-server-is-ready)).
 - `watch` takes no session name. It streams NDJSON for every session, or for
   one namespace with `--namespace`. Choose streams with `--events` (run
   lifecycle), `--logs` (output) and `--annotations`. `--from-now` skips the
@@ -701,6 +752,11 @@ Some features need more:
   remote host. An older one would ignore them, so tendr sends such a request
   in a form it refuses instead (exit 2, `unsupported remote request
   version 2`).
+- The ready check (`start --ready-when-output`, `--ready-when-port`,
+  `--ready-within`, `--after-ready`, and `wait --ready`) needs 0.8.0 or
+  newer on the remote host. An older remote refuses the request with exit 2
+  and `unsupported remote request version 2`, before anything runs; a
+  request without these flags still goes to it as before.
 
 An older client still works against a newer remote.
 
@@ -1106,10 +1162,11 @@ or an I/O error.
 |any, with `--host`|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s); while `attach --host` reconnects, it tries again instead|
 |`start`|2, 5|The child failed to spawn; the sidecar failed|
 |`run`|the child's|The child's own code, or 2 spawn failed, 3 sidecar lost, 4 dependency failed, 5 sidecar failed, 124 timed out, 137 killed|
-|`wait`|1|`--timeout` passed before the sessions ended|
+|`wait`|1|`--timeout` passed before the sessions ended (with `--ready`, before they were ready or not); with `--ready`, a session has no ready condition|
 |`wait`|2, 3, 4, 5|Spawn failed, sidecar lost, dependency failed, sidecar failed|
 |`wait`|42|The child exited non-zero (any code)|
 |`wait`|124, 137|A dependency timed out; killed while waiting on a dependency|
+|`wait --ready`|43|A session will not be ready: it missed its `--ready-within` deadline, or its run ended before it was ready|
 |`exec`|the command's|The command's own exit code (an NDJSON reply's is 1 for `"ok": false` or a non-null `error`); 124 if `--timeout` passed; 2 for a malformed `--frame-from-stdin` frame or an invalid NDJSON request|
 |`events`|44, 65|`--from-cursor` names history that is gone; `--strict` found unparseable lines|
 |`events`|124|`--timeout` passed (before `--max-count` events were printed, when given)|
@@ -1123,7 +1180,8 @@ or an I/O error.
 |`attach`, `push` to a PTY session|84|Runtime or transport: the attach socket is missing or unreachable, the connection fails, the session already serves as many connections of that kind as it admits (eight read-only viewers, or eight attaches, takeovers, resumes and pushes), an `attach --read-only` was cut off short of the run's output (at the run's end too, when it was not reading its last bytes within 2 s; with a session started by an older `tendr`, only without a terminal or over `--host`, and only while the run went on), or a push ended revoked or stopped with bytes unwritten (stderr gives the byte counts)|
 |`attach`, `push` to a PTY session|85|Identity: the socket's listener, or the connecting client, is another user|
 
-With several sessions, `wait` returns the most severe code. A session that was
+With several sessions, `wait` returns the most severe code, and `wait --ready`
+returns 43 if any session reported is not ready. A session that was
 killed or timed out on request counts as success (0). A `push` whose every
 byte reached the terminal exits 0, even if a takeover lands just after. An
 `attach` ended by SIGHUP, SIGTERM or SIGINT exits 1. A `push` to a pipe session

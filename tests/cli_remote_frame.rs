@@ -292,6 +292,67 @@ fn host_start_records_every_field_and_hostile_value_exactly() {
     );
 }
 
+// -- the ready check needs frame version 2 --
+
+/// A ready condition, `--after-ready` and `wait --ready` all reach the
+/// remote tendr, where its sidecar checks the condition, and `wait --ready`
+/// exits with the remote's code.
+#[test]
+fn host_ready_check_runs_on_the_remote() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    let remote = Remote::new();
+    remote
+        .tendr(&root)
+        .args([
+            "start",
+            "srv",
+            "--ready-when-output",
+            "^up$",
+            "--ready-within",
+            "1h",
+        ])
+        .args(["--", "sh", "-c", "echo up; sleep 3600"])
+        .assert()
+        .success();
+    remote.assert_constant_argv();
+    remote
+        .tendr(&root)
+        .args(["wait", "--ready", "srv"])
+        .assert()
+        .success();
+    let srv = read_json(&meta_path(&root, "default", "srv"));
+    assert_eq!(srv["ready"]["state"], "Ready", "{srv}");
+    assert_eq!(srv["launch_spec"]["ready"]["within_ms"], 3_600_000);
+
+    remote
+        .tendr(&root)
+        .args(["start", "app", "--after-ready", "srv", "--", "true"])
+        .assert()
+        .success();
+    remote.tendr(&root).args(["wait", "app"]).assert().success();
+    let app = read_json(&meta_path(&root, "default", "app"));
+    assert_eq!(app["launch_spec"]["after_ready"][0]["session"], "srv");
+
+    // A port nothing listens on, and a run that ends before it could be ready.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+        .to_string();
+    remote
+        .tendr(&root)
+        .args(["start", "quits", "--ready-when-port", &port, "--", "true"])
+        .assert()
+        .success();
+    remote
+        .tendr(&root)
+        .args(["wait", "--ready", "quits"])
+        .assert()
+        .code(43);
+}
+
 // -- byte compatibility with local --
 
 /// Every framed operation prints what the same command prints locally, byte

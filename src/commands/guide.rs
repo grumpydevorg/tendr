@@ -18,6 +18,7 @@ const GUIDE: &str = include_str!("../../docs/guide.md");
 const TOPICS: &[(&str, &str)] = &[
     ("install", "Install and build"),
     ("exec", "Drive it with"),
+    ("ready", "a server is ready"),
     ("remote", "Reach remote hosts"),
     ("python", "Python /"),
     ("duckdb", "DuckDB"),

@@ -9,10 +9,16 @@
 //!
 //! The JSON is `{"v": <version>, "op": <operation>, "params": {…}}`: the
 //! request types of [`crate::remote_op`] under a version. Unknown fields are
-//! ignored; an unknown version or operation is refused. The client sends the
-//! lowest version that carries everything the request asks for
-//! ([`min_frame_version`]), so a remote that would drop an option it does not
-//! know refuses the request instead.
+//! ignored; an unknown version or operation is refused.
+//!
+//! Because unknown fields are ignored, a remote that predates an option
+//! would silently drop it. So a request that uses one is sent under the
+//! version that introduced it ([`min_frame_version`]), which an older remote
+//! refuses ([`FrameError::Version`]); every other request is still sent as
+//! version 1, which every remote since 0.5.0 reads. Version 2 (tendr 0.8.0)
+//! carries `start --record-input` and `--no-record`, and the ready check:
+//! `start --ready-when-*`, `--ready-within`, `--after-ready`, and
+//! `wait --ready`.
 //!
 //! [`serve`] (`tendr _remote`) reads the frame, checks everything it can
 //! before anything runs, then dispatches the request as if typed on this
@@ -31,21 +37,10 @@ use tendr::model::ids::{Namespace, SessionName};
 use crate::commands::{check_unset_env_name, parse_env_entry};
 use crate::remote_op::{self, RemoteOperation, StartRequest};
 
-/// The newest frame version this binary reads and writes. Version 2 is
-/// version 1 with options a 0.7 remote would ignore ([`min_frame_version`]);
-/// this binary reads both.
+/// The newest frame version this binary reads and writes; it reads every
+/// version from 1. Version 2 is version 1 with options a 0.7 remote would
+/// ignore ([`min_frame_version`]).
 pub const FRAME_VERSION: u32 = 2;
-
-/// The lowest frame version that carries `operation` faithfully: 1, unless
-/// it uses an option that a remote speaking only version 1 (0.7 and older)
-/// would drop without a word. Such a remote refuses version 2 with
-/// [`FrameError::Version`] instead.
-fn min_frame_version(operation: &RemoteOperation) -> u32 {
-    match operation {
-        RemoteOperation::Start(r) if r.record_input || r.no_record => 2,
-        _ => 1,
-    }
-}
 
 /// The largest JSON header accepted, in bytes.
 pub const MAX_HEADER_LEN: usize = 1 << 20;
@@ -92,7 +87,7 @@ pub enum FrameError {
     #[error("invalid remote request: {0}")]
     Parse(#[from] serde_json::Error),
     #[error(
-        "unsupported remote request version {0} (this tendr speaks {FRAME_VERSION}): \
+        "unsupported remote request version {0} (this tendr speaks 1 to {FRAME_VERSION}): \
          use the same tendr version on both hosts"
     )]
     Version(u32),
@@ -102,8 +97,28 @@ pub enum FrameError {
     Invalid(String),
 }
 
-/// Encode `operation` as a frame: the length, then the JSON header. A cwd
-/// that is not UTF-8 is refused rather than altered: JSON carries UTF-8 only.
+/// The oldest frame version that carries `operation` whole: 1, unless it
+/// uses an option a version 1 remote would ignore.
+fn min_frame_version(operation: &RemoteOperation) -> u32 {
+    match operation {
+        RemoteOperation::Start(r)
+            if r.record_input
+                || r.no_record
+                || r.ready_when_output.is_some()
+                || r.ready_when_port.is_some()
+                || r.ready_within_ms.is_some()
+                || !r.after_ready.is_empty() =>
+        {
+            2
+        }
+        RemoteOperation::Wait(r) if r.ready => 2,
+        _ => 1,
+    }
+}
+
+/// Encode `operation` as a frame: the length, then the JSON header, under
+/// the oldest version that carries it ([`min_frame_version`]). A cwd that is
+/// not UTF-8 is refused rather than altered: JSON carries UTF-8 only.
 ///
 /// # Errors
 /// [`EncodeError`] if the request cannot be carried.
@@ -251,6 +266,10 @@ fn validate_start(r: &StartRequest) -> Result<(), String> {
     if r.any_exit && r.after.is_empty() {
         return Err("--any-exit requires --after".to_owned());
     }
+    for dependency in &r.after_ready {
+        SessionName::new(dependency).map_err(|e| e.to_string())?;
+    }
+    r.ready_check()?;
     if r.boundary.is_none() && !r.boundary_parent.is_empty() {
         return Err("--boundary-parent requires --boundary".to_owned());
     }
@@ -516,6 +535,40 @@ mod tests {
             decode(br#"{"v":1,"op":"list","params":{"namespace":"n","later":1},"extra":[true]}"#)
                 .unwrap();
         assert_eq!(operation, op(&["list", "--namespace", "n"]));
+    }
+
+    /// A request that needs nothing new still goes as version 1, so an
+    /// older remote runs it; one that uses the ready check goes as version
+    /// 2, which a remote that reads only version 1 refuses instead of
+    /// dropping the option. This tendr reads both.
+    #[test]
+    fn only_a_request_that_needs_version_2_is_sent_as_it() {
+        let header = |args: &[&str]| encode(&op(args)).unwrap()[4..].to_vec();
+        let version = |header: &[u8]| {
+            serde_json::from_slice::<serde_json::Value>(header).unwrap()["v"].clone()
+        };
+        for args in [
+            &["start", "--after", "a", "s", "--", "srv"][..],
+            &["wait", "--any", "s"],
+        ] {
+            let plain = header(args);
+            assert_eq!(version(&plain), 1, "{args:?}");
+            assert!(decode_speaking(&plain, 1).is_ok(), "{args:?}");
+        }
+        for args in [
+            &["start", "--ready-when-port", "80", "s", "--", "srv"][..],
+            &["start", "--ready-when-output", "up", "s", "--", "srv"],
+            &["start", "--after-ready", "db", "s", "--", "srv"],
+            &["wait", "--ready", "s"],
+        ] {
+            let ready = header(args);
+            assert_eq!(version(&ready), 2, "{args:?}");
+            assert!(
+                matches!(decode_speaking(&ready, 1), Err(FrameError::Version(2))),
+                "{args:?}"
+            );
+            assert_eq!(decode(&ready).unwrap(), op(args), "{args:?}");
+        }
     }
 
     /// Attach names travel as data like any other, and are checked as any

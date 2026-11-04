@@ -229,6 +229,28 @@ the dependent waits, the dependent run ends as dependency-failed instead of
 following a different run. The generation number is a counter for people and
 is not used for this check.
 
+### The caller says when a run is ready; a missed deadline only records
+
+*2026-11-04.* A server is `Running` once it spawns, which says nothing about
+whether it serves yet. `start` takes one ready condition the caller names,
+a regex on its output or a TCP port on its host, with an optional deadline;
+tendr does not guess what ready means for any program (rule 1). The sidecar
+checks it, so a detached or `--host` session needs no client watching, and
+the result is a fact in the event log and `meta.json` (`run.ready`,
+`ready`), not a lifecycle state: the run is `Running` either way, and
+`--after-ready` and `wait --ready` read that fact.
+
+A missed deadline records `run.ready_missed` and leaves the child running.
+Stopping it would be a policy that cannot be undone, and a caller who wants
+it can `kill` on exit 43 from `wait --ready`. The miss is final: the check
+stops there, so `wait --ready` and `--after-ready` never see a run go from
+missed to ready. A dependency that misses or ends first fails the waiter as
+a failed dependency, as an `--after` dependency that fails does.
+
+The flags say "ready when", not "ready file": `watch --ready-file` and
+`events --ready-file` name the watcher's own baseline, not the child's
+state.
+
 ### `output.log` is a line log; the PTY recording is the exact record
 
 *2026-03, recording added 2026-09.* `output.log` stores lines with a timestamp
