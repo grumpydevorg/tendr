@@ -88,8 +88,7 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
 
 | Exec target | Result channel | Completion signal |
 |---|---|---|
-| POSIX shell | `output.log` | stderr end marker `__TENDR_EXEC_ERR__ <token>`, then stdout sentinel `__TENDR_EXEC__ <token> <exit> <cwd>` |
-| DuckDB | `output.log` | stdout sentinel, then up to 100 ms for trailing stderr |
+| POSIX shell, DuckDB | `output.log` | stderr end marker `__TENDR_EXEC_ERR__ <token>`, then stdout sentinel `__TENDR_EXEC__ <token> <exit> <cwd>` |
 | Python REPL | `exec-results/<token>.json` | the result file appears |
 | PowerShell | `exec-results/<token>.json` | the result file appears |
 | NDJSON | `output.log` | a stdout line that is a JSON object with `"id": "<token>"`, then 20 ms for trailing stderr |
@@ -97,10 +96,15 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
 - **Sentinel framing (POSIX shell, DuckDB).** The frame prints a sentinel
   line with the token after the command. `exec` scans `output.log` from the
   offset it recorded before sending.
-  - The sidecar logs stdout and stderr from separate threads. So for a POSIX
-    shell, `exec` waits for both markers. If the stderr marker never comes
-    (for example, the shell's stderr was redirected), it gives up waiting
-    one second after the sentinel.
+  - The sidecar logs stdout and stderr from separate threads. So `exec`
+    waits for both markers: each pipe is logged in order, so once both are
+    in, so is everything the command wrote before them. If the stderr
+    marker never comes (for example, the shell's stderr was redirected, or
+    a DuckDB cannot print to `stderr`), it gives up waiting one second after
+    the sentinel and says stderr may be incomplete.
+  - The DuckDB frame prints its stderr marker with `.output stderr`, which
+    names the stream, not a file, then `.output` to print the sentinel on
+    stdout again.
   - Either marker may end a line rather than start one, when the command's
     last output has no newline. The bytes before the marker are command
     output.
@@ -148,8 +152,7 @@ The next exec reads it under `exec.lock`, before any event or framing:
 
 | Exec target | The earlier frame has finished when |
 |---|---|
-| POSIX shell | its stdout sentinel and stderr end marker are in `output.log` after the offset; with the sentinel but no marker, after one more second |
-| DuckDB | its stdout sentinel is in `output.log` after the offset, then 100 ms more for trailing stderr |
+| POSIX shell, DuckDB | its stdout sentinel and stderr end marker are in `output.log` after the offset; with the sentinel but no marker, after one more second |
 | Python REPL, PowerShell | `exec-results/<token>.json` exists |
 
 If it has finished, the exec removes the record (and result file) and runs as

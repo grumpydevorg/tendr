@@ -160,32 +160,19 @@ impl PendingExec {
     }
 
     /// Whether this exec's frame has finished in the session: its result
-    /// file exists, or its sentinel and, for a POSIX shell, its stderr end
-    /// marker are in `output.log`.
+    /// file exists, or its sentinel and, for a POSIX shell or DuckDB, its
+    /// stderr end marker are in `output.log`.
     fn is_finished(&self, session: &SessionDir, target: ExecTarget) -> anyhow::Result<bool> {
         match target {
             ExecTarget::PythonRepl | ExecTarget::PowerShell => {
                 Ok(result_file(session, &self.token).exists())
             }
-            ExecTarget::PosixShell => self.sentinel_logged(session, true),
-            ExecTarget::DuckDb => {
-                let finished = self.sentinel_logged(session, false)?;
-                if finished {
-                    // As in drain_trailing_stderr: the statement's stderr may
-                    // be logged just after the sentinel.
-                    std::thread::sleep(DUCKDB_STDERR_GRACE);
-                }
-                Ok(finished)
-            }
+            ExecTarget::PosixShell | ExecTarget::DuckDb => self.sentinel_logged(session),
             ExecTarget::Ndjson | ExecTarget::None => Ok(true),
         }
     }
 
-    fn sentinel_logged(
-        &self,
-        session: &SessionDir,
-        require_err_marker: bool,
-    ) -> anyhow::Result<bool> {
+    fn sentinel_logged(&self, session: &SessionDir) -> anyhow::Result<bool> {
         let log_path = session.path().join("output.log");
         let file = match File::open(&log_path) {
             Ok(file) => file,
@@ -196,7 +183,7 @@ impl PendingExec {
         reader.seek(SeekFrom::Start(self.log_offset))?;
 
         let mut sentinel = false;
-        let mut err_marked = !require_err_marker;
+        let mut err_marked = false;
         let mut buf: Vec<u8> = Vec::new();
         while !(sentinel && err_marked) {
             buf.clear();
@@ -216,9 +203,7 @@ impl PendingExec {
             };
             if parsed.tag == "O" && exec_frame::parse_sentinel(content, &self.token).is_some() {
                 sentinel = true;
-            } else if require_err_marker
-                && exec_frame::parse_err_marker(content, &self.token).is_some()
-            {
+            } else if exec_frame::parse_err_marker(content, &self.token).is_some() {
                 err_marked = true;
             }
         }
@@ -690,39 +675,24 @@ fn run_exec(
     match wait_mode {
         WaitMode::SideChannel => wait_side_channel_result(session, &session_name, token, deadline),
         WaitMode::Ndjson => wait_ndjson_result(session, &session_name, token, cursor, deadline),
-        WaitMode::Sentinel => {
-            wait_sentinel_result(session, &session_name, token, cursor, deadline, true)
-        }
+        WaitMode::Sentinel => wait_sentinel_result(session, &session_name, token, cursor, deadline),
         WaitMode::SentinelWithStderrCheck => {
-            let mut result =
-                wait_sentinel_result(session, &session_name, token, cursor, deadline, false)?;
-
-            // DuckDB's sentinel hardcodes exit code 0 (SQL has no $?).
-            // Detect errors from stderr. Stderr lines may arrive in the log
-            // after the sentinel due to pipe read ordering, so always drain
-            // trailing stderr to catch races and partial-success cases
-            // (e.g. "SELECT 1; SELECT * FROM bad;").
-            let trailing_stderr = drain_trailing_stderr(session, cursor);
-            if !trailing_stderr.is_empty() {
-                if result.stderr.is_empty() {
-                    result.stderr = trailing_stderr;
-                } else {
-                    result.stderr.push('\n');
-                    result.stderr.push_str(&trailing_stderr);
-                }
-            }
+            let mut result = wait_sentinel_result(session, &session_name, token, cursor, deadline)?;
+            // DuckDB's sentinel hardcodes exit code 0 (SQL has no $?), so an
+            // error is told by stderr, all of which is in by the end marker,
+            // including a partial success ("SELECT 1; SELECT * FROM bad;").
             if !result.stderr.is_empty() {
                 result.exit_code = 1;
             }
-
             Ok(result)
         }
     }
 }
 
 /// How long exec keeps reading after the stdout sentinel for the stderr end
-/// marker. Only reached when the session shell's stderr no longer reaches the
-/// sidecar (e.g. an earlier `push 'exec 2>/dev/null'`).
+/// marker. Only reached when the session's stderr no longer reaches the
+/// sidecar (e.g. an earlier `push 'exec 2>/dev/null'`), or a DuckDB that
+/// cannot print to stderr.
 const ERR_MARKER_GRACE: Duration = Duration::from_secs(1);
 
 /// [`ERR_MARKER_GRACE`]. Debug builds accept `TENDR_TEST_ERR_MARKER_GRACE_MS`
@@ -735,18 +705,16 @@ fn err_marker_grace() -> Duration {
 /// Scan output.log for the result of one framed exec (PosixShell, DuckDB).
 ///
 /// The sidecar logs stdout and stderr from separate threads, so their lines
-/// interleave in no fixed order. With `require_err_marker` (the POSIX frame)
-/// the exec is complete only once both the stdout sentinel and the stderr end
-/// marker are logged; each pipe is logged in order, so nothing of the
-/// command's output can still be in flight (#92). DuckDB's frame has no stderr
-/// marker and relies on `drain_trailing_stderr` instead.
+/// interleave in no fixed order. Both frames print a stderr end marker, so the
+/// exec is complete only once both the stdout sentinel and that marker are
+/// logged; each pipe is logged in order, so nothing of the command's output
+/// can still be in flight (#92).
 fn wait_sentinel_result(
     session: &SessionDir,
     session_name: &str,
     token: &str,
     cursor: u64,
     deadline: Option<Instant>,
-    require_err_marker: bool,
 ) -> anyhow::Result<ExecResult> {
     let log_path = session.path().join("output.log");
 
@@ -754,7 +722,7 @@ fn wait_sentinel_result(
     let mut stderr_lines: Vec<String> = Vec::new();
     // The stdout sentinel's (exit code, cwd), and when it was seen.
     let mut sentinel: Option<(i32, String, Instant)> = None;
-    let mut err_marked = !require_err_marker;
+    let mut err_marked = false;
 
     let result = |stdout: &[String], stderr: &[String], done: Option<(i32, String)>| {
         let (exit_code, cwd_after, timed_out) = match done {
@@ -811,7 +779,7 @@ fn wait_sentinel_result(
             if let Some((code, cwd, seen_at)) = &sentinel {
                 if seen_at.elapsed() >= err_marker_grace() {
                     eprintln!(
-                        "tendr exec: stderr end marker not seen; the session shell's stderr \
+                        "tendr exec: stderr end marker not seen; the session's stderr \
                          may be redirected, so stderr may be incomplete"
                     );
                     return Ok(result(
@@ -847,10 +815,7 @@ fn wait_sentinel_result(
                         stdout_lines.push(residual.to_owned());
                     }
                     sentinel.get_or_insert((code, cwd, Instant::now()));
-                } else if let Some(residual) = require_err_marker
-                    .then(|| exec_frame::parse_err_marker(content, token))
-                    .flatten()
-                {
+                } else if let Some(residual) = exec_frame::parse_err_marker(content, token) {
                     // A PTY merges both streams onto stdout.
                     if !residual.is_empty() {
                         stdout_lines.push(residual.to_owned());
@@ -861,10 +826,7 @@ fn wait_sentinel_result(
                 }
             }
             "E" => {
-                if let Some(residual) = require_err_marker
-                    .then(|| exec_frame::parse_err_marker(content, token))
-                    .flatten()
-                {
+                if let Some(residual) = exec_frame::parse_err_marker(content, token) {
                     if !residual.is_empty() {
                         stderr_lines.push(residual.to_owned());
                     }
@@ -1043,79 +1005,6 @@ fn wait_ndjson_result(
     }
 }
 
-/// How long a DuckDB exec reads past its sentinel for trailing stderr.
-const DUCKDB_STDERR_GRACE: Duration = Duration::from_millis(100);
-
-/// After the sentinel has been found, re-scan the log for any 'E' (stderr)
-/// lines that arrived after the sentinel.
-///
-/// The sidecar reads stdout and stderr from separate pipes on separate threads,
-/// writing both to output.log with 'O' and 'E' tags. Line ordering between
-/// tags is not guaranteed: a child can write to stderr and then stdout nearly
-/// simultaneously, and the sidecar may flush the stdout ('O') sentinel line
-/// to the log before the stderr ('E') error line. This function accommodates
-/// that race by waiting up to DUCKDB_STDERR_GRACE after the sentinel for
-/// trailing stderr.
-fn drain_trailing_stderr(session: &SessionDir, cursor: u64) -> String {
-    let log_path = session.path().join("output.log");
-    let Ok(file) = std::fs::File::open(&log_path) else {
-        return String::new();
-    };
-    let mut reader = BufReader::new(file);
-    let _ = reader.seek(SeekFrom::Start(cursor));
-
-    let mut stderr_lines: Vec<String> = Vec::new();
-    let mut buf = String::new();
-    let deadline = Instant::now() + DUCKDB_STDERR_GRACE;
-    let mut saw_sentinel = false;
-
-    loop {
-        if Instant::now() >= deadline {
-            break;
-        }
-        buf.clear();
-        match reader.read_line(&mut buf) {
-            Ok(0) => {
-                if saw_sentinel {
-                    // Already past the sentinel and no more data — give a small
-                    // window for stderr to arrive, then stop.
-                    std::thread::sleep(Duration::from_millis(20));
-                    buf.clear();
-                    if reader.read_line(&mut buf).unwrap_or(0) == 0 {
-                        break;
-                    }
-                    // Fall through to parse the line
-                } else {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-
-        let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
-        if let Ok(parsed) = serde_json::from_str::<LogLine>(trimmed) {
-            match parsed.tag.as_str() {
-                "O" if parsed
-                    .content_text()
-                    .is_some_and(|c| c.contains("__TENDR_EXEC__")) =>
-                {
-                    saw_sentinel = true;
-                }
-                "E" if saw_sentinel => {
-                    if let Some(content) = parsed.content_text() {
-                        stderr_lines.push(content.to_owned());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    stderr_lines.join("\n")
-}
-
 /// SHA-256 of `bytes` as lowercase hex (same convention as `events::hex`).
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -1275,7 +1164,7 @@ mod tests {
                 ("E", "__TENDR_EXEC_ERR__ tok"),
             ],
         );
-        let result = wait_sentinel_result(&dir, "s", "tok", 0, None, true).unwrap();
+        let result = wait_sentinel_result(&dir, "s", "tok", 0, None).unwrap();
         assert_eq!(result.stderr, "late");
         assert_eq!(result.exit_code, 0);
         assert!(!result.timed_out);
@@ -1292,7 +1181,7 @@ mod tests {
                 ("O", "foo__TENDR_EXEC__ tok 3 /tmp"),
             ],
         );
-        let result = wait_sentinel_result(&dir, "s", "tok", 0, None, true).unwrap();
+        let result = wait_sentinel_result(&dir, "s", "tok", 0, None).unwrap();
         assert_eq!(result.stdout, "foo");
         assert_eq!(result.stderr, "y");
         assert_eq!(result.exit_code, 3);

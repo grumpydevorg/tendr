@@ -84,14 +84,19 @@ pub fn powershell_frame(code: &str, result_path: &str) -> String {
 /// Build a framed SQL exec string for injection into a DuckDB session.
 ///
 /// Results flow through stdout (`.mode json`) and are captured in the output
-/// log, just like shell exec. No `.output` file redirection — that dot-command
-/// has path-escaping fragility that breaks on Windows backslashes and paths
-/// with spaces.
+/// log, just like shell exec. No `.output` to a file: a path has escaping
+/// fragility that breaks on Windows backslashes and paths with spaces.
 ///
 /// We deliberately do NOT use `.bail on` — it would exit the DuckDB process
 /// on error, killing the session. Errors are detected from stderr lines in
 /// the output log. The sentinel always fires with exit code 0; the caller
 /// must check stderr to detect failures.
+///
+/// As in [`unix_frame`], the [`EXEC_ERR_MARKER`] goes to stderr after the SQL
+/// and before the stdout sentinel, so once both are logged every error the
+/// SQL wrote is too. `.output stderr` names the stream, not a file (DuckDB's
+/// shell, like SQLite's, takes `stdout` and `stderr` as stream names), and
+/// `.output` sends output back to stdout for the sentinel.
 ///
 /// Token must be hex-only (as produced by `generate_token`).
 pub fn duckdb_frame(sql: &str, token: &str) -> String {
@@ -99,7 +104,9 @@ pub fn duckdb_frame(sql: &str, token: &str) -> String {
         token.bytes().all(|b| b.is_ascii_hexdigit()),
         "token must be hex-only, got: {token}"
     );
-    format!(".mode json\n.nullvalue null\n{sql}\n.print __TENDR_EXEC__ {token} 0 .\n")
+    format!(
+        ".mode json\n.nullvalue null\n{sql}\n.output stderr\n.print {EXEC_ERR_MARKER} {token}\n.output\n.print __TENDR_EXEC__ {token} 0 .\n"
+    )
 }
 
 /// Parse a sentinel line into `(residual, exit code, cwd)`.
@@ -403,10 +410,6 @@ mod tests {
         assert!(
             !frame.contains(".bail on"),
             "frame must not use .bail on — it kills the session"
-        );
-        assert!(
-            !frame.contains(".output"),
-            "frame must not use .output — path escaping is fragile"
         );
         assert!(frame.contains(".nullvalue null\n"));
         assert!(frame.contains("SELECT 42 as answer;\n"));

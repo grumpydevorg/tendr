@@ -1112,6 +1112,61 @@ fn exec_duckdb_mixed_success_reports_error() {
         .success();
 }
 
+/// A DuckDB error logged after the sentinel still fails the exec. The
+/// sidecar logs stdout and stderr from separate threads, so DuckDB's error,
+/// written before the sentinel, can reach the log after it. This stand-in
+/// for DuckDB writes the error and the stderr end marker only once the test
+/// has seen the sentinel logged, the latest order the sidecar can produce:
+/// the exec must wait for the marker, not for a while.
+#[cfg(unix)]
+#[test]
+fn exec_duckdb_error_logged_after_the_sentinel_fails_the_exec() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let gate = root.path().join("gate");
+    let _open = harness::OpenGate(gate.clone());
+    let late_duckdb = format!(
+        r#"while IFS= read -r line; do
+  case "$line" in
+    ".print __TENDR_EXEC_ERR__ "*) marker="${{line#.print }}" ;;
+    ".print __TENDR_EXEC__ "*)
+      printf '%s\n' "${{line#.print }}"
+      until [ -e '{gate}' ]; do sleep 0.01; done
+      echo 'Catalog Error: Table with name late does not exist!' >&2
+      [ -n "$marker" ] && printf '%s\n' "$marker" >&2
+      marker= ;;
+  esac
+done"#,
+        gate = gate.display()
+    );
+    harness::tendr(&root)
+        .args(["start", "db", "--stdin", "--exec-target", "duckdb", "--"])
+        .args(["sh", "-c", &late_duckdb])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "db");
+    harness::wait_running(&root, "db");
+
+    let exec = spawn_exec(&root, "db", "SELECT * FROM late;");
+    harness::wait_log_tail(&root, "db", "__TENDR_EXEC__");
+    std::fs::write(&gate, b"").unwrap();
+    let output = finish_exec(exec);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the error decides the exit code: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        result["stderr"]
+            .as_str()
+            .is_some_and(|stderr| stderr.contains("late does not exist")),
+        "{result}"
+    );
+}
+
 /// DuckDB exec: paths with spaces work correctly (no .output path escaping needed).
 #[test]
 fn exec_duckdb_path_with_spaces() {
