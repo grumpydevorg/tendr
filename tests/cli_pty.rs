@@ -138,15 +138,55 @@ fn pty_capture_reads_a_held_terminal_for_up_to_2_s_after_the_child() {
     assert!(log.contains("started"), "{log:?}");
 
     // The job writes once its leader has exited: a zombie the sidecar has
-    // not reaped yet, or gone. The grace is stretched so the job's write,
-    // however late load makes it, falls within it.
-    let log = run(
-        "pty-kept-job",
-        "trap '' HUP; \
-         (until s=$(ps -o stat= -p $$ | tr -d ' '); case \"$s\" in Z*|'') true;; *) false;; esac; \
-          do sleep 0.05; done; echo late) & echo started",
-        &[("TENDR_TEST_HOLDER_GRACE_MS", HANG.as_millis().to_string())],
-    );
+    // not reaped yet, or gone. The test watches the leader from the kernel
+    // (a Nix sandbox has no `ps`) and opens the job's gate then. The grace
+    // is stretched so the job's write, however late load makes it, falls
+    // within it.
+    let gate = root.path().join("leader-gone");
+    let _open = harness::OpenGate(gate.clone());
+    let session = "pty-kept-job";
+    tendr(&root)
+        .env("TENDR_TEST_HOLDER_GRACE_MS", HANG.as_millis().to_string())
+        .args(["start", session, "--pty", "--", "sh", "-c"])
+        .arg(format!(
+            "trap '' HUP; (until [ -e '{gate}' ]; do sleep 0.05; done; echo late) & echo started",
+            gate = gate.display()
+        ))
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, session);
+    let meta_path = root
+        .path()
+        .join(format!(".tendr/sessions/default/{session}/meta.json"));
+    // The leader's pid, recorded once it is spawned; it stays in meta.json
+    // after the run ends.
+    let leader: i32 = harness::poll_until(HANG, Duration::from_millis(20), || {
+        let pid = std::fs::read(&meta_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|meta| meta["child"]["pid"].as_i64());
+        match pid {
+            Some(pid) => Observation::Ready(pid as i32),
+            None => Observation::Pending("no child pid in meta.json".to_owned()),
+        }
+    })
+    .unwrap_or_else(|e| panic!("the leader's pid was never recorded: {e}"));
+    harness::poll_until(HANG, Duration::from_millis(20), || {
+        if harness::process_running(leader) {
+            Observation::Pending(format!("leader {leader} still running"))
+        } else {
+            Observation::Ready(())
+        }
+    })
+    .unwrap_or_else(|e| panic!("the session leader never exited: {e}"));
+    std::fs::write(&gate, b"").unwrap();
+    let meta = harness::wait_terminal(&root, session);
+    assert_eq!(meta["reason"], "ExitedOk", "{meta}");
+    let output = tendr(&root)
+        .args(["log", session, "--raw"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stdout);
     assert!(log.contains("started"), "{log:?}");
     if cfg!(target_os = "macos") {
         assert!(!log.contains("late"), "{log:?}");
