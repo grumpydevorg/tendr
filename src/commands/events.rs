@@ -17,6 +17,7 @@ use tendr::events::{
     POLL_INTERVAL, decode_cursor, encode_cursor, merge_key, project_log_line, read_segment_records,
 };
 use tendr::log::LogLine;
+use tendr::log_files::{LogCursor, LogReader};
 use tendr::model::event::{Event, EventTimestamp};
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::session::{self, SessionRoot};
@@ -194,35 +195,23 @@ struct BookmarkState {
     last_mark: Instant,
 }
 
-/// Read complete `output.log` lines from a byte offset — the same
+/// Read complete log lines from `cursor` on, across rotations — the same
 /// only-`\n`-terminated discipline as event segments, so a line mid-write
 /// waits instead of being lost. Unparseable lines are consumed silently:
 /// output.log is a separate contract and never feeds `--strict`.
-fn read_log_lines(path: &Path, from: u64) -> io::Result<(Vec<LogLine>, u64)> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(from))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-
+fn read_log_lines(dir: &Path, cursor: LogCursor) -> io::Result<(Vec<LogLine>, LogCursor)> {
+    let mut reader = LogReader::new(dir, cursor);
     let mut lines = Vec::new();
-    let mut consumed_to = from;
-    let mut line_start = 0usize;
-    while let Some(nl) = buf[line_start..].iter().position(|b| *b == b'\n') {
-        let line_end = line_start + nl;
-        let raw = &buf[line_start..line_end];
-        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-        if let Some(parsed) = std::str::from_utf8(raw)
+    let mut raw = Vec::new();
+    while reader.next_line(&mut raw)? {
+        if let Some(parsed) = std::str::from_utf8(&raw)
             .ok()
             .and_then(|line| serde_json::from_str::<LogLine>(line).ok())
         {
             lines.push(parsed);
         }
-        consumed_to = from + line_end as u64 + 1;
-        line_start = line_end + 1;
     }
-    Ok((lines, consumed_to))
+    Ok((lines, reader.cursor()))
 }
 
 /// Incremental reader over the event segments (and optionally output.log)
@@ -245,8 +234,8 @@ struct StreamReader {
     tracker: CursorTracker,
     /// `<ns>/<session>/events/<seg>.jsonl` → offset after last consumed line.
     seg_offsets: BTreeMap<String, u64>,
-    /// `<ns>/<session>` → output.log offset after last consumed line.
-    log_offsets: BTreeMap<String, u64>,
+    /// `<ns>/<session>` → log position after last consumed line.
+    log_offsets: BTreeMap<String, LogCursor>,
     /// Monotonic tiebreak so derived records keep arrival order at equal ts.
     derived_tie: u64,
 }
@@ -341,17 +330,14 @@ impl StreamReader {
         batch: &mut Batch,
     ) {
         let key = format!("{}/{}", namespace.as_str(), name.as_str());
-        let log_path = session_dir.join("output.log");
         let from = match self.log_offsets.get(&key) {
-            Some(offset) => *offset,
+            Some(cursor) => *cursor,
             // First sight after a cursor resume: start at the wall-clock
             // EOF, documented best-effort (cursors never cover output.log).
-            None if self.logs_from_end => std::fs::metadata(&log_path)
-                .map(|m| m.len())
-                .unwrap_or_default(),
-            None => 0,
+            None if self.logs_from_end => LogCursor::end(session_dir).unwrap_or_default(),
+            None => LogCursor::default(),
         };
-        let Ok((lines, consumed_to)) = read_log_lines(&log_path, from) else {
+        let Ok((lines, consumed_to)) = read_log_lines(session_dir, from) else {
             return;
         };
         self.log_offsets.insert(key, consumed_to);

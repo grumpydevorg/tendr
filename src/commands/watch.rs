@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tendr::events::{POLL_INTERVAL, merge_key, read_segment_records};
 use tendr::log::LogLine;
+use tendr::log_files::{LogCursor, LogReader};
 use tendr::model::event::Event;
 use tendr::model::ids::Namespace;
 use tendr::model::state::{ExitReason, RunStatus};
@@ -16,7 +17,7 @@ struct SessionWatcher {
     session: String,
     run_id: String,
     last_status: String,
-    last_log_offset: u64,
+    log_cursor: LogCursor,
     /// When the session has an `events/` dir, the run-event stream is
     /// derived from the event log (spec §5.3) — true timestamps,
     /// un-collapsed transitions, real sources. Sessions without one keep
@@ -257,7 +258,7 @@ pub fn cmd_watch(
                 // Detect run_id change (session replaced) — reset log offset
                 if watcher.run_id != run_id_str {
                     watcher.run_id = run_id_str.clone();
-                    watcher.last_log_offset = 0;
+                    watcher.log_cursor = LogCursor::default();
                     watcher.last_status = String::new(); // force status re-emit
                 }
 
@@ -307,7 +308,7 @@ pub fn cmd_watch(
                     session: name.as_str().to_owned(),
                     run_id: run_id_str,
                     last_status: current_status_key,
-                    last_log_offset: 0,
+                    log_cursor: LogCursor::default(),
                     event_mode: has_event_log,
                     seg_offsets: BTreeMap::new(),
                 };
@@ -374,10 +375,9 @@ pub fn cmd_watch(
                 watchers.insert(key.clone(), watcher);
 
                 if skip_initial {
-                    // Skip existing log content — seek to end.
-                    let log_path = session_dir.path().join("output.log");
-                    if let Ok(file_meta) = std::fs::metadata(&log_path) {
-                        watchers.get_mut(&key).unwrap().last_log_offset = file_meta.len();
+                    // Skip existing log content — start at its end.
+                    if let Ok(end) = LogCursor::end(session_dir.path()) {
+                        watchers.get_mut(&key).unwrap().log_cursor = end;
                     }
                 }
             }
@@ -385,82 +385,55 @@ pub fn cmd_watch(
             // Read new log lines.
             if emit_logs || emit_annotations {
                 let watcher = watchers.get_mut(&key).unwrap();
-                let log_path = session_dir.path().join("output.log");
-                if log_path.exists() {
-                    if let Ok(file) = std::fs::File::open(&log_path) {
-                        let mut reader = BufReader::new(file);
-                        if reader
-                            .seek(SeekFrom::Start(watcher.last_log_offset))
-                            .is_ok()
-                        {
-                            let mut buf = String::new();
-                            loop {
-                                buf.clear();
-                                match reader.read_line(&mut buf) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        watcher.last_log_offset += n as u64;
-                                        let trimmed =
-                                            buf.trim_end_matches('\n').trim_end_matches('\r');
-                                        if let Ok(parsed) = serde_json::from_str::<LogLine>(trimmed)
-                                        {
-                                            let ts_secs = parsed.ts;
-                                            match parsed.tag.as_str() {
-                                                "O" | "E" if emit_logs => {
-                                                    let log_name = if parsed.tag == "O" {
-                                                        "log.stdout"
-                                                    } else {
-                                                        "log.stderr"
-                                                    };
-                                                    if !emit_event(
-                                                        &mut stdout,
-                                                        ts_secs,
-                                                        &watcher.namespace,
-                                                        &watcher.session,
-                                                        &watcher.run_id,
-                                                        "tendr.sidecar",
-                                                        "log",
-                                                        log_name,
-                                                        log_data(&parsed),
-                                                    ) {
-                                                        return Ok(());
-                                                    }
-                                                }
-                                                "A" if emit_annotations
-                                                    && !parsed.content.is_null() =>
-                                                {
-                                                    let ann = parsed.content.clone();
-                                                    let source = ann["source"]
-                                                        .as_str()
-                                                        .unwrap_or("unknown")
-                                                        .to_owned();
-                                                    let event_name = ann["event"]
-                                                        .as_str()
-                                                        .unwrap_or("unknown")
-                                                        .to_owned();
-                                                    let name = format!("annotation.{event_name}");
-                                                    if !emit_event(
-                                                        &mut stdout,
-                                                        ts_secs,
-                                                        &watcher.namespace,
-                                                        &watcher.session,
-                                                        &watcher.run_id,
-                                                        &source,
-                                                        "annotation",
-                                                        &name,
-                                                        ann,
-                                                    ) {
-                                                        return Ok(());
-                                                    }
-                                                }
-                                                _ => {} // skip if not emitting this type
-                                            }
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
+                let mut reader = LogReader::new(session_dir.path(), watcher.log_cursor);
+                let mut raw = Vec::new();
+                while let Ok(true) = reader.next_line(&mut raw) {
+                    watcher.log_cursor = reader.cursor();
+                    let Ok(parsed) = serde_json::from_slice::<LogLine>(&raw) else {
+                        continue;
+                    };
+                    let ts_secs = parsed.ts;
+                    match parsed.tag.as_str() {
+                        "O" | "E" if emit_logs => {
+                            let log_name = if parsed.tag == "O" {
+                                "log.stdout"
+                            } else {
+                                "log.stderr"
+                            };
+                            if !emit_event(
+                                &mut stdout,
+                                ts_secs,
+                                &watcher.namespace,
+                                &watcher.session,
+                                &watcher.run_id,
+                                "tendr.sidecar",
+                                "log",
+                                log_name,
+                                log_data(&parsed),
+                            ) {
+                                return Ok(());
                             }
                         }
+                        "A" if emit_annotations && !parsed.content.is_null() => {
+                            let ann = parsed.content.clone();
+                            let source = ann["source"].as_str().unwrap_or("unknown").to_owned();
+                            let event_name = ann["event"].as_str().unwrap_or("unknown").to_owned();
+                            let name = format!("annotation.{event_name}");
+                            if !emit_event(
+                                &mut stdout,
+                                ts_secs,
+                                &watcher.namespace,
+                                &watcher.session,
+                                &watcher.run_id,
+                                &source,
+                                "annotation",
+                                &name,
+                                ann,
+                            ) {
+                                return Ok(());
+                            }
+                        }
+                        _ => {} // skip if not emitting this type
                     }
                 }
             }

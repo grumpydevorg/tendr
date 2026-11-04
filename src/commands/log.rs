@@ -29,22 +29,20 @@ pub fn cmd_log(
         all_updates,
     };
 
-    let log_path = session.path().join("output.log");
+    let dir = session.path();
 
     let written = if follow {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        follow_log(&log_path, &query, &mut out, || {
+        follow_log(dir, &query, &mut out, || {
             session::read_meta(&session)
                 .map(|m| m.status().is_terminal())
                 .unwrap_or(false)
         })
-    } else if !log_path.exists() {
-        return Ok(());
     } else {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        query_log(&log_path, &query, &mut out).map(drop)
+        query_log(dir, &query, &mut out).map(drop)
     };
     match written {
         // Only stdout can break the pipe: the reader exited early.

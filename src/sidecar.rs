@@ -1732,9 +1732,12 @@ fn signal_readiness(session: &SessionDir, ready: &mut Option<ReadyWriter>, meta:
     }
 }
 
-/// Write one record of a stream to the shared log file.
+use crate::log_files::LogSink;
+/// Write one record of a stream to the shared log file. A warning the
+/// writer raised (a failed rotation) goes to `failed`, once.
 fn write_log_line(
-    log: &Mutex<Box<dyn Write + Send>>,
+    log: &Mutex<Box<dyn LogSink>>,
+    failed: &std::sync::mpsc::Sender<String>,
     tag: char,
     line: String,
     terminator: Option<crate::log::Terminator>,
@@ -1747,7 +1750,13 @@ fn write_log_line(
     })
     .expect("JSON serialization cannot fail")
         + "\n";
-    test_fault("output_log_write").and_then(|()| lock(log).write_all(formatted.as_bytes()))
+    test_fault("output_log_write")?;
+    let mut log = lock(log);
+    log.write_all(formatted.as_bytes())?;
+    if let Some(warning) = log.take_warning() {
+        let _ = failed.send(warning);
+    }
+    Ok(())
 }
 
 /// The warning for a stream whose `output.log` write failed.
@@ -1770,7 +1779,7 @@ const PIPE_READ_BYTES: usize = 8192;
 fn capture_stream(
     mut stream: Box<dyn std::io::Read + Send>,
     tag: char,
-    log: &Mutex<Box<dyn Write + Send>>,
+    log: &Mutex<Box<dyn LogSink>>,
     failed: &std::sync::mpsc::Sender<String>,
     mut ready: Option<OutputMatcher>,
     delimiter: crate::model::spec::LogDelimiter,
@@ -1782,7 +1791,7 @@ fn capture_stream(
     let mut emit = |bytes: &[u8], terminator| -> io::Result<()> {
         if logging {
             let text = String::from_utf8_lossy(bytes).into_owned();
-            match write_log_line(log, tag, text, terminator) {
+            match write_log_line(log, failed, tag, text, terminator) {
                 Ok(()) => telemetry.record_written(),
                 Err(e) => {
                     let _ = failed.send(log_write_warning(tag, &e));
@@ -1825,7 +1834,7 @@ fn capture_stream(
 fn capture_stream_with_tee(
     mut stream: Box<dyn std::io::Read + Send>,
     tag: char,
-    log: &Mutex<Box<dyn Write + Send>>,
+    log: &Mutex<Box<dyn LogSink>>,
     failed: &std::sync::mpsc::Sender<String>,
     attach_sink: &AttachSink,
     recorder: Option<&Recorder>,
@@ -1850,7 +1859,7 @@ fn capture_stream_with_tee(
         if logging {
             let text = String::from_utf8_lossy(&buf[..n]);
             for line in text.lines() {
-                if let Err(e) = write_log_line(log, tag, line.to_owned(), None) {
+                if let Err(e) = write_log_line(log, failed, tag, line.to_owned(), None) {
                     let _ = failed.send(log_write_warning(tag, &e));
                     logging = false;
                     break;

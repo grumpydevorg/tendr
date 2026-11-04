@@ -1,10 +1,11 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use tendr::events::{self, EventDraft, EventWriter};
 use tendr::exec_frame;
 use tendr::log::LogLine;
+use tendr::log_files::{self, LogCursor, LogReader};
 use tendr::model::event::{Event, Kind, Uuid7};
 use tendr::model::ids::{Namespace, SessionName, Source};
 use tendr::model::meta::Meta;
@@ -103,9 +104,12 @@ struct PendingExec {
     started_at: String,
     /// The command, shortened for messages.
     command: String,
-    /// `output.log` length before the frame was sent; the sentinel targets
-    /// look for its completion from here.
+    /// The log position before the frame was sent; the sentinel targets
+    /// look for its completion from here. `log_archive` is absent in a
+    /// record from before `output.log` rotated, which means none.
     log_offset: u64,
+    #[serde(default)]
+    log_archive: u64,
 }
 
 const PENDING_EXEC_FILE: &str = "exec.pending.json";
@@ -114,7 +118,7 @@ const PENDING_EXEC_FILE: &str = "exec.pending.json";
 const PENDING_COMMAND_BYTES: usize = 120;
 
 impl PendingExec {
-    fn new(cmd: &[String], token: &str, log_offset: u64) -> Self {
+    fn new(cmd: &[String], token: &str, log_cursor: LogCursor) -> Self {
         Self {
             token: token.to_owned(),
             started_at: humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string(),
@@ -122,7 +126,8 @@ impl PendingExec {
                 &shell_words::join(cmd),
                 PENDING_COMMAND_BYTES,
             ),
-            log_offset,
+            log_offset: log_cursor.offset,
+            log_archive: log_cursor.archive,
         }
     }
 
@@ -174,30 +179,28 @@ impl PendingExec {
     }
 
     fn sentinel_logged(&self, session: &SessionDir, fence: ErrFence) -> anyhow::Result<bool> {
-        let log_path = session.path().join("output.log");
-        let file = match File::open(&log_path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e.into()),
+        let from = LogCursor {
+            archive: self.log_archive,
+            offset: self.log_offset,
         };
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(self.log_offset))?;
+        if from.is_gone(session.path())? {
+            anyhow::bail!(
+                "{}: its output was rotated out of output.log before it finished, so its end \
+                 cannot be seen; stop the session with `tendr kill`",
+                self.describe()
+            );
+        }
+        let mut reader = LogReader::new(session.path(), from);
 
         let mut sentinel = false;
         let mut err_marked = false;
         let mut buf: Vec<u8> = Vec::new();
         let mut joined = tendr::log::Reassemble::default();
         while !(sentinel && err_marked) {
-            buf.clear();
-            if reader.read_until(b'\n', &mut buf)? == 0 {
+            if !reader.next_line(&mut buf)? {
                 break;
             }
-            // A torn last line does not parse; the next exec reads it whole.
-            let Ok(line) = std::str::from_utf8(&buf) else {
-                continue;
-            };
-            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-            let Ok(parsed) = serde_json::from_str::<LogLine>(trimmed) else {
+            let Ok(parsed) = serde_json::from_slice::<LogLine>(&buf) else {
                 continue;
             };
             let Some(parsed) = joined.push(parsed) else {
@@ -578,8 +581,7 @@ fn run_exec(
     let deadline = timeout.map(|t| Instant::now() + Duration::from_secs(t));
 
     // 1. Capture log cursor (for sentinel path)
-    let log_path = session.path().join("output.log");
-    let cursor = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let cursor = LogCursor::end(session.path())?;
 
     // 2. Frame the command according to the session's exec target.
     enum WaitMode {
@@ -783,11 +785,11 @@ fn wait_sentinel_result(
     session: &SessionDir,
     session_name: &str,
     token: &str,
-    cursor: u64,
+    cursor: LogCursor,
     deadline: Option<Instant>,
     fence: ErrFence,
 ) -> anyhow::Result<ExecResult> {
-    let log_path = session.path().join("output.log");
+    let log_dir = session.path();
 
     let mut stdout_lines: Vec<String> = Vec::new();
     let mut stderr_lines: Vec<String> = Vec::new();
@@ -819,7 +821,7 @@ fn wait_sentinel_result(
     };
 
     // Wait for log file to exist
-    while !log_path.exists() {
+    while !log_files::exists(log_dir) {
         if let Some(dl) = deadline {
             if Instant::now() >= dl {
                 return Ok(result(&[], &[], None));
@@ -828,11 +830,9 @@ fn wait_sentinel_result(
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let file = std::fs::File::open(&log_path)?;
-    let mut reader = BufReader::new(file);
-    reader.seek(SeekFrom::Start(cursor))?;
+    let mut reader = LogReader::new(log_dir, cursor);
 
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut joined = tendr::log::Reassemble::default();
     loop {
         if let Some((code, cwd, _)) = &sentinel {
@@ -850,9 +850,7 @@ fn wait_sentinel_result(
             }
         }
 
-        buf.clear();
-        let bytes = reader.read_line(&mut buf)?;
-        if bytes == 0 {
+        if !reader.next_line(&mut buf)? {
             if let Some((code, cwd, seen_at)) = &sentinel {
                 let done = Some((*code, cwd.clone()));
                 if fence == ErrFence::Stderr && !unfenced_marker {
@@ -902,8 +900,7 @@ fn wait_sentinel_result(
             continue;
         }
 
-        let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
-        let Some(parsed) = serde_json::from_str::<LogLine>(trimmed).ok() else {
+        let Some(parsed) = serde_json::from_slice::<LogLine>(&buf).ok() else {
             continue;
         };
         // A line over the record cap arrives as fragments; match it whole.
@@ -1025,10 +1022,10 @@ fn wait_ndjson_result(
     session: &SessionDir,
     session_name: &str,
     token: &str,
-    cursor: u64,
+    cursor: LogCursor,
     deadline: Option<Instant>,
 ) -> anyhow::Result<ExecResult> {
-    let log_path = session.path().join("output.log");
+    let log_dir = session.path();
     let mut reply: Option<(String, i32)> = None;
     let mut unmatched: Vec<String> = Vec::new();
     let mut stderr_lines: Vec<String> = Vec::new();
@@ -1051,29 +1048,15 @@ fn wait_ndjson_result(
         }
     };
 
-    while !log_path.exists() {
-        if deadline.is_some_and(|dl| Instant::now() >= dl) {
-            return Ok(result(None, unmatched, &stderr_lines));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let mut reader = BufReader::new(std::fs::File::open(&log_path)?);
-    reader.seek(SeekFrom::Start(cursor))?;
+    // Reads only whole lines, so the reply is never lost to a torn read,
+    // and follows the log across rotations.
+    let mut reader = LogReader::new(log_dir, cursor);
 
     let mut grace_ends: Option<Instant> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut joined = tendr::log::Reassemble::default();
     loop {
-        buf.clear();
-        // Bytes, not a String: a torn read can end mid-character.
-        let bytes = reader.read_until(b'\n', &mut buf)?;
-        if bytes > 0 && !buf.ends_with(b"\n") {
-            // A line the sidecar is still writing: read it again once whole,
-            // since the reply must not be lost to a torn read.
-            reader.seek(SeekFrom::Current(-(bytes as i64)))?;
-        }
-        if bytes == 0 || !buf.ends_with(b"\n") {
+        if !reader.next_line(&mut buf)? {
             if reply.is_some() {
                 let ends = *grace_ends.get_or_insert_with(|| Instant::now() + NDJSON_STDERR_GRACE);
                 if Instant::now() >= ends {
@@ -1098,8 +1081,7 @@ fn wait_ndjson_result(
         let Ok(line) = std::str::from_utf8(&buf) else {
             continue;
         };
-        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-        let Some(parsed) = serde_json::from_str::<LogLine>(trimmed).ok() else {
+        let Some(parsed) = serde_json::from_str::<LogLine>(line).ok() else {
             continue;
         };
         // A reply over the record cap arrives as fragments; parse it whole.
@@ -1279,7 +1261,15 @@ mod tests {
                 ("E", "__TENDR_EXEC_ERR__ tok"),
             ],
         );
-        let result = wait_sentinel_result(&dir, "s", "tok", 0, None, ErrFence::AnyStream).unwrap();
+        let result = wait_sentinel_result(
+            &dir,
+            "s",
+            "tok",
+            LogCursor::default(),
+            None,
+            ErrFence::AnyStream,
+        )
+        .unwrap();
         assert_eq!(result.stderr, "late");
         assert_eq!(result.exit_code, 0);
         assert!(!result.timed_out);
@@ -1296,7 +1286,15 @@ mod tests {
                 ("O", "foo__TENDR_EXEC__ tok 3 /tmp"),
             ],
         );
-        let result = wait_sentinel_result(&dir, "s", "tok", 0, None, ErrFence::AnyStream).unwrap();
+        let result = wait_sentinel_result(
+            &dir,
+            "s",
+            "tok",
+            LogCursor::default(),
+            None,
+            ErrFence::AnyStream,
+        )
+        .unwrap();
         assert_eq!(result.stdout, "foo");
         assert_eq!(result.stderr, "y");
         assert_eq!(result.exit_code, 3);
@@ -1317,12 +1315,28 @@ mod tests {
                 ("E", "boom"),
             ],
         );
-        let duckdb = wait_sentinel_result(&dir, "s", "tok", 0, None, ErrFence::Stderr).unwrap();
+        let duckdb = wait_sentinel_result(
+            &dir,
+            "s",
+            "tok",
+            LogCursor::default(),
+            None,
+            ErrFence::Stderr,
+        )
+        .unwrap();
         assert_eq!(
             (duckdb.stdout.as_str(), duckdb.stderr.as_str()),
             ("", "boom")
         );
-        let shell = wait_sentinel_result(&dir, "s", "tok", 0, None, ErrFence::AnyStream).unwrap();
+        let shell = wait_sentinel_result(
+            &dir,
+            "s",
+            "tok",
+            LogCursor::default(),
+            None,
+            ErrFence::AnyStream,
+        )
+        .unwrap();
         assert_eq!(shell.stderr, "");
     }
 
@@ -1343,7 +1357,11 @@ mod tests {
     }
 
     fn pending(token: &str, log_offset: u64) -> PendingExec {
-        PendingExec::new(&["sleep".to_owned(), "9".to_owned()], token, log_offset)
+        let cursor = LogCursor {
+            archive: 0,
+            offset: log_offset,
+        };
+        PendingExec::new(&["sleep".to_owned(), "9".to_owned()], token, cursor)
     }
 
     /// A shell frame is finished only once its own sentinel and stderr end

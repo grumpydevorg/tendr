@@ -287,6 +287,23 @@ stops the clock at the file's own time once capture or the sidecar has
 ended, so dead values do not look live. Source: the silent pipe output plan
 (`docs/plans/backlog/silent-pipe-output.md`, removed with this change).
 
+### `output.log` rotates by size into numbered archives
+
+*2026-11.* A session that runs for weeks must not fill the disk, so
+`output.log` rotates at 64 MiB and keeps the newest three archives (256 MiB
+in all) rather than capping and dropping the oldest lines: dropping lines
+means rewriting a file other processes are reading and appending to, while a
+rename between two records leaves every byte where it was. Archives are
+numbered upwards (`output.log.<n>`) and never renamed again, unlike a
+`.1`/`.2` shift, so a reader's position is (archive count, offset) and a
+follower or a pending `exec` can find its file again after any number of
+rotations. The sizes are the recording's segment size and a bound a laptop
+tolerates per session; they are not from measurement, since no long-running
+session data exists yet. Synthetically, a 120-byte line is a 168-byte record
+(measured through the sidecar), so a chatty dev server at 10 lines a second
+writes about 145 MB a day and keeps almost two days; one at a line a second
+keeps over two weeks.
+
 ### Viewers are cursors into one output ring
 
 *2026-11-02.* A PTY run keeps its latest 32 MiB of output in one ring, from

@@ -94,8 +94,9 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
 | NDJSON | `output.log` | a stdout line that is a JSON object with `"id": "<token>"`, then 20 ms for trailing stderr |
 
 - **Sentinel framing (POSIX shell, DuckDB).** The frame prints a sentinel
-  line with the token after the command. `exec` scans `output.log` from the
-  offset it recorded before sending.
+  line with the token after the command. `exec` scans the session's log from
+  the position it recorded before sending, across rotations
+  ([02-session-storage.md](02-session-storage.md#limits)).
   - The sidecar logs stdout and stderr from separate threads. So `exec`
     waits for both markers: each pipe is logged in order, so once both are
     in, so is everything the command wrote before them. A shell's stderr
@@ -137,7 +138,7 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
 - **Request id (NDJSON).** The command is one JSON object; `exec` adds
   `"id": "<token>"` and writes it as one line. A request that is not one
   object, or already has an `id`, exits 2 before the exec lock or any event.
-  `exec` scans `output.log` from the offset it recorded before sending. The
+  `exec` scans the log from the position it recorded before sending. The
   first stdout line that parses as a JSON object with that `id` is the
   reply; every other stdout line goes to `unmatched`, and stderr lines to
   `stderr`. A reply with `"ok": false` or a non-null `error` sets the exit
@@ -157,7 +158,7 @@ earlier frame is known to have finished.
 
 `exec.pending.json` carries that across processes. Just before sending a
 frame, `exec` writes it (temporary file, then rename) with the token, start
-time, a shortened command and the `output.log` offset. Once it has the
+time, a shortened command and the log position. Once it has the
 result, it removes the record and then the result file. The result file is
 the side-channel completion signal, so a client that dies between the two
 leaves no record rather than a record nothing can satisfy. A timeout keeps
@@ -168,7 +169,7 @@ The next exec reads it under `exec.lock`, before any event or framing:
 
 | Exec target | The earlier frame has finished when |
 |---|---|
-| POSIX shell, DuckDB | its stdout sentinel and stderr end marker are in `output.log` after the offset; with the sentinel but no marker, after one more second |
+| POSIX shell, DuckDB | its stdout sentinel and stderr end marker are in the log after its position; with the sentinel but no marker, after one more second. If retention deleted the file its position is in, `exec` refuses with an error saying to `tendr kill` the session |
 | Python REPL, PowerShell | `exec-results/<token>.json` exists |
 
 If it has finished, the exec removes the record (and result file) and runs as

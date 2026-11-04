@@ -78,6 +78,7 @@ pub mod events;
 pub mod exec_frame;
 pub mod exec_request;
 pub mod log;
+pub mod log_files;
 pub mod model;
 pub mod pipe_reader;
 pub mod platform;

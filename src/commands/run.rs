@@ -127,7 +127,7 @@ pub fn cmd_run(
 /// This avoids the race where a separate terminal-state detector signals stop
 /// before the sidecar has flushed its last log lines.
 fn foreground_wait(session: &session::SessionDir) -> anyhow::Result<()> {
-    let log_path = session.path().join("output.log");
+    let session_dir = session.path().to_path_buf();
     let meta_path = session.path().join("meta.json");
     let meta_path_clone = meta_path.clone();
 
@@ -150,7 +150,7 @@ fn foreground_wait(session: &session::SessionDir) -> anyhow::Result<()> {
                 .unwrap_or(false)
         };
         let mut stdout = std::io::stdout().lock();
-        let _ = follow_log(&log_path, &query, &mut stdout, should_stop);
+        let _ = follow_log(&session_dir, &query, &mut stdout, should_stop);
     });
 
     // Wait for the follow thread to finish (it exits when terminal + no more data).

@@ -190,7 +190,7 @@ exception; see below.
 The JSON result always holds the full output. The matching `output.log` line
 is shortened when it would be too large. At worst it becomes an
 `exec_truncated` record with `stdout_len`, `stderr_len`, `stdout_sha256` and
-`stderr_sha256`. Find these with `rg '"event":"exec_truncated"' output.log`.
+`stderr_sha256`. Find these with `rg '"event":"exec_truncated"' output.log*`.
 
 ## REPLs and databases
 
@@ -583,6 +583,11 @@ tendr watch --namespace nightly --events --logs
   ([Drive an agent turn through its hooks](#drive-an-agent-turn-through-its-hooks)).
 - `wait` waits for processes to exit. An interactive agent keeps running
   between turns, so wait for a turn with `tendr events`, not `wait`.
+- A session keeps its latest 256 MiB of output or so: `output.log` rotates at
+  64 MiB and the newest four files are kept. `log`, `watch --logs` and
+  `events --include-logs` read them as one log, and `log -f` keeps following
+  through a rotation. Output older than that is gone; to keep everything,
+  have the child write to its own file too.
 
 ### Partial lines and progress output
 
