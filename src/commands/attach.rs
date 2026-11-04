@@ -728,9 +728,34 @@ impl Control {
     }
 }
 
-/// How long a client waits for the sidecar's answer to its hello.
+/// How long a client waits for the answer to its hello from a sidecar that
+/// may predate the hello (see [`reply_deadline`]). Every later sidecar
+/// answers, so its answer is waited for however long it takes.
 #[cfg(unix)]
-const HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const PRE_HELLO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The deadline for the answer to a hello in session `session_dir`, if any.
+///
+/// A sidecar from before the hello (tendr 0.3 and older) never answers one:
+/// it serves the connection as attached and is silent until the child
+/// writes. Every sidecar since answers every hello, or closes the
+/// connection; and every one of them, from 0.4.0 on, records its PTY
+/// recording in `meta.json` (`pty.recording`) in each write while the run is
+/// running, which no earlier one did. So only a session whose `meta.json`
+/// lacks it, or cannot be read, gets [`PRE_HELLO_REPLY_TIMEOUT`]: an answer
+/// from any other is waited for, so a loaded machine slows the attach but
+/// cannot fail it. A debug build's `TENDR_TEST_PRE_HELLO_REPLY_MS` shortens
+/// the timeout, so a test can show it is not applied.
+#[cfg(unix)]
+fn reply_deadline(session_dir: &std::path::Path) -> Option<std::time::Duration> {
+    let answers = std::fs::read(session_dir.join("meta.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<tendr::model::meta::Meta>(&bytes).ok())
+        .is_some_and(|meta| meta.pty().is_some_and(|pty| pty.recording.is_some()));
+    (!answers).then(|| {
+        tendr::test_timer::or_env("TENDR_TEST_PRE_HELLO_REPLY_MS", PRE_HELLO_REPLY_TIMEOUT)
+    })
+}
 
 /// The sidecar's acceptance: version 1's controller epoch, or version 2's
 /// point in the run, from which a viewer's stamped output starts; or, for a
@@ -816,8 +841,9 @@ pub(super) fn connect(
 )> {
     use attach_proto::{RejectClass, Version};
     let mut stream = open_socket(session_dir)?;
+    let deadline = reply_deadline(session_dir);
     let hello = |version| Frame::Hello { version, mode };
-    let mut reply = exchange(&mut stream, &hello(version), verb(mode))?;
+    let mut reply = exchange(&mut stream, &hello(version), verb(mode), deadline)?;
     let mut version = version;
     while let Ok(Frame::Rejected {
         class: RejectClass::Protocol,
@@ -834,7 +860,7 @@ pub(super) fn connect(
             _ => break,
         }
         stream = open_socket(session_dir)?;
-        reply = exchange(&mut stream, &hello(version), verb(mode))?;
+        reply = exchange(&mut stream, &hello(version), verb(mode), deadline)?;
     }
     let accept = hello_reply(reply, mode, version)?;
     // From here an attach waits for output, and a push as long as the terminal
@@ -885,8 +911,10 @@ impl Resumption {
 /// A sidecar started by a tendr from before `version` refuses it with the
 /// protocol class, and this says it again in the version before, down to
 /// version 2. One that cannot resume it at all refuses that too; that is
-/// "cannot resume" (80), never a fresh attach. Returns the connection, the
-/// answer, and the version it was given in.
+/// "cannot resume" (80), never a fresh attach. Its answer is waited for
+/// however long it takes: a session that can be resumed answered a hello
+/// before. Returns the connection, the answer, and the version it was given
+/// in.
 #[cfg(unix)]
 fn connect_resume(
     session_dir: &std::path::Path,
@@ -898,7 +926,7 @@ fn connect_resume(
     attach_proto::Version,
 )> {
     let mut stream = open_socket(session_dir)?;
-    let mut reply = exchange(&mut stream, &point.resume_frame(version), "resume")?;
+    let mut reply = exchange(&mut stream, &point.resume_frame(version), "resume", None)?;
     let mut version = version;
     while let Ok(Frame::Rejected {
         class: attach_proto::RejectClass::Protocol,
@@ -918,7 +946,7 @@ fn connect_resume(
             }
         }
         stream = open_socket(session_dir)?;
-        reply = exchange(&mut stream, &point.resume_frame(version), "resume")?;
+        reply = exchange(&mut stream, &point.resume_frame(version), "resume", None)?;
     }
     let resumed = resume_reply(reply, point)?;
     stream
@@ -951,8 +979,8 @@ fn open_socket(session_dir: &std::path::Path) -> anyhow::Result<std::os::unix::n
 }
 
 /// Send `hello` (a hello, or the resume that replaces it), and read the
-/// sidecar's reply under the reply deadline, for [`hello_reply`] or
-/// [`resume_reply`] to classify.
+/// sidecar's reply, within `deadline` if there is one ([`reply_deadline`]),
+/// for [`hello_reply`] or [`resume_reply`] to classify.
 ///
 /// The sidecar refuses a peer of another user, or a connection beyond its
 /// limit, before reading the hello, and closes the connection. If that lands
@@ -964,6 +992,7 @@ fn exchange(
     stream: &mut std::os::unix::net::UnixStream,
     hello: &Frame,
     what: &str,
+    deadline: Option<std::time::Duration>,
 ) -> anyhow::Result<Result<Frame, FrameError>> {
     let transport = |e: std::io::Error| {
         PtyExitCode::Runtime.error(anyhow::anyhow!("{what} handshake failed: {e}"))
@@ -972,14 +1001,14 @@ fn exchange(
     // shut down: exactly the refusal-before-hello case. Then read without
     // blocking, so a buffered refusal is still seen and a live peer that never
     // got a hello cannot hold the read forever.
-    let timeout = stream.set_read_timeout(Some(HELLO_REPLY_TIMEOUT));
+    let timeout = deadline.map_or(Ok(()), |deadline| stream.set_read_timeout(Some(deadline)));
     let unbounded = timeout.is_err();
     if unbounded {
         stream.set_nonblocking(true).map_err(transport)?;
     }
     let sent = timeout.and_then(|()| attach_proto::write_frame(stream, hello));
     // After a failed write the peer has closed its end, so this read returns
-    // at once; otherwise it is bounded by the reply timeout.
+    // at once; otherwise it waits for the answer, within the deadline if any.
     let reply = attach_proto::read_frame(stream);
     if unbounded {
         let _ = stream.set_nonblocking(false);
@@ -1114,7 +1143,10 @@ impl client::Link {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{Accept, Point, Resumption, exchange, hello_reply, resume_reply, resume_request};
+    use super::{
+        Accept, PRE_HELLO_REPLY_TIMEOUT, Point, Resumption, exchange, hello_reply, reply_deadline,
+        resume_reply, resume_request,
+    };
     use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
     use tendr::attach_proto::{
@@ -1219,13 +1251,64 @@ mod tests {
         assert!(rest.is_empty());
     }
 
-    /// The hello and its reply, as a client speaking `version` sees them.
-    fn hello(stream: &mut UnixStream, version: Version, mode: Mode) -> anyhow::Result<Accept> {
+    /// The hello and its reply, as a client speaking `version` sees them,
+    /// under `deadline` ([`reply_deadline`]).
+    fn hello(
+        stream: &mut UnixStream,
+        version: Version,
+        mode: Mode,
+        deadline: Option<std::time::Duration>,
+    ) -> anyhow::Result<Accept> {
         hello_reply(
-            exchange(stream, &Frame::Hello { version, mode }, "attach")?,
+            exchange(stream, &Frame::Hello { version, mode }, "attach", deadline)?,
             mode,
             version,
         )
+    }
+
+    /// Only a session whose `meta.json` cannot show a sidecar with a hello
+    /// (no `pty.recording`, or no readable meta) gets a reply deadline.
+    #[test]
+    fn only_a_session_that_may_predate_the_hello_gets_a_reply_deadline() {
+        use std::num::NonZeroU32;
+        use tendr::model::ids::{EpochTimestamp, Generation, ProcessIdentity, RunId, SessionName};
+        use tendr::model::meta::Meta;
+        use tendr::model::pty::{PtyMeta, PtyRecording, RecordingState};
+        use tendr::model::spec::LaunchSpec;
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(reply_deadline(dir.path()).is_some(), "no meta.json");
+
+        let run_id = RunId::new();
+        let mut meta = Meta::new_starting(
+            SessionName::new("s").unwrap(),
+            run_id,
+            Generation::first(),
+            LaunchSpec::new(vec!["bash".into()]).unwrap(),
+            ProcessIdentity {
+                pid: NonZeroU32::new(100).unwrap(),
+                start_time_ns: 1000,
+            },
+            EpochTimestamp::now(),
+        );
+        meta.set_pty(PtyMeta::new());
+        let write = |meta: &Meta| {
+            std::fs::write(
+                dir.path().join("meta.json"),
+                serde_json::to_vec(meta).unwrap(),
+            )
+            .unwrap();
+        };
+        write(&meta);
+        assert!(reply_deadline(dir.path()).is_some(), "a 0.3 sidecar's meta");
+
+        meta.set_pty_recording(PtyRecording {
+            dir: format!("recording/{run_id}"),
+            input_recorded: false,
+            state: RecordingState::Recording,
+        });
+        write(&meta);
+        assert_eq!(reply_deadline(dir.path()), None, "a sidecar with a hello");
     }
 
     #[test]
@@ -1463,17 +1546,20 @@ mod tests {
 
     /// The sidecar refuses an identity mismatch or a full listener before
     /// reading the hello; the refusal is still read and gives the code, even
-    /// though the hello could not be written.
+    /// though the hello could not be written: with a reply deadline (which
+    /// macOS refuses on such a socket) or without.
     #[test]
     fn a_refusal_sent_before_the_hello_is_read_keeps_its_code() {
-        for (class, expected) in [(RejectClass::Identity, 85), (RejectClass::Runtime, 84)] {
-            let mut client = closed_peer(Some(Frame::Rejected {
-                class,
-                reason: "refused first".to_owned(),
-            }));
-            let err = hello(&mut client, Version::V1, Mode::Push).unwrap_err();
-            assert_eq!(exit_code(&err), expected, "{class:?}: {err:#}");
-            assert!(format!("{err:#}").contains("refused first"), "{err:#}");
+        for deadline in [None, Some(PRE_HELLO_REPLY_TIMEOUT)] {
+            for (class, expected) in [(RejectClass::Identity, 85), (RejectClass::Runtime, 84)] {
+                let mut client = closed_peer(Some(Frame::Rejected {
+                    class,
+                    reason: "refused first".to_owned(),
+                }));
+                let err = hello(&mut client, Version::V1, Mode::Push, deadline).unwrap_err();
+                assert_eq!(exit_code(&err), expected, "{class:?} {deadline:?}: {err:#}");
+                assert!(format!("{err:#}").contains("refused first"), "{err:#}");
+            }
         }
     }
 
@@ -1481,9 +1567,11 @@ mod tests {
     /// failure.
     #[test]
     fn a_hello_that_cannot_be_written_and_gets_no_reply_exits_84() {
-        let mut client = closed_peer(None);
-        let err = hello(&mut client, Version::V2, Mode::Attach).unwrap_err();
-        assert_eq!(exit_code(&err), 84, "{err:#}");
-        assert!(format!("{err:#}").contains("handshake failed"), "{err:#}");
+        for deadline in [None, Some(PRE_HELLO_REPLY_TIMEOUT)] {
+            let mut client = closed_peer(None);
+            let err = hello(&mut client, Version::V2, Mode::Attach, deadline).unwrap_err();
+            assert_eq!(exit_code(&err), 84, "{deadline:?}: {err:#}");
+            assert!(format!("{err:#}").contains("handshake failed"), "{err:#}");
+        }
     }
 }

@@ -4103,6 +4103,9 @@ impl HeldPush {
 enum FakeReply {
     /// After reading the hello, as a sidecar answering it does.
     AfterHello,
+    /// Half a second after reading the hello, as a sidecar slowed by load
+    /// might.
+    Late,
     /// On accepting, then closing without reading anything, as the real
     /// sidecar refuses a peer of another user or a connection over its limit.
     BeforeHello,
@@ -4117,9 +4120,12 @@ fn fake_sidecar(root: &TempDir, session: &str, label: &str, when: FakeReply, rep
     std::thread::spawn(move || {
         for mut stream in listener.incoming().map_while(Result::ok) {
             match when {
-                FakeReply::AfterHello => {
+                FakeReply::AfterHello | FakeReply::Late => {
                     let _ = stream.set_read_timeout(Some(HANG));
                     if read_msg(&mut stream).is_ok() {
+                        if matches!(when, FakeReply::Late) {
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
                         let _ = stream.write_all(&reply);
                     }
                 }
@@ -4408,6 +4414,31 @@ fn cli_push_to_an_older_sidecar_exits_80() {
         let output = push_output(&root, "pty-x80-push", b"never-written\n");
         assert_exit(&output, 80, &format!("push to a {label} sidecar"));
     }
+}
+
+/// The answer to a hello is waited for however long it takes, so a loaded
+/// machine cannot fail an attach or push. The deadline a session that may
+/// predate the hello still gets (see `reply_deadline`'s unit test) is
+/// shortened here to well under the time the fake takes to answer, so the
+/// answer is taken only because none applies to this session.
+#[test]
+fn a_late_answer_to_the_hello_is_waited_for() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TempDir::new().unwrap();
+    let _kill = harness::SessionGuard::new(&root, "pty-late-answer");
+    start_cat(&root, "pty-late-answer");
+    // A control refusal (81), told apart from the deadline's protocol
+    // failure (80).
+    let refusal = frame_bytes(MSG_REJECTED, b"\x02held");
+    fake_sidecar(&root, "pty-late-answer", "late", FakeReply::Late, refusal);
+    let output = tendr(&root)
+        .args(["push", "pty-late-answer"])
+        .env("TENDR_TEST_PRE_HELLO_REPLY_MS", "100")
+        .write_stdin(b"never-written\n".to_vec())
+        .timeout(HANG)
+        .output()
+        .expect("push returns");
+    assert_exit(&output, 81, "a late answer from a sidecar with a hello");
 }
 
 #[test]

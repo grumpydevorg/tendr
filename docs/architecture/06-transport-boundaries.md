@@ -158,7 +158,7 @@ command line as the other operations, and keeps the terminal on the client
   session, running, not under human control unless `--takeover`), reads the
   hello, which must name the request's mode (otherwise exit 80), and makes
   the same connection a local attach makes: peer check, a hello in the
-  agreed version with the client's mode, the sidecar's answer within 10 s.
+  agreed version with the client's mode, and the sidecar's answer.
   A sidecar started by an older tendr refuses a hello in a version it does
   not speak with the protocol class; the remote tendr then connects once
   more and says hello one version lower, down to version 1 (version 2 for a

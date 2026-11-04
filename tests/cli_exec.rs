@@ -1112,6 +1112,114 @@ fn exec_duckdb_mixed_success_reports_error() {
         .success();
 }
 
+/// A DuckDB error logged after the sentinel still fails the exec. The
+/// sidecar logs stdout and stderr from separate threads, so DuckDB's error,
+/// written before the sentinel, can reach the log after it. This stand-in
+/// for DuckDB writes the error and the stderr end marker only once the test
+/// has seen the sentinel logged, the latest order the sidecar can produce:
+/// the exec must wait for the marker, not for a while.
+#[cfg(unix)]
+#[test]
+fn exec_duckdb_error_logged_after_the_sentinel_fails_the_exec() {
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    let gate = root.path().join("gate");
+    let _open = harness::OpenGate(gate.clone());
+    let late_duckdb = format!(
+        r#"while IFS= read -r line; do
+  case "$line" in
+    ".print __TENDR_EXEC_ERR__ "*) marker="${{line#.print }}" ;;
+    ".print __TENDR_EXEC__ "*)
+      printf '%s\n' "${{line#.print }}"
+      until [ -e '{gate}' ]; do sleep 0.01; done
+      echo 'Catalog Error: Table with name late does not exist!' >&2
+      [ -n "$marker" ] && printf '%s\n' "$marker" >&2
+      marker= ;;
+  esac
+done"#,
+        gate = gate.display()
+    );
+    harness::tendr(&root)
+        .args(["start", "db", "--stdin", "--exec-target", "duckdb", "--"])
+        .args(["sh", "-c", &late_duckdb])
+        .assert()
+        .success();
+    let _session = harness::SessionGuard::new(&root, "db");
+    harness::wait_running(&root, "db");
+
+    let exec = spawn_exec(&root, "db", "SELECT * FROM late;");
+    harness::wait_log_tail(&root, "db", "__TENDR_EXEC__");
+    std::fs::write(&gate, b"").unwrap();
+    let output = finish_exec(exec);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the error decides the exit code: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        result["stderr"]
+            .as_str()
+            .is_some_and(|stderr| stderr.contains("late does not exist")),
+        "{result}"
+    );
+}
+
+/// A `tendr exec` in DuckDB session `name`, as its parsed result.
+fn duckdb_exec(root: &tempfile::TempDir, name: &str, sql: &str) -> serde_json::Value {
+    let output = harness::tendr(root)
+        .args(["exec", name, "--timeout", EXEC_TIMEOUT, "--", sql])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+/// DuckDB in safe mode refuses the `.output` that puts the frame's stderr
+/// marker on stderr: started with `-safe`, whose frame has no marker, and
+/// switched on with `.safe_mode`, whose refusals of the marker's `.output`
+/// are the frame's own. Neither fails a statement that succeeded. (An error
+/// there is waited for one second after the sentinel, a bound safe mode
+/// leaves no way around, so it is not asserted here.)
+#[test]
+fn exec_duckdb_in_safe_mode_does_not_fail_a_good_statement() {
+    if !harness::duckdb_or_skip() {
+        return;
+    }
+    let _lock = lock();
+    let root = tempfile::TempDir::new().unwrap();
+    for (name, argv) in [
+        ("safe", &["duckdb", "-safe"][..]),
+        ("toggled", &["duckdb"][..]),
+    ] {
+        harness::tendr(&root)
+            .args(["start", name, "--stdin", "--exec-target", "duckdb", "--"])
+            .args(argv)
+            .assert()
+            .success();
+        let _session = harness::SessionGuard::new(&root, name);
+        harness::wait_running(&root, name);
+        if name == "toggled" {
+            duckdb_exec(&root, name, ".safe_mode");
+        }
+
+        let ok = duckdb_exec(&root, name, "SELECT 1 AS ok;");
+        assert_eq!(ok["exit_code"], 0, "{name}: {ok}");
+        assert_eq!(ok["stderr"], "", "{name}: {ok}");
+        assert!(
+            ok["stdout"].as_str().unwrap().contains("\"ok\":1"),
+            "{name}: {ok}"
+        );
+    }
+}
+
 /// DuckDB exec: paths with spaces work correctly (no .output path escaping needed).
 #[test]
 fn exec_duckdb_path_with_spaces() {

@@ -84,23 +84,48 @@ pub fn powershell_frame(code: &str, result_path: &str) -> String {
 /// Build a framed SQL exec string for injection into a DuckDB session.
 ///
 /// Results flow through stdout (`.mode json`) and are captured in the output
-/// log, just like shell exec. No `.output` file redirection — that dot-command
-/// has path-escaping fragility that breaks on Windows backslashes and paths
-/// with spaces.
+/// log, just like shell exec. No `.output` to a file: a path has escaping
+/// fragility that breaks on Windows backslashes and paths with spaces.
 ///
 /// We deliberately do NOT use `.bail on` — it would exit the DuckDB process
 /// on error, killing the session. Errors are detected from stderr lines in
 /// the output log. The sentinel always fires with exit code 0; the caller
 /// must check stderr to detect failures.
 ///
+/// With `stderr_marker`, as in [`unix_frame`], the [`EXEC_ERR_MARKER`] goes to
+/// stderr after the SQL and before the stdout sentinel, so once both are
+/// logged every error the SQL wrote is too. `.output stderr` names the
+/// stream, not a file (DuckDB's shell, like SQLite's, takes `stdout` and
+/// `stderr` as stream names), and `.output` sends output back to stdout for
+/// the sentinel. A DuckDB in safe mode refuses `.output`, and has no other
+/// way to write to stderr, so its frame has no marker
+/// ([`duckdb_safe_mode`]).
+///
 /// Token must be hex-only (as produced by `generate_token`).
-pub fn duckdb_frame(sql: &str, token: &str) -> String {
+pub fn duckdb_frame(sql: &str, token: &str, stderr_marker: bool) -> String {
     debug_assert!(
         token.bytes().all(|b| b.is_ascii_hexdigit()),
         "token must be hex-only, got: {token}"
     );
-    format!(".mode json\n.nullvalue null\n{sql}\n.print __TENDR_EXEC__ {token} 0 .\n")
+    let marker = if stderr_marker {
+        format!(".output stderr\n.print {EXEC_ERR_MARKER} {token}\n.output\n")
+    } else {
+        String::new()
+    };
+    format!(".mode json\n.nullvalue null\n{sql}\n{marker}.print __TENDR_EXEC__ {token} 0 .\n")
 }
+
+/// Whether a DuckDB session's command starts it in safe mode (`-safe` or
+/// `--safe`), in which DuckDB refuses `.output`.
+pub fn duckdb_safe_mode(argv: &[String]) -> bool {
+    argv.iter().any(|arg| arg == "-safe" || arg == "--safe")
+}
+
+/// What a DuckDB in safe mode prints to stderr for each `.output`, `.once` or
+/// `.excel` it refuses. A session put in safe mode with `.safe_mode`, whose
+/// frame still has the marker, prints it twice for the frame's `.output`s:
+/// the last two lines of the exec's stderr. Any other is the SQL's own.
+pub const DUCKDB_SAFE_MODE_REFUSAL: &str = ".output/.once/.excel cannot be used in -safe mode";
 
 /// Parse a sentinel line into `(residual, exit code, cwd)`.
 ///
@@ -398,15 +423,11 @@ mod tests {
 
     #[test]
     fn duckdb_frame_basic_query() {
-        let frame = duckdb_frame("SELECT 42 as answer;", "abc123");
+        let frame = duckdb_frame("SELECT 42 as answer;", "abc123", true);
         assert!(frame.starts_with(".mode json\n"));
         assert!(
             !frame.contains(".bail on"),
             "frame must not use .bail on — it kills the session"
-        );
-        assert!(
-            !frame.contains(".output"),
-            "frame must not use .output — path escaping is fragile"
         );
         assert!(frame.contains(".nullvalue null\n"));
         assert!(frame.contains("SELECT 42 as answer;\n"));
@@ -417,7 +438,7 @@ mod tests {
     #[test]
     fn duckdb_frame_multi_statement() {
         let sql = "SELECT 1;\nSELECT 2;";
-        let frame = duckdb_frame(sql, "def456");
+        let frame = duckdb_frame(sql, "def456", true);
         assert!(frame.contains("SELECT 1;\nSELECT 2;\n"));
         assert!(frame.contains("__TENDR_EXEC__ def456 0 ."));
     }

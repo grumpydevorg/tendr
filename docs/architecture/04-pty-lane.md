@@ -335,12 +335,21 @@ own failures ([guide](../guide.md#exit-codes), `tendr::pty_exit`):
 
 | Failure | Exit code |
 |---|---:|
-| no reply to the hello within 10 s, or a reply outside the protocol | 80 |
+| a reply outside the protocol, or no reply within 10 s from a sidecar that may predate the hello | 80 |
 | the CLI's own human-control or not-running check; an attach retired by another client's `--takeover` | 81 |
 | socket missing or unreachable | 84 |
 | listener belongs to another user | 85 |
 
 A `push` to a pipe session that is not running exits 1.
+
+A client waits for the answer to its hello for as long as it takes, so a
+loaded machine slows an attach or push but cannot fail it. The one
+exception is a sidecar from before the hello (tendr 0.3 and older), which
+never answers one: it serves the connection as attached and stays silent
+until the child writes. The client tells such a session from its
+`meta.json`, which has no `pty.recording`: every sidecar from 0.4.0 on
+records one in each write while the run is running. Only such a session
+gets the 10 s deadline (`reply_deadline` in `src/commands/attach.rs`).
 
 ## Input arbitration
 
@@ -529,7 +538,7 @@ tendr that bridges them to the session's socket
 - The handshake is the one above, and the request agrees its version
   ([transport boundaries](06-transport-boundaries.md#the-attach-bridge)):
   the remote tendr speaks the newest version both the client and the
-  sidecar know, applies the 10 s reply deadline and classifies the reply,
+  sidecar know, waits for the reply as a local attach does and classifies it,
   so refusals keep their exit codes. On success it passes the sidecar's
   acceptance to the client as it came.
 - On a version 2 attach, the client keeps the run, the offset just past the
