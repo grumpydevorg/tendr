@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.7.2 — attach, push and exec fixes
+
+No protocol change: works with 0.7.1, 0.7.0, 0.6.0 and 0.5.0 exactly as 0.7.1
+does.
 
 ### Fixed
 
