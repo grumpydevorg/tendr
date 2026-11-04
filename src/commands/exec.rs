@@ -211,8 +211,10 @@ impl PendingExec {
             }
         }
         if sentinel && !err_marked {
-            // As in wait_sentinel_result: the shell's stderr may no longer
-            // reach the log. Give stragglers the same grace before the next
+            // As for a shell in wait_sentinel_result: its stderr may no
+            // longer reach the log. A DuckDB's marker is on its way, but a
+            // record left by a tendr whose DuckDB frame had none must not hold
+            // the session for ever, so it gets the same grace before the next
             // exec takes its log offset.
             std::thread::sleep(err_marker_grace());
         }
@@ -791,6 +793,9 @@ fn wait_sentinel_result(
     let mut err_marked = false;
     // A marker that came but cannot fence stderr (see `ErrFence::Stderr`).
     let mut unfenced_marker = false;
+    // The run was seen ended at an empty read: capture had logged both
+    // pipes by then, so the next empty read is the end of the log.
+    let mut run_ended = false;
 
     let result = |stdout: &[String], stderr: &[String], done: Option<(i32, String)>| {
         let (exit_code, cwd_after, timed_out) = match done {
@@ -850,22 +855,26 @@ fn wait_sentinel_result(
                     // DuckDB always prints the marker on stderr here (no SQL
                     // can redirect its stderr), so it is on its way: wait for
                     // it, not for a while. Only the exec's deadline, or the
-                    // run ending (by then capture has logged both pipes),
-                    // ends the wait first.
-                    let ended = !matches!(
+                    // run ending, ends the wait first. Terminal meta follows
+                    // capture's last log write, so a run seen ended is read
+                    // to the end once more before the exec gives up on it.
+                    if run_ended {
+                        return Ok(result(&stdout_lines, &stderr_lines, done));
+                    }
+                    if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                        eprintln!(
+                            "tendr exec: stderr end marker not seen by the deadline, \
+                             so stderr may be incomplete"
+                        );
+                        return Ok(result(&stdout_lines, &stderr_lines, done));
+                    }
+                    run_ended = !matches!(
                         session::read_meta(session)?.status(),
                         RunStatus::Running { .. }
                     );
-                    if deadline.is_some_and(|dl| Instant::now() >= dl) || ended {
-                        if !ended {
-                            eprintln!(
-                                "tendr exec: stderr end marker not seen by the deadline, \
-                                 so stderr may be incomplete"
-                            );
-                        }
-                        return Ok(result(&stdout_lines, &stderr_lines, done));
+                    if !run_ended {
+                        std::thread::sleep(Duration::from_millis(50));
                     }
-                    std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
                 if seen_at.elapsed() >= err_marker_grace() {
