@@ -3900,9 +3900,10 @@ fn fifo_input_waits_behind_an_agent_push() {
 /// drop them).
 ///
 /// How much a PTY and a pipe buffer differs by platform (a Linux PTY absorbs
-/// tens of KiB), so the test assumes no size. It writes until the FIFO itself
-/// stays full, which can only happen once the forwarder is stuck on a full
-/// PTY, and closes the writer there.
+/// tens of KiB), so the test assumes no size. It writes until the sidecar
+/// reports the PTY full (`TENDR_TEST_PTY_FULL_FILE`), then until the FIFO is
+/// full too, and closes the writer there: far more than a full PTY can still
+/// take is then waiting, so the frame cannot end before the child reads.
 #[test]
 fn fifo_input_is_delivered_after_its_writer_closes() {
     use std::os::unix::fs::OpenOptionsExt;
@@ -3911,11 +3912,13 @@ fn fifo_input_is_delivered_after_its_writer_closes() {
     let root = Home::new();
     let go = root.path().join("go");
     let out = root.path().join("received");
+    let pty_full = root.path().join("pty-full");
 
     // Reads nothing until the go file exists, then copies its input to a file.
     let script = "stty raw -echo; printf READY; \
                   while [ ! -f \"$GO\" ]; do sleep 0.05; done; exec cat > \"$OUT\"";
     tendr(&root)
+        .env("TENDR_TEST_PTY_FULL_FILE", &pty_full)
         .args(["start", "pty-fifo-gone", "--pty", "--stdin"])
         .arg("--env")
         .arg(format!("GO={}", go.display()))
@@ -3944,27 +3947,28 @@ fn fifo_input_is_delivered_after_its_writer_closes() {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    // Fill the FIFO until it has stayed full for a whole second. The forwarder
-    // drains it as fast as the PTY takes input, so a FIFO that stays full means
-    // the PTY is full and the forwarder is stuck mid-frame. Nothing shows that
-    // state directly, so a forwarder starved for the whole second by load
-    // would fake it.
+    // Write until the PTY has refused input as full: the child reads none,
+    // so it stays full. The forwarder drains the FIFO as fast as the PTY
+    // takes input, so a full FIFO meanwhile only paces the writes.
     let chunk = [b'a'; 1024];
     let mut written = 0usize;
-    let mut last_progress = Instant::now();
-    while last_progress.elapsed() < Duration::from_secs(1) {
-        assert!(Instant::now() < deadline, "the FIFO never stayed full");
+    let mut write = |until_full: bool| loop {
         match fifo.write(&chunk) {
-            Ok(n) => {
-                written += n;
-                last_progress = Instant::now();
-            }
+            Ok(n) => written += n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if until_full || pty_full.exists() {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "the PTY never filled");
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => panic!("write stdin.pipe: {e}"),
         }
-    }
+    };
+    write(false);
+    // Then fill the FIFO: a Linux PTY may still move a few KiB on to the
+    // child's queue, and a FIFO holds more than that.
+    write(true);
     drop(fifo); // the writer is gone; its frame is not all delivered
 
     let early = tendr(&root)
@@ -3990,16 +3994,25 @@ fn fifo_input_is_delivered_after_its_writer_closes() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let after = tendr(&root)
-        .args(["push", "pty-fifo-gone"])
-        .write_stdin("AFTER\n")
-        .output()
-        .unwrap();
-    assert!(
-        after.status.success(),
-        "push after the frame: {}",
-        String::from_utf8_lossy(&after.stderr)
-    );
+    // The frame lets the input go only after its last byte is in the PTY,
+    // which the child may have read already: a push refused as the agent's
+    // until then is tried again.
+    loop {
+        let after = tendr(&root)
+            .args(["push", "pty-fifo-gone"])
+            .write_stdin("AFTER\n")
+            .output()
+            .unwrap();
+        let after_err = String::from_utf8_lossy(&after.stderr);
+        if after.status.success() {
+            break;
+        }
+        assert!(
+            after_err.contains("(Agent)") && Instant::now() < deadline,
+            "push after the frame: {after_err}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     while received() < written + 6 {
         assert!(Instant::now() < deadline, "the later push never arrived");
         std::thread::sleep(Duration::from_millis(20));

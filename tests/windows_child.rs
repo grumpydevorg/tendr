@@ -208,14 +208,18 @@ fn windows_kill_graceful_cooperative() {
 
     let handle = WindowsPlatform::child_kill_handle(&child);
 
-    WindowsPlatform::kill_child(&handle, false).expect("graceful kill should succeed");
+    // The graceful kill with a grace of HANG, not the product's 5 s: a
+    // responder starved by load past 5 s would be escalated and exit 1. The
+    // grace is passed, not set in the environment, because the kill runs in
+    // this process beside other tests.
+    WindowsPlatform::stop_gracefully(&handle, harness::HANG).expect("graceful kill should succeed");
 
     let status = WindowsPlatform::child_wait(&mut child).expect("wait should succeed");
 
     // Exit code 42 proves the child handled CTRL_BREAK cooperatively and exited
-    // on its own. Forced escalation (TerminateJobObject after the 5s grace)
+    // on its own. Forced escalation (TerminateJobObject after the grace)
     // would instead produce exit code 1 — so the cooperative exit code alone
-    // proves no escalation occurred, with no fragile sub-escalation wall-clock bound.
+    // proves no escalation occurred.
     assert_eq!(
         status.code(),
         Some(42),

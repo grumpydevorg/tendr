@@ -41,6 +41,9 @@
 //! stall-if <path>   while <path> exists, stall before the remote command
 //!                   starts (sleep), as a lapsed check-mode approval does
 //! hold <pid> <secs> sleep until process <pid> is gone, at most <secs>
+//! wait-for <path>   wait until <path> exists: a test holds the fake there
+//!                   until it has seen what came before. Stops waiting once
+//!                   <path>'s directory is gone: the test has ended
 //! give-up-if <path> from now on, once <path> exists: remove it, write
 //!                   `Timeout, server box not responding.` to stderr and
 //!                   exit 255, as ssh does when its keepalives go unanswered
@@ -186,6 +189,17 @@ fn main() {
                     pid.parse().unwrap(),
                     Duration::from_secs(secs.parse().unwrap()),
                 );
+            }
+            "wait-for" => {
+                let path = std::path::Path::new(value);
+                let dir = path.parent().expect("fake ssh: wait-for <path>");
+                // The gate's directory going away means the test ended
+                // (a failing test drops its temp dir while unwinding):
+                // nothing will open the gate, and this fake must not
+                // outlive it.
+                while !path.exists() && dir.exists() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
             "give-up-if" => give_up_if(value.to_owned()),
             "die-if" => {
