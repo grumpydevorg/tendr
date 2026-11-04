@@ -217,3 +217,24 @@ fn launch_spec_ready_check_round_trips_and_changes_the_hash() {
     assert_eq!(back, after);
     assert_ne!(after.canonical_hash(), plain.canonical_hash());
 }
+
+// --- log_delimiter ---
+
+/// The default delimiter is left out (pinned above by the canonical form of
+/// a plain spec); another one is carried, and a restart with a different
+/// delimiter is not mistaken for the same run.
+#[test]
+fn launch_spec_log_delimiter_round_trips_and_changes_the_hash() {
+    use tendr::model::spec::{LaunchSpec, LogDelimiter};
+    let plain = LaunchSpec::new(vec!["rsync".into()]).unwrap();
+    let mut spec = plain.clone();
+    spec.log_delimiter = LogDelimiter::NewlineOrCr;
+    let json = serde_json::to_string(&spec).unwrap();
+    assert!(
+        json.contains(r#""log_delimiter":"newline-or-cr""#),
+        "json: {json}"
+    );
+    let back: LaunchSpec = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, spec);
+    assert_ne!(spec.canonical_hash(), plain.canonical_hash());
+}

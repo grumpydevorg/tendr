@@ -98,6 +98,7 @@ pub fn cmd_run(
         RecordingPolicy::default(), // nor recording options, which need a PTY
         None,                       // nor a ready check: a foreground run is waited for to its end
         &[],
+        tendr::model::spec::LogDelimiter::Newline, // nor --log-delimiter
     )?;
 
     // Check for spawn failure.
@@ -139,6 +140,7 @@ fn foreground_wait(session: &session::SessionDir) -> anyhow::Result<()> {
             tail: None,
             since_us: Some(0), // Show all output from the beginning, don't seek to EOF.
             raw: true,
+            all_updates: true, // following: every update
         };
         let should_stop = || {
             std::fs::read_to_string(&meta_path_clone)

@@ -88,6 +88,23 @@
   submit rule, the permission signals, reading the result, and what the
   events cannot prove. The herdr guide no longer says every agent belongs
   outside tendr: that holds for agents a person watches.
+- **`tendr start --log-delimiter newline-or-cr` logs progress updates as they
+  happen.** A pipe session's child that redraws a progress meter with carriage
+  returns (`rsync --info=progress2`) showed nothing in `output.log` until it
+  wrote a newline or exited, which looked like a hang. With the new option a
+  carriage return ends a record at once (`"terminator": "cr"`); CRLF stays one
+  record. Every update is stored, and `tendr log` and `events --include-logs`
+  show only the last of each run unless given `--all-updates`; `log -f`,
+  `watch --logs` and `events --follow` show every update. Works on Windows
+  pipes too. Over `--host` it needs the remote at 0.8.0; an older one refuses
+  the request (exit 2) instead of starting without it. The default stays
+  `newline`.
+- **`tendr status` says what a pipe session's reader is holding.**
+  `pipe_reader.pending_partial_bytes` counts output waiting for a newline and
+  `last_record_age_s` the time since the last record, so a child buffering
+  progress is told apart from a silent one. `live` turns false, and the values
+  stop changing, once capture ends or the sidecar is gone. See `tendr guide
+  pty`.
 
 ### Changed
 
@@ -100,6 +117,13 @@
   `TENDR_BLOCK_ID` while the code runs, as the POSIX shell frame does, so a
   `tendr emit` inside it chains to the exec. Over `--host` this needs the
   remote `tendr` to be 0.8.0 or later.
+- **No `output.log` record holds more than 16 KiB.** A stretch of output
+  without a terminator was held in the sidecar's memory until one came, with
+  no limit, and landed as one record too large for `--tail` or a JSON reader.
+  It is now logged in records of at most 16 KiB marked
+  `"terminator": "fragment"`, cut between characters, whose contents join to
+  the original; a record cut short by the stream's end is marked `"eof"`.
+  Line-feed records are unchanged.
 
 ### Fixed
 

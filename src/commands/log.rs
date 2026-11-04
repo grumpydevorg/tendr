@@ -8,6 +8,7 @@ pub fn cmd_log(
     follow: bool,
     since: Option<String>,
     raw: bool,
+    all_updates: bool,
     namespace: &Namespace,
 ) -> anyhow::Result<()> {
     let session_name = SessionName::new(name)?;
@@ -25,6 +26,7 @@ pub fn cmd_log(
         tail,
         since_us,
         raw,
+        all_updates,
     };
 
     let log_path = session.path().join("output.log");

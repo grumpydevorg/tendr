@@ -5,7 +5,7 @@ use tendr::model::boundary::BoundaryContext;
 use tendr::model::ids::{Namespace, SessionName};
 use tendr::model::ready::ReadyCheck;
 use tendr::model::spec::{
-    DependencyBinding, ExecTarget, IoMode, LaunchSpec, RecordingPolicy, StdinMode,
+    DependencyBinding, ExecTarget, IoMode, LaunchSpec, LogDelimiter, RecordingPolicy, StdinMode,
 };
 use tendr::platform::{Current, Platform};
 use tendr::session::{self, SessionRoot};
@@ -30,6 +30,7 @@ pub fn cmd_start(
     recording: RecordingPolicy,
     ready: Option<ReadyCheck>,
     after_ready: &[String],
+    log_delimiter: LogDelimiter,
 ) -> anyhow::Result<()> {
     let (meta, _session) = launch_session(
         name,
@@ -50,6 +51,7 @@ pub fn cmd_start(
         recording,
         ready,
         after_ready,
+        log_delimiter,
     )?;
 
     let json = serde_json::to_string_pretty(&meta)?;
@@ -96,6 +98,7 @@ pub(crate) fn launch_session(
     recording: RecordingPolicy,
     ready: Option<ReadyCheck>,
     after_ready: &[String],
+    log_delimiter: LogDelimiter,
 ) -> anyhow::Result<(tendr::model::meta::Meta, session::SessionDir)> {
     let session_name = SessionName::new(name)?;
     let root = SessionRoot::default_path()?;
@@ -129,6 +132,7 @@ pub(crate) fn launch_session(
     launch_spec.boundary = boundary;
     launch_spec.recording = recording;
     launch_spec.ready = ready;
+    launch_spec.log_delimiter = log_delimiter;
     if pty {
         launch_spec.io_mode = IoMode::Pty;
     }

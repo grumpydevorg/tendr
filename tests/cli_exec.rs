@@ -2864,3 +2864,46 @@ fn exec_after_a_killed_client_never_gets_the_late_output() {
     let next = exec_once_earlier_finishes(&root, "shell", &["echo", "next"], None);
     assert_eq!(next["stdout"], "next", "{next}");
 }
+
+/// A reply longer than the 16 KiB record cap is logged as fragments; exec
+/// joins them and matches the whole reply.
+#[test]
+fn an_ndjson_reply_over_the_record_cap_returns_whole() {
+    let _lock = lock();
+    let root = Home::new();
+    ndjson_session(&root, "dev");
+    let pad = "x".repeat(20_000);
+    let output = ndjson_exec(&root, "dev", EXEC_TIMEOUT, &format!(r#"{{"cmd":"{pad}"}}"#));
+    assert!(output.status.success(), "{output:?}");
+    let result = json(&output.stdout);
+    assert_eq!(result["timed_out"], false, "{result}");
+    let reply: serde_json::Value =
+        serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
+    assert_eq!(reply["cmd"], pad.as_str());
+}
+
+/// A shell stdout line longer than the record cap comes back byte for byte,
+/// with no newline where the log cut it.
+#[test]
+#[cfg(unix)]
+fn a_shell_line_over_the_record_cap_returns_byte_exact() {
+    let _lock = lock();
+    let root = Home::new();
+    posix_shell(&root, "shell");
+    let line = "é".repeat(10_000) + "end"; // 20,003 bytes, multi-byte throughout
+    let output = harness::tendr(&root)
+        .args([
+            "exec",
+            "shell",
+            "--timeout",
+            EXEC_TIMEOUT,
+            "--",
+            "printf",
+            "%s\\n",
+        ])
+        .arg(&line)
+        .assert_within_deadline();
+    let result = json(&output.get_output().stdout);
+    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_eq!(result["stdout"], line.as_str());
+}

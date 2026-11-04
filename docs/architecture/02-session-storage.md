@@ -69,6 +69,13 @@ create no state of their own.
 | `E` | stderr (pipe sessions only) |
 | `A` | annotations written by `wrap` and `exec` |
 
+Each line is `{"ts": <epoch seconds>, "tag": …, "content": …}`. A pipe
+session's `O`/`E` record also has `terminator` when it did not end at a line
+feed: `cr` (a carriage return under `--log-delimiter newline-or-cr`),
+`fragment` (it reached 16 KiB, and the next record of that stream continues
+it) or `eof` (the stream closed). LF records and records written before 0.8.0
+have none. Readers' collapse of `cr` runs: [guide](../guide.md#partial-lines-and-progress-output).
+
 ## Limits
 
 What bounds each growing file, and what removes it. Nothing is removed by
@@ -107,6 +114,7 @@ once used.
 | `events/append.lock` | Unix advisory lock for event appends. | Stays; only the lock matters. |
 | `~/.tendr/lost+found/append.lock` | Lock that lost+found appends and `prune` take, on every platform. | Stays; only the lock matters. |
 | `a.sock.path` (via `a.sock.path.tmp`) | Path of the PTY attach socket. | Removed with the socket when the run ends. |
+| `reader.json` (via `reader.json.tmp`) | A pipe session's reader telemetry for `status`: `pending_partial_bytes`, `last_record_at`, `as_of`, `ended`. Rewritten by the sidecar at most once a second while the values change, and once when capture ends. | Stays; replaced by the next run's. |
 
 ## PTY attach socket
 

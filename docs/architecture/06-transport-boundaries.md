@@ -90,13 +90,14 @@ The JSON is the request under a version:
   Unknown JSON fields are ignored; an unknown `v` or `op` is refused.
 - `v` is the lowest version that carries the request
   (`remote_frame::min_frame_version`). Version 2 is version 1 with options a
-  0.7 remote would ignore as unknown fields: `start --record-input` and
-  `--no-record`, and the ready check (`start --ready-when-output`,
-  `--ready-when-port`, `--ready-within`, `--after-ready`, and
-  `wait --ready`). A request that uses one goes as version 2, which a 0.7
-  remote refuses (`unsupported remote request version 2`, exit 2) instead of
-  running it without the option; every other request goes as version 1. A
-  0.8 remote reads every version from 1 to its own newest.
+  0.7 remote would ignore as unknown fields: `start --record-input`,
+  `--no-record` and `--log-delimiter`, and the ready check
+  (`start --ready-when-output`, `--ready-when-port`, `--ready-within`,
+  `--after-ready`, and `wait --ready`). A request that uses one goes as
+  version 2, which a 0.7 remote refuses (`unsupported remote request
+  version 2`, exit 2) instead of running it without the option; every other
+  request goes as version 1. A 0.8 remote reads every version from 1 to its
+  own newest.
 - Otherwise the request runs as the same command typed on the remote host:
   stdout, stderr and exit code are the local command's, and `log -f` and
   `watch` stream. `attach` is the exception: the client keeps the terminal,

@@ -9,7 +9,7 @@
 //! [`reconcile`](crate::reconcile) path may heal or infer terminal state.
 
 use std::io;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,9 +17,11 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 
 mod output_ring;
+mod pipe_framer;
 mod ready_check;
 mod supervised_run;
 use output_ring::OutputRing;
+use pipe_framer::PipeFramer;
 use ready_check::OutputMatcher;
 use supervised_run::SupervisedRun;
 
@@ -1730,12 +1732,18 @@ fn signal_readiness(session: &SessionDir, ready: &mut Option<ReadyWriter>, meta:
     }
 }
 
-/// Write one line of a stream to the shared log file.
-fn write_log_line(log: &Mutex<Box<dyn Write + Send>>, tag: char, line: String) -> io::Result<()> {
+/// Write one record of a stream to the shared log file.
+fn write_log_line(
+    log: &Mutex<Box<dyn Write + Send>>,
+    tag: char,
+    line: String,
+    terminator: Option<crate::log::Terminator>,
+) -> io::Result<()> {
     let formatted = serde_json::to_string(&crate::log::LogLine {
         ts: crate::log::timestamp_secs(),
         tag: tag.to_string(),
         content: serde_json::Value::String(line),
+        terminator,
     })
     .expect("JSON serialization cannot fail")
         + "\n";
@@ -1748,47 +1756,65 @@ fn log_write_warning(tag: char, e: &io::Error) -> String {
     format!("{stream} capture: output.log write failed; later output not logged: {e}")
 }
 
-/// Read lines from a stream and write them to the shared log file. Invalid
-/// UTF-8 is logged lossily. Each line logged is then offered to `ready`, the
-/// run's output ready check, if it has one. After the first failed write,
-/// send its warning to `failed`, then read the rest unlogged so the child
-/// never blocks: unparsed, unless the ready check still needs its lines.
+/// How much a pipe capture reads at once.
+const PIPE_READ_BYTES: usize = 8192;
+
+/// Read a pipe stream and write its records to the shared log file, framed
+/// by [`PipeFramer`]: each record is written as soon as it ends, and none
+/// holds more than [`crate::log::MAX_RECORD_BYTES`]. Invalid UTF-8 is logged
+/// lossily. Each record is then offered to `ready`, the run's output ready
+/// check, if it has one. `telemetry` follows the bytes waiting for a
+/// terminator. After the first failed write, send its warning to `failed`,
+/// then read the rest unlogged so the child never blocks: unparsed, unless
+/// the ready check still needs its records.
 fn capture_stream(
-    stream: Box<dyn std::io::Read + Send>,
+    mut stream: Box<dyn std::io::Read + Send>,
     tag: char,
     log: &Mutex<Box<dyn Write + Send>>,
     failed: &std::sync::mpsc::Sender<String>,
-    ready: Option<OutputMatcher>,
+    mut ready: Option<OutputMatcher>,
+    delimiter: crate::model::spec::LogDelimiter,
+    telemetry: &crate::pipe_reader::Telemetry,
 ) {
-    let mut reader = BufReader::new(stream);
-    let mut line = Vec::new();
+    let slot = usize::from(tag == 'E');
+    let mut framer = PipeFramer::new(delimiter);
     let mut logging = true;
-    loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => return, // pipe closed
-            Ok(_) => {}
-        }
-        if line.last() == Some(&b'\n') {
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-        }
+    let mut emit = |bytes: &[u8], terminator| -> io::Result<()> {
         if logging {
-            let text = String::from_utf8_lossy(&line).into_owned();
-            if let Err(e) = write_log_line(log, tag, text) {
-                let _ = failed.send(log_write_warning(tag, &e));
-                if ready.is_none() {
-                    let _ = io::copy(&mut reader, &mut io::sink());
-                    return;
+            let text = String::from_utf8_lossy(bytes).into_owned();
+            match write_log_line(log, tag, text, terminator) {
+                Ok(()) => telemetry.record_written(),
+                Err(e) => {
+                    let _ = failed.send(log_write_warning(tag, &e));
+                    if ready.is_none() {
+                        return Err(e);
+                    }
+                    logging = false;
                 }
-                logging = false;
             }
         }
-        if let Some(ready) = &ready {
-            ready.line(&line);
+        if let Some(ready) = ready.as_mut() {
+            ready.record(bytes, terminator);
         }
+        Ok(())
+    };
+    let mut buf = vec![0u8; PIPE_READ_BYTES];
+    let written = loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) => break framer.finish(&mut emit),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break framer.finish(&mut emit), // pipe closed
+        };
+        let fed = framer.feed(&buf[..n], &mut emit);
+        telemetry.set_pending(slot, framer.pending());
+        if fed.is_err() {
+            break fed;
+        }
+    };
+    telemetry.set_pending(slot, 0);
+    if written.is_err() {
+        let _ = io::copy(&mut stream, &mut io::sink());
     }
 }
 
@@ -1824,7 +1850,7 @@ fn capture_stream_with_tee(
         if logging {
             let text = String::from_utf8_lossy(&buf[..n]);
             for line in text.lines() {
-                if let Err(e) = write_log_line(log, tag, line.to_owned()) {
+                if let Err(e) = write_log_line(log, tag, line.to_owned(), None) {
                     let _ = failed.send(log_write_warning(tag, &e));
                     logging = false;
                     break;

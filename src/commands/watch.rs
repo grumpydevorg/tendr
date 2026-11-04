@@ -421,7 +421,7 @@ pub fn cmd_watch(
                                                         "tendr.sidecar",
                                                         "log",
                                                         log_name,
-                                                        serde_json::json!({"content": parsed.format_raw()}),
+                                                        log_data(&parsed),
                                                     ) {
                                                         return Ok(());
                                                     }
@@ -492,4 +492,15 @@ pub fn cmd_watch(
         first_scan = false;
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// A `log.stdout`/`log.stderr` record's data: its content and, as in `events
+/// --include-logs`, its `terminator` when it has one.
+fn log_data(line: &LogLine) -> serde_json::Value {
+    let mut data = serde_json::json!({"content": line.format_raw()});
+    if let Some(terminator) = line.terminator {
+        data["terminator"] =
+            serde_json::to_value(terminator).expect("Terminator is always serializable");
+    }
+    data
 }

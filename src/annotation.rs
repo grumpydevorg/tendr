@@ -28,6 +28,7 @@ pub fn write_annotation_line(log_path: &Path, payload: &serde_json::Value) -> io
         ts: crate::log::timestamp_secs(),
         tag: "A".to_owned(),
         content: payload.clone(),
+        terminator: None,
     })
     .expect("JSON serialization cannot fail")
         + "\n";

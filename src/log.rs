@@ -12,7 +12,28 @@ pub struct LogQuery {
     pub tail: Option<usize>,
     pub since_us: Option<u64>,
     pub raw: bool,
+    /// Keep every `cr` update. Without it a historical read keeps only the
+    /// last update of each run ([`Collapse`]); following reads never collapse.
+    pub all_updates: bool,
 }
+
+/// How a stdout or stderr record ended, when not with a line feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Terminator {
+    /// A carriage return (`--log-delimiter newline-or-cr`): a progress update.
+    Cr,
+    /// The stream closed with no terminator after it.
+    Eof,
+    /// The record reached [`MAX_RECORD_BYTES`]; the next record of the same
+    /// stream continues it, byte for byte.
+    Fragment,
+}
+
+/// The most bytes of child output one record holds: a chosen bound that
+/// keeps the reader's memory small and every record a size `--tail` and
+/// JSON readers handle.
+pub const MAX_RECORD_BYTES: usize = crate::events::MAX_INLINE_DATA_BYTES;
 
 /// One JSONL line from `output.log`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +44,10 @@ pub struct LogLine {
     pub tag: String,
     /// String content for O/E, structured JSON for A.
     pub content: serde_json::Value,
+    /// How the record ended. Absent for a line feed (and every record
+    /// written before the field existed), so LF records are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminator: Option<Terminator>,
 }
 
 impl LogLine {
@@ -57,6 +82,8 @@ pub fn timestamp_secs() -> f64 {
 /// Read and filter a log file, writing matching lines to `out`.
 ///
 /// Returns the number of lines written. Malformed lines are silently skipped.
+/// Runs of `cr` updates collapse to their last one unless `all_updates`;
+/// `tail` counts what is left.
 pub fn query_log(path: &Path, query: &LogQuery, out: &mut dyn Write) -> io::Result<usize> {
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
@@ -64,6 +91,24 @@ pub fn query_log(path: &Path, query: &LogQuery, out: &mut dyn Write) -> io::Resu
     let tail_n = query.tail;
     let mut ring: VecDeque<LogLine> = VecDeque::with_capacity(tail_n.unwrap_or(0));
     let mut count = 0usize;
+    let mut collapse = Collapse::default();
+    let mut kept = Vec::new();
+    let mut take = |line: LogLine, ring: &mut VecDeque<LogLine>| -> io::Result<()> {
+        match tail_n {
+            Some(0) => {}
+            Some(n) => {
+                if ring.len() == n {
+                    ring.pop_front();
+                }
+                ring.push_back(line);
+            }
+            None => {
+                write_line(out, &line, query.raw)?;
+                count += 1;
+            }
+        }
+        Ok(())
+    };
 
     for raw_line in reader.lines() {
         let raw_line = raw_line?;
@@ -75,17 +120,18 @@ pub fn query_log(path: &Path, query: &LogQuery, out: &mut dyn Write) -> io::Resu
             continue;
         }
 
-        if let Some(n) = tail_n {
-            if n > 0 {
-                if ring.len() == n {
-                    ring.pop_front();
-                }
-                ring.push_back(parsed);
-            }
+        if query.all_updates {
+            take(parsed, &mut ring)?;
         } else {
-            write_line(out, &parsed, query.raw)?;
-            count += 1;
+            collapse.push(parsed, &mut kept);
+            for line in kept.drain(..) {
+                take(line, &mut ring)?;
+            }
         }
+    }
+    collapse.finish(&mut kept);
+    for line in kept {
+        take(line, &mut ring)?;
     }
 
     for line in &ring {
@@ -94,6 +140,85 @@ pub fn query_log(path: &Path, query: &LogQuery, out: &mut dyn Write) -> io::Resu
     }
 
     Ok(count)
+}
+
+/// The read-time view of `cr` updates: each run of `cr` records within one
+/// stream tag keeps only its last record. A run ends at the next record of
+/// the same stream that is not `cr` (a line, `eof` or `fragment`), or at the
+/// end of the input; records of the other stream and annotations pass
+/// through without ending it. The kept update is placed where its run ends.
+/// A `cr` record right after a `fragment` is the rest of that update, so it
+/// is shown, not held.
+#[derive(Default)]
+pub struct Collapse {
+    /// The latest `cr` record held back, for stdout and stderr.
+    held: [Option<LogLine>; 2],
+    /// The stream's last record was a `fragment`.
+    after_fragment: [bool; 2],
+}
+
+impl Collapse {
+    /// Feed one record; append to `out` what can be shown now, in order.
+    pub fn push(&mut self, line: LogLine, out: &mut Vec<LogLine>) {
+        let slot = match line.tag.as_str() {
+            "O" => 0,
+            "E" => 1,
+            _ => {
+                out.push(line);
+                return;
+            }
+        };
+        let after_fragment = std::mem::replace(
+            &mut self.after_fragment[slot],
+            line.terminator == Some(Terminator::Fragment),
+        );
+        if line.terminator == Some(Terminator::Cr) && !after_fragment {
+            self.held[slot] = Some(line);
+            return;
+        }
+        out.extend(self.held[slot].take());
+        out.push(line);
+    }
+
+    /// End of input: release held updates, oldest first.
+    pub fn finish(&mut self, out: &mut Vec<LogLine>) {
+        let mut held: Vec<LogLine> = self.held.iter_mut().filter_map(Option::take).collect();
+        held.sort_by(|a, b| a.ts.total_cmp(&b.ts));
+        out.extend(held);
+    }
+}
+
+/// Joins each stream's `fragment` records to the record that ends them, so a
+/// reader that matches whole lines (an exec's sentinel or NDJSON reply) sees
+/// a line over [`MAX_RECORD_BYTES`] as one record.
+#[derive(Default)]
+pub struct Reassemble {
+    partial: [String; 2],
+}
+
+impl Reassemble {
+    /// Feed one record: `None` for a fragment (held), otherwise the record,
+    /// with any fragments before it joined to its content.
+    pub fn push(&mut self, mut line: LogLine) -> Option<LogLine> {
+        let slot = match line.tag.as_str() {
+            "O" => 0,
+            "E" => 1,
+            _ => return Some(line),
+        };
+        let Some(text) = line.content.as_str() else {
+            return Some(line);
+        };
+        if line.terminator == Some(Terminator::Fragment) {
+            self.partial[slot].push_str(text);
+            return None;
+        }
+        if !self.partial[slot].is_empty() {
+            let mut whole = std::mem::take(&mut self.partial[slot]);
+            whole.push_str(text);
+            line.content = serde_json::Value::String(whole);
+        }
+        Some(line)
+    }
 }
 
 fn matches_query(line: &LogLine, query: &LogQuery) -> bool {
@@ -107,7 +232,12 @@ fn matches_query(line: &LogLine, query: &LogQuery) -> bool {
 
 fn write_line(out: &mut dyn Write, line: &LogLine, raw: bool) -> io::Result<()> {
     if raw {
-        writeln!(out, "{}", line.format_raw())
+        // A fragment continues in the next record: raw output joins them.
+        if line.terminator == Some(Terminator::Fragment) {
+            write!(out, "{}", line.format_raw())
+        } else {
+            writeln!(out, "{}", line.format_raw())
+        }
     } else {
         writeln!(
             out,
@@ -299,6 +429,53 @@ mod tests {
             writeln!(f, "{}", serde_json::to_string(&line).unwrap()).unwrap();
         }
         path
+    }
+
+    fn record(tag: &str, content: serde_json::Value, terminator: Option<Terminator>) -> LogLine {
+        LogLine {
+            ts: 0.0,
+            tag: tag.into(),
+            content,
+            terminator,
+        }
+    }
+
+    #[test]
+    fn reassemble_joins_interleaved_stdout_and_stderr_fragments_per_stream() {
+        let frag = Some(Terminator::Fragment);
+        let mut reassemble = Reassemble::default();
+        let out: Vec<LogLine> = [
+            record("O", "o1".into(), frag),
+            record("E", "e1".into(), frag),
+            record("A", serde_json::json!({"event": "x"}), None),
+            record("O", "o2".into(), frag),
+            record("E", "e2".into(), None),
+            record("O", "o3".into(), None),
+        ]
+        .into_iter()
+        .filter_map(|line| reassemble.push(line))
+        .collect();
+        assert_eq!(
+            out,
+            [
+                record("A", serde_json::json!({"event": "x"}), None),
+                record("E", "e1e2".into(), None),
+                record("O", "o1o2o3".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapse_shows_a_cr_record_that_directly_follows_a_fragment() {
+        let fragment = record("O", "progress ".into(), Some(Terminator::Fragment));
+        let rest = record("O", "50%".into(), Some(Terminator::Cr));
+        let mut collapse = Collapse::default();
+        let mut out = Vec::new();
+        collapse.push(fragment.clone(), &mut out);
+        collapse.push(rest.clone(), &mut out);
+        assert_eq!(out, [fragment, rest]);
+        collapse.finish(&mut out);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]

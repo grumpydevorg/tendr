@@ -776,6 +776,11 @@ fn remote_entry_refuses_bad_requests_without_side_effects() {
             "unsupported remote request version 3",
         ),
         (
+            "log delimiter with pty",
+            start_frame(serde_json::json!({"pty": true, "log_delimiter": "newline-or-cr"})),
+            "--log-delimiter",
+        ),
+        (
             "unknown operation",
             frame(br#"{"v":1,"op":"explode","params":{}}"#),
             "unknown remote operation 'explode'",

@@ -259,6 +259,34 @@ bytes exactly. A PTY session also writes an exact recording of its output and
 window sizes under `recording/<run_id>/`. A caller that needs exact bytes from
 a pipe session redirects the child's output to its own file.
 
+### Pipe records are bounded; CR framing is opt-in and collapsed at read time
+
+*2026-11.* A pipe reader that waited for a newline showed nothing of a
+two-hour `rsync --info=progress2` (0 bytes in `output.log` after 63 minutes,
+then one 17.7 MB record at exit), held the whole run in memory, and produced a
+record too large for `--tail` or a JSON reader. So every record is capped at
+16 KiB in every mode, including the default an unaware user gets: a chosen
+bound that keeps the reader's memory small and every record a size `--tail`
+and JSON readers handle. Nothing is dropped: a cut record is a `fragment`,
+cut on a character boundary, and fragments concatenate to the original
+bytes. Readers that match whole lines (`exec`) join fragments first.
+
+`--log-delimiter newline-or-cr` ends a record at CR at once rather than
+holding the CR to see whether LF follows, which would delay each update until
+the next write; the LF that follows is swallowed instead, even from the next
+read. Every update is stored. Collapsing a run of updates to its last is a
+read-time view for historical reads only: a follower cannot know which update
+is the last. Holding CR output until LF or EOF, keyed replacement events and
+redrawing in place on `-f` were rejected for that reason. The default stays
+`newline`, the behaviour existing callers rely on.
+
+What the reader holds is published in `reader.json`, not `meta.json`:
+`meta.json` is the lifecycle record, written on state changes, and a
+once-a-second rewrite would bury them. `status` reads it best-effort, and
+stops the clock at the file's own time once capture or the sidecar has
+ended, so dead values do not look live. Source: the silent pipe output plan
+(`docs/plans/backlog/silent-pipe-output.md`, removed with this change).
+
 ### Viewers are cursors into one output ring
 
 *2026-11-02.* A PTY run keeps its latest 32 MiB of output in one ring, from
