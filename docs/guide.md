@@ -523,7 +523,12 @@ tendr watch --namespace nightly --events --logs
   All three are repeatable. Use `--follow` to keep
   reading, `--since <RFC 3339>` or `--last <N>` to limit history, and
   `--cursors` with `--from-cursor` to resume where you stopped.
-  `--include-logs` merges output lines in.
+  `--include-logs` merges output lines in. `--data <key>=<value>` keeps events
+  by a field of their data, and `--max-count <N>` and `--timeout` end a follow
+  on a match or at a deadline
+  ([Drive an agent turn through its hooks](#drive-an-agent-turn-through-its-hooks)).
+- `wait` waits for processes to exit. An interactive agent keeps running
+  between turns, so wait for a turn with `tendr events`, not `wait`.
 
 ## Lifecycle, batches, and hooks
 
@@ -836,6 +841,196 @@ on your `PATH`. See the [analytics recipes](analytics-recipes.md).
 tendr query "SELECT kind, count(*) FROM events GROUP BY kind"
 ```
 
+## Drive an agent turn through its hooks
+
+Some agent features exist only in an interactive session. A program can still
+drive one under tendr: it pushes a prompt into the agent's terminal, and the
+agent's lifecycle hooks write events that say when the prompt was taken, when
+the turn waits for a permission and when it ended. The caller waits on those
+events instead of reading the screen.
+
+`tendr wait` waits for a process to exit, not for a turn. An interactive agent
+keeps running between turns, so wait for a turn with
+`tendr events --follow --max-count`.
+
+Tendr stores these events and does not interpret them: what `hook.stop` means
+is the caller's decision. Consumers such as UIs, analytics or `tendr query`
+read the `hook.*` events; tendr does not route or render them. For a local
+caller that needs one Claude Code turn, `claude --bg` and `claude --bg --resume`
+are simpler. Use tendr when the record must be queryable, the session must
+survive an SSH loss, or the agent has no background mode.
+
+**The pattern.** A hook runs `tendr emit --kind hook.<name>` to record an
+event, or `tendr wrap --event hook.<name> -- <cmd>` to run a command and
+record it with its output. Hooks are the agent's children, so they inherit the
+session's `TENDR_*` variables and need no `--session`. `hook.` is open
+vocabulary, not reserved.
+
+**Wait for one event.** One `tendr events` call blocks until the event arrives
+or a deadline passes, with no follower in the background:
+
+```bash
+tendr events --session agents/cc --kind hook.stop --data prompt_id=$PROMPT_ID \
+  --since "$SUBMIT_TS" --follow --max-count 1 --timeout 10m
+```
+
+- `--max-count <N>` ends the follow with 0 once it has printed N events.
+- `--timeout <duration>` ends it with 124 if the duration passes first,
+  counted from the start of the command. Both need `--follow`.
+- `--data <key>=<value>` keeps an event only when its `data` has the top-level
+  field `<key>` equal to `<value>`, a string by its text or a number as JSON
+  writes it ([event protocol](architecture/07-event-protocol.md) §5.1 has the
+  full rule). Repeat it to require several fields. It combines with
+  `--session`, `--kind` and `--source`, and works without `--follow` too.
+- **A payload over 16 KiB loses its fields** (event protocol §3.4), so
+  `--data` cannot match it. Project payloads with `jq` before emitting them,
+  as the hook script below does.
+- `--from-now` skips what the sessions hold when the command starts, so an
+  event written earlier never matches. To wait for a turn's end after its
+  submit event, use `--since` with the submit event's `ts` instead: the end may
+  already be written, and `--since` replays it.
+- With `--ready-file`, the file is created once the replay is printed, even
+  when the replay already held N events. With `--cursors`, a last bookmark
+  follows the Nth event.
+- `events` runs only where the sessions are (it is refused with `--host`).
+  For a remote agent, run it there, for example
+  `ssh box 'tendr events … --max-count 1 --timeout 10m'`, with tendr 0.8.0 or
+  newer on that host.
+
+**Claude Code.** `tendr-hook.sh` gets the hook name as its argument. It keeps
+the payload under the 16 KiB cap and writes nothing to stdout, which Claude
+Code reads as a hook decision:
+
+```sh
+#!/bin/sh
+jq -c '{hook_event_name, session_id, prompt_id, transcript_path,
+        notification_type, message, tool_name, error,
+        last_assistant_message: ((.last_assistant_message // "") | .[0:4000])}' \
+  | tendr emit --best-effort --source claude.hook --kind "hook.$1" --data-stdin >/dev/null
+```
+
+The settings, given to `claude --settings` so they apply to this run only:
+
+```json
+{"hooks":{
+  "SessionStart":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh session_start"}]}],
+  "UserPromptSubmit":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh user_prompt_submit"}]}],
+  "PermissionRequest":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh permission_request"}]}],
+  "Notification":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh notification"}]}],
+  "Stop":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh stop"}]}],
+  "StopFailure":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh stop_failure"}]}]
+}}
+```
+
+Start each wait before the action it waits for:
+
+```bash
+ev() { tendr events --session agents/cc "$@"; }
+
+# 1. Wait for the session start, then launch the resolved binary:
+#    tendr start takes argv, so shell aliases do not apply.
+rm -f ./ready
+ev --kind hook.session_start --follow --from-now --max-count 1 --timeout 60s \
+  --ready-file ./ready > ./start.ndjson &
+until [ -f ./ready ]; do sleep 0.1; done
+CLAUDE=$(readlink -f "$(command -v claude)")
+tendr start cc --namespace agents --pty --cwd "$PWD" \
+  --unset-env CI --unset-env NO_COLOR \
+  -- "$CLAUDE" --settings ./tendr-hooks.json
+wait $!
+sleep 3   # give the input box a moment
+
+# 2. Submit: text, a pause, then a lone carriage return.
+rm -f ./ready
+ev --kind hook.user_prompt_submit --follow --from-now --max-count 1 --timeout 30s \
+  --ready-file ./ready > ./submit.ndjson &
+until [ -f ./ready ]; do sleep 0.1; done
+printf 'Summarise README.md in one line.' | tendr push cc --namespace agents
+sleep 0.5
+printf '\r' | tendr push cc --namespace agents
+wait $! || echo "not submitted"   # 124: the prompt was not taken
+PROMPT_ID=$(jq -r .data.prompt_id ./submit.ndjson)
+SUBMIT_TS=$(jq -r .ts ./submit.ndjson)
+
+# 3. The turn's end: hook.stop, or hook.stop_failure on an API error
+#    (--kind is a prefix match).
+ev --kind hook.stop --data "prompt_id=$PROMPT_ID" --since "$SUBMIT_TS" \
+  --follow --max-count 1 --timeout 10m > ./end.ndjson
+# 124: the outcome is unknown, not "still working".
+```
+
+While the turn runs, `hook.permission_request`, or a `hook.notification`
+with `notification_type` `permission_prompt`, means it waits for a
+permission. Decide by your own policy, and answer with `push`, for example
+`printf 1 | tendr push cc --namespace agents`.
+
+**Read the result** from the stop event's `last_assistant_message`, or from
+the transcript at its `transcript_path`. Scope a transcript query to the turn
+by `promptId`: it is on the user entries (the prompt and each tool result),
+not on the assistant's. This one finds the URLs of the turn's `Artifact`
+calls:
+
+```bash
+jq -rs --arg p "$PROMPT_ID" '
+  ([.[] | select(.type=="user" and .promptId==$p)
+        | .message.content[]? | select(.type=="tool_result") | .tool_use_id]) as $ids
+  | [.[] | select(.type=="assistant") | .message.content[]?
+         | select(.type=="tool_use" and .name=="Artifact" and (.id as $i | $ids | index($i)))
+         | .input.url // empty] | unique[]' "$TRANSCRIPT"
+```
+
+On 2026-10-08 it returned nothing for a plain-text turn and the URL for a
+`/design` turn of the same session. Claude Code writes the transcript
+asynchronously, so it can lag behind the hook: retry a missing result briefly
+before treating it as absent. A person can watch or take over with
+`tendr attach cc --namespace agents`.
+
+**Measured** on 2026-11-04 on an exe.dev VM (Ubuntu 24.04, x86_64) with Claude
+Code 2.1.316 through exe.dev's LLM gateway and tendr 0.7.2 with this section's
+`events` options, running the recipe above, unless a point says otherwise:
+
+- Hooks inherit the session: `tendr emit` without `--session` wrote to the
+  right session and run. `hook.session_start` reached a `--from-now` waiter
+  started before the session existed, 0.4 s after `tendr start`.
+- Text, a 0.5 s pause, then `\r` was taken first time, in both turns. A long
+  prompt ending in its own `\r` is taken as a paste and the CR is removed
+  (2026-10-08, macOS 26.6.2, tendr 0.3.0, Claude Code 2.1.293). Only
+  `hook.user_prompt_submit` confirms that a prompt was taken.
+- `hook.user_prompt_submit` and `hook.stop` carry the same `prompt_id`;
+  the stop also carries `last_assistant_message` and `transcript_path`. In
+  the transcript, `promptId` was on the turn's user entries (the prompt and
+  its tool result) and on no assistant entry.
+- With the API endpoint unreachable, the turn ended with `hook.stop_failure`,
+  `error` `server_error`, after 180 s of Claude Code's retries. The
+  `--kind hook.stop --data prompt_id=…` wait above caught it.
+- A `hook.notification` with `notification_type` `idle_prompt` came after
+  each turn had ended. A wait on `hook.notification` must check the type.
+- Permission prompts were not re-measured: on that VM Claude Code asked for
+  none, even for a `Write` outside its working directory. On 2026-10-08 a
+  `hook.notification` with `permission_prompt` arrived 9 s after the prompt
+  was taken, and `printf 1 | tendr push` answered it. Claude Code's docs say
+  `PermissionRequest` fires at once; that hook has not been seen live.
+- A PTY child gets `TERM=xterm-256color` when the caller's `TERM` is `dumb`,
+  as in agent shells, which also set `CI=true` and `NO_COLOR=1` (2026-10-08);
+  the launch line removes those two.
+- A raw 40 KB `Stop` payload lost its `prompt_id` to the spill (2026-10-08);
+  the tests check that `--data` does not match such an event.
+
+**Trust and failure.**
+
+- Hook events are not authenticated. Only `tendr.*` sources are reserved, and
+  `source` is whatever the caller passes
+  ([event protocol](architecture/07-event-protocol.md) §1). Any process in the
+  session can emit a `hook.stop` with a guessed `prompt_id`. Never grant a
+  permission on the strength of an event alone.
+- `--best-effort` loses events silently. A missing hook script, a full disk,
+  or a session pruned or replaced mid-turn (its emits go to `lost+found`) all
+  look like a slow turn. A missed deadline means the outcome is unknown.
+- A user interrupt fires neither `Stop` nor `StopFailure`, so give every wait
+  a deadline.
+- The payload shapes are Claude Code's and can change with any release. Name
+  the fields in the projection, so a rename shows as a missing value.
+
 ## Tendr inside herdr
 
 [herdr](https://herdr.dev) hosts interactive agents in panes and shows whether
@@ -882,8 +1077,10 @@ Limits:
 
 - Read results from tendr, not from `herdr pane read`. A pane is a screen and
   has no exit code.
-- Run agents in herdr panes, not under tendr. `tendr start --pty -- omp` works,
-  but herdr cannot see that agent's state.
+- Run an agent that a person watches in a herdr pane, not under tendr:
+  `tendr start --pty -- omp` works, but herdr cannot see that agent's state.
+  An agent that a program drives can run under tendr instead
+  ([Drive an agent turn through its hooks](#drive-an-agent-turn-through-its-hooks)).
 
 ## Exit codes
 
@@ -907,6 +1104,7 @@ or an I/O error.
 |`wait`|124, 137|A dependency timed out; killed while waiting on a dependency|
 |`exec`|the command's|The command's own exit code (an NDJSON reply's is 1 for `"ok": false` or a non-null `error`); 124 if `--timeout` passed; 2 for a malformed `--frame-from-stdin` frame or an invalid NDJSON request|
 |`events`|44, 65|`--from-cursor` names history that is gone; `--strict` found unparseable lines|
+|`events`|124|`--timeout` passed (before `--max-count` events were printed, when given)|
 |`emit`|2, 3, 5, 6|Invalid `--parent`; no session given and none in `TENDR_SESSION`, or an invalid `TENDR_NAMESPACE`/`TENDR_SESSION`; corrupt session; invalid kind or source|
 |`wrap`|the child's|The wrapped command's code; 6 for an `--event` with a reserved prefix|
 |`query`|DuckDB's|DuckDB's exit code|

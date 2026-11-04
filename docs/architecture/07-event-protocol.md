@@ -287,7 +287,8 @@ Not guaranteed:
 ```sh
 tendr events [--namespace ns] [--session ns/name]... [--kind prefix]... \
   [--source prefix]... [--follow] [--from-now | --from-cursor <c> | --since <rfc3339>] \
-  [--last N] [--cursors] [--include-logs] [--strict] [--ready-file <path>]
+  [--last N] [--cursors] [--include-logs] [--strict] [--ready-file <path>] \
+  [--data key=value]... [--max-count N] [--timeout <duration>]
 ```
 
 - **Replay** reads every segment of the matching sessions in name order,
@@ -302,6 +303,17 @@ tendr events [--namespace ns] [--session ns/name]... [--kind prefix]... \
 - **`--strict`** exits 65 if any unparseable line was skipped.
 - **`--ready-file`** (with `--follow`) creates the file once the baseline is
   set and the initial replay is flushed.
+- **`--data key=value`** keeps a record whose stored `data` has that
+  top-level field: a string equal to `value`, or a number whose JSON text is
+  `value`. Other types and nested fields never match. A spilled payload's
+  `data` is its preview (§3.4), so its fields match only where the preview
+  kept them; `emit` and `wrap` keep none. Derived log records match on their
+  `data.content`.
+- **`--max-count N`** (with `--follow`) exits 0 once N records are printed,
+  counting replay; the ready-file is still created first, and with
+  `--cursors` a last bookmark resumes after the Nth record.
+- **`--timeout <duration>`** (with `--follow`) exits 124 when the duration,
+  counted from the start, passes first. The last poll runs at the deadline.
 
 ### 5.2 Cursors
 

@@ -2,11 +2,14 @@
 //! segments of matching sessions merged by (ts, writer, seq) as envelope
 //! NDJSON, with warm starts (`--since`, `--last`, `--from-now`,
 //! `--from-cursor`), read-time output.log projection (`--include-logs`),
-//! resumable cursor bookmarks (`--cursors`), and poll-based live tailing
-//! (`--follow` at the shipped 100 ms constant — the disk is the buffer).
+//! resumable cursor bookmarks (`--cursors`), poll-based live tailing
+//! (`--follow` at the shipped 100 ms constant — the disk is the buffer),
+//! and a follow that ends on its Nth match or at a deadline
+//! (`--max-count`, `--timeout`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -39,23 +42,55 @@ pub struct EventsOptions {
     /// Follow-only: atomically publish this file once the baseline is
     /// established and initial replay is flushed. See [`ready_file`](tendr::ready_file).
     pub ready_file: Option<PathBuf>,
+    /// `--data KEY=VALUE` pairs; a record passes when every one matches.
+    pub data: Vec<(String, String)>,
+    /// Follow-only: exit 0 once this many records have been printed.
+    pub max_count: Option<NonZeroUsize>,
+    /// Follow-only: exit 124 when this passes before the follow ends.
+    pub timeout: Option<Duration>,
 }
 
-/// Kind/source/since filters, applied uniformly to stored and derived
+/// The deadline's exit code, the one `exec` and `run` use for a timeout.
+const EXIT_TIMEOUT: i32 = 124;
+
+/// Kind/source/since/data filters, applied uniformly to stored and derived
 /// records at read time. Offsets still advance past filtered records —
 /// a cursor tracks read position, not printed position.
 struct Filters {
     kinds: Vec<String>,
     sources: Vec<String>,
     since: Option<EventTimestamp>,
+    data: Vec<(String, String)>,
 }
 
 impl Filters {
-    fn passes(&self, kind: &str, source: &str, ts: EventTimestamp) -> bool {
+    fn passes(
+        &self,
+        kind: &str,
+        source: &str,
+        ts: EventTimestamp,
+        data: Option<&serde_json::Value>,
+    ) -> bool {
         (self.kinds.is_empty() || self.kinds.iter().any(|prefix| kind.starts_with(prefix)))
             && (self.sources.is_empty()
                 || self.sources.iter().any(|prefix| source.starts_with(prefix)))
             && self.since.is_none_or(|since| ts >= since)
+            && self.data.iter().all(|(key, want)| {
+                data.and_then(|data| data.get(key))
+                    .is_some_and(|value| data_value_is(value, want))
+            })
+    }
+}
+
+/// `--data` compares a top-level field of the stored `data`: a string by
+/// its text, a number as JSON writes it. Anything else never matches.
+/// A spilled payload's stored `data` is its preview, so its fields match
+/// only where the preview kept them (spec §3.4).
+fn data_value_is(value: &serde_json::Value, want: &str) -> bool {
+    match value {
+        serde_json::Value::String(text) => text == want,
+        serde_json::Value::Number(number) => number.to_string() == want,
+        _ => false,
     }
 }
 
@@ -280,6 +315,7 @@ impl StreamReader {
                     record.event.kind.as_str(),
                     record.event.source.as_str(),
                     record.event.ts,
+                    record.event.data.as_ref(),
                 ) {
                     self.tracker.note_pending(&rel, record.start);
                     batch.records.push(OutRecord::Stored {
@@ -338,7 +374,10 @@ impl StreamReader {
             } else {
                 "log.stderr"
             };
-            if self.filters.passes(kind, "tendr.sidecar", ts) {
+            if self
+                .filters
+                .passes(kind, "tendr.sidecar", ts, value.get("data"))
+            {
                 batch.records.push(OutRecord::Derived {
                     ts,
                     tie: self.derived_tie,
@@ -384,8 +423,11 @@ fn write_bookmark(
 }
 
 /// Sort and print one batch, maintaining cursor exactness and bookmark
-/// cadence. Returns false when stdout's pipe closed — the consumer went
-/// away, which is a normal exit, not an error.
+/// cadence. `remaining` counts down the records `--max-count` still allows;
+/// at zero the rest of the batch stays unprinted (and pending, so a final
+/// bookmark resumes right after the last one printed). Returns false when
+/// stdout's pipe closed — the consumer went away, which is a normal exit,
+/// not an error.
 fn emit_batch(
     out: &mut impl Write,
     opts: &EventsOptions,
@@ -393,6 +435,7 @@ fn emit_batch(
     mark: &mut BookmarkState,
     mut records: Vec<OutRecord>,
     limit_last: Option<usize>,
+    remaining: &mut Option<usize>,
 ) -> anyhow::Result<bool> {
     records.sort_by_key(OutRecord::sort_key);
     if let Some(n) = limit_last {
@@ -407,6 +450,9 @@ fn emit_batch(
         }
     }
     for record in records {
+        if *remaining == Some(0) {
+            break;
+        }
         let line = record.to_line()?;
         if writeln!(out, "{line}").is_err() {
             return Ok(false);
@@ -415,6 +461,9 @@ fn emit_batch(
             tracker.note_consumed(rel, *start);
         }
         mark.since_count += 1;
+        if let Some(left) = remaining.as_mut() {
+            *left -= 1;
+        }
         mark.last_mark = Instant::now();
         if opts.cursors
             && mark.since_count >= BOOKMARK_EVERY_RECORDS
@@ -440,6 +489,12 @@ fn strict_check(opts: &EventsOptions, skipped: usize) {
 }
 
 pub fn cmd_events(opts: EventsOptions) -> anyhow::Result<()> {
+    // `--timeout` counts from the start of the command, before any history
+    // is read or discarded. A duration too large to add never passes.
+    let deadline = opts
+        .timeout
+        .and_then(|timeout| Instant::now().checked_add(timeout));
+
     // clap enforces this via the warm_start ArgGroup; restated here so the
     // command layer carries the invariant too.
     anyhow::ensure!(
@@ -516,6 +571,7 @@ pub fn cmd_events(opts: EventsOptions) -> anyhow::Result<()> {
             kinds: opts.kinds.clone(),
             sources: opts.sources.clone(),
             since: opts.since,
+            data: opts.data.clone(),
         },
         include_logs: opts.include_logs,
         logs_from_end: opts.from_cursor.is_some(),
@@ -545,6 +601,8 @@ pub fn cmd_events(opts: EventsOptions) -> anyhow::Result<()> {
         last_mark: Instant::now(),
     };
 
+    let mut remaining = opts.max_count.map(NonZeroUsize::get);
+
     // Replay: everything between the warm-start position and now.
     let batch = reader.poll()?;
     let skipped = batch.skipped;
@@ -555,6 +613,7 @@ pub fn cmd_events(opts: EventsOptions) -> anyhow::Result<()> {
         &mut mark,
         batch.records,
         opts.last,
+        &mut remaining,
     )? {
         return Ok(());
     }
@@ -584,7 +643,23 @@ pub fn cmd_events(opts: EventsOptions) -> anyhow::Result<()> {
     }
 
     loop {
-        std::thread::sleep(POLL_INTERVAL);
+        if remaining == Some(0) {
+            return final_bookmark(&mut out, &opts, &reader.tracker, &mut mark);
+        }
+        let pause = match deadline {
+            None => POLL_INTERVAL,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    final_bookmark(&mut out, &opts, &reader.tracker, &mut mark)?;
+                    std::process::exit(EXIT_TIMEOUT);
+                }
+                // Wake at the deadline itself, so the poll that follows
+                // still catches an event written just before it.
+                left.min(POLL_INTERVAL)
+            }
+        };
+        std::thread::sleep(pause);
         let batch = reader.poll()?;
         let skipped = batch.skipped;
         if !emit_batch(
@@ -594,6 +669,7 @@ pub fn cmd_events(opts: EventsOptions) -> anyhow::Result<()> {
             &mut mark,
             batch.records,
             None,
+            &mut remaining,
         )? {
             return Ok(());
         }
@@ -605,4 +681,20 @@ pub fn cmd_events(opts: EventsOptions) -> anyhow::Result<()> {
             return Ok(());
         }
     }
+}
+
+/// Before a follow ends on `--max-count` or `--timeout`: with `--cursors`, one
+/// last bookmark so the caller can resume right after the last record printed.
+/// A closed stdout is a normal end here too.
+fn final_bookmark(
+    out: &mut impl Write,
+    opts: &EventsOptions,
+    tracker: &CursorTracker,
+    mark: &mut BookmarkState,
+) -> anyhow::Result<()> {
+    if opts.cursors {
+        write_bookmark(out, tracker, mark)?;
+    }
+    let _ = out.flush();
+    Ok(())
 }

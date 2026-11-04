@@ -7,6 +7,7 @@
 //! copy-stdin <path> — copy stdin to <path> as it arrives, until end of input
 //! print-cwd         — print the current working directory to stdout
 //! ndjson-echo       — a line-oriented JSON process (see `ndjson_echo`)
+//! hook-agent <tendr> — a scripted agent whose hooks emit events (see `hook_agent`)
 //! ```
 
 fn main() {
@@ -66,10 +67,47 @@ fn main() {
             println!("{}", cwd.display());
         }
         "ndjson-echo" => ndjson_echo(),
+        "hook-agent" => match args.get(2) {
+            Some(tendr) => hook_agent(tendr),
+            None => {
+                eprintln!("usage: test_callback hook-agent <tendr>");
+                std::process::exit(1);
+            }
+        },
         other => {
             eprintln!("test_callback: unknown command '{other}'");
             std::process::exit(1);
         }
+    }
+}
+
+/// A stand-in for an interactive agent with lifecycle hooks: each stdin line
+/// `<hook> <json>` fires that hook as the guide's recipe does, running
+/// `<tendr> emit --best-effort --source claude.hook --kind hook.<hook>
+/// --data-stdin` with `<json>` on its stdin. Like a real hook it is the
+/// agent's child, so the event finds its session through the inherited
+/// `TENDR_*` variables. Hooks fire in line order; end of input ends it.
+fn hook_agent(tendr: &str) {
+    use std::io::{BufRead, Write};
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { return };
+        let Some((hook, data)) = line.split_once(' ') else {
+            continue;
+        };
+        let mut emit = std::process::Command::new(tendr)
+            .args(["emit", "--best-effort", "--source", "claude.hook", "--kind"])
+            .arg(format!("hook.{hook}"))
+            .arg("--data-stdin")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| {
+                eprintln!("test_callback hook-agent: {e}");
+                std::process::exit(1);
+            });
+        let mut stdin = emit.stdin.take().expect("piped stdin");
+        stdin.write_all(data.as_bytes()).unwrap();
+        drop(stdin);
+        emit.wait().unwrap();
     }
 }
 
