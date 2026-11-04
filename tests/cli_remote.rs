@@ -20,17 +20,11 @@ static SERIAL: Mutex<()> = Mutex::new(());
 const CONNECTS: &str = "600";
 
 /// How long a call whose ssh exited without a hello waits for the rest of
-/// ssh's stderr when something else still holds it: long enough for a relay
-/// thread starved by load to pass on what ssh wrote before it exited, and
-/// still the only way out while a leftover holds the pipe.
-///
-/// This bound is the one clock in
-/// `host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process`,
-/// accepted because no other test proves that what ssh wrote before exiting
-/// without a hello reaches the caller, and with a leftover holding the pipe
-/// there is no event to wait for instead: 10 s of starvation would be needed
-/// to fail it wrongly.
-const PRE_HELLO_RELAY: (&str, &str) = ("TENDR_TEST_PRE_HELLO_RELAY_MS", "10000");
+/// ssh's stderr: far past anything load can do to the relay, so what ssh
+/// wrote just before exiting reaches the caller, and the end of stderr at
+/// ssh's exit, not this timer, ends the wait. Only a test where a leftover
+/// holds the pipe meets the timer, and there it is left at its default.
+const PRE_HELLO_RELAY: (&str, &str) = ("TENDR_TEST_PRE_HELLO_RELAY_MS", "3600000");
 
 /// A fake ssh that prints each of its args as `ARG:<value>` on stdout.
 fn fake_ssh_echo() -> TempDir {
@@ -395,6 +389,7 @@ fn host_call(tmp: &TempDir, deadline: &str, args: &[&str]) -> std::process::Outp
         .args(args)
         .env("PATH", tmp.path())
         .env("TENDR_SSH_CONNECT_TIMEOUT", deadline)
+        .env(PRE_HELLO_RELAY.0, PRE_HELLO_RELAY.1)
         .output()
         .unwrap()
 }
@@ -469,6 +464,13 @@ fn host_call_that_never_reaches_the_remote_tendr_stops_at_the_deadline() {
 /// inheritable handle and not just the stdio it is given, that takes tendr
 /// keeping its own stdio from being inherited. The leftover outlives the
 /// test's hang detector, so the call returning at all is the proof.
+///
+/// ssh exits only once its last line has reached the caller: with the
+/// leftover holding the pipe no end of stderr comes, so the relay's short
+/// wait for the rest is the only way out, and a line still in flight could
+/// be lost under load. That a line written just before the exit is passed on
+/// is shown where the pipe ends with ssh
+/// (`host_call_to_a_tendr_without_hello_or_trailer_says_to_upgrade_it`).
 #[test]
 fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
     use std::io::Read;
@@ -479,10 +481,13 @@ fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
         // ProxyCommand is (its stdout is the ssh connection, not ours).
         // The leftover runs from the built fake, not the linked `ssh` copy, so
         // it does not keep that copy (and its temp dir) in use on Windows.
+        let gate = TempDir::new().unwrap();
+        let line_seen = gate.path().join("line-seen");
         let tmp = fake_ssh(&format!(
-            "leftover {} {}\nerr ssh: connection closed\\n\nexit 255",
+            "leftover {} {}\nerr ssh: connection closed\\n\nwait-for {}\nexit 255",
             2 * HANG.as_secs(),
-            assert_cmd::cargo::cargo_bin("fake_ssh").display()
+            assert_cmd::cargo::cargo_bin("fake_ssh").display(),
+            line_seen.display()
         ));
         // tendr gives ssh its stdout, for remote output to stream straight
         // through, and the fake ssh, like an ssh without a handle allow-list,
@@ -496,7 +501,6 @@ fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
             .args(args)
             .env("PATH", tmp.path())
             .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
-            .env(PRE_HELLO_RELAY.0, PRE_HELLO_RELAY.1)
             .stdin(std::process::Stdio::null())
             .stdout(std::fs::File::create(out_dir.path().join("stdout")).unwrap())
             .stderr(std::process::Stdio::piped())
@@ -505,48 +509,71 @@ fn host_call_that_exits_without_hello_is_not_held_open_by_a_leftover_process() {
         let mut caller_stderr = child.stderr.take().unwrap();
         let (read, stderr_read) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut stderr = String::new();
-            let _ = caller_stderr.read_to_string(&mut stderr);
-            let _ = read.send(stderr);
+            let mut chunk = [0u8; 4096];
+            while let Ok(n @ 1..) = caller_stderr.read(&mut chunk) {
+                if read.send(chunk[..n].to_vec()).is_err() {
+                    return;
+                }
+            }
         });
+        let mut stderr = Vec::new();
+        let deadline = std::time::Instant::now() + HANG;
+        while !String::from_utf8_lossy(&stderr).contains("ssh: connection closed") {
+            match stderr_read
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(chunk) => stderr.extend(chunk),
+                Err(e) => {
+                    let _ = child.kill();
+                    panic!(
+                        "{args:?}: ssh's line never reached the caller ({e}): {}",
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+            }
+        }
+        std::fs::write(&line_seen, b"").unwrap();
         let status =
             poll_child_exit(&mut child, HANG, Duration::from_millis(20)).unwrap_or_else(|e| {
                 let _ = child.kill();
                 panic!("{args:?}: the call was held open: {e}")
             });
-        let stderr = stderr_read
-            .recv_timeout(HANG)
-            .unwrap_or_else(|e| panic!("{args:?}: the caller's stderr was held open: {e}"));
+        loop {
+            match stderr_read
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(chunk) => stderr.extend(chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(e) => panic!("{args:?}: the caller's stderr was held open: {e}"),
+            }
+        }
+        let stderr = String::from_utf8_lossy(&stderr);
 
         assert_eq!(status.code(), Some(1), "{args:?}: {stderr}");
-        assert!(
-            stderr.contains("ssh: connection closed"),
-            "{args:?}: {stderr}"
-        );
         assert!(stderr.contains("exit 255"), "{args:?}: {stderr}");
     }
 }
 
-/// Once the remote tendr has said hello the deadline no longer applies: a
-/// call that runs on long after it (`wait`, `log -f`) is left alone. The hello
-/// itself is not shown; everything else on stderr is, in order, including a
-/// fragment without a newline that a login shell's rc file wrote just before
-/// tendr started, which the hello is glued onto.
+/// The remote tendr's hello is not shown; everything else on stderr is, in
+/// order, including a fragment without a newline that a login shell's rc
+/// file wrote just before tendr started, which the hello is glued onto. That
+/// the deadline no longer applies once the hello has come is the unit test
+/// `ssh::tests::only_a_call_without_its_hello_misses_the_deadline`: here it
+/// would take a call outliving a deadline that load cannot outlast.
 #[test]
-fn host_call_runs_past_the_deadline_once_the_remote_tendr_says_hello() {
+fn host_call_relays_everything_on_stderr_but_the_hello() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let tmp = fake_ssh(&format!(
         "err ssh: before hello\\n\n\
          err rc says hi \n\
          err {}\\n\n\
-         sleep 3\n\
          out remote result\\n\n\
          err remote: after hello\\n\n\
          exit 0",
         tendr::ssh::HELLO_LINE
     ));
-    let output = host_call(&tmp, "2", &["wait", "job"]);
+    let output = host_call(&tmp, CONNECTS, &["wait", "job"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(0), "{stderr}");
