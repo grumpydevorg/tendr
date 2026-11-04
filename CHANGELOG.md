@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Event logs start a new segment every 64 MiB.** A session's
+  `events/*.jsonl` grew in one file for as long as the session existed. Once
+  the newest segment reaches 64 MiB, the next append starts a new one that
+  opens with a `segment.opened` event naming the full segment. Segments
+  are never renamed and are kept until the session is pruned, so cursors
+  taken before a rotation stay valid, and `events`, `events --follow`,
+  `watch` and `query` read across them. Mixed versions: an older `tendr`
+  writing into the same session appends to the newest segment and never
+  starts one, which is harmless.
+- **`prune --older-than` sweeps `~/.tendr/lost+found` and
+  `~/.tendr/callbacks`.** Both grew for ever. With `--older-than <d>`, prune
+  now also removes lost+found events stamped more than `<d>` ago and
+  `--on-exit` result files written more than `<d>` ago, only in
+  `--namespace` when one is given, and reports them as `lost_found_removed`
+  and `callbacks_removed` in its summary line (their bytes count in
+  `bytes_reclaimed`). The lost+found rewrite holds the lock appenders now
+  take before opening the file, so a concurrent `emit` never loses an event;
+  an `emit` from an older `tendr` takes the lock after opening and can.
+
+### Changed
+
+- **PowerShell `exec` keeps variables and functions between calls.** Each
+  `exec` ran its code in a scope of its own, so `$x = 42` or
+  `function f {}` was gone by the next call unless written as `$global:`.
+  The code now runs in the session's own scope, as if typed at its prompt,
+  under both Windows PowerShell 5.1 and pwsh 7, and the frame removes its
+  own variables afterwards. The PowerShell frame also exports
+  `TENDR_BLOCK_ID` while the code runs, as the POSIX shell frame does, so a
+  `tendr emit` inside it chains to the exec. Over `--host` this needs the
+  remote `tendr` to be 0.8.0 or later.
+
 ## v0.7.2 — attach, push and exec fixes
 
 No protocol change: works with 0.7.1, 0.7.0, 0.6.0 and 0.5.0 exactly as 0.7.1

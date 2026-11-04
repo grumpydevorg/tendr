@@ -130,7 +130,10 @@ back (`src/exec_frame.rs`, `src/commands/exec.rs`):
   stdout, stderr, exit code and working directory, and writes them as JSON
   to `exec-results/<token>.json` (temporary file, then rename). `exec` polls
   for the file and reads it; the file is removed with the exec's record (see
-  [Timeouts](#timeouts)). A Python traceback is appended to stderr.
+  [Timeouts](#timeouts)). A Python traceback is appended to stderr. The
+  PowerShell frame dot-sources the code in the session's scope, so its
+  variables and functions persist, and exports `TENDR_BLOCK_ID` for the
+  code only.
 - **Request id (NDJSON).** The command is one JSON object; `exec` adds
   `"id": "<token>"` and writes it as one line. A request that is not one
   object, or already has an `id`, exits 2 before the exec lock or any event.

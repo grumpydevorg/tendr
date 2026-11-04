@@ -58,6 +58,7 @@
             fileset = fs.unions [
               ./Cargo.toml
               ./Cargo.lock
+              ./build.rs
               ./src
               ./tests
               ./docs/guide.md

@@ -10,12 +10,13 @@ readme = "README.md"
 default-run = "tendr"
 keywords = ["cli", "supervisor", "agent", "process", "session"]
 categories = ["command-line-utilities", "development-tools"]
-# Whitelist the crate package: public source, the embedded skill, the guide the
-# binary include_str!s, README, and licenses. Keep src/bin test helpers and
-# examples/ (development aids such as dump-recording) out of the package so
-# crates.io installs only `tendr`, while local builds can still auto-discover
-# them.
+# Whitelist the crate package: the build script, public source, the embedded
+# skill, the guide the binary include_str!s, README, and licenses. Keep
+# src/bin test helpers and examples/ (development aids such as
+# dump-recording) out of the package so crates.io installs only `tendr`,
+# while local builds can still auto-discover them.
 include = [
+    "/build.rs",
     "/src/*.rs",
     "/src/commands/**/*",
     "/src/embedded/**/*",

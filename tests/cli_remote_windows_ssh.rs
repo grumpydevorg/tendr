@@ -591,7 +591,8 @@ fn push_wait_kill_and_exit_codes_round_trip() {
 
 /// `exec` into a Windows PowerShell session: the payload, shell syntax and
 /// non-ASCII included, runs in the session and its output comes back
-/// exactly. The session sees no pwsh 7 module directory on `PSModulePath`,
+/// exactly, and a variable or function one exec defines is there for the
+/// next. The session sees no pwsh 7 module directory on `PSModulePath`,
 /// even when pwsh 7 is the login shell that started tendr: Windows
 /// PowerShell loading pwsh 7's modules swallowed the first exec on ARM64.
 #[test]
@@ -633,6 +634,33 @@ fn exec_runs_in_a_powershell_session() {
                 ),
                 Err(e) => failures.0.push(format!(
                     "exec output is not JSON ({e}): {}",
+                    describe(&output)
+                )),
+            }
+            let exec = |code: &str| {
+                remote.tendr(&[
+                    "exec",
+                    "ps",
+                    "--namespace",
+                    &ns,
+                    "--timeout",
+                    "600",
+                    "--",
+                    code,
+                ])
+            };
+            let output = exec("$kept = 42; function kept { 7 }");
+            failures.check(output.status.success(), || {
+                format!("exec defining state: {}", describe(&output))
+            });
+            let output = exec("\"$kept $(kept)\"");
+            match serde_json::from_slice::<Value>(&output.stdout) {
+                Ok(result) => failures.check(
+                    output.status.success() && result["stdout"] == "42 7\r\n",
+                    || format!("state lost between execs: {}", describe(&output)),
+                ),
+                Err(e) => failures.0.push(format!(
+                    "state exec output is not JSON ({e}): {}",
                     describe(&output)
                 )),
             }

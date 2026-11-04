@@ -55,7 +55,7 @@ create no state of their own.
 |---|---|---|
 | `meta.json` | sidecar; CLI reconciliation | Written to `meta.json.tmp`, then renamed. |
 | `output.log` | sidecar; `wrap`; `exec` | Append-only JSONL. See tags below. |
-| `events/<uuidv7>.jsonl` | sidecar; `emit`; `exec`; `wrap`; reconciliation | Append-only. Format: [07-event-protocol.md](07-event-protocol.md). |
+| `events/<uuidv7>.jsonl` | sidecar; `emit`; `exec`; `wrap`; reconciliation | Append-only segments, never renamed. Format: [07-event-protocol.md](07-event-protocol.md). |
 | `events/blobs/<sha256>` | any event writer | Payloads over 16 KiB, keyed by SHA-256. |
 | `recording/<run_id>/seg-<index:08>.tndrrec` | sidecar (PTY sessions) | Directories `0700`, segments `0600` on Unix. Format: [08-pty-recording-format.md](08-pty-recording-format.md). |
 | `~/.tendr/callbacks/<run_id>.json` | sidecar | `--on-exit` results. Outside the session dir, so it survives `--replace`. |
@@ -68,6 +68,23 @@ create no state of their own.
 | `O` | stdout, or the merged PTY output |
 | `E` | stderr (pipe sessions only) |
 | `A` | annotations written by `wrap` and `exec` |
+
+## Limits
+
+What bounds each growing file, and what removes it. Nothing is removed by
+time alone: removal is `prune` or `start --replace`.
+
+| File | Limit | Removed by |
+|---|---|---|
+| `output.log` | None: one file, no rotation. | `prune` or `--replace`, with the session. |
+| `events/<uuidv7>.jsonl` | A new segment starts once the newest reaches 64 MiB, with a `segment.opened` event ([07-event-protocol.md §3.3](07-event-protocol.md#33-segments)). No cap on the number of segments. | `prune` or `--replace`, with the session. |
+| `events/blobs/<sha256>` | One file per distinct payload over 16 KiB; not rotated. | `prune` or `--replace`, with the session. |
+| `recording/<run_id>/` | 64 MiB segments; recording stops at 1 GiB and the session keeps running ([08-pty-recording-format.md](08-pty-recording-format.md)). | `prune` or `--replace`, with the session. |
+| `~/.tendr/lost+found/events.jsonl` | None. | `prune --older-than <d>`: events whose `ts` is older than `<d>` ([07-event-protocol.md §7](07-event-protocol.md#7-orphan-emitters-lostfound)). |
+| `~/.tendr/callbacks/<run_id>.json` | One small file per run with `--on-exit`. | `prune --older-than <d>`: files last written more than `<d>` ago. |
+
+With `--namespace`, `prune --older-than` removes only that namespace's
+lost+found events and callback files.
 
 ## Control files
 
@@ -88,6 +105,7 @@ once used.
 | `exec.pending.json` (via `exec.pending.json.tmp`) | The exec whose frame was sent and not yet seen to finish. A later exec refuses to send until that frame finishes ([05-key-flows.md](05-key-flows.md#timeouts)). | `exec` removes it once it has the result; otherwise kept until the next exec sees the frame finish. |
 | `exec-results/<token>.json` | Result file for a Python REPL or PowerShell exec. | Removed with `exec.pending.json`. |
 | `events/append.lock` | Unix advisory lock for event appends. | Stays; only the lock matters. |
+| `~/.tendr/lost+found/append.lock` | Lock that lost+found appends and `prune` take, on every platform. | Stays; only the lock matters. |
 | `a.sock.path` (via `a.sock.path.tmp`) | Path of the PTY attach socket. | Removed with the socket when the run ends. |
 
 ## PTY attach socket

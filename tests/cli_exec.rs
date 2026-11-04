@@ -1300,6 +1300,13 @@ fn exec_duckdb_path_with_spaces() {
 
 #[cfg(windows)]
 fn powershell_start_args(session: &str) -> Vec<String> {
+    powershell_session_args(session, "powershell")
+}
+
+/// `start` arguments for a `--exec-target powershell` session running
+/// `shell` (`powershell` for Windows PowerShell 5.1, `pwsh` for 7).
+#[cfg(windows)]
+fn powershell_session_args(session: &str, shell: &str) -> Vec<String> {
     // Plain `powershell -NoProfile` enters interactive REPL mode and reads
     // commands from the persistent stdin pipe. `-Command -` would buffer
     // until EOF and only execute once — incompatible with multiple execs.
@@ -1310,7 +1317,7 @@ fn powershell_start_args(session: &str) -> Vec<String> {
         "--exec-target",
         "powershell",
         "--",
-        "powershell",
+        shell,
         "-NoProfile",
     ]
     .iter()
@@ -1446,10 +1453,59 @@ fn exec_powershell_pipeline() {
     );
 }
 
-/// PowerShell exec: variables persist across exec calls (same REPL session).
+/// PowerShell exec: what one exec defines, the next sees, as at the prompt:
+/// plain variables, functions, the location and the environment.
+#[cfg(windows)]
+fn powershell_state_persists_across_calls(shell: &str) {
+    let _lock = lock();
+    let root = Home::new();
+
+    harness::tendr(&root)
+        .args(powershell_session_args("ps", shell))
+        .assert()
+        .success();
+    harness::wait_running(&root, "ps");
+
+    let exec = |code: &str| {
+        let output = harness::tendr(&root)
+            .args(["exec", "ps", "--timeout", EXEC_TIMEOUT, "--", code])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{shell} exec {code:?} failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        result["stdout"].as_str().unwrap().trim().to_owned()
+    };
+
+    exec("$x = 42; function f { 7 }; Set-Location C:\\; $env:TENDR_TEST_STATE = 'kept'");
+    assert_eq!(
+        exec("\"$x $(f) $env:TENDR_TEST_STATE $((Get-Location).Path)\""),
+        "42 7 kept C:\\",
+        "{shell} lost state between execs"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn exec_powershell_state_persists_across_calls() {
+    powershell_state_persists_across_calls("powershell");
+}
+
+#[cfg(windows)]
+#[test]
+fn exec_pwsh_state_persists_across_calls() {
+    powershell_state_persists_across_calls("pwsh");
+}
+
+/// PowerShell exec: a payload sharing the frame's scope cannot wedge it.
+/// Assigning or removing the frame's variable is an error, a stray `break`
+/// ends only the payload, and each time the next exec still works.
+#[cfg(windows)]
+#[test]
+fn exec_powershell_payload_cannot_break_the_frame() {
     let _lock = lock();
     let root = Home::new();
 
@@ -1459,40 +1515,26 @@ fn exec_powershell_state_persists_across_calls() {
         .success();
     harness::wait_running(&root, "ps");
 
-    // Set a variable
-    harness::tendr(&root)
-        .args([
-            "exec",
-            "ps",
-            "--timeout",
-            EXEC_TIMEOUT,
-            "--",
-            "$global:tendr_test_var = 42",
-        ])
-        .assert()
-        .success();
+    let exec = |code: &str| {
+        let output = harness::tendr(&root)
+            .args(["exec", "ps", "--timeout", EXEC_TIMEOUT, "--", code])
+            .output()
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("exec {code:?} output is not JSON ({e}): {output:?}"));
+        assert_eq!(result["timed_out"], false, "exec {code:?} wedged the frame");
+        (
+            result["exit_code"].as_i64().unwrap(),
+            result["stdout"].as_str().unwrap().trim().to_owned(),
+        )
+    };
 
-    // Read it back in a separate exec
-    let output = harness::tendr(&root)
-        .args([
-            "exec",
-            "ps",
-            "--timeout",
-            EXEC_TIMEOUT,
-            "--",
-            "$global:tendr_test_var",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "exec failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["exit_code"].as_i64(), Some(0));
-    assert_eq!(result["stdout"].as_str().unwrap().trim(), "42");
+    for code in ["$__tendr_frame = 1", "Remove-Variable __tendr_frame"] {
+        assert_eq!(exec(code).0, 1, "{code:?} must fail");
+        assert_eq!(exec("'alive'"), (0, "alive".to_owned()), "after {code:?}");
+    }
+    assert_eq!(exec("'before'; break; 'after'"), (0, "before".to_owned()));
+    assert_eq!(exec("'alive'"), (0, "alive".to_owned()), "after break");
 }
 
 /// PowerShell exec: Write-Error goes to stderr field, not stdout.
@@ -1837,25 +1879,27 @@ fn exec_event_append_is_best_effort() {
     assert!(envelope["stdout"].as_str().unwrap().contains("still fine"));
 }
 
-/// The PosixShell frame exports TENDR_BLOCK_ID for the payload's duration:
-/// the payload sees exactly the block_id its exec events carry.
-#[cfg_attr(
-    windows,
-    ignore = "PowerShell TENDR_BLOCK_ID env propagation — windows-parity, PowerShell state"
-)]
+/// The shell frames export TENDR_BLOCK_ID for the payload's duration: the
+/// payload sees exactly the block_id its exec events carry.
 #[test]
 fn exec_payload_sees_block_id_env() {
     let _lock = lock();
     let root = Home::new();
 
     harness::tendr(&root)
-        .args(["start", "shell", "--stdin", "--", "bash"])
+        .args(native_shell_start_args("shell"))
         .assert()
         .success();
     harness::wait_running(&root, "shell");
 
+    let payload: &[&str] = if cfg!(windows) {
+        &["$env:TENDR_BLOCK_ID"]
+    } else {
+        &["printenv", "TENDR_BLOCK_ID"]
+    };
     let output = harness::tendr(&root)
-        .args(["exec", "shell", "--", "printenv", "TENDR_BLOCK_ID"])
+        .args(["exec", "shell", "--timeout", EXEC_TIMEOUT, "--"])
+        .args(payload)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -2093,10 +2137,8 @@ fn exec_frame_empty_cmd_exits_2() {
 /// ignored set can never grow silently and every name stays tracked.
 #[test]
 fn windows_ignored_exec_set_is_exactly_tracked() {
-    // Tracked parity gaps (see the attribute above each named test):
-    //   exec_payload_sees_block_id_env — PowerShell has no TENDR_BLOCK_ID env
-    //     propagation yet (windows-parity, PowerShell state).
-    const EXPECTED: &[&str] = &["exec_payload_sees_block_id_env"];
+    // Tracked parity gaps (see the attribute above each named test): none.
+    const EXPECTED: &[&str] = &[];
 
     let src = include_str!("cli_exec.rs");
     // Scan only the source *before* this guard, so the guard's own body can
