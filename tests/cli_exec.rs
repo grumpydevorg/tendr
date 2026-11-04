@@ -8,6 +8,14 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `--timeout` for an exec that must not time out: as long as
+/// [`harness::HANG`], so it only ever stops an exec that hangs, however
+/// loaded the machine. (A fresh Windows PowerShell 5.1 session's first
+/// command from a module it has not loaded yet can take 22-38 s on GitHub's
+/// windows-11-arm runner while 5.1 analyses the installed modules, run
+/// 41308875674.)
+const EXEC_TIMEOUT: &str = "120";
+
 /// Returns the Python interpreter argv for the current platform.
 /// POSIX: `["python3", "-i"]`, Windows: `["py", "-3", "-i"]`.
 fn python_repl_argv() -> &'static [&'static str] {
@@ -216,7 +224,7 @@ fn exec_session_no_stdin() {
     let _lock = lock();
     let root = tempfile::TempDir::new().unwrap();
     harness::tendr(&root)
-        .args(["start", "job1", "--", "sleep", "30"])
+        .args(["start", "job1", "--", "sleep", "3600"])
         .assert()
         .success();
     let _session = harness::SessionGuard::new(&root, "job1");
@@ -428,7 +436,8 @@ fn exec_timeout() {
         "1".to_string(),
         "--".to_string(),
     ];
-    args.extend(native_sleep(4));
+    // Never ends by itself: the timeout is the only way out.
+    args.extend(native_sleep(3600));
     let output = harness::tendr(&root).args(args).output().unwrap();
 
     assert_eq!(output.status.code(), Some(124));
@@ -457,10 +466,11 @@ fn exec_concurrent_busy() {
     let _session = harness::SessionGuard::new(&root, "shell");
     harness::wait_running(&root, "shell");
 
-    // Start a long exec in the background (holds the exec lock while it sleeps)
+    // Start a long exec in the background (holds the exec lock while it
+    // sleeps; it never ends by itself)
     let mut long_exec = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .env("HOME", root.path())
-        .args(exec_argv("shell", native_sleep(30)))
+        .args(exec_argv("shell", native_sleep(3600)))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -525,7 +535,7 @@ fn exec_none_target_rejected() {
     let root = tempfile::TempDir::new().unwrap();
     // sleep is not a shell — infers ExecTarget::None
     harness::tendr(&root)
-        .args(["start", "sleeper", "--stdin", "--", "sleep", "60"])
+        .args(["start", "sleeper", "--stdin", "--", "sleep", "3600"])
         .assert()
         .success();
     let _session = harness::SessionGuard::new(&root, "sleeper");
@@ -639,7 +649,7 @@ fn exec_python_repl_basic() {
             "exec",
             "py",
             "--timeout",
-            "10",
+            EXEC_TIMEOUT,
             "--",
             "print('hello from python')",
         ])
@@ -684,7 +694,7 @@ fn exec_python_repl_exception() {
             "exec",
             "py",
             "--timeout",
-            "10",
+            EXEC_TIMEOUT,
             "--",
             "raise ValueError('boom')",
         ])
@@ -716,7 +726,7 @@ fn exec_python_repl_cwd() {
     // Use forward slashes — valid on Windows and avoids raw string edge cases
     let chdir_code = format!("import os; os.chdir('{}')", tmp_str.replace('\\', "/"));
     let output = harness::tendr(&root)
-        .args(["exec", "py", "--timeout", "10", "--", &chdir_code])
+        .args(["exec", "py", "--timeout", EXEC_TIMEOUT, "--", &chdir_code])
         .output()
         .unwrap();
 
@@ -823,7 +833,7 @@ fn exec_duckdb_basic_select() {
             "exec",
             "db",
             "--timeout",
-            "10",
+            EXEC_TIMEOUT,
             "--",
             "SELECT 42 as answer;",
         ])
@@ -885,7 +895,7 @@ fn exec_duckdb_sql_error() {
             "exec",
             "db",
             "--timeout",
-            "10",
+            EXEC_TIMEOUT,
             "--",
             "SELECT * FROM nonexistent_table_xyz;",
         ])
@@ -921,7 +931,7 @@ fn exec_duckdb_sql_error() {
             "exec",
             "db",
             "--timeout",
-            "10",
+            EXEC_TIMEOUT,
             "--",
             "SELECT 'recovered' as status;",
         ])
@@ -966,7 +976,7 @@ fn exec_duckdb_multi_statement() {
             "exec",
             "db",
             "--timeout",
-            "10",
+            EXEC_TIMEOUT,
             "--",
             "SELECT 1 as a;\nSELECT 2 as b;",
         ])
@@ -1022,7 +1032,7 @@ fn exec_duckdb_explicit_target() {
             "exec",
             "db",
             "--timeout",
-            "10",
+            EXEC_TIMEOUT,
             "--",
             "SELECT 'hello' as greeting;",
         ])
@@ -1068,7 +1078,7 @@ fn exec_duckdb_mixed_success_reports_error() {
             "exec",
             "db",
             "--timeout",
-            "10",
+            EXEC_TIMEOUT,
             "--",
             "SELECT 1 as ok;\nSELECT * FROM nonexistent_table_xyz;",
         ])
@@ -1129,22 +1139,18 @@ fn exec_duckdb_path_with_spaces() {
     cmd.assert().success();
 
     // Wait for running
-    harness::poll_until(
-        std::time::Duration::from_secs(5),
-        std::time::Duration::from_millis(100),
-        || {
-            let mut status_cmd = assert_cmd::Command::cargo_bin("tendr").unwrap();
-            status_cmd.env("HOME", &spaced_dir);
-            status_cmd.args(["status", "db"]);
-            let out = status_cmd.output().unwrap();
-            let s = String::from_utf8_lossy(&out.stdout);
-            if out.status.success() && s.contains("Running") {
-                harness::Observation::Ready(())
-            } else {
-                harness::Observation::Pending(format!("status exit {}: {s}", out.status))
-            }
-        },
-    )
+    harness::poll_until(harness::HANG, std::time::Duration::from_millis(100), || {
+        let mut status_cmd = assert_cmd::Command::cargo_bin("tendr").unwrap();
+        status_cmd.env("HOME", &spaced_dir);
+        status_cmd.args(["status", "db"]);
+        let out = status_cmd.output().unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        if out.status.success() && s.contains("Running") {
+            harness::Observation::Ready(())
+        } else {
+            harness::Observation::Pending(format!("status exit {}: {s}", out.status))
+        }
+    })
     .unwrap_or_else(|e| panic!("timed out waiting for db to start: {e}"));
 
     let mut exec_cmd = assert_cmd::Command::cargo_bin("tendr").unwrap();
@@ -1153,7 +1159,7 @@ fn exec_duckdb_path_with_spaces() {
         "exec",
         "db",
         "--timeout",
-        "10",
+        EXEC_TIMEOUT,
         "--",
         "SELECT 42 as answer;",
     ]);
@@ -1187,14 +1193,6 @@ fn exec_duckdb_path_with_spaces() {
 // envelope is clean (no prompt, no echoed framing), stderr is partitioned
 // from stdout, exit codes propagate, state persists across exec calls, and
 // cwd_after tracks Set-Location.
-
-/// `--timeout` for an exec into a fresh Windows PowerShell 5.1 session. Its
-/// first command from a module it has not loaded yet makes 5.1 analyse the
-/// installed modules when it has no module analysis cache: 22-38 s on
-/// GitHub's windows-11-arm runner whether cmd.exe or tendr starts it, under
-/// 0.5 s on x64 (run 41308875674).
-#[cfg(windows)]
-const PS_EXEC_TIMEOUT: &str = "90";
 
 #[cfg(windows)]
 fn powershell_start_args(session: &str) -> Vec<String> {
@@ -1239,7 +1237,7 @@ fn exec_powershell_clean_stdout() {
             "exec",
             "ps",
             "--timeout",
-            PS_EXEC_TIMEOUT,
+            EXEC_TIMEOUT,
             "--",
             "echo hello-world",
         ])
@@ -1288,7 +1286,7 @@ fn exec_powershell_arbitrary_expression() {
             "exec",
             "ps",
             "--timeout",
-            PS_EXEC_TIMEOUT,
+            EXEC_TIMEOUT,
             "--",
             "$x = 1; $x + 1",
         ])
@@ -1324,7 +1322,7 @@ fn exec_powershell_pipeline() {
             "exec",
             "ps",
             "--timeout",
-            PS_EXEC_TIMEOUT,
+            EXEC_TIMEOUT,
             "--",
             "1..3 | ForEach-Object { $_ * 10 }",
         ])
@@ -1367,7 +1365,7 @@ fn exec_powershell_state_persists_across_calls() {
             "exec",
             "ps",
             "--timeout",
-            PS_EXEC_TIMEOUT,
+            EXEC_TIMEOUT,
             "--",
             "$global:tendr_test_var = 42",
         ])
@@ -1380,7 +1378,7 @@ fn exec_powershell_state_persists_across_calls() {
             "exec",
             "ps",
             "--timeout",
-            PS_EXEC_TIMEOUT,
+            EXEC_TIMEOUT,
             "--",
             "$global:tendr_test_var",
         ])
@@ -1416,7 +1414,7 @@ fn exec_powershell_stderr_separated() {
             "exec",
             "ps",
             "--timeout",
-            PS_EXEC_TIMEOUT,
+            EXEC_TIMEOUT,
             "--",
             "Write-Error 'oops'",
         ])
@@ -1457,7 +1455,7 @@ fn exec_powershell_cwd_after() {
             "exec",
             "ps",
             "--timeout",
-            PS_EXEC_TIMEOUT,
+            EXEC_TIMEOUT,
             "--",
             "Set-Location C:\\",
         ])
@@ -1495,7 +1493,7 @@ fn exec_python_result_file_cleaned() {
             "exec",
             "py",
             "--timeout",
-            "10",
+            EXEC_TIMEOUT,
             "--",
             "print('cleanup test')",
         ])
@@ -1702,7 +1700,8 @@ fn exec_timeout_still_emits_result_event() {
         "1".to_string(),
         "--".to_string(),
     ];
-    args.extend(native_sleep(3));
+    // Never ends by itself: the timeout is the only way out.
+    args.extend(native_sleep(3600));
     let output = harness::tendr(&root).args(args).output().unwrap();
     assert_eq!(output.status.code(), Some(124));
 
@@ -1847,7 +1846,7 @@ fn exec_frame_payload_survives_quoting_torture() {
         "v": 1,
         "session": "shell",
         "cmd": ["printf", "%s\\n", torture],
-        "timeout": 30,
+        "timeout": harness::HANG.as_secs(),
     });
     let output = harness::tendr(&root)
         .args(["exec", "--frame-from-stdin"])
@@ -1880,7 +1879,8 @@ fn exec_frame_timeout_exits_124() {
     let frame = serde_json::json!({
         "v": 1,
         "session": "shell",
-        "cmd": native_sleep(3),
+        // Never ends by itself: the timeout is the only way out.
+        "cmd": native_sleep(3600),
         "timeout": 1,
     });
     let output = harness::tendr(&root)
@@ -2073,7 +2073,15 @@ fn exec_stdout_without_trailing_newline_returns() {
     let _session = posix_shell(&root, "shell");
 
     let output = harness::tendr(&root)
-        .args(["exec", "shell", "--timeout", "5", "--", "printf", "foo"])
+        .args([
+            "exec",
+            "shell",
+            "--timeout",
+            EXEC_TIMEOUT,
+            "--",
+            "printf",
+            "foo",
+        ])
         .assert_within_deadline();
     let output = output.get_output();
     assert!(
@@ -2094,7 +2102,10 @@ fn exec_stderr_marker_is_stripped() {
     let root = tempfile::TempDir::new().unwrap();
     let _session = posix_shell(&root, "shell");
 
+    // The marker arrives, so the grace for a missing one must not cut the
+    // wait short however late the sidecar logs it.
     let output = harness::tendr(&root)
+        .env("TENDR_TEST_ERR_MARKER_GRACE_MS", "3600000")
         .args([
             "exec",
             "shell",
@@ -2191,12 +2202,11 @@ fn ndjson_session<'a>(root: &'a tempfile::TempDir, name: &str) -> harness::Sessi
 fn ndjson_exec(
     root: &tempfile::TempDir,
     name: &str,
-    timeout: u64,
+    timeout: &str,
     request: &str,
 ) -> std::process::Output {
-    let timeout = timeout.to_string();
     harness::tendr(root)
-        .args(["exec", name, "--timeout", &timeout, "--", request])
+        .args(["exec", name, "--timeout", timeout, "--", request])
         .assert_within_deadline()
         .get_output()
         .clone()
@@ -2207,6 +2217,49 @@ fn json(bytes: &[u8]) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(bytes)))
 }
 
+/// `tendr exec <name> -- <request>` in the background.
+fn spawn_exec(root: &tempfile::TempDir, name: &str, request: &str) -> std::process::Child {
+    std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+        .env("HOME", root.path())
+        .args(["exec", name, "--timeout", EXEC_TIMEOUT, "--", request])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// The output of a background `tendr` once it exits, bounded by
+/// [`harness::HANG`].
+fn finish_exec(mut child: std::process::Child) -> std::process::Output {
+    harness::poll_child_exit(
+        &mut child,
+        harness::HANG,
+        std::time::Duration::from_millis(10),
+    )
+    .unwrap_or_else(|e| panic!("exec did not return: {e}"));
+    child.wait_with_output().unwrap()
+}
+
+/// Wait until `session`'s output.log holds the stderr line `line`.
+fn wait_logged_stderr(root: &tempfile::TempDir, session: &str, line: &str) {
+    let log = root
+        .path()
+        .join(format!(".tendr/sessions/default/{session}/output.log"));
+    harness::poll_until(harness::HANG, std::time::Duration::from_millis(10), || {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|l| l["tag"] == "E" && l["content"] == line)
+        {
+            harness::Observation::Ready(())
+        } else {
+            harness::Observation::Pending(format!("{} bytes of log", text.len()))
+        }
+    })
+    .unwrap_or_else(|e| panic!("{session} never logged stderr {line:?}: {e}"));
+}
+
 /// The reply carrying the id tendr added is the result's stdout, verbatim;
 /// other stdout lines are `unmatched` and stderr is `stderr`.
 #[test]
@@ -2215,14 +2268,20 @@ fn exec_ndjson_returns_the_matching_reply() {
     let root = tempfile::TempDir::new().unwrap();
     let _session = ndjson_session(&root, "dev");
 
-    // The child sleeps after its stderr line, so the sidecar has logged it
-    // before the reply.
-    let output = ndjson_exec(
-        &root,
-        "dev",
-        10,
-        r#"{"cmd":"read","push":"telemetry 1","stderr":"diag","sleep_ms":200}"#,
-    );
+    // The child holds its reply until the gate opens, which the test does
+    // once the sidecar has logged the stderr line.
+    let gate = root.path().join("reply-gate");
+    let request = serde_json::json!({
+        "cmd": "read",
+        "push": "telemetry 1",
+        "stderr": "diag",
+        "wait_path": gate,
+    })
+    .to_string();
+    let exec = spawn_exec(&root, "dev", &request);
+    wait_logged_stderr(&root, "dev", "diag");
+    std::fs::write(&gate, b"").unwrap();
+    let output = finish_exec(exec);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let mut keys = EXEC_RESULT_KEYS.map(str::to_owned).to_vec();
     keys.push("unmatched".to_owned());
@@ -2261,7 +2320,7 @@ fn exec_ndjson_failure_reply_exits_1() {
         r#"{"cmd":"open","ok":false}"#,
         r#"{"cmd":"open","error":{"code":"busy"}}"#,
     ] {
-        let output = ndjson_exec(&root, "dev", 10, request);
+        let output = ndjson_exec(&root, "dev", EXEC_TIMEOUT, request);
         assert_eq!(output.status.code(), Some(1), "{request}: {output:?}");
         let result = json(&output.stdout);
         assert_eq!(result["exit_code"], 1, "{result}");
@@ -2293,7 +2352,10 @@ fn exec_ndjson_late_reply_lands_in_the_next_exec() {
     let root = tempfile::TempDir::new().unwrap();
     let _session = ndjson_session(&root, "dev");
 
-    let slow = ndjson_exec(&root, "dev", 1, r#"{"cmd":"slow","sleep_ms":4000}"#);
+    // The child answers the slow request only once it has read the next
+    // one, so the timeout is the only way out of this exec, and the late
+    // reply comes after the next exec has sent its request.
+    let slow = ndjson_exec(&root, "dev", "1", r#"{"cmd":"slow","hold_for_next":true}"#);
     assert_eq!(slow.status.code(), Some(124), "{slow:?}");
     let warning = String::from_utf8_lossy(&slow.stderr);
     assert!(
@@ -2311,7 +2373,7 @@ fn exec_ndjson_late_reply_lands_in_the_next_exec() {
         .expect("request_id on a timeout");
     assert!(!request_id.is_empty(), "{slow}");
 
-    let next = ndjson_exec(&root, "dev", 20, r#"{"cmd":"fast"}"#);
+    let next = ndjson_exec(&root, "dev", EXEC_TIMEOUT, r#"{"cmd":"fast"}"#);
     assert_eq!(next.status.code(), Some(0), "{next:?}");
     let next = json(&next.stdout);
     let reply: serde_json::Value = serde_json::from_str(next["stdout"].as_str().unwrap()).unwrap();
@@ -2344,7 +2406,7 @@ fn exec_ndjson_rejects_bad_requests_with_exit_2() {
     ];
     for args in cases {
         let output = harness::tendr(&root)
-            .args(["exec", "dev", "--timeout", "10", "--"])
+            .args(["exec", "dev", "--timeout", EXEC_TIMEOUT, "--"])
             .args(args)
             .assert_within_deadline()
             .get_output()
@@ -2359,7 +2421,7 @@ fn exec_ndjson_rejects_bad_requests_with_exit_2() {
         .count();
     assert_eq!(started, 0, "a refused request writes no exec event");
 
-    let output = ndjson_exec(&root, "dev", 10, r#"{"cmd":"ping"}"#);
+    let output = ndjson_exec(&root, "dev", EXEC_TIMEOUT, r#"{"cmd":"ping"}"#);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let log = std::fs::read_to_string(root.path().join(".tendr/sessions/default/dev/output.log"))
         .unwrap();
@@ -2378,7 +2440,7 @@ fn exec_ndjson_child_exit_before_reply_fails() {
     let root = tempfile::TempDir::new().unwrap();
     let _session = ndjson_session(&root, "dev");
 
-    let output = ndjson_exec(&root, "dev", 20, r#"{"cmd":"quit","exit":3}"#);
+    let output = ndjson_exec(&root, "dev", EXEC_TIMEOUT, r#"{"cmd":"quit","exit":3}"#);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("session exited while waiting"),
@@ -2520,30 +2582,39 @@ fn exec_once_earlier_finishes(
     cmd: &[&str],
     token: Option<&str>,
 ) -> serde_json::Value {
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
+    harness::poll_until(harness::HANG, std::time::Duration::from_millis(200), || {
         let output = harness::tendr(root)
-            .args(["exec", session, "--timeout", "20", "--"])
+            .args(["exec", session, "--timeout", EXEC_TIMEOUT, "--"])
             .args(cmd)
             .assert_within_deadline()
             .get_output()
             .clone();
         if output.status.success() {
-            return json(&output.stdout);
+            return harness::Observation::Ready(json(&output.stdout));
         }
         assert_refused(&output, token);
-        assert!(
-            std::time::Instant::now() < until,
-            "the earlier exec never finished: {output:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+        harness::Observation::Pending(format!("refused: {output:?}"))
+    })
+    .unwrap_or_else(|e| panic!("the earlier exec never finished: {e}"))
+}
+
+/// A command, run by the session's shell, that ends only once `gate`
+/// exists, then writes `late-out` to stdout and `late-err` to stderr.
+#[cfg(unix)]
+fn gated_shell_command(gate: &std::path::Path) -> String {
+    format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; echo late-out; echo late-err >&2",
+        shell_words::quote(gate.to_str().unwrap())
+    )
 }
 
 /// A timed-out Python REPL exec returns at its deadline. Until its frame
 /// finishes, the next exec is refused with a message that names it, and
 /// nothing is sent; afterwards the next exec gets only its own result, and
 /// the late result file is cleaned up.
+///
+/// The frame ends only once the test opens its gate, after the refusal: the
+/// timeout is the only way the first exec can return.
 #[test]
 fn exec_after_python_timeout_waits_for_the_earlier_frame() {
     let _lock = lock();
@@ -2555,24 +2626,20 @@ fn exec_after_python_timeout_waits_for_the_earlier_frame() {
     let _session = harness::SessionGuard::new(&root, "py");
     harness::wait_running(&root, "py");
 
-    let started = std::time::Instant::now();
+    let gate = root.path().join("frame-gate");
+    let frame = format!(
+        "import os, time; [time.sleep(0.05) for _ in iter(lambda: os.path.exists({:?}), True)]; print('late-py')",
+        gate.to_str().unwrap()
+    );
     let slow = harness::tendr(&root)
-        .args([
-            "exec",
-            "py",
-            "--timeout",
-            "1",
-            "--",
-            "import time; time.sleep(12); print('late-py')",
-        ])
+        .args(["exec", "py", "--timeout", "1", "--", &frame])
         .assert_within_deadline()
         .get_output()
         .clone();
     assert_eq!(slow.status.code(), Some(124), "{slow:?}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(6),
-        "returns at its deadline, not when the frame ends: {:?}",
-        started.elapsed()
+        !String::from_utf8_lossy(&slow.stdout).contains("late-py"),
+        "returns at its deadline, not when the frame ends: {slow:?}"
     );
     let token = timed_out_token(&root, "py");
 
@@ -2582,6 +2649,8 @@ fn exec_after_python_timeout_waits_for_the_earlier_frame() {
         .get_output()
         .clone();
     assert_refused(&too_soon, Some(&token));
+
+    std::fs::write(&gate, b"").unwrap();
 
     let next = exec_once_earlier_finishes(&root, "py", &["print('next')"], Some(&token));
     assert_eq!(
@@ -2603,6 +2672,9 @@ fn exec_after_python_timeout_waits_for_the_earlier_frame() {
 /// A timed-out shell exec returns at its deadline. Until the shell finishes
 /// the command, the next exec is refused with a message that names it; the
 /// command's late stdout and stderr never reach a later exec's result.
+///
+/// The command ends only once the test opens its gate, after the refusal:
+/// the timeout is the only way the first exec can return.
 #[test]
 #[cfg(unix)]
 fn exec_after_shell_timeout_never_gets_the_late_output() {
@@ -2610,18 +2682,17 @@ fn exec_after_shell_timeout_never_gets_the_late_output() {
     let root = tempfile::TempDir::new().unwrap();
     let _session = posix_shell(&root, "shell");
 
-    let started = std::time::Instant::now();
+    let gate = root.path().join("command-gate");
     let slow = harness::tendr(&root)
         .args(["exec", "shell", "--timeout", "1", "--", "bash", "-c"])
-        .arg("sleep 10; echo late-out; echo late-err >&2")
+        .arg(gated_shell_command(&gate))
         .assert_within_deadline()
         .get_output()
         .clone();
     assert_eq!(slow.status.code(), Some(124), "{slow:?}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "returns at its deadline, not when the command ends: {:?}",
-        started.elapsed()
+        !String::from_utf8_lossy(&slow.stdout).contains("late-out"),
+        "returns at its deadline, not when the command ends: {slow:?}"
     );
     let token = timed_out_token(&root, "shell");
 
@@ -2632,6 +2703,8 @@ fn exec_after_shell_timeout_never_gets_the_late_output() {
         .clone();
     assert_refused(&too_soon, Some(&token));
 
+    std::fs::write(&gate, b"").unwrap();
+
     let next = exec_once_earlier_finishes(&root, "shell", &["echo", "next"], Some(&token));
     assert_eq!(next["stdout"], "next", "{next}");
     assert_eq!(next["stderr"], "", "{next}");
@@ -2640,6 +2713,8 @@ fn exec_after_shell_timeout_never_gets_the_late_output() {
 /// An exec whose client dies before the result (killed, or its SSH link
 /// dropped) leaves the same guard as a timeout: the next exec is refused
 /// until the shell finishes, so the late output is never taken as its own.
+/// The command ends only once the test opens its gate, after the client is
+/// gone.
 #[test]
 #[cfg(unix)]
 fn exec_after_a_killed_client_never_gets_the_late_output() {
@@ -2647,16 +2722,11 @@ fn exec_after_a_killed_client_never_gets_the_late_output() {
     let root = tempfile::TempDir::new().unwrap();
     let _session = posix_shell(&root, "shell");
 
+    let gate = root.path().join("command-gate");
     let mut client = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
         .env("HOME", root.path())
-        .args([
-            "exec",
-            "shell",
-            "--",
-            "bash",
-            "-c",
-            "sleep 5; echo late-out",
-        ])
+        .args(["exec", "shell", "--", "bash", "-c"])
+        .arg(gated_shell_command(&gate))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -2666,12 +2736,13 @@ fn exec_after_a_killed_client_never_gets_the_late_output() {
         &root
             .path()
             .join(".tendr/sessions/default/shell/exec.pending.json"),
-        std::time::Duration::from_secs(10),
+        harness::HANG,
         std::time::Duration::from_millis(10),
     )
     .unwrap_or_else(|e| panic!("waiting for the exec to send its frame: {e}"));
     client.kill().unwrap();
     client.wait().unwrap();
+    std::fs::write(&gate, b"").unwrap();
 
     let next = exec_once_earlier_finishes(&root, "shell", &["echo", "next"], None);
     assert_eq!(next["stdout"], "next", "{next}");

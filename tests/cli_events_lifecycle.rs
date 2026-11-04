@@ -2,7 +2,7 @@
 
 mod harness;
 
-use harness::{Observation, poll_until, tendr, wait_running, wait_terminal};
+use harness::{HANG, Observation, poll_until, tendr, wait_running, wait_terminal};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -44,12 +44,12 @@ fn kinds(events: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// Poll until the session's event log contains `kind`, or panic after 10 s.
+/// Poll until the session's event log contains `kind`, or panic at `HANG`.
 fn wait_for_event_kind(root: &TempDir, session: &str, kind: &str) -> Vec<serde_json::Value> {
     let events_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/events"));
-    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         if !events_dir.exists() {
             return Observation::Pending("no events dir".into());
         }
@@ -141,11 +141,19 @@ fn spawn_failure_logs_spawn_failed() {
 fn graceful_kill_logs_run_killed() {
     let root = TempDir::new().unwrap();
     tendr(&root)
-        .args(["start", "s1", "--", "sleep", "30"])
+        .args(["start", "s1", "--", "sleep", "3600"])
         .assert()
         .success();
+    // Never exits by itself: only the kill can end it.
+    let _session = harness::SessionGuard::new(&root, "s1");
     wait_running(&root, "s1");
-    tendr(&root).args(["kill", "s1"]).assert().success();
+    // The sidecar must record the kill itself (run.killed), so `kill` waits for
+    // it up to the hang deadline instead of 11 s.
+    tendr(&root)
+        .env("TENDR_TEST_KILL_WAIT_MS", HANG.as_millis().to_string())
+        .args(["kill", "s1"])
+        .assert()
+        .success();
     wait_terminal(&root, "s1");
     let events = wait_for_event_kind(&root, "s1", "run.killed");
 
@@ -231,10 +239,24 @@ fn crash_before_terminal_event_leaves_neither() {
 #[test]
 fn unwritable_event_log_salvages_terminal_event_to_lost_found() {
     let root = TempDir::new().unwrap();
+    // The child exits (0) only once the gate exists, which the test creates
+    // after the sabotage, so its terminal record is always the one that fails
+    // to append, however slowly the test gets there.
+    let gate = root.path().join("gate");
     tendr(&root)
-        .args(["start", "s1", "--", "sleep", "2"])
+        .args([
+            "start",
+            "s1",
+            "--",
+            "sh",
+            "-c",
+            "until [ -e \"$1\" ]; do sleep 0.05; done",
+            "sh",
+            gate.to_str().unwrap(),
+        ])
         .assert()
         .success();
+    let _session = harness::SessionGuard::new(&root, "s1");
     wait_running(&root, "s1");
 
     // Sabotage: replace the events dir with a regular file so every further
@@ -242,6 +264,7 @@ fn unwritable_event_log_salvages_terminal_event_to_lost_found() {
     let session_dir = root.path().join(".tendr/sessions/default/s1");
     std::fs::remove_dir_all(session_dir.join("events")).unwrap();
     std::fs::write(session_dir.join("events"), "not a dir").unwrap();
+    std::fs::write(&gate, "").unwrap();
 
     let meta = wait_terminal(&root, "s1");
     assert_eq!(meta["status"], "Exited");

@@ -330,6 +330,13 @@ pub fn is_locked(session: &SessionDir) -> Result<bool, SessionError> {
 /// keeps a stuck sidecar from turning those commands into hangs.
 pub const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// [`RELEASE_GRACE`]. Debug builds accept `TENDR_TEST_RELEASE_GRACE_MS` so
+/// tests can hold a session's lock past the grace however slow the machine.
+#[must_use]
+pub fn release_grace() -> std::time::Duration {
+    crate::test_timer::or_env("TENDR_TEST_RELEASE_GRACE_MS", RELEASE_GRACE)
+}
+
 /// Poll until nothing holds the session lock, or `bound` elapses. Returns
 /// `Ok(true)` once the lock is free, `Ok(false)` if `bound` passed first.
 ///

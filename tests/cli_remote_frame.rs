@@ -10,13 +10,16 @@
 
 mod harness;
 
-use harness::{SessionGuard, fake_ssh, shim_path_env, tendr, wait_running, wait_terminal_ns};
+use harness::{
+    HANG, Observation, SessionGuard, fake_ssh, poll_child_exit, poll_until, shim_path_env, tendr,
+    wait_running, wait_terminal_ns,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -45,9 +48,6 @@ const HOSTILE: &str = "& | $ ; ( ) \" ' ` \r\n \u{e9}\u{4e2d} C:\\Program Files\
 /// valid directory name on every platform.
 const HOSTILE_NAME: &str = "x&calc;$(id)`'\u{e9}";
 
-/// How long a streamed line may take to arrive.
-const STREAM_DEADLINE: Duration = Duration::from_secs(20);
-
 /// A fake ssh that records its argv, then forwards to the real tendr.
 struct Remote {
     ssh: TempDir,
@@ -68,21 +68,22 @@ impl Remote {
     }
 
     /// `tendr --host box`, through this remote, with `root` as HOME on both
-    /// sides.
+    /// sides. The connect deadline is far past anything load can do to the
+    /// remote tendr's start: no test here is about it.
     fn command(&self, root: &TempDir) -> std::process::Command {
         let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"));
         cmd.args(["--host", "box"])
             .env("HOME", root.path())
             .env("PATH", shim_path_env(&self.ssh))
             .env("TENDR_TEST_BIN", assert_cmd::cargo::cargo_bin("tendr"))
-            .env_remove("TENDR_SSH_CONNECT_TIMEOUT");
+            .env("TENDR_SSH_CONNECT_TIMEOUT", "600");
         cmd
     }
 
     /// [`Self::command`], run to completion.
     fn tendr(&self, root: &TempDir) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::from_std(self.command(root));
-        cmd.timeout(Duration::from_secs(60));
+        cmd.timeout(HANG);
         cmd
     }
 
@@ -117,38 +118,6 @@ fn outcome(output: &Output) -> (Option<i32>, String, String) {
     )
 }
 
-/// Force-kills a session in `namespace` when dropped.
-struct NsGuard<'a> {
-    root: &'a TempDir,
-    namespace: String,
-    name: String,
-}
-
-impl<'a> NsGuard<'a> {
-    fn new(root: &'a TempDir, namespace: &str, name: &str) -> Self {
-        Self {
-            root,
-            namespace: namespace.to_owned(),
-            name: name.to_owned(),
-        }
-    }
-}
-
-impl Drop for NsGuard<'_> {
-    fn drop(&mut self) {
-        let _ = tendr(self.root)
-            .args([
-                "kill",
-                "--force",
-                "--namespace",
-                &self.namespace,
-                &self.name,
-            ])
-            .timeout(harness::CMD_DEADLINE)
-            .output();
-    }
-}
-
 fn meta_path(root: &TempDir, namespace: &str, session: &str) -> PathBuf {
     root.path()
         .join(".tendr")
@@ -162,13 +131,16 @@ fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
-/// Poll until `check` holds, panicking with `what` after `deadline`.
-fn wait_for(deadline: Duration, what: &str, mut check: impl FnMut() -> bool) {
-    let until = Instant::now() + deadline;
-    while !check() {
-        assert!(Instant::now() < until, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+/// Poll until `check` holds, panicking with `what` if it never does.
+fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
+    poll_until(HANG, Duration::from_millis(20), || {
+        if check() {
+            Observation::Ready(())
+        } else {
+            Observation::Pending(format!("not yet {what}"))
+        }
+    })
+    .unwrap_or_else(|e| panic!("waiting for {what}: {e}"));
 }
 
 /// Lines of `child`'s stdout, as they arrive. The reader lets go of the pipe
@@ -190,19 +162,12 @@ fn stdout_lines(child: &mut Child, limit: usize) -> mpsc::Receiver<String> {
     rx
 }
 
-/// Wait for `child` to exit, killing it and failing after `deadline`.
-fn wait_exit(child: &mut Child, deadline: Duration, what: &str) -> std::process::ExitStatus {
-    let until = Instant::now() + deadline;
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return status;
-        }
-        if Instant::now() >= until {
-            let _ = child.kill();
-            panic!("{what} did not exit within {deadline:?}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+/// Wait for `child` to exit, killing it and failing if it hangs.
+fn wait_exit(child: &mut Child, what: &str) -> std::process::ExitStatus {
+    poll_child_exit(child, HANG, Duration::from_millis(20)).unwrap_or_else(|e| {
+        let _ = child.kill();
+        panic!("{what} did not exit: {e}");
+    })
 }
 
 // -- start: every field and hostile values survive the wire --
@@ -223,17 +188,17 @@ fn host_start_records_every_field_and_hostile_value_exactly() {
 
     // The dependency, and a run of the session for --replace to replace.
     let dep_meta = tendr(&root)
-        .args(["start", "--namespace", &ns, &dep, "--", "sleep", "30"])
+        .args(["start", "--namespace", &ns, &dep, "--", "sleep", "3600"])
         .output()
         .unwrap();
-    let _dep = NsGuard::new(&root, &ns, &dep);
+    let _dep = SessionGuard::new_ns(&root, &ns, &dep);
     assert!(dep_meta.status.success(), "{:?}", outcome(&dep_meta));
     let dep_meta: serde_json::Value = serde_json::from_slice(&dep_meta.stdout).unwrap();
     tendr(&root)
-        .args(["start", "--namespace", &ns, name, "--", "sleep", "30"])
+        .args(["start", "--namespace", &ns, name, "--", "sleep", "3600"])
         .assert()
         .success();
-    let _session = NsGuard::new(&root, &ns, name);
+    let _session = SessionGuard::new_ns(&root, &ns, name);
 
     let env_a = format!("A={HOSTILE}");
     let boundary = format!("container:{HOSTILE}");
@@ -392,7 +357,7 @@ fn host_operations_match_local_byte_for_byte() {
         let local = tendr(&root)
             .args(args)
             .write_stdin("")
-            .timeout(Duration::from_secs(60))
+            .timeout(HANG)
             .output()
             .unwrap();
         let over_host = remote
@@ -410,7 +375,7 @@ fn host_operations_match_local_byte_for_byte() {
     let snapshot = |child: &mut Child| -> Vec<String> {
         let lines = stdout_lines(child, 2);
         (0..2)
-            .map(|_| lines.recv_timeout(STREAM_DEADLINE).expect("snapshot line"))
+            .map(|_| lines.recv_timeout(HANG).expect("snapshot line"))
             .collect()
     };
     let mut local = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
@@ -438,7 +403,7 @@ fn host_operations_match_local_byte_for_byte() {
         ])
         .assert()
         .success();
-    wait_exit(&mut over_host, STREAM_DEADLINE, "watch");
+    wait_exit(&mut over_host, "watch");
 }
 
 // -- streaming --
@@ -468,13 +433,13 @@ fn host_log_follow_streams() {
         Stdio::null(),
     );
     let lines = stdout_lines(&mut child, usize::MAX);
-    let first = lines.recv_timeout(STREAM_DEADLINE).expect("first line");
+    let first = lines.recv_timeout(HANG).expect("first line");
     assert_eq!(first, "first-line");
     assert!(child.try_wait().unwrap().is_none(), "still following");
     remote.assert_constant_argv();
 
     tendr(&root).args(["kill", "follow"]).assert().success();
-    let status = wait_exit(&mut child, STREAM_DEADLINE, "log --follow");
+    let status = wait_exit(&mut child, "log --follow");
     assert_eq!(status.code(), Some(0));
 }
 
@@ -485,10 +450,18 @@ fn host_watch_streams() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     tendr(&root)
-        .args(["start", "--namespace", "watched", "w", "--", "sleep", "30"])
+        .args([
+            "start",
+            "--namespace",
+            "watched",
+            "w",
+            "--",
+            "sleep",
+            "3600",
+        ])
         .assert()
         .success();
-    let _session = NsGuard::new(&root, "watched", "w");
+    let _session = SessionGuard::new_ns(&root, "watched", "w");
 
     let remote = Remote::new();
     let mut child = remote.spawn(
@@ -499,7 +472,7 @@ fn host_watch_streams() {
     // The reader lets go after one line, so the remote watch fails its next
     // write once the session ends, and exits.
     let lines = stdout_lines(&mut child, 1);
-    let first = lines.recv_timeout(STREAM_DEADLINE).expect("first record");
+    let first = lines.recv_timeout(HANG).expect("first record");
     let record: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(record["session"], "w");
     assert!(child.try_wait().unwrap().is_none(), "still watching");
@@ -509,7 +482,7 @@ fn host_watch_streams() {
         .args(["kill", "--namespace", "watched", "w"])
         .assert()
         .success();
-    wait_exit(&mut child, STREAM_DEADLINE, "watch");
+    wait_exit(&mut child, "watch");
 }
 
 // -- push: the body follows the header --
@@ -548,7 +521,7 @@ fn host_push_preserves_binary_bytes() {
     assert_eq!(output.status.code(), Some(0), "{:?}", outcome(&output));
     remote.assert_constant_argv();
 
-    wait_for(STREAM_DEADLINE, "every pushed byte", || {
+    wait_for("every pushed byte", || {
         std::fs::metadata(&out).is_ok_and(|m| m.len() >= body.len() as u64)
     });
     assert!(std::fs::read(&out).unwrap() == body, "bytes differ");
@@ -567,17 +540,17 @@ fn host_push_streams_before_stdin_ends() {
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(b"chunk-1\n").unwrap();
     stdin.flush().unwrap();
-    wait_for(STREAM_DEADLINE, "the first chunk", || {
+    wait_for("the first chunk", || {
         std::fs::read(&out).is_ok_and(|b| b == b"chunk-1\n")
     });
     assert!(child.try_wait().unwrap().is_none(), "push still running");
 
     stdin.write_all(b"chunk-2\n").unwrap();
     drop(stdin);
-    let status = wait_exit(&mut child, STREAM_DEADLINE, "push");
+    let status = wait_exit(&mut child, "push");
     assert_eq!(status.code(), Some(0));
     remote.assert_constant_argv();
-    wait_for(STREAM_DEADLINE, "both chunks", || {
+    wait_for("both chunks", || {
         std::fs::read(&out).is_ok_and(|b| b == b"chunk-1\nchunk-2\n")
     });
 }
@@ -604,7 +577,7 @@ fn host_push_reaches_a_pty_session() {
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{:?}", outcome(&output));
     remote.assert_constant_argv();
-    wait_for(STREAM_DEADLINE, "the pushed line in the log", || {
+    wait_for("the pushed line in the log", || {
         let log = tendr(&root).args(["log", "--raw", "pty"]).output().unwrap();
         String::from_utf8_lossy(&log.stdout).contains("pushed-over-host")
     });
@@ -636,7 +609,8 @@ fn host_ndjson_exec_matches_its_reply() {
 
     let output = remote
         .tendr(&root)
-        .args(["exec", "dev", "--timeout", "20", "--", r#"{"cmd":"read"}"#])
+        .args(["exec", "dev", "--timeout", &HANG.as_secs().to_string()])
+        .args(["--", r#"{"cmd":"read"}"#])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{:?}", outcome(&output));
@@ -685,7 +659,7 @@ fn run_remote_entry(root: &TempDir, stdin: Vec<u8>) -> Output {
     tendr(root)
         .arg("_remote")
         .write_stdin(stdin)
-        .timeout(Duration::from_secs(60))
+        .timeout(HANG)
         .output()
         .unwrap()
 }
@@ -717,7 +691,7 @@ fn remote_entry_refuses_bad_requests_without_side_effects() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let started = tendr(&root)
-        .args(["start", "victim", "--", "sleep", "30"])
+        .args(["start", "victim", "--", "sleep", "3600"])
         .output()
         .unwrap();
     let _victim = SessionGuard::new(&root, "victim");
@@ -856,7 +830,7 @@ fn with_trailer(root: &TempDir, args: &[&str]) -> (Option<i32>, String, String) 
         .arg("--exit-trailer")
         .args(args)
         .write_stdin("")
-        .timeout(Duration::from_secs(60))
+        .timeout(HANG)
         .output()
         .unwrap();
     outcome(&output)
@@ -874,7 +848,7 @@ fn exit_trailer_is_the_last_stderr_line_and_matches_the_exit_code() {
         .success();
     let _failed = SessionGuard::new(&root, "failed");
     tendr(&root)
-        .args(["start", "running", "--", "sleep", "30"])
+        .args(["start", "running", "--", "sleep", "3600"])
         .assert()
         .success();
     let _running = SessionGuard::new(&root, "running");
@@ -889,7 +863,7 @@ fn exit_trailer_is_the_last_stderr_line_and_matches_the_exit_code() {
         let local = tendr(&root)
             .args(args)
             .write_stdin("")
-            .timeout(Duration::from_secs(60))
+            .timeout(HANG)
             .output()
             .unwrap();
         let (got, stdout, stderr) = with_trailer(&root, args);
@@ -941,12 +915,12 @@ fn exit_trailer_leaves_stdin_to_the_command() {
     let output = tendr(&root)
         .args(["--exit-trailer", "push", "wrapped"])
         .write_stdin(body.clone())
-        .timeout(Duration::from_secs(60))
+        .timeout(HANG)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{:?}", outcome(&output));
     assert_eq!(String::from_utf8_lossy(&output.stderr), "tendr-exit 0\n");
-    wait_for(STREAM_DEADLINE, "every pushed byte", || {
+    wait_for("every pushed byte", || {
         std::fs::metadata(&out).is_ok_and(|m| m.len() >= body.len() as u64)
     });
     assert!(std::fs::read(&out).unwrap() == body, "bytes differ");

@@ -24,7 +24,7 @@
 mod harness;
 
 use harness::terminal::{WrappedAttach, tendr_bin};
-use harness::{CMD_DEADLINE, Observation, poll_until};
+use harness::{HANG, Observation, poll_until};
 use std::process::Output;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -58,7 +58,7 @@ fn ssh_batch(host: &str, command: &str) -> std::io::Result<Output> {
         .arg("-T")
         .args(SSH_OPTIONS)
         .args([host, command])
-        .timeout(CMD_DEADLINE)
+        .timeout(HANG)
         .output()
 }
 
@@ -101,12 +101,20 @@ impl Remote {
     }
 
     /// The remote command line that runs tendr with the private HOME, quoted
-    /// for the remote login shell.
+    /// for the remote login shell. A client leaving waits to turn its
+    /// terminal's modes off (`MODES_GRACE`) longer than load can delay it,
+    /// so the tests that check the modes are off never race that grace (a
+    /// release build on the host ignores the variable).
     fn tendr_command(&self, args: &[&str]) -> String {
         let home = format!("HOME={}", self.home);
-        let argv = ["env", &home, &self.tendr]
-            .into_iter()
-            .chain(args.iter().copied());
+        let argv = [
+            "env",
+            &home,
+            "TENDR_TEST_MODES_GRACE_MS=600000",
+            &self.tendr,
+        ]
+        .into_iter()
+        .chain(args.iter().copied());
         shell_words::join(argv)
     }
 
@@ -142,7 +150,7 @@ impl Remote {
     }
 
     fn wait_log_contains(&self, session: &str, needle: &str) -> String {
-        poll_until(Duration::from_secs(15), Duration::from_millis(100), || {
+        poll_until(HANG, Duration::from_millis(100), || {
             let output = self.tendr(&["log", session, "--raw"]);
             let log = String::from_utf8_lossy(&output.stdout).into_owned();
             if log.contains(needle) {
@@ -156,7 +164,7 @@ impl Remote {
 
     /// Wait until the remote `status` shows `pty.control == expected`.
     fn wait_control(&self, session: &str, expected: &str) {
-        poll_until(Duration::from_secs(15), Duration::from_millis(100), || {
+        poll_until(HANG, Duration::from_millis(100), || {
             let output = self.tendr(&["status", session]);
             let control = serde_json::from_slice::<serde_json::Value>(&output.stdout)
                 .map(|meta| meta["pty"]["control"].clone());
@@ -224,12 +232,7 @@ fn ssh_detach_restores_the_terminal_and_turns_the_modes_off() {
     let mut wrapped = attach(&root, &remote, "detach", "ssh-detach");
     wrapped.cli.type_bytes(b"\x1cd");
 
-    assert_eq!(
-        wrapped.wait_exit(Duration::from_secs(15)),
-        0,
-        "{:?}",
-        wrapped.cli.output()
-    );
+    assert_eq!(wrapped.wait_exit(), 0, "{:?}", wrapped.cli.output());
     remote.wait_control("ssh-detach", "AgentControl");
     wrapped.assert_terminal_restored_but_pendin();
     let output = wrapped.cli.output();
@@ -255,7 +258,7 @@ fn ssh_ctrl_right_bracket_passes_through() {
     assert!(!wrapped.exited(), "Ctrl-] must not end the attach");
 
     wrapped.cli.type_bytes(b"\x1cd");
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(wrapped.wait_exit(), 0);
     wrapped.assert_terminal_restored_but_pendin();
 }
 
@@ -284,7 +287,7 @@ fn ssh_paste_with_prefixes_reaches_the_child() {
     assert!(!wrapped.exited(), "a doubled prefix does not detach");
 
     wrapped.cli.type_bytes(b"\x1cd");
-    assert_eq!(wrapped.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(wrapped.wait_exit(), 0);
     wrapped.assert_terminal_restored_but_pendin();
 }
 
@@ -317,12 +320,7 @@ fn ssh_takeover_over_a_stopped_first_client() {
         first.cli.output()
     );
     first.signal(libc::SIGCONT);
-    assert_eq!(
-        first.wait_exit(Duration::from_secs(15)),
-        81,
-        "{:?}",
-        first.cli.output()
-    );
+    assert_eq!(first.wait_exit(), 81, "{:?}", first.cli.output());
     first.assert_terminal_restored_but_pendin();
     let old = first.cli.output();
     let (old_terminal, old_note) = after_modes_on(&old)
@@ -338,6 +336,6 @@ fn ssh_takeover_over_a_stopped_first_client() {
     );
 
     second.cli.type_bytes(b"\x1cd");
-    assert_eq!(second.wait_exit(Duration::from_secs(15)), 0);
+    assert_eq!(second.wait_exit(), 0);
     second.assert_terminal_restored_but_pendin();
 }

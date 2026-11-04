@@ -248,6 +248,7 @@ pub fn parse_since(value: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::HANG;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -453,10 +454,15 @@ mod tests {
 
         let seen = Arc::new(AtomicBool::new(false));
         let seen_for_stop = Arc::clone(&seen);
+        // Set once the follower has written the tail and polls for more.
+        let following = Arc::new(AtomicBool::new(false));
+        let following_for_stop = Arc::clone(&following);
         let path_clone = path.clone();
 
         let appender = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(250));
+            while !following.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+            }
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path_clone)
@@ -473,9 +479,10 @@ mod tests {
             tail: Some(100),
             ..Default::default()
         };
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + HANG;
         let mut writer = SignallingWriter::new(b"appended line", seen);
         follow_log(&path, &query, &mut writer, || {
+            following_for_stop.store(true, Ordering::Release);
             seen_for_stop.load(Ordering::Acquire) || std::time::Instant::now() >= deadline
         })
         .unwrap();
@@ -493,11 +500,16 @@ mod tests {
 
         let seen = Arc::new(AtomicBool::new(false));
         let seen_for_stop = Arc::clone(&seen);
+        // Set once the follower has looked for the file and is waiting.
+        let waiting = Arc::new(AtomicBool::new(false));
+        let waiting_for_stop = Arc::clone(&waiting);
         let path_clone = path.clone();
         let temp_path = dir.path().join("delayed.log.tmp");
 
         let creator = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(300));
+            while !waiting.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+            }
             {
                 let mut f = std::fs::File::create(&temp_path).unwrap();
                 writeln!(
@@ -514,9 +526,10 @@ mod tests {
             tail: Some(100),
             ..Default::default()
         };
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + HANG;
         let mut writer = SignallingWriter::new(b"delayed line", seen);
         follow_log(&path, &query, &mut writer, || {
+            waiting_for_stop.store(true, Ordering::Release);
             seen_for_stop.load(Ordering::Acquire) || std::time::Instant::now() >= deadline
         })
         .unwrap();

@@ -9,7 +9,8 @@ use tempfile::TempDir;
 fn session_guard_kills_the_session_when_the_test_panics() {
     let root = TempDir::new().unwrap();
     tendr(&root)
-        .args(["start", "guarded", "sleep", "60"])
+        // Never ends by itself: only the guard's kill can end it.
+        .args(["start", "guarded", "sleep", "3600"])
         .assert()
         .success();
     wait_running(&root, "guarded");

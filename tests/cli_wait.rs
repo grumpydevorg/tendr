@@ -1,11 +1,33 @@
 mod harness;
 
-use harness::{DeadlineAssertExt, tendr, wait_running, wait_terminal};
+use harness::{DeadlineAssertExt, HANG, tendr, wait_running, wait_terminal};
 use predicates::prelude::*;
 use std::sync::Mutex;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// `tendr kill --force <session>`, waiting for its sidecar to record the end
+/// however long that takes rather than falling back to a direct kill.
+fn kill_forced(root: &TempDir, session: &str) {
+    tendr(root)
+        .env("TENDR_TEST_KILL_WAIT_MS", "3600000")
+        .args(["kill", "--force", session])
+        .assert()
+        .success();
+}
+
+/// Kills a background child on drop, so a failed assertion does not leak it.
+struct KillOnDrop(Option<std::process::Child>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 #[test]
 fn wait_returns_terminal_state() {
@@ -33,22 +55,48 @@ fn wait_blocks_until_exit() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
+    // The child runs until the test opens the gate.
+    let gate = root.path().join("exit-gate");
+    let _open = harness::OpenGate(gate.clone());
+    let script = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done",
+        shell_words::quote(gate.to_str().unwrap())
+    );
     tendr(&root)
-        .args(["start", "wait-block", "sleep", "2"])
+        .args(["start", "wait-block", "--", "sh", "-c", &script])
         .assert()
         .success();
+    let _session = harness::SessionGuard::new(&root, "wait-block");
     wait_running(&root, "wait-block");
 
-    let start = std::time::Instant::now();
-    tendr(&root)
-        .args(["wait", "wait-block"])
-        .assert_within_deadline()
-        .success();
-    let elapsed = start.elapsed();
+    let mut waiter = KillOnDrop(Some(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
+            .args(["wait", "wait-block"])
+            .env("HOME", root.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let child = waiter.0.as_mut().unwrap();
+    // `wait` blocks while the child runs. The sleep waits out a `wait` that
+    // would return at once; under load it can only pass wrongly.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "wait returned while the child still ran"
+    );
 
-    // Lower bound proves `wait` actually blocked until the child exited; the
-    // hang detector (not a fragile 5s upper bound) guards against a true hang.
-    assert!(elapsed > std::time::Duration::from_secs(1));
+    std::fs::write(&gate, b"").unwrap();
+    harness::poll_child_exit(child, HANG, std::time::Duration::from_millis(20))
+        .unwrap_or_else(|e| panic!("wait did not return once the child exited: {e}"));
+    let out = waiter.0.take().unwrap().wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("ExitedOk"));
 }
 
 #[test]
@@ -57,9 +105,10 @@ fn wait_timeout_expires() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "wait-timeout", "sleep", "60"])
+        .args(["start", "wait-timeout", "sleep", "3600"])
         .assert()
         .success();
+    let _session = harness::SessionGuard::new(&root, "wait-timeout");
     wait_running(&root, "wait-timeout");
 
     // The failure + exit 1 + "timeout" stderr prove the product's --timeout
@@ -71,10 +120,7 @@ fn wait_timeout_expires() {
         .code(1)
         .stderr(predicate::str::contains("timeout"));
 
-    tendr(&root)
-        .args(["kill", "--force", "wait-timeout"])
-        .assert()
-        .success();
+    kill_forced(&root, "wait-timeout");
 }
 
 #[test]
@@ -155,9 +201,10 @@ fn wait_any_returns_on_first_terminal() {
         .assert()
         .success();
     tendr(&root)
-        .args(["start", "any-slow", "sleep", "60"])
+        .args(["start", "any-slow", "sleep", "3600"])
         .assert()
         .success();
+    let _any_slow = harness::SessionGuard::new(&root, "any-slow");
     wait_terminal(&root, "any-fast");
     wait_running(&root, "any-slow");
 
@@ -169,16 +216,13 @@ fn wait_any_returns_on_first_terminal() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let arr: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
     // Only the terminal session is in the output — proves `--any` returned on
-    // the terminal session without blocking on the 60s sibling, so no fragile
-    // wall-clock upper bound is needed.
+    // the terminal session without blocking on the sibling, which never ends
+    // by itself, so no wall-clock upper bound is needed.
     assert!(!arr.is_empty());
     assert!(arr.iter().any(|m| m["session"] == "any-fast"));
 
     // Cleanup the slow session.
-    tendr(&root)
-        .args(["kill", "--force", "any-slow"])
-        .assert()
-        .success();
+    kill_forced(&root, "any-slow");
 }
 
 #[test]
@@ -249,13 +293,15 @@ fn wait_multiple_timeout() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "mt-slow1", "sleep", "60"])
+        .args(["start", "mt-slow1", "sleep", "3600"])
         .assert()
         .success();
+    let _mt_slow1 = harness::SessionGuard::new(&root, "mt-slow1");
     tendr(&root)
-        .args(["start", "mt-slow2", "sleep", "60"])
+        .args(["start", "mt-slow2", "sleep", "3600"])
         .assert()
         .success();
+    let _mt_slow2 = harness::SessionGuard::new(&root, "mt-slow2");
     wait_running(&root, "mt-slow1");
     wait_running(&root, "mt-slow2");
 
@@ -269,14 +315,8 @@ fn wait_multiple_timeout() {
         .stderr(predicate::str::contains("timeout"));
 
     // Cleanup.
-    tendr(&root)
-        .args(["kill", "--force", "mt-slow1"])
-        .assert()
-        .success();
-    tendr(&root)
-        .args(["kill", "--force", "mt-slow2"])
-        .assert()
-        .success();
+    kill_forced(&root, "mt-slow1");
+    kill_forced(&root, "mt-slow2");
 }
 
 #[test]
@@ -284,11 +324,13 @@ fn wait_dep_timed_out_exits_124() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    // job1 runs forever; job2 depends on it with a 2s timeout.
+    // job1 never ends by itself; job2 depends on it with a 2s timeout, which
+    // is its only way out.
     tendr(&root)
-        .args(["start", "dep-slow", "sleep", "60"])
+        .args(["start", "dep-slow", "sleep", "3600"])
         .assert()
         .success();
+    let _dep_slow = harness::SessionGuard::new(&root, "dep-slow");
     wait_running(&root, "dep-slow");
 
     tendr(&root)
@@ -304,14 +346,12 @@ fn wait_dep_timed_out_exits_124() {
         ])
         .assert()
         .success();
+    let _dep_waiter = harness::SessionGuard::new(&root, "dep-waiter");
     wait_terminal(&root, "dep-waiter");
 
     tendr(&root).args(["wait", "dep-waiter"]).assert().code(124);
 
-    tendr(&root)
-        .args(["kill", "--force", "dep-slow"])
-        .assert()
-        .success();
+    kill_forced(&root, "dep-slow");
 }
 
 #[test]
@@ -319,31 +359,35 @@ fn wait_killed_during_dep_wait_exits_137() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    // job1 runs forever; job2 depends on it.
+    // job1 never ends by itself; job2 depends on it.
     tendr(&root)
-        .args(["start", "dep-block", "sleep", "60"])
+        .args(["start", "dep-block", "sleep", "3600"])
         .assert()
         .success();
+    let _dep_block = harness::SessionGuard::new(&root, "dep-block");
     wait_running(&root, "dep-block");
 
     tendr(&root)
         .args(["start", "dep-victim", "--after", "dep-block", "--", "true"])
         .assert()
         .success();
+    let _dep_victim = harness::SessionGuard::new(&root, "dep-victim");
 
     // No sleep: start returning proves the first scan completed. The kill
     // request written now persists on disk until the poll loop consumes it.
 
-    // Kill the waiting session.
-    tendr(&root).args(["kill", "dep-victim"]).assert().success();
+    // Kill the waiting session. The kill waits for its sidecar to record the
+    // end however long that takes, not falling back to a direct kill.
+    tendr(&root)
+        .env("TENDR_TEST_KILL_WAIT_MS", "3600000")
+        .args(["kill", "dep-victim"])
+        .assert()
+        .success();
     wait_terminal(&root, "dep-victim");
 
     tendr(&root).args(["wait", "dep-victim"]).assert().code(137);
 
-    tendr(&root)
-        .args(["kill", "--force", "dep-block"])
-        .assert()
-        .success();
+    kill_forced(&root, "dep-block");
 }
 
 #[test]

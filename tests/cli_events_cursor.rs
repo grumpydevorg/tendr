@@ -212,9 +212,12 @@ fn follow_cursors_bookmarks_within_5s_of_idle() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     tendr(&root)
-        .args(["start", "idle", "--", "sleep", "8"])
+        .args(["start", "idle", "--", "sleep", "3600"])
         .assert()
         .success();
+    // The session never ends by itself, so nothing but the idle timer can
+    // put a record on the follower's stream.
+    let _session = harness::SessionGuard::new(&root, "idle");
     wait_running(&root, "idle");
 
     let bin = assert_cmd::cargo::cargo_bin("tendr");
@@ -226,8 +229,8 @@ fn follow_cursors_bookmarks_within_5s_of_idle() {
         .spawn()
         .unwrap();
     // The idle follower emits a cursor.bookmark after ~5s of idleness. Read its
-    // stdout until that bookmark arrives (with a generous outer deadline) rather
-    // than sleeping a fixed window — a loaded runner can take longer than a fixed
+    // stdout until that bookmark arrives (up to the hang deadline) rather than
+    // sleeping a fixed window — a loaded runner can take longer than a fixed
     // nap to fire the wall-clock idle timer.
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -243,7 +246,7 @@ fn follow_cursors_bookmarks_within_5s_of_idle() {
         }
     });
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + harness::HANG;
     let mut bookmark: Option<serde_json::Value> = None;
     while std::time::Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(200)) {

@@ -12,7 +12,7 @@
 
 mod harness;
 
-use harness::{Observation, echo_env_cmd, poll_until, read_events, tendr, touch_cmd};
+use harness::{HANG, Observation, echo_env_cmd, poll_until, read_events, tendr, touch_cmd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::Mutex;
@@ -23,6 +23,10 @@ use tendr::platform::{Current, Platform, ProcessStatus};
 use tendr::session::{self, LockGuard, SessionRoot};
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// `--timeout` for a run that ends by itself: as long as [`HANG`], so it
+/// only ever stops a run that hangs.
+const RUN_TIMEOUT: &str = "120";
 
 fn session_dir(root: &TempDir, session: &str) -> PathBuf {
     root.path()
@@ -39,11 +43,25 @@ enum Inject {
 /// `tendr start` in the background, so a row can act while the client is
 /// still blocked on readiness.
 fn spawn_start(root: &TempDir, inject: Inject, gate: &Path, args: &[&str]) -> Child {
+    start_command(root, inject, gate, args)
+        .spawn()
+        .expect("spawn tendr start")
+}
+
+/// The `tendr start` command [`spawn_start`] runs, for a row that adds to it.
+fn start_command(
+    root: &TempDir,
+    inject: Inject,
+    gate: &Path,
+    args: &[&str],
+) -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"));
     cmd.arg("start")
         .args(args)
         .env("HOME", root.path())
         .env("TENDR_TEST_FAULT_GATE", gate)
+        // The fault waits for the gate however long the row takes to open it.
+        .env("TENDR_TEST_GATE_BOUND_MS", "3600000")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -60,21 +78,18 @@ fn spawn_start(root: &TempDir, inject: Inject, gate: &Path, args: &[&str]) -> Ch
             cmd.env("PATH", format!("{};{path}", git_usr_bin.display()));
         }
     }
-    cmd.spawn().expect("spawn tendr start")
+    cmd
 }
 
 fn wait_for_file(path: &Path, what: &str) {
-    harness::poll_path_exists(path, Duration::from_secs(10), Duration::from_millis(10))
+    harness::poll_path_exists(path, HANG, Duration::from_millis(10))
         .unwrap_or_else(|e| panic!("timed out waiting for {what}: {e}"));
 }
 
-/// Reap the start client (bounded) and return (exit code, stdout, stderr).
+/// Reap the start client (bounded by [`HANG`]) and return (exit code,
+/// stdout, stderr).
 fn finish_client(mut client: Child) -> (Option<i32>, String, String) {
-    if let Err(e) = harness::poll_child_exit(
-        &mut client,
-        Duration::from_secs(30),
-        Duration::from_millis(10),
-    ) {
+    if let Err(e) = harness::poll_child_exit(&mut client, HANG, Duration::from_millis(10)) {
         let _ = client.kill();
         panic!("start client did not return: {e}");
     }
@@ -96,7 +111,7 @@ fn wait_sidecar_gone(root: &TempDir, session: &str) -> (serde_json::Value, LockG
         .expect("open session")
         .expect("session exists");
     poll_until(
-        Duration::from_secs(30),
+        HANG,
         Duration::from_millis(10),
         || match LockGuard::try_acquire(&dir) {
             Ok(lock) => {
@@ -139,7 +154,7 @@ fn child_identity(meta: &serde_json::Value) -> ProcessIdentity {
 /// The child is gone: not merely signalled, but no longer a live process.
 fn assert_process_gone(id: &ProcessIdentity, what: &str) {
     poll_until(
-        Duration::from_secs(10),
+        HANG,
         Duration::from_millis(20),
         || match Current::process_status(id) {
             ProcessStatus::Missing | ProcessStatus::IdentityMismatch => Observation::Ready(()),
@@ -158,7 +173,7 @@ fn assert_pid_gone(pid_file: &Path, what: &str) {
         .trim()
         .parse()
         .expect("pid");
-    harness::poll_pid_dead(pid, Duration::from_secs(10), Duration::from_millis(20))
+    harness::poll_pid_dead(pid, HANG, Duration::from_millis(20))
         .unwrap_or_else(|e| panic!("{what} (pid {pid}) survived the group kill: {e}"));
 }
 
@@ -169,10 +184,10 @@ fn event_kinds(root: &TempDir, session: &str) -> Vec<String> {
         .collect()
 }
 
-/// The hook's output, or an empty string if it is still empty after 5 s.
+/// The hook's output, or an empty string if it is still empty at [`HANG`].
 fn wait_file_content(path: &Path) -> String {
     wait_for_file(path, "the --on-exit hook");
-    poll_until(Duration::from_secs(5), Duration::from_millis(10), || {
+    poll_until(HANG, Duration::from_millis(10), || {
         let content = std::fs::read_to_string(path).unwrap_or_default();
         if content.is_empty() {
             Observation::Pending("empty".into())
@@ -234,21 +249,25 @@ fn assert_sidecar_failed(root: &TempDir, session: &str, step: &str, error: &str,
     let hook = wait_file_content(hook_out);
     assert_eq!(hook.trim(), format!("{session} default SidecarFailed"));
 
+    // The run has ended, so `wait` returns at once; its timeout only bounds
+    // a hang.
+    let hang = HANG.as_secs().to_string();
     tendr(root)
-        .args(["wait", "--timeout", "5", session])
+        .args(["wait", "--timeout", &hang, session])
         .assert()
         .code(5);
 }
 
 /// A child that leaves a grandchild in its process group, and records both
 /// pids. With `quiet`, it closes its output first, so capture ends at once
-/// and supervision moves on to waiting for the exit.
+/// and supervision moves on to waiting for the exit. Neither ends by itself:
+/// only a stop ends them.
 #[cfg(unix)]
 fn family_child(dir: &Path, quiet: bool) -> (Vec<String>, PathBuf) {
     let gpid = dir.join("grandchild.pid");
     let quiet = if quiet { "exec >/dev/null 2>&1; " } else { "" };
     let script = format!(
-        "{quiet}sleep 60 & echo $! > {}; wait",
+        "{quiet}sleep 3600 & echo $! > {}; wait",
         shell_words::quote(gpid.to_str().unwrap())
     );
     (vec!["sh".into(), "-c".into(), script], gpid)
@@ -266,6 +285,7 @@ fn ends_the_run(
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let gate = root.path().join("fault-gate");
+    let _open = harness::OpenGate(gate.clone());
     let hook_out = root.path().join("hook-env");
     let hook = echo_env_cmd(&hook_out);
 
@@ -277,10 +297,10 @@ fn ends_the_run(
             vec![
                 "sh".into(),
                 "-c".into(),
-                "exec >/dev/null 2>&1; sleep 60".into(),
+                "exec >/dev/null 2>&1; sleep 3600".into(),
             ]
         } else {
-            vec!["sleep".into(), "60".into()]
+            vec!["sleep".into(), "3600".into()]
         }
     };
 
@@ -428,17 +448,23 @@ fn pty_io_failure_stops_the_session_leader_and_records_sidecar_failed() {
 /// read what it left) is released by the stop, so the child's exit does not
 /// wait on a reader that will never run. The child is exec'd directly, not
 /// through a shell, which would open `/dev/tty` and hold the terminal itself.
+///
+/// "Promptly" means the stop ends it without the guard's forced fallback,
+/// which gives up the hold: that fallback is put off past [`HANG`]
+/// (`TENDR_TEST_STOP_GRACE_MS`), so a child whose exit still waited on the
+/// hold would hang the client. The child never ends by itself.
 #[cfg(unix)]
 #[test]
 fn pty_failure_stops_a_child_whose_output_was_never_read() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let gate = root.path().join("fault-gate");
+    let _open = harness::OpenGate(gate.clone());
     let hook_out = root.path().join("hook-env");
     let hook = echo_env_cmd(&hook_out);
     let pid_file = root.path().join("child.pid");
     let pid_arg = pid_file.to_str().unwrap();
-    let client = spawn_start(
+    let client = start_command(
         &root,
         Inject::Fail("running_meta"),
         &gate,
@@ -450,12 +476,14 @@ fn pty_failure_stops_a_child_whose_output_was_never_read() {
             "--",
             "perl",
             "-e",
-            r#"$| = 1; print "written before the fault\n"; open(my $f, ">", $ARGV[0]) or die; print $f $$; close $f; sleep 60"#,
+            r#"$| = 1; print "written before the fault\n"; open(my $f, ">", $ARGV[0]) or die; print $f $$; close $f; sleep"#,
             pid_arg,
         ],
-    );
+    )
+    .env("TENDR_TEST_STOP_GRACE_MS", "3600000")
+    .spawn()
+    .expect("spawn tendr start");
     wait_for_file(&pid_file, "the child to write");
-    let failed_at = std::time::Instant::now();
     std::fs::write(&gate, b"").expect("open the fault gate");
 
     let (code, _, _) = finish_client(client);
@@ -467,11 +495,6 @@ fn pty_failure_stops_a_child_whose_output_was_never_read() {
         &hook_out,
     );
     assert_pid_gone(&pid_file, "the child");
-    let took = failed_at.elapsed();
-    assert!(
-        took < Duration::from_secs(8),
-        "stopping the child took {took:?}"
-    );
     assert_eq!(code, Some(5));
 }
 
@@ -485,11 +508,12 @@ fn failure_record_failure_still_stops_the_child_and_says_so() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let gate = root.path().join("fault-gate");
+    let _open = harness::OpenGate(gate.clone());
     let client = spawn_start(
         &root,
         Inject::Fail("stdin_transport,failure_record"),
         &gate,
-        &["s1", "--stdin", "--", "sleep", "60"],
+        &["s1", "--stdin", "--", "sleep", "3600"],
     );
     let breadcrumb = session_dir(&root, "s1").join("child_pid");
     wait_for_file(&breadcrumb, "the child to be spawned");
@@ -553,7 +577,7 @@ fn failure_record_failure_on_the_after_path_heals_to_sidecar_failed() {
         &root,
         Inject::Fail("stdin_transport,failure_record"),
         &gate,
-        &["job", "--after", "dep", "--stdin", "--", "sleep", "60"],
+        &["job", "--after", "dep", "--stdin", "--", "sleep", "3600"],
     );
     let (code, _stdout, stderr) = finish_client(client);
     assert_eq!(
@@ -583,8 +607,9 @@ fn failure_record_failure_on_the_after_path_heals_to_sidecar_failed() {
         status["transition_provenance"]["evidence"],
         serde_json::json!(["event_log_terminal"])
     );
+    let hang = HANG.as_secs().to_string();
     tendr(&root)
-        .args(["wait", "--timeout", "5", "job"])
+        .args(["wait", "--timeout", &hang, "job"])
         .assert()
         .code(5);
 }
@@ -680,7 +705,7 @@ fn output_log_write_failure_drains_output_and_recovers() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_root, meta) = recovers(
         Inject::Fail("output_log_write"),
-        &["--timeout", "20"],
+        &["--timeout", RUN_TIMEOUT],
         &[
             "sh",
             "-c",
@@ -699,23 +724,22 @@ fn output_log_write_failure_warns_while_the_run_is_live() {
     let root = TempDir::new().unwrap();
     let gate = root.path().join("fault-gate");
     std::fs::write(&gate, b"").unwrap();
+    let release = root.path().join("release");
+    let live = format!(
+        "yes tendr | head -c 2000000; while [ ! -e {} ]; do sleep 0.05; done",
+        shell_words::quote(release.to_str().unwrap())
+    );
     let client = spawn_start(
         &root,
         Inject::Fail("output_log_write"),
         &gate,
-        &[
-            "s1",
-            "--timeout",
-            "20",
-            "--",
-            "sh",
-            "-c",
-            "yes tendr | head -c 2000000; sleep 5",
-        ],
+        &["s1", "--timeout", RUN_TIMEOUT, "--", "sh", "-c", &live],
     );
     let _ = finish_client(client);
     let needle = write_warning("stdout");
-    poll_until(Duration::from_secs(4), Duration::from_millis(50), || {
+    // The child waits for `release`, so it is still running however long
+    // the warning takes to show.
+    poll_until(HANG, Duration::from_millis(50), || {
         let meta = status_of(&root, "s1");
         assert_eq!(
             meta["status"], "Running",
@@ -728,6 +752,7 @@ fn output_log_write_failure_warns_while_the_run_is_live() {
         }
     })
     .unwrap_or_else(|e| panic!("no live warning: {e}"));
+    std::fs::write(&release, b"").unwrap();
     let (meta, _lock) = wait_sidecar_gone(&root, "s1");
     assert_exited_ok(&meta);
     assert_one_write_warning(&meta, "stdout");
@@ -740,7 +765,7 @@ fn pty_output_log_write_failure_keeps_recording_and_recovers() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (root, meta) = recovers(
         Inject::Fail("output_log_write"),
-        &["--pty", "--timeout", "20"],
+        &["--pty", "--timeout", RUN_TIMEOUT],
         &["sh", "-c", "yes tendr | head -c 2000000"],
     );
     assert_exited_ok(&meta);
@@ -762,7 +787,7 @@ fn invalid_utf8_line_is_logged_and_capture_continues() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (root, meta) = recovers(
         Inject::Fail("none"),
-        &["--timeout", "20"],
+        &["--timeout", RUN_TIMEOUT],
         &["sh", "-c", r"printf 'a\377b\r\nafter\n'"],
     );
     assert_exited_ok(&meta);
@@ -838,14 +863,27 @@ fn readiness_write_to_a_closed_reader_fails() {
 #[test]
 fn pty_group_kill_reaches_the_session_leader_and_its_children() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TempDir::new().unwrap();
-    let (argv, gpid) = family_child(root.path(), false);
-    let mut args = vec!["start", "s1", "--pty", "--timeout", "1", "--"];
-    args.extend(argv.iter().map(String::as_str));
-    tendr(&root).args(&args).assert().success();
-    wait_for_file(&gpid, "the grandchild to start");
-
-    let (meta, _lock) = wait_sidecar_gone(&root, "s1");
+    // The 1 s timeout must end the run only after the grandchild has written
+    // its pid. Under load it can fire first; then nothing was proved, so run
+    // again with a fresh root until a run got that far.
+    let (_root, gpid, meta) = poll_until(HANG, Duration::ZERO, || {
+        let root = TempDir::new().unwrap();
+        let (argv, gpid) = family_child(root.path(), false);
+        let mut args = vec!["start", "s1", "--pty", "--timeout", "1", "--"];
+        args.extend(argv.iter().map(String::as_str));
+        tendr(&root).args(&args).assert().success();
+        let (meta, lock) = wait_sidecar_gone(&root, "s1");
+        drop(lock);
+        let written = std::fs::read_to_string(&gpid).is_ok_and(|p| !p.trim().is_empty());
+        if written {
+            Observation::Ready((root, gpid, meta))
+        } else {
+            Observation::Pending(format!(
+                "the run ended before the grandchild started: {meta}"
+            ))
+        }
+    })
+    .unwrap_or_else(|e| panic!("no run outlived the grandchild's start: {e}"));
     assert_eq!(meta["reason"], "TimedOut", "{meta}");
     assert_process_gone(&child_identity(&meta), "the PTY session leader");
     assert_pid_gone(&gpid, "the session leader's child");
@@ -865,6 +903,16 @@ fn crash_at(root: &TempDir, point: &str, args: &[&str]) -> serde_json::Value {
     let (meta, lock) = wait_sidecar_gone(root, args[0]);
     drop(lock);
     meta
+}
+
+/// Runs the test's own cleanup, `status` (reconciliation kills the orphan),
+/// on drop, so a failing assertion does not leave the crashed run's child.
+struct ReconcileOnDrop<'a>(&'a TempDir, &'a str);
+
+impl Drop for ReconcileOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = tendr(self.0).args(["status", self.1]).output();
+    }
 }
 
 fn status_of(root: &TempDir, session: &str) -> serde_json::Value {
@@ -892,10 +940,11 @@ fn crash_while_running_leaves_an_orphan_that_status_kills() {
     #[cfg(unix)]
     let (argv, gpid) = family_child(root.path(), false);
     #[cfg(windows)]
-    let argv: Vec<String> = vec!["sleep".into(), "60".into()];
+    let argv: Vec<String> = vec!["sleep".into(), "3600".into()];
     let mut args = vec!["s1", "--"];
     args.extend(argv.iter().map(String::as_str));
 
+    let _reconcile = ReconcileOnDrop(&root, "s1");
     let left = crash_at(&root, "after_running", &args);
     assert_eq!(left["status"], "Running", "{left}");
     let child = child_identity(&left);
@@ -949,10 +998,11 @@ fn crash_before_running_is_found_through_the_breadcrumb() {
     let (_dep, lock) = wait_sidecar_gone(&root, "dep");
     drop(lock);
 
+    let _reconcile = ReconcileOnDrop(&root, "job");
     let left = crash_at(
         &root,
         "after_spawn",
-        &["job", "--after", "dep", "--", "sleep", "60"],
+        &["job", "--after", "dep", "--", "sleep", "3600"],
     );
     assert_eq!(left["status"], "Starting", "{left}");
     let breadcrumb: ProcessIdentity = serde_json::from_str(

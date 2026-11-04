@@ -93,6 +93,13 @@ pub fn cmd_attach(
 #[cfg(unix)]
 const RUN_END_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// [`RUN_END_GRACE`]. Debug builds accept `TENDR_TEST_RUN_END_GRACE_MS` so
+/// tests are not cut off by a sidecar a loaded machine slows.
+#[cfg(unix)]
+fn run_end_grace() -> std::time::Duration {
+    tendr::test_timer::or_env("TENDR_TEST_RUN_END_GRACE_MS", RUN_END_GRACE)
+}
+
 /// How long it waits once the socket is gone: the sidecar removes it as the
 /// run ends, before the durable writes that record the end, which a busy
 /// disk can hold past [`RUN_END_GRACE`]. Beyond this the sidecar is taken to
@@ -119,7 +126,7 @@ fn run_ended(session: &SessionDir, run_id: tendr::model::ids::RunId) -> anyhow::
             return Ok(());
         }
         let grace = if attach_proto::read_sock_path(session.path()).is_some() {
-            RUN_END_GRACE
+            run_end_grace()
         } else {
             RUN_END_RECORD_GRACE
         };
@@ -193,6 +200,12 @@ const SSH_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 /// the remote end has closed the connection. ssh still running after it
 /// counts as a lost connection.
 const SSH_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`SSH_CLOSE_GRACE`]. Debug builds accept `TENDR_TEST_SSH_CLOSE_GRACE_MS`
+/// so tests can wait for ssh's exit code however slow the machine.
+fn ssh_close_grace() -> std::time::Duration {
+    tendr::test_timer::or_env("TENDR_TEST_SSH_CLOSE_GRACE_MS", SSH_CLOSE_GRACE)
+}
 
 /// `attach --host`. `frame` is the encoded remote frame
 /// of `request`; the hello follows it on ssh's stdin, and then the typed

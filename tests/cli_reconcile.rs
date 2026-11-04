@@ -2,7 +2,7 @@
 
 mod harness;
 
-use harness::{tendr, wait_pid_dead, wait_running};
+use harness::{HANG, SessionGuard, tendr, wait_pid_dead, wait_running};
 use predicates::prelude::*;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -31,9 +31,11 @@ fn status_reconciles_crashed_sidecar() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "crashed-sc", "sleep", "60"])
+        .args(["start", "crashed-sc", "sleep", "3600"])
         .assert()
         .success();
+    // Never exits by itself: still there to be found as an orphan.
+    let _session = SessionGuard::new(&root, "crashed-sc");
     wait_running(&root, "crashed-sc");
 
     let meta = read_meta_json(&root, "crashed-sc");
@@ -68,9 +70,10 @@ fn status_does_not_reconcile_running_session() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "still-running", "sleep", "60"])
+        .args(["start", "still-running", "sleep", "3600"])
         .assert()
         .success();
+    let _session = SessionGuard::new(&root, "still-running");
     wait_running(&root, "still-running");
 
     tendr(&root)
@@ -80,6 +83,7 @@ fn status_does_not_reconcile_running_session() {
         .stdout(predicate::str::contains(r#""status": "Running"#));
 
     tendr(&root)
+        .env("TENDR_TEST_KILL_WAIT_MS", HANG.as_millis().to_string())
         .args(["kill", "--force", "still-running"])
         .assert()
         .success();
@@ -91,9 +95,10 @@ fn wait_reconciles_crashed_sidecar() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "wait-crashed", "sleep", "60"])
+        .args(["start", "wait-crashed", "sleep", "3600"])
         .assert()
         .success();
+    let _session = SessionGuard::new(&root, "wait-crashed");
     wait_running(&root, "wait-crashed");
 
     let meta = read_meta_json(&root, "wait-crashed");
@@ -101,8 +106,15 @@ fn wait_reconciles_crashed_sidecar() {
     unsafe { libc::kill(sc_pid, libc::SIGKILL) };
     wait_pid_dead(sc_pid);
 
+    // wait's timeout is not the scenario: the hang deadline, so load cannot
+    // reach it before reconciliation does.
     let output = tendr(&root)
-        .args(["wait", "--timeout", "5", "wait-crashed"])
+        .args([
+            "wait",
+            "--timeout",
+            &HANG.as_secs().to_string(),
+            "wait-crashed",
+        ])
         .assert()
         .code(3)
         .stdout(predicate::str::contains(r#""status": "SidecarLost"#));

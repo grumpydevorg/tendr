@@ -90,3 +90,7 @@ pub mod session;
 pub mod sidecar;
 pub mod ssh;
 pub mod term_modes;
+#[cfg(test)]
+mod test_support;
+#[doc(hidden)]
+pub mod test_timer;

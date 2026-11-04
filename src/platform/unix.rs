@@ -1028,6 +1028,22 @@ const TREE_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const TREE_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// [`TREE_TERM_GRACE`], or `TENDR_TEST_TREE_TERM_GRACE_MS` in debug builds,
+/// so tests whose processes must clean up on SIGTERM are not killed first
+/// by a loaded machine.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_term_grace() -> std::time::Duration {
+    crate::test_timer::or_env("TENDR_TEST_TREE_TERM_GRACE_MS", TREE_TERM_GRACE)
+}
+
+/// [`TREE_STOP_LIMIT`], or `TENDR_TEST_TREE_STOP_LIMIT_MS` in debug builds,
+/// so tests that expect every process stopped do not see a loaded machine
+/// give up first.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_stop_limit() -> std::time::Duration {
+    crate::test_timer::or_env("TENDR_TEST_TREE_STOP_LIMIT_MS", TREE_STOP_LIMIT)
+}
+
 /// What a stop looks for besides the child, which `kill_child` deals with.
 ///
 /// On Linux the sidecar is a child subreaper, so every process the run
@@ -1385,7 +1401,7 @@ fn stop_tree(tree: &RunTree, force: bool) -> io::Result<()> {
     // signalled again, though their children still are.
     let mut refused = BTreeSet::new();
     if !force {
-        let deadline = std::time::Instant::now() + TREE_TERM_GRACE;
+        let deadline = std::time::Instant::now() + tree_term_grace();
         for pid in tree.live(&refused, |_| {}) {
             if !tree.in_child_group(pid)
                 && send_signal_direct(pid as i32, Signal::TERM)
@@ -1401,7 +1417,7 @@ fn stop_tree(tree: &RunTree, force: bool) -> io::Result<()> {
         }
     }
 
-    let deadline = std::time::Instant::now() + TREE_STOP_LIMIT;
+    let deadline = std::time::Instant::now() + tree_stop_limit();
     let mut empty_searches = 0;
     while empty_searches < 2 {
         // Stop what a search finds, and search again until one finds nothing
@@ -1524,6 +1540,13 @@ pub struct PtyReader {
 /// master has been drained, while other processes still hold the terminal.
 const HOLDER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// [`HOLDER_GRACE`]. Debug builds accept `TENDR_TEST_HOLDER_GRACE_MS` so
+/// tests whose held-terminal output must land are not cut short by a loaded
+/// machine.
+fn holder_grace() -> std::time::Duration {
+    crate::test_timer::or_env("TENDR_TEST_HOLDER_GRACE_MS", HOLDER_GRACE)
+}
+
 /// Where a [`PtyReader`] is in its child's life.
 enum Drain {
     /// No child to watch: end of stream comes when the terminal closes.
@@ -1594,7 +1617,7 @@ impl SlaveHold {
     /// session leader, revokes the terminal from every process, so this
     /// should not happen there.
     fn holders_warning(&self) -> String {
-        let grace = HOLDER_GRACE.as_secs();
+        let grace = holder_grace().as_secs();
         let lead = format!("capture ended {grace} s after the child exited");
         #[cfg(target_os = "linux")]
         {
@@ -1740,7 +1763,7 @@ impl PtyReader {
             // Dropping the watch releases the hold.
             self.drain = Drain::Released {
                 hold,
-                deadline: std::time::Instant::now() + HOLDER_GRACE,
+                deadline: std::time::Instant::now() + holder_grace(),
             };
             return Ok(());
         }
@@ -1920,6 +1943,7 @@ impl Write for PtyWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::HANG;
     use std::num::NonZeroU32;
     use std::time::{Duration, Instant};
 
@@ -1967,6 +1991,8 @@ mod tests {
     fn pty_reader_waits_for_late_output_instead_of_ending() {
         let (r, mut w) = nonblocking_pipe();
         let writer = std::thread::spawn(move || {
+            // Paces the write after the reader has likely found the pipe
+            // empty; a delayed reader only means it finds the data at once.
             std::thread::sleep(Duration::from_millis(100));
             w.write_all(b"late").unwrap();
             // Dropping `w` closes the pipe: end of stream after the data.
@@ -2029,7 +2055,7 @@ mod tests {
         let mut reader = UnixPlatform::child_stdout(&mut child).unwrap();
         let mut out = Vec::new();
         let mut chunk = [0u8; 1024];
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + HANG;
         // A PTY master reports hangup as EIO on Linux and as EOF on macOS.
         while Instant::now() < deadline {
             match reader.read(&mut chunk) {
@@ -2122,8 +2148,9 @@ mod tests {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
+        // Never ends by itself: it is killed once read.
         let mut cmd = Command::new("sleep");
-        cmd.arg("10");
+        cmd.arg("3600");
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -2160,12 +2187,14 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let dir = tempfile::TempDir::new().unwrap();
-        // The trailing `:` keeps the shell from exec'ing `sleep` in its place.
-        std::fs::write(dir.path().join(SIDECAR_ARG), "sleep 10; :\n").unwrap();
+        // `read` is a builtin, so the shell itself stays the process, and
+        // it waits on stdin, open until the shell is killed: the script
+        // never ends by itself and leaves nothing behind.
+        std::fs::write(dir.path().join(SIDECAR_ARG), "read line\n").unwrap();
         let mut child = Command::new("sh")
             .arg(SIDECAR_ARG)
             .current_dir(dir.path())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .spawn()
             .unwrap();
         let found = poll_is_sidecar(child.id());
@@ -2178,15 +2207,20 @@ mod tests {
         );
     }
 
-    /// `is_sidecar(pid)`, retried briefly while the spawned shell starts.
+    /// `is_sidecar(pid)`, retried while the spawned shell starts, up to
+    /// [`HANG`].
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn poll_is_sidecar(pid: u32) -> bool {
-        (0..50).any(|_| {
-            is_sidecar(pid) || {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                false
+        let deadline = Instant::now() + HANG;
+        loop {
+            if is_sidecar(pid) {
+                return true;
             }
-        })
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// A PTY leader that exits on its hangup stays a zombie until its parent
@@ -2200,8 +2234,9 @@ mod tests {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
+        // Never ends by itself, only on its hangup.
         let mut cmd = Command::new("sleep");
-        cmd.arg("30")
+        cmd.arg("3600")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -2215,13 +2250,21 @@ mod tests {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn().unwrap();
-        let identity = capture_spawned_identity(child.id()).unwrap();
+        /// Kills and reaps the child on drop, so a failed step never
+        /// leaves `sleep 3600` behind.
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = KillOnDrop(cmd.spawn().unwrap());
+        let identity = capture_spawned_identity(child.0.id()).unwrap();
 
         // `sleep` dies on SIGHUP; nothing reaps it until the end of the test.
         let result = kill_process(&identity, false, true);
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child);
         result.expect("killing a leader that exited on its hangup");
     }
 }

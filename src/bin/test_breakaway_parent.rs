@@ -1,7 +1,8 @@
 //! Test fixture for tests/windows_breakaway.rs.
 //!
 //! Opens a named Job Object passed via TEST_JOB_NAME, assigns itself to it,
-//! then spawns `tendr start <session> -- powershell -NoProfile -Command "Start-Sleep 30"`.
+//! then spawns `tendr start <session> -- powershell -NoProfile -Command "Start-Sleep 3600"`,
+//! a child that never ends by itself within a test (cleanup kills it).
 //! After tendr start returns, runs `tendr status <session>` to read the
 //! sidecar PID and writes it to the file path given as the fourth argv.
 //!
@@ -63,7 +64,7 @@ fn main() {
             "powershell",
             "-NoProfile",
             "-Command",
-            "Start-Sleep 30",
+            "Start-Sleep 3600",
         ])
         .status()
         .unwrap_or_else(|e| die(&format!("tendr start spawn failed: {e}")));

@@ -24,7 +24,7 @@
 
 mod harness;
 
-use harness::{Observation, poll_until};
+use harness::{HANG, Observation, poll_until};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Output;
@@ -33,9 +33,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Bound on one `tendr --host` call: ssh password login plus a remote tendr
-/// on a loaded runner, with room to spare. A hang fails the test.
-const CALL_DEADLINE: Duration = Duration::from_secs(90);
+/// The connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, seconds) of every
+/// call: ssh login plus a remote tendr's start on a loaded runner never
+/// reaches it, so it never fires; [`HANG`] bounds each call instead.
+const CONNECTS: &str = "600";
 
 /// The remote host, the scratch directory, and this test's namespace.
 struct Remote {
@@ -115,7 +116,8 @@ impl Remote {
             .args(["--host", &self.host])
             .args(args)
             .write_stdin(stdin)
-            .timeout(CALL_DEADLINE)
+            .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
+            .timeout(HANG)
             .output()
             .unwrap_or_else(|e| panic!("tendr --host {} {args:?} did not run: {e}", self.host))
     }
@@ -146,15 +148,13 @@ impl Remote {
 
     /// Wait for `session` to reach `status` (`Running`, `Exited`, …).
     fn await_status(&self, session: &str, status: &str) -> Result<Value, String> {
-        poll_until(
-            Duration::from_secs(60),
-            Duration::from_millis(500),
-            || match self.status(session) {
+        poll_until(HANG, Duration::from_millis(500), || {
+            match self.status(session) {
                 Ok(meta) if meta["status"] == status => Observation::Ready(meta),
                 Ok(meta) => Observation::Pending(meta.to_string()),
                 Err(e) => Observation::Pending(e),
-            },
-        )
+            }
+        })
         .map_err(|e| format!("{session} never reached {status}: {e}"))
     }
 
@@ -272,8 +272,9 @@ fn attach_names_arrive_as_data_over_the_bridge() {
             .args(["--host", &remote.host])
             .args(args)
             .env("TENDR_TEST_ATTACH_TERMINAL", "24x80")
+            .env("TENDR_SSH_CONNECT_TIMEOUT", CONNECTS)
             .write_stdin(b"")
-            .timeout(CALL_DEADLINE)
+            .timeout(HANG)
             .output()
             .unwrap_or_else(|e| panic!("tendr --host {} {args:?} did not run: {e}", remote.host));
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -506,7 +507,7 @@ fn push_wait_kill_and_exit_codes_round_trip() {
             failures.check(output.status.success(), || {
                 format!("push: {}", describe(&output))
             });
-            let output = remote.tendr(&["wait", "echo", "--namespace", &ns, "--timeout", "60"]);
+            let output = remote.tendr(&["wait", "echo", "--namespace", &ns, "--timeout", "600"]);
             failures.check(output.status.code() == Some(0), || {
                 format!("wait echo: {}", describe(&output))
             });
@@ -529,7 +530,7 @@ fn push_wait_kill_and_exit_codes_round_trip() {
     failures.check(output.status.success(), || {
         format!("start code: {}", describe(&output))
     });
-    let output = remote.tendr(&["wait", "code", "--namespace", &ns, "--timeout", "60"]);
+    let output = remote.tendr(&["wait", "code", "--namespace", &ns, "--timeout", "600"]);
     failures.check(output.status.code() == Some(42), || {
         format!(
             "wait for a child that exits 7 should exit 42: {}",
@@ -554,7 +555,7 @@ fn push_wait_kill_and_exit_codes_round_trip() {
             failures.check(output.status.success(), || {
                 format!("kill long: {}", describe(&output))
             });
-            let output = remote.tendr(&["wait", "long", "--namespace", &ns, "--timeout", "60"]);
+            let output = remote.tendr(&["wait", "long", "--namespace", &ns, "--timeout", "600"]);
             failures.check(output.status.code() == Some(0), || {
                 format!("wait after kill should exit 0: {}", describe(&output))
             });
@@ -619,7 +620,7 @@ fn exec_runs_in_a_powershell_session() {
                 "--namespace",
                 &ns,
                 "--timeout",
-                "30",
+                "600",
                 "--",
                 &payload,
             ]);
@@ -641,7 +642,7 @@ fn exec_runs_in_a_powershell_session() {
                 "--namespace",
                 &ns,
                 "--timeout",
-                "30",
+                "600",
                 "--",
                 "Write-Output $env:PSModulePath",
             ]);
@@ -697,6 +698,10 @@ fn run_outlives_the_ssh_session_that_started_it() {
     let session = "outlives";
     let output = remote.start(session, &[], &["ping", "-n", "300", "127.0.0.1"]);
     assert!(output.status.success(), "start: {}", describe(&output));
+    // Waits out the server tearing down the ssh session that started the
+    // run, which this side cannot observe. Under load the teardown may come
+    // later, which can only let the test pass without proving it, never
+    // fail it.
     std::thread::sleep(Duration::from_secs(10));
     let meta = remote.status(session);
     remote.kill(session);

@@ -10,7 +10,7 @@
 
 mod harness;
 
-use harness::{DeadlineAssertExt, tendr, wait_running, wait_terminal};
+use harness::{DeadlineAssertExt, HANG, tendr, wait_running, wait_terminal};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -21,10 +21,16 @@ use tendr::session::{self, SessionRoot};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Start `name` with the unlock gate armed at `gate`.
+/// A product timer lengthened past anything load can do, for a test where it
+/// must not fire.
+const FOREVER_MS: &str = "3600000";
+
+/// Start `name` with the unlock gate armed at `gate`. The sidecar holds the
+/// lock until the test opens the gate: the gate's own bound is put off.
 fn start_gated(root: &TempDir, name: &str, gate: &Path, argv: &[&str]) {
     tendr(root)
         .env("TENDR_TEST_UNLOCK_GATE", gate)
+        .env("TENDR_TEST_GATE_BOUND_MS", FOREVER_MS)
         .args(["start", name, "--"])
         .args(argv)
         .assert()
@@ -43,11 +49,16 @@ fn locked(root: &TempDir, name: &str) -> bool {
 }
 
 /// A `tendr` invocation running in the background, with the same environment
-/// as `harness::tendr` (temp HOME; on Windows, Git's coreutils on PATH).
-fn spawn_tendr(root: &TempDir, args: &[&str]) -> Child {
+/// as `harness::tendr` (temp HOME; on Windows, Git's coreutils on PATH). Its
+/// release grace, `--replace` wait and kill wait are put off, so it waits for
+/// the sidecar however long the test takes to open the gate.
+fn spawn_tendr(root: &TempDir, args: &[&str]) -> KillOnDrop {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("tendr"));
     cmd.args(args)
         .env("HOME", root.path())
+        .env("TENDR_TEST_RELEASE_GRACE_MS", FOREVER_MS)
+        .env("TENDR_TEST_REPLACE_WAIT_MS", FOREVER_MS)
+        .env("TENDR_TEST_KILL_WAIT_MS", FOREVER_MS)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -59,23 +70,42 @@ fn spawn_tendr(root: &TempDir, args: &[&str]) -> Child {
             cmd.env("PATH", format!("{};{path}", git_usr_bin.display()));
         }
     }
-    cmd.spawn().unwrap()
+    KillOnDrop(Some(cmd.spawn().unwrap()))
 }
 
-/// Wait for a background `tendr` to exit, bounded.
-fn finish(mut child: Child) -> std::process::Output {
-    harness::poll_child_exit(
-        &mut child,
-        Duration::from_secs(15),
-        Duration::from_millis(20),
-    )
-    .unwrap_or_else(|e| panic!("tendr did not exit: {e}"));
-    child.wait_with_output().unwrap()
+/// A background `tendr` killed and reaped on drop, so a failing test does not
+/// leave it waiting out its put-off bounds.
+struct KillOnDrop(Option<Child>);
+
+impl KillOnDrop {
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().unwrap()
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Wait for a background `tendr` to exit, bounded by [`HANG`].
+fn finish(mut bg: KillOnDrop) -> std::process::Output {
+    let child = bg.child();
+    harness::poll_child_exit(child, HANG, Duration::from_millis(20))
+        .unwrap_or_else(|e| panic!("tendr did not exit: {e}"));
+    bg.0.take().unwrap().wait_with_output().unwrap()
 }
 
 /// The background command must still be waiting: the session is terminal but
-/// its sidecar holds the lock.
-fn assert_still_waiting(child: &mut Child, what: &str) {
+/// its sidecar holds the lock. The sleep waits out a command that would
+/// return without waiting for the release; under load it can only pass
+/// wrongly, never fail wrongly.
+fn assert_still_waiting(bg: &mut KillOnDrop, what: &str) {
+    let child = bg.child();
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         child.try_wait().unwrap().is_none(),
@@ -88,6 +118,7 @@ fn wait_returns_only_after_the_sidecar_releases_the_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let gate = root.path().join("gate");
+    let _open = harness::OpenGate(gate.clone());
     start_gated(&root, "rel-wait", &gate, &["true"]);
     let _session = harness::SessionGuard::new(&root, "rel-wait");
 
@@ -113,13 +144,18 @@ fn wait_warns_and_returns_when_the_sidecar_keeps_the_lock() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let gate = root.path().join("gate");
+    let _open = harness::OpenGate(gate.clone());
     start_gated(&root, "rel-grace", &gate, &["true"]);
     let _session = harness::SessionGuard::new(&root, "rel-grace");
     wait_terminal(&root, "rel-grace");
 
+    // The sidecar holds the lock until the gate opens, after the assertions,
+    // so the grace (default, 2 s) is the only way out. `--timeout` only
+    // bounds a hang: the session is already terminal.
+    let hang = HANG.as_secs().to_string();
     let started = Instant::now();
     let out = tendr(&root)
-        .args(["wait", "rel-grace", "--timeout", "10"])
+        .args(["wait", "rel-grace", "--timeout", &hang])
         .assert_within_deadline();
     let out = out.get_output();
     assert!(
@@ -146,13 +182,14 @@ fn replace_waits_for_a_finished_sidecar_to_release() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let gate = root.path().join("gate");
+    let _open = harness::OpenGate(gate.clone());
     start_gated(&root, "rel-replace", &gate, &["true"]);
     let _session = harness::SessionGuard::new(&root, "rel-replace");
     wait_terminal(&root, "rel-replace");
 
     let mut replace = spawn_tendr(
         &root,
-        &["start", "rel-replace", "--replace", "--", "sleep", "30"],
+        &["start", "rel-replace", "--replace", "--", "sleep", "3600"],
     );
     assert_still_waiting(&mut replace, "start --replace");
 
@@ -171,7 +208,8 @@ fn kill_returns_only_after_the_sidecar_releases_the_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let gate = root.path().join("gate");
-    start_gated(&root, "rel-kill", &gate, &["sleep", "60"]);
+    let _open = harness::OpenGate(gate.clone());
+    start_gated(&root, "rel-kill", &gate, &["sleep", "3600"]);
     let _session = harness::SessionGuard::new(&root, "rel-kill");
     wait_running(&root, "rel-kill");
 

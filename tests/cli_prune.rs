@@ -101,7 +101,7 @@ fn prune_skips_running_session() {
     let root = TempDir::new().unwrap();
 
     let out = tendr(&root)
-        .args(["start", "prune-running", "--", "sleep", "60"])
+        .args(["start", "prune-running", "--", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -322,7 +322,7 @@ fn prune_summary_counts_match_mixed_outcomes() {
 
     // 2. Running session (will be skipped)
     let out = tendr(&root)
-        .args(["start", "prune-mix-run", "--", "sleep", "60"])
+        .args(["start", "prune-mix-run", "--", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -449,7 +449,7 @@ fn prune_by_name_skips_a_running_session() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "prune-live", "--", "sleep", "60"])
+        .args(["start", "prune-live", "--", "sleep", "3600"])
         .assert()
         .success();
     let _session = harness::SessionGuard::new(&root, "prune-live");
@@ -625,7 +625,12 @@ fn prune_sweeps_orphaned_attach_sockets_only() {
         backdate(path);
     }
 
+    // `fresh` must stay younger than the orphan grace however slowly the two
+    // prunes come round: lengthened from a minute to ten, still well short of
+    // the backdated sockets' hour.
+    const ORPHAN_GRACE_MS: &str = "600000";
     let dry = tendr(&root)
+        .env("TENDR_TEST_ORPHAN_GRACE_MS", ORPHAN_GRACE_MS)
         .args(["prune", "--older-than", "1h", "--dry-run"])
         .output()
         .unwrap();
@@ -636,6 +641,7 @@ fn prune_sweeps_orphaned_attach_sockets_only() {
     assert!(orphan.exists(), "a dry run removes nothing");
 
     let out = tendr(&root)
+        .env("TENDR_TEST_ORPHAN_GRACE_MS", ORPHAN_GRACE_MS)
         .args(["prune", "--older-than", "1h"])
         .output()
         .unwrap();
@@ -694,10 +700,11 @@ fn prune_keeps_a_listener_with_a_full_backlog_without_waiting_on_it() {
     }
     backdate(&live);
 
-    // Killed at the deadline if it waits on the listener.
+    // Killed at the hang deadline if it waits on the listener, which never
+    // accepts: returning at all is the proof.
     let out = tendr(&root)
         .args(["prune", "--older-than", "1h"])
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(harness::HANG)
         .output()
         .expect("run prune");
     assert!(

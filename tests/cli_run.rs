@@ -1,7 +1,7 @@
 mod harness;
 
 use assert_cmd::Command;
-use harness::DeadlineAssertExt;
+use harness::{DeadlineAssertExt, SessionGuard};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -16,6 +16,9 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
 fn tendr(root: &TempDir) -> Command {
     harness::tendr(root)
 }
+
+/// Python that never ends by itself.
+const FOREVER_PY: &str = "import time; time.sleep(3600)";
 
 /// Write a Python script (cross-platform, .py extension triggers launcher).
 fn write_py_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
@@ -174,7 +177,8 @@ fn run_foreground_overrides_detach_directive() {
 #[test]
 fn run_detach_returns_immediately_with_json() {
     let root = TempDir::new().unwrap();
-    let script = write_py_script(root.path(), "slow.py", "import time; time.sleep(30)");
+    let _run = SessionGuard::new_ns(&root, "default", "slow");
+    let script = write_py_script(root.path(), "slow.py", FOREVER_PY);
 
     tendr(&root)
         .args(["run", "--detach", script.to_str().unwrap()])
@@ -186,10 +190,11 @@ fn run_detach_returns_immediately_with_json() {
 #[test]
 fn run_session_name_from_filename() {
     let root = TempDir::new().unwrap();
+    let _run = SessionGuard::new_ns(&root, "default", "my-build");
     let script = write_py_script(
         root.path(),
         "my-build.py",
-        "#tendr: detach\nimport time; time.sleep(30)",
+        &format!("#tendr: detach\n{FOREVER_PY}"),
     );
 
     tendr(&root)
@@ -202,10 +207,11 @@ fn run_session_name_from_filename() {
 #[test]
 fn run_session_directive_overrides_filename() {
     let root = TempDir::new().unwrap();
+    let _run = SessionGuard::new_ns(&root, "default", "custom-name");
     let script = write_py_script(
         root.path(),
         "build.py",
-        "#tendr: session=custom-name\n#tendr: detach\nimport time; time.sleep(30)",
+        &format!("#tendr: session=custom-name\n#tendr: detach\n{FOREVER_PY}"),
     );
 
     tendr(&root)
@@ -218,10 +224,13 @@ fn run_session_directive_overrides_filename() {
 #[test]
 fn run_directives_map_to_launch_spec() {
     let root = TempDir::new().unwrap();
+    let _run = SessionGuard::new_ns(&root, "test-ns", "my-session");
     let script = write_py_script(
         root.path(),
         "directives.py",
-        "#tendr: namespace=test-ns\n#tendr: timeout=999\n#tendr: session=my-session\n#tendr: detach\nimport time; time.sleep(30)",
+        &format!(
+            "#tendr: namespace=test-ns\n#tendr: timeout=999\n#tendr: session=my-session\n#tendr: detach\n{FOREVER_PY}"
+        ),
     );
 
     tendr(&root)
@@ -236,12 +245,16 @@ fn run_directives_map_to_launch_spec() {
 #[test]
 fn run_cli_flags_override_directives() {
     let root = TempDir::new().unwrap();
+    let _run = SessionGuard::new_ns(&root, "cli-ns", "override");
     let script = write_py_script(
         root.path(),
         "override.py",
-        "#tendr: namespace=directive-ns\n#tendr: timeout=999\n#tendr: detach\nimport time; time.sleep(30)",
+        &format!(
+            "#tendr: namespace=directive-ns\n#tendr: timeout=999\n#tendr: detach\n{FOREVER_PY}"
+        ),
     );
 
+    // `--timeout 42` only has to be recorded; the run is killed long before.
     tendr(&root)
         .args([
             "run",
@@ -382,7 +395,7 @@ fn run_session_rejects_exec() {
     let script = write_py_script(
         root.path(),
         "server.py",
-        "#tendr: detach\nimport time; time.sleep(60)",
+        &format!("#tendr: detach\n{FOREVER_PY}"),
     );
 
     tendr(&root)
@@ -410,7 +423,10 @@ fn run_session_rejects_exec() {
 #[test]
 fn harness_deadline_reports_timeout_with_command_and_deadline() {
     let root = TempDir::new().unwrap();
-    let script = write_py_script(root.path(), "hang.py", "import time; time.sleep(2)");
+    // The run never ends by itself, so the deadline is the only way out; the
+    // guard stops the session the killed client leaves behind.
+    let _run = SessionGuard::new_ns(&root, "default", "hang");
+    let script = write_py_script(root.path(), "hang.py", FOREVER_PY);
     let script_str = script.to_str().unwrap().to_owned();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

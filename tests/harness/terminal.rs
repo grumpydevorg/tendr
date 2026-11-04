@@ -1,7 +1,7 @@
 //! A terminal driver for tests: runs a command in a PTY, types into it and
 //! captures what it writes, as a person at a terminal would.
 
-use super::{Observation, logged_output, poll_path_exists, poll_until};
+use super::{HANG, Observation, logged_output, poll_path_exists, poll_until};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,7 +124,7 @@ impl CliAttach {
     /// output is read joined ([`logged_output`]): a shell may echo the line in
     /// pieces, and capture logs each piece it reads on lines of its own.
     pub fn type_until_logged(&mut self, root: &TempDir, session: &str, line: &str) {
-        poll_until(Duration::from_secs(15), Duration::from_millis(200), || {
+        poll_until(HANG, Duration::from_millis(200), || {
             self.type_bytes(line.as_bytes());
             let joined = logged_output(root, session);
             if joined.contains(line.trim_end()) {
@@ -222,7 +222,7 @@ impl WrappedAttach {
         );
         let cli =
             CliAttach::spawn_argv_env(root, &["sh".to_owned(), "-c".to_owned(), script], extra_env);
-        poll_path_exists(&before, Duration::from_secs(10), Duration::from_millis(20))
+        poll_path_exists(&before, HANG, Duration::from_millis(20))
             .unwrap_or_else(|e| panic!("wrapper never started: {e}"));
         Self {
             cli,
@@ -236,15 +236,17 @@ impl WrappedAttach {
     /// Send `signal` to the wrapped command itself, not to the shell running it.
     pub fn signal(&self, signal: libc::c_int) {
         let pid: libc::pid_t =
-            poll_until(Duration::from_secs(10), Duration::from_millis(20), || {
-                match std::fs::read_to_string(&self.pid)
+            poll_until(
+                HANG,
+                Duration::from_millis(20),
+                || match std::fs::read_to_string(&self.pid)
                     .ok()
                     .and_then(|p| p.trim().parse().ok())
                 {
                     Some(pid) => Observation::Ready(pid),
                     None => Observation::Pending(format!("{} has no pid", self.pid.display())),
-                }
-            })
+                },
+            )
             .unwrap_or_else(|e| panic!("wrapped command's pid never recorded: {e}"));
         // SAFETY: kill(2) takes a pid and a signal number.
         let rc = unsafe { libc::kill(pid, signal) };
@@ -253,7 +255,7 @@ impl WrappedAttach {
 
     /// Wait until what the CLI wrote to its terminal contains `needle`.
     pub fn wait_output_contains(&self, needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + HANG;
         while !self.cli.output().contains(needle) {
             assert!(
                 Instant::now() < deadline,
@@ -269,10 +271,10 @@ impl WrappedAttach {
     }
 
     /// Wait for the wrapped command to exit and return its exit code.
-    pub fn wait_exit(&self, within: Duration) -> i32 {
-        poll_path_exists(&self.code, within, Duration::from_millis(20)).unwrap_or_else(|e| {
+    pub fn wait_exit(&self) -> i32 {
+        poll_path_exists(&self.code, HANG, Duration::from_millis(20)).unwrap_or_else(|e| {
             panic!(
-                "the wrapped command did not exit within {within:?} ({e}); cli output: {}",
+                "the wrapped command did not exit ({e}); cli output: {}",
                 self.cli.output()
             )
         });

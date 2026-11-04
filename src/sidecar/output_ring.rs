@@ -326,13 +326,14 @@ mod tests {
             let (ring, cursor) = (Arc::clone(&ring), Arc::clone(&cursor));
             std::thread::spawn(move || got.send(ring.next(&cursor, 64)).unwrap())
         };
+        // Waits out an early return; under load it can only miss one.
         assert!(
             read.recv_timeout(Duration::from_millis(100)).is_err(),
             "a cursor at the head returned without output"
         );
         ring.append(b"after");
         assert_eq!(
-            read.recv_timeout(Duration::from_secs(10)).unwrap(),
+            read.recv_timeout(crate::test_support::HANG).unwrap(),
             Next::Bytes {
                 offset: 6,
                 bytes: b"after".to_vec()
@@ -349,6 +350,8 @@ mod tests {
             let (ring, cursor) = (Arc::clone(&ring), Arc::clone(&cursor));
             std::thread::spawn(move || ring.next(&cursor, 64))
         };
+        // Lets the reader start waiting first; if load delays it, it finds
+        // the cursor already closed, which ends it the same way.
         std::thread::sleep(Duration::from_millis(50));
         ring.close(&cursor);
         assert_eq!(reader.join().unwrap(), Next::Closed);
@@ -369,12 +372,16 @@ mod tests {
             let (ring, cursor) = (Arc::clone(&ring), Arc::clone(&waiting));
             std::thread::spawn(move || ring.next(&cursor, 64))
         };
+        // Lets the reader start waiting first; if load delays it, it finds
+        // the ring already finished, which ends it the same way.
         std::thread::sleep(Duration::from_millis(50));
         ring.finish();
         assert_eq!(reader.join().unwrap(), Next::Ended(4));
         assert_eq!(drain(&ring, &behind, 2), b"last");
         assert_eq!(ring.next(&behind, 64), Next::Ended(4));
 
+        // Nothing closes a cursor meanwhile, so this deadline only bounds
+        // the wait; it returns false however late.
         let soon = std::time::Instant::now() + Duration::from_millis(50);
         assert!(
             !ring.wait_closed(&[Arc::clone(&behind), Arc::clone(&waiting)], soon),
@@ -384,11 +391,12 @@ mod tests {
         let closer = {
             let (ring, cursor) = (Arc::clone(&ring), Arc::clone(&behind));
             std::thread::spawn(move || {
+                // Paces the close after the wait has begun.
                 std::thread::sleep(Duration::from_millis(50));
                 ring.close(&cursor);
             })
         };
-        let later = std::time::Instant::now() + Duration::from_secs(10);
+        let later = std::time::Instant::now() + crate::test_support::HANG;
         assert!(ring.wait_closed(&[behind, waiting], later));
         closer.join().unwrap();
     }

@@ -204,11 +204,12 @@ fn single_exit_code(status: &RunStatus) -> i32 {
 /// session lock before reporting the session done. Warns on stderr if it has
 /// not; the caller reports the session either way (#91).
 pub(crate) fn await_release(session_dir: &session::SessionDir, name: &str, command: &str) {
-    if let Ok(false) = session::wait_unlocked(session_dir, session::RELEASE_GRACE) {
+    let grace = session::release_grace();
+    if let Ok(false) = session::wait_unlocked(session_dir, grace) {
         eprintln!(
             "tendr {command}: {name} is terminal but its sidecar still holds the session lock \
              after {}s; prune and start --replace may still find it locked",
-            session::RELEASE_GRACE.as_secs()
+            grace.as_secs()
         );
     }
 }

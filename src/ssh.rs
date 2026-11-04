@@ -456,6 +456,18 @@ fn classify(
     }
 }
 
+/// How long a call whose ssh exited without a hello waits for the relay to
+/// pass on the rest of ssh's stderr: a leftover holder of it must not hold
+/// the call open.
+const PRE_HELLO_RELAY: Duration = Duration::from_secs(1);
+
+/// [`PRE_HELLO_RELAY`]. Debug builds accept `TENDR_TEST_PRE_HELLO_RELAY_MS`
+/// so tests whose ssh stderr must be relayed are not cut short by a loaded
+/// machine.
+fn pre_hello_relay() -> Duration {
+    crate::test_timer::or_env("TENDR_TEST_PRE_HELLO_RELAY_MS", PRE_HELLO_RELAY)
+}
+
 /// The default time for ssh to get through authentication and start the
 /// remote tendr.
 const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
@@ -642,7 +654,7 @@ impl Watch {
                         &mut self.hello,
                         limit.map(|limit| limit.saturating_duration_since(Instant::now())),
                     ),
-                    None => wait_relay(&self.events, &mut self.hello, Some(Duration::from_secs(1))),
+                    None => wait_relay(&self.events, &mut self.hello, Some(pre_hello_relay())),
                 };
                 // A hello relayed only after ssh's exit still proves the
                 // remote tendr ran, and its answer, if it wrote one, is on

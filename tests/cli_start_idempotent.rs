@@ -1,11 +1,24 @@
 mod harness;
 
-use harness::{tendr, test_callback_bin, wait_running, wait_terminal};
+use harness::{HANG, SessionGuard, tendr, test_callback_bin, wait_running, wait_terminal};
 use predicates::prelude::*;
 use std::sync::Mutex;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// `kill --force`, waiting for the sidecar to record it up to the hang
+/// deadline rather than kill's 11 s.
+fn kill_force(root: &TempDir, name: &str) {
+    tendr(root)
+        .env("TENDR_TEST_KILL_WAIT_MS", HANG.as_millis().to_string())
+        .args(["kill", "--force", name])
+        .assert()
+        .success();
+}
+
+// The first run of each spec-matching test below never ends by itself: a
+// second start must find it live, however long the test takes to get there.
 
 #[test]
 fn start_same_spec_is_idempotent() {
@@ -13,10 +26,11 @@ fn start_same_spec_is_idempotent() {
     let root = TempDir::new().unwrap();
 
     let out1 = tendr(&root)
-        .args(["start", "idem-same", "sleep", "60"])
+        .args(["start", "idem-same", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(out1.status.success(), "first start failed");
+    let _session = SessionGuard::new(&root, "idem-same");
     wait_running(&root, "idem-same");
 
     let meta1: serde_json::Value =
@@ -24,7 +38,7 @@ fn start_same_spec_is_idempotent() {
     let run_id1 = meta1["run_id"].as_str().expect("no run_id");
 
     let out2 = tendr(&root)
-        .args(["start", "idem-same", "sleep", "60"])
+        .args(["start", "idem-same", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(
@@ -43,10 +57,7 @@ fn start_same_spec_is_idempotent() {
         "idempotent start should return same run_id"
     );
 
-    tendr(&root)
-        .args(["kill", "--force", "idem-same"])
-        .assert()
-        .success();
+    kill_force(&root, "idem-same");
 }
 
 #[test]
@@ -55,9 +66,10 @@ fn start_different_spec_is_conflict() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "idem-diff", "sleep", "60"])
+        .args(["start", "idem-diff", "sleep", "3600"])
         .assert()
         .success();
+    let _session = SessionGuard::new(&root, "idem-diff");
     wait_running(&root, "idem-diff");
 
     tendr(&root)
@@ -66,10 +78,7 @@ fn start_different_spec_is_conflict() {
         .failure()
         .stderr(predicate::str::contains("session conflict"));
 
-    tendr(&root)
-        .args(["kill", "--force", "idem-diff"])
-        .assert()
-        .success();
+    kill_force(&root, "idem-diff");
 }
 
 #[test]
@@ -182,11 +191,12 @@ fn start_with_different_cwd_is_spec_conflict() {
             dir_a.to_str().unwrap(),
             "--",
             "sleep",
-            "60",
+            "3600",
         ])
         .output()
         .unwrap();
     assert!(out1.status.success());
+    let _session = SessionGuard::new(&root, "cwd-conflict");
 
     let out2 = tendr(&root)
         .args([
@@ -196,7 +206,7 @@ fn start_with_different_cwd_is_spec_conflict() {
             dir_b.to_str().unwrap(),
             "--",
             "sleep",
-            "60",
+            "3600",
         ])
         .output()
         .unwrap();
@@ -231,11 +241,12 @@ fn start_with_different_env_is_spec_conflict() {
             "FOO=bar",
             "--",
             "sleep",
-            "60",
+            "3600",
         ])
         .output()
         .unwrap();
     assert!(out1.status.success());
+    let _session = SessionGuard::new(&root, "env-conflict");
 
     let out2 = tendr(&root)
         .args([
@@ -245,7 +256,7 @@ fn start_with_different_env_is_spec_conflict() {
             "FOO=baz",
             "--",
             "sleep",
-            "60",
+            "3600",
         ])
         .output()
         .unwrap();
@@ -439,11 +450,12 @@ fn start_with_same_cwd_and_env_is_idempotent() {
             "FOO=bar",
             "--",
             "sleep",
-            "60",
+            "3600",
         ])
         .output()
         .unwrap();
     assert!(out1.status.success());
+    let _session = SessionGuard::new(&root, "idem-cwd-env");
     let meta1: serde_json::Value = serde_json::from_slice(&out1.stdout).unwrap();
     let run_id1 = meta1["run_id"].as_str().unwrap().to_string();
 
@@ -457,7 +469,7 @@ fn start_with_same_cwd_and_env_is_idempotent() {
             "FOO=bar",
             "--",
             "sleep",
-            "60",
+            "3600",
         ])
         .output()
         .unwrap();

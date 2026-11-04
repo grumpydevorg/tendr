@@ -1,6 +1,6 @@
 mod harness;
 
-use harness::{tendr, wait_running_ns, wait_terminal, wait_terminal_ns};
+use harness::{HANG, SessionGuard, tendr, wait_running_ns, wait_terminal, wait_terminal_ns};
 use std::sync::Mutex;
 use tempfile::TempDir;
 
@@ -45,7 +45,7 @@ fn same_name_different_namespace() {
 
     // Start "job" in ns-a
     let out_a = tendr(&root)
-        .args(["start", "job", "--namespace", "ns-a", "--", "sleep", "60"])
+        .args(["start", "job", "--namespace", "ns-a", "--", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(
@@ -53,11 +53,12 @@ fn same_name_different_namespace() {
         "start in ns-a failed: {}",
         String::from_utf8_lossy(&out_a.stderr)
     );
+    let _session_a = SessionGuard::new_ns(&root, "ns-a", "job");
     wait_running_ns(&root, "ns-a", "job");
 
     // Start "job" in ns-b — should succeed because different namespace
     let out_b = tendr(&root)
-        .args(["start", "job", "--namespace", "ns-b", "--", "sleep", "60"])
+        .args(["start", "job", "--namespace", "ns-b", "--", "sleep", "3600"])
         .output()
         .unwrap();
     assert!(
@@ -65,6 +66,7 @@ fn same_name_different_namespace() {
         "start in ns-b failed: {}",
         String::from_utf8_lossy(&out_b.stderr)
     );
+    let _session_b = SessionGuard::new_ns(&root, "ns-b", "job");
     wait_running_ns(&root, "ns-b", "job");
 
     // Verify status works for each
@@ -100,15 +102,33 @@ fn list_with_namespace_filters() {
 
     // Create sessions in two namespaces
     tendr(&root)
-        .args(["start", "alpha", "--namespace", "ns-a", "--", "sleep", "60"])
+        .args([
+            "start",
+            "alpha",
+            "--namespace",
+            "ns-a",
+            "--",
+            "sleep",
+            "3600",
+        ])
         .assert()
         .success();
+    let _session_a = SessionGuard::new_ns(&root, "ns-a", "alpha");
     wait_running_ns(&root, "ns-a", "alpha");
 
     tendr(&root)
-        .args(["start", "beta", "--namespace", "ns-b", "--", "sleep", "60"])
+        .args([
+            "start",
+            "beta",
+            "--namespace",
+            "ns-b",
+            "--",
+            "sleep",
+            "3600",
+        ])
         .assert()
         .success();
+    let _session_b = SessionGuard::new_ns(&root, "ns-b", "beta");
     wait_running_ns(&root, "ns-b", "beta");
 
     // list --namespace ns-a should only show ns-a sessions
@@ -145,15 +165,17 @@ fn list_without_namespace_returns_all() {
 
     // Create sessions in two namespaces
     tendr(&root)
-        .args(["start", "one", "--namespace", "ns-a", "--", "sleep", "60"])
+        .args(["start", "one", "--namespace", "ns-a", "--", "sleep", "3600"])
         .assert()
         .success();
+    let _session_a = SessionGuard::new_ns(&root, "ns-a", "one");
     wait_running_ns(&root, "ns-a", "one");
 
     tendr(&root)
-        .args(["start", "two", "--namespace", "ns-b", "--", "sleep", "60"])
+        .args(["start", "two", "--namespace", "ns-b", "--", "sleep", "3600"])
         .assert()
         .success();
+    let _session_b = SessionGuard::new_ns(&root, "ns-b", "two");
     wait_running_ns(&root, "ns-b", "two");
 
     // list without --namespace should return all
@@ -217,7 +239,7 @@ fn start_with_namespace_idempotent() {
             "myns",
             "--",
             "sleep",
-            "60",
+            "3600",
         ])
         .output()
         .unwrap();
@@ -226,6 +248,7 @@ fn start_with_namespace_idempotent() {
         "first start failed: {}",
         String::from_utf8_lossy(&out1.stderr)
     );
+    let _session = SessionGuard::new_ns(&root, "myns", "idem-ns");
     wait_running_ns(&root, "myns", "idem-ns");
 
     let meta1: serde_json::Value =
@@ -241,7 +264,7 @@ fn start_with_namespace_idempotent() {
             "myns",
             "--",
             "sleep",
-            "60",
+            "3600",
         ])
         .output()
         .unwrap();
@@ -331,22 +354,18 @@ fn push_resolves_session_in_namespace() {
     // `push` returns once the bytes are handed to the child's stdin, not once
     // `cat` has echoed them into the log. Wait for the echo before killing, or a
     // force-kill can land while the line is still in flight.
-    harness::poll_until(
-        std::time::Duration::from_secs(10),
-        std::time::Duration::from_millis(50),
-        || {
-            let log_out = tendr(&root)
-                .args(["log", "push-ns", "--namespace", "ns-push", "--raw"])
-                .output()
-                .unwrap();
-            let log = String::from_utf8_lossy(&log_out.stdout).into_owned();
-            if log.contains("hello from push") {
-                harness::Observation::Ready(())
-            } else {
-                harness::Observation::Pending(format!("log so far: {log:?}"))
-            }
-        },
-    )
+    harness::poll_until(HANG, std::time::Duration::from_millis(50), || {
+        let log_out = tendr(&root)
+            .args(["log", "push-ns", "--namespace", "ns-push", "--raw"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log_out.stdout).into_owned();
+        if log.contains("hello from push") {
+            harness::Observation::Ready(())
+        } else {
+            harness::Observation::Pending(format!("log so far: {log:?}"))
+        }
+    })
     .unwrap_or_else(|e| panic!("pushed data should appear in log: {e}"));
 
     tendr(&root)
@@ -416,7 +435,9 @@ fn wait_resolves_session_in_namespace() {
             "--namespace",
             "ns-wait",
             "--timeout",
-            "5",
+            // Not the scenario under test: the hang deadline, so load
+            // cannot make the wait time out.
+            &HANG.as_secs().to_string(),
         ])
         .output()
         .unwrap();

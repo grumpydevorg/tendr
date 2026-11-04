@@ -24,32 +24,31 @@ pub mod conpty;
 #[cfg(unix)]
 pub mod terminal;
 
-/// Hang-detector deadline for a single `tendr` CLI invocation in tests.
+/// The one hang detector: how long any test waits for something that is
+/// expected to happen (a command to return, a state, an event, a file, a
+/// process to end) before calling it hung.
 ///
-/// This is NOT a performance assertion. A normal detached start completes in
-/// ~20 ms (warm) to ~570 ms (cold); this bound exists only to fail a genuine
-/// hang (deadlock) rather than let it stall CI forever. It is deliberately
-/// generous: the old hard-coded 5 s per-command deadline false-fired on a
-/// loaded Windows CI runner — `assert_cmd` killed the still-starting `tendr`
-/// process, which surfaced as exit 1 with empty output. 30 s keeps substantial
-/// headroom over observed individual starts while still surfacing a true hang
-/// promptly. Fixed and shared — raise this one value only if a real environment
-/// proves it insufficient.
+/// It is not a performance bound and never decides a passing test: a
+/// passing wait returns as soon as its condition holds, so the size costs
+/// nothing then. It is sized for the slowest machine the suite runs on,
+/// a Mac at a load average of 300 under other builds, where 10 s and 30 s
+/// deadlines fired on correct behaviour (#200). A real hang takes this long
+/// to report.
 #[allow(dead_code)]
-pub const CMD_DEADLINE: Duration = Duration::from_secs(30);
+pub const HANG: Duration = Duration::from_secs(120);
 
 /// Extension trait so call sites read `cmd.args(..).assert_within_deadline()` —
 /// a drop-in for the fluent `.assert()` that runs the command under the shared
-/// [`CMD_DEADLINE`] hang detector with explicit timeout diagnostics.
+/// [`HANG`] hang detector with explicit timeout diagnostics.
 #[allow(dead_code)]
 pub trait DeadlineAssertExt {
-    /// Assert the command under the shared [`CMD_DEADLINE`] hang detector.
+    /// Assert the command under the shared [`HANG`] hang detector.
     fn assert_within_deadline(&mut self) -> Assert;
 }
 
 impl DeadlineAssertExt for Command {
     fn assert_within_deadline(&mut self) -> Assert {
-        assert_within(self, CMD_DEADLINE)
+        assert_within(self, HANG)
     }
 }
 
@@ -72,8 +71,7 @@ pub fn assert_within(cmd: &mut Command, deadline: Duration) -> Assert {
         panic!(
             "HARNESS TIMEOUT: command reached the {:.1}s harness deadline; the invocation \
              returned after {:.1}s.\n  command: {desc}\n  This is the harness hang-detector \
-             firing — on a loaded runner it may mean the process was starved, not a product failure. \
-             Raise harness::CMD_DEADLINE only after ruling out a real hang.",
+             firing: the command hung, or the machine starved it for that long.",
             deadline.as_secs_f64(),
             elapsed.as_secs_f64(),
         );
@@ -111,14 +109,21 @@ pub fn tendr(root: &TempDir) -> Command {
 #[allow(dead_code)]
 pub struct SessionGuard<'a> {
     root: &'a TempDir,
+    namespace: String,
     name: String,
 }
 
 #[allow(dead_code)]
 impl<'a> SessionGuard<'a> {
     pub fn new(root: &'a TempDir, name: &str) -> Self {
+        Self::new_ns(root, "default", name)
+    }
+
+    /// [`new`](Self::new) for a session in `namespace`.
+    pub fn new_ns(root: &'a TempDir, namespace: &str, name: &str) -> Self {
         Self {
             root,
+            namespace: namespace.to_owned(),
             name: name.to_owned(),
         }
     }
@@ -129,9 +134,27 @@ impl Drop for SessionGuard<'_> {
         // The result is ignored: the session may already be terminal, and a
         // panic here while unwinding would abort the whole test binary.
         let _ = tendr(self.root)
-            .args(["kill", "--force", &self.name])
-            .timeout(CMD_DEADLINE)
+            .args([
+                "kill",
+                "--force",
+                "--namespace",
+                &self.namespace,
+                &self.name,
+            ])
+            .timeout(HANG)
             .output();
+    }
+}
+
+/// Creates the gate file a test's child or sidecar waits on, when dropped,
+/// so a party held at the gate never outlives a failing test. Create it
+/// right after the gate's path, before anything that can panic.
+#[allow(dead_code)]
+pub struct OpenGate(pub PathBuf);
+
+impl Drop for OpenGate {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"");
     }
 }
 
@@ -317,7 +340,7 @@ pub fn wait_log_tail(root: &TempDir, session: &str, marker: &str) {
     let log = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/output.log"));
-    poll_until(Duration::from_secs(60), Duration::from_millis(100), || {
+    poll_until(HANG, Duration::from_millis(100), || {
         use std::io::{Read, Seek, SeekFrom};
         let mut tail = Vec::new();
         if let Ok(mut file) = std::fs::File::open(&log) {
@@ -338,16 +361,42 @@ pub fn wait_log_tail(root: &TempDir, session: &str, marker: &str) {
     .unwrap_or_else(|e| panic!("{session} never logged {marker}: {e}"));
 }
 
+// Time. A test passes or fails by what it observes, never by how long that
+// took, so that a loaded machine only makes it slower:
+//
+// - A wait for something expected to happen gives up only at [`HANG`].
+// - A test that something does not wait (for a stalled child, a full pipe,
+//   a timer) makes that thing wait for ever, or until the test releases it
+//   after the assertion, so "it returned" is the proof, not "it returned
+//   within N".
+// - A test that a timer fires makes the timer the only way out: the party
+//   it times out never makes progress by itself. A lower bound ("waited at
+//   least the grace") is sound, since load only lengthens it.
+// - A test that a timer does not fire needs the timer to outlast anything
+//   load can do to the scenario; a product timer too short for that is
+//   lengthened for the test (debug-only `TENDR_TEST_*` variable) or the
+//   scenario is changed so the timer is not in its path.
+// - A timing policy (quiet windows, bounds, backoff) is a pure function of
+//   instants, tested with chosen instants, not with sleeping threads.
+// - A wait that a thing does NOT happen (sleep, then assert absence) can
+//   only pass wrongly under load, never fail wrongly; keep it short and say
+//   what it waits out.
+// - `thread::sleep` otherwise only paces a producer; it never orders two
+//   things. Wait for the event that means the first one happened.
+//
+// `scripts/load-test.sh` checks a test against these on Linux: it runs the
+// test binary frozen for most of each second, as a loaded machine freezes a
+// starved process, beside CPU hogs sharing its quota.
+//
 // Polling. A wait on the filesystem or a process (meta.json, event logs, a
 // path, PID liveness, `try_wait`, `try_acquire`, `tendr log` or `status`
 // output) goes through `poll_until` or a wrapper below. The rules:
 //
 // - Probe at once: never sleep before the first probe.
 // - One `Instant` deadline per wait, computed on entry.
-// - A wait keeps its own timeout and interval. On a timeout it panics,
-//   returns `false`, returns the error so cleanup runs first, or ignores it
-//   for best-effort cleanup. `poll_*` wrappers return the `Result`; `wait_*`
-//   wrappers panic.
+// - A wait keeps its own interval. On a timeout it panics, returns `false`,
+//   returns the error so cleanup runs first, or ignores it for best-effort
+//   cleanup. `poll_*` wrappers return the `Result`; `wait_*` wrappers panic.
 // - `Pending` describes the last state for the timeout message. Keep it short,
 //   or move in output the probe already owns; never clone a large buffer.
 // - Add a wrapper only when three or more call sites share a probe.
@@ -422,17 +471,15 @@ pub fn poll_until<T>(
 /// Wait for a session event of `kind`, returning the observed record.
 #[allow(dead_code)]
 pub fn wait_event_kind(root: &TempDir, session: &str, kind: &str) -> serde_json::Value {
-    poll_until(
-        Duration::from_secs(10),
-        Duration::from_millis(10),
-        || match read_events(root, session)
+    poll_until(HANG, Duration::from_millis(10), || {
+        match read_events(root, session)
             .into_iter()
             .find(|event| event["kind"] == kind)
         {
             Some(event) => Observation::Ready(event),
             None => Observation::Pending(format!("no event kind {kind} in {session} yet")),
-        },
-    )
+        }
+    })
     .unwrap_or_else(|e| panic!("waiting for event kind {kind} in {session}: {e}"))
 }
 
@@ -457,14 +504,12 @@ pub fn wait_running_ns(root: &TempDir, namespace: &str, session: &str) {
     let path = root
         .path()
         .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
-    poll_until(
-        Duration::from_secs(5),
-        Duration::from_millis(50),
-        || match meta_status(&path).as_deref() {
+    poll_until(HANG, Duration::from_millis(50), || {
+        match meta_status(&path).as_deref() {
             Some("Running") => Observation::Ready(()),
             other => Observation::Pending(format!("status={}", other.unwrap_or("<unreadable>"))),
-        },
-    )
+        }
+    })
     .unwrap_or_else(|e| panic!("waiting for Running state in {namespace}/{session}: {e}"))
 }
 
@@ -491,7 +536,7 @@ pub fn poll_terminal_ns(
     let path = root
         .path()
         .join(format!(".tendr/sessions/{namespace}/{session}/meta.json"));
-    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         let meta = std::fs::read_to_string(&path)
             .ok()
             .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok());
@@ -550,11 +595,11 @@ pub fn poll_pid_dead(pid: i32, timeout: Duration, interval: Duration) -> Result<
     })
 }
 
-/// Wait up to 5 s for `pid` to die (not just be signalled).
+/// Wait up to [`HANG`] for `pid` to die (not just be signalled).
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn wait_pid_dead(pid: i32) {
-    poll_pid_dead(pid, Duration::from_secs(5), Duration::from_millis(50))
+    poll_pid_dead(pid, HANG, Duration::from_millis(50))
         .unwrap_or_else(|e| panic!("waiting for pid {pid} to die: {e}"))
 }
 
@@ -652,7 +697,7 @@ pub fn wait_terminal_quiescent_ns(
     let namespace = Namespace::new(namespace).expect("test namespace is valid");
     let session_name = SessionName::new(session_name).expect("test session name is valid");
 
-    poll_until(Duration::from_secs(10), Duration::from_millis(10), || {
+    poll_until(HANG, Duration::from_millis(10), || {
         if let Ok(Some(session_dir)) = session::open(&session_root, &namespace, &session_name) {
             if session::read_meta(&session_dir).is_ok_and(|meta| meta.status().is_terminal()) {
                 match LockGuard::try_acquire(&session_dir) {
@@ -700,7 +745,7 @@ pub fn wait_orphaned_running(root: &TempDir, session_name: &str) -> OrphanedRunn
     let namespace = Namespace::new("default").expect("default namespace is valid");
     let session_name = SessionName::new(session_name).expect("test session name is valid");
 
-    poll_until(Duration::from_secs(10), Duration::from_millis(10), || {
+    poll_until(HANG, Duration::from_millis(10), || {
         // `start` has returned, so the session directory and meta must exist:
         // anything else is a defect, not a state to wait out.
         let session_dir = match session::open(&session_root, &namespace, &session_name) {
@@ -768,13 +813,13 @@ pub fn duckdb_or_skip() -> bool {
 #[allow(dead_code)]
 static FOLLOWER_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Poll until `path` exists or `deadline` elapses (panicking). The follower
+/// Poll until `path` exists, panicking at [`HANG`]. The follower
 /// publishes its `--ready-file` only after its baseline is established, so this
 /// is the deterministic "safe to mutate now" barrier that replaces a fixed
 /// post-spawn sleep.
 #[allow(dead_code)]
-pub fn wait_ready_file(path: &Path, deadline: Duration) {
-    poll_path_exists(path, deadline, Duration::from_millis(10))
+pub fn wait_ready_file(path: &Path) {
+    poll_path_exists(path, HANG, Duration::from_millis(10))
         .unwrap_or_else(|e| panic!("waiting for ready-file {}: {e}", path.display()))
 }
 
@@ -802,7 +847,7 @@ pub struct ReadyFollower {
 impl ReadyFollower {
     /// Spawn `tendr <subcommand> <args...> --ready-file <temp>` and block until
     /// the follower signals readiness. Panics — after killing/reaping the child
-    /// — if the follower exits before readiness or the 10 s barrier elapses,
+    /// — if the follower exits before readiness or [`HANG`] elapses,
     /// surfacing the follower's captured stderr rather than a bare timeout.
     pub fn spawn(root: &TempDir, subcommand: &str, args: &[&str]) -> Self {
         let bin = assert_cmd::cargo::cargo_bin("tendr");
@@ -853,7 +898,7 @@ impl ReadyFollower {
         };
 
         // `Ready(Some(status))` is an exit before readiness.
-        let ready = poll_until(Duration::from_secs(10), Duration::from_millis(10), || {
+        let ready = poll_until(HANG, Duration::from_millis(10), || {
             if ready_path.exists() {
                 return Observation::Ready(None);
             }
@@ -868,7 +913,7 @@ impl ReadyFollower {
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                Some(format!("never published its ready-file within 10s ({e})"))
+                Some(format!("never published its ready-file ({e})"))
             }
         };
         // On failure, join both readers so the captured stderr is complete (the
@@ -894,16 +939,12 @@ impl ReadyFollower {
         }
     }
 
-    /// Block until a streamed record satisfies `pred`, returning it. Panics on
-    /// `deadline`. Rescans every record seen so far each poll, so a record that
+    /// Block until a streamed record satisfies `pred`, returning it. Panics at
+    /// [`HANG`]. Rescans every record seen so far each poll, so a record that
     /// arrived just before the call is never missed — this is the delivery
     /// barrier that replaces a fixed pre-kill sleep.
-    pub fn read_until(
-        &self,
-        deadline: Duration,
-        pred: impl Fn(&serde_json::Value) -> bool,
-    ) -> serde_json::Value {
-        let end = Instant::now() + deadline;
+    pub fn read_until(&self, pred: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        let end = Instant::now() + HANG;
         loop {
             if let Some(found) = self
                 .records
@@ -917,7 +958,7 @@ impl ReadyFollower {
             }
             assert!(
                 Instant::now() < end,
-                "follower `{}` produced no matching record within {deadline:?}",
+                "follower `{}` produced no matching record within {HANG:?}",
                 self.label
             );
             std::thread::sleep(Duration::from_millis(10));

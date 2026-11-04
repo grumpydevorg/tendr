@@ -5,23 +5,53 @@
 
 mod harness;
 
-use harness::{Observation, poll_until};
+use harness::{HANG, Observation, WaitTimeout, poll_until};
 use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// An interval no wait in these tests is meant to sleep through: a poller
+/// that slept it would still be asleep long after [`HANG`].
+const NEVER: Duration = Duration::from_secs(20 * 60);
+
+/// Run one `poll_until` on its own thread and return its result with the
+/// number of probes it made. A poller that sleeps an interval it should not
+/// is then reported at [`HANG`] rather than hanging the test.
+fn run_poll<T: Send + 'static>(
+    timeout: Duration,
+    interval: Duration,
+    mut probe: impl FnMut(u32) -> Observation<T> + Send + 'static,
+) -> (Result<T, WaitTimeout>, u32) {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut probes = 0u32;
+        let result = poll_until(timeout, interval, || {
+            probes += 1;
+            probe(probes)
+        });
+        let _ = tx.send((result, probes));
+    });
+    rx.recv_timeout(HANG)
+        .expect("poll_until slept through an interval it should have skipped")
+}
 
 /// The first probe runs immediately — no leading sleep — so an already-true
-/// condition returns without waiting an interval.
+/// condition returns without waiting an interval. The interval is one no
+/// test outlives: a poller that slept it first would not return at all.
 #[test]
 fn probes_immediately_without_initial_sleep() {
-    let start = Instant::now();
-    let r: Result<u32, _> = poll_until(Duration::from_secs(5), Duration::from_secs(1), || {
-        Observation::Ready(42)
-    });
+    let (r, probes) = run_poll(NEVER, NEVER, |_| Observation::Ready(42u32));
     assert_eq!(r.unwrap(), 42);
-    assert!(
-        start.elapsed() < Duration::from_millis(100),
-        "must not sleep before the first probe"
-    );
+    assert_eq!(probes, 1, "one probe, already ready");
+}
+
+/// An already-true condition is reported even when the deadline has already
+/// passed: the probe comes before the deadline check.
+#[test]
+fn probes_before_checking_the_deadline() {
+    let (r, probes) = run_poll(Duration::ZERO, NEVER, |_| Observation::Ready(7u32));
+    assert_eq!(r.unwrap(), 7);
+    assert_eq!(probes, 1);
 }
 
 /// A timeout returns `Err(WaitTimeout)` carrying the last `Pending` description
@@ -35,6 +65,7 @@ fn deadline_trips_and_records_last_state() {
     })
     .unwrap_err();
 
+    // A lower bound: load only lengthens the wait.
     assert!(
         err.elapsed >= Duration::from_millis(80),
         "elapsed reaches the deadline"
@@ -51,17 +82,21 @@ fn deadline_trips_and_records_last_state() {
 }
 
 /// The final wait is clamped to the remaining time, so a long interval cannot
-/// overshoot a short deadline.
+/// overshoot a short deadline: with an interval no test outlives, the wait
+/// still ends, at its deadline, after probing once more.
 #[test]
 fn final_sleep_clamped_to_remaining() {
-    let start = Instant::now();
-    let _ = poll_until::<()>(Duration::from_millis(100), Duration::from_secs(5), || {
-        Observation::Pending("still".into())
+    let (r, probes) = run_poll(Duration::from_millis(100), NEVER, |_| {
+        Observation::<()>::Pending("still".into())
     });
-    // Unclamped, the single sleep would be 5s; clamped, we return in ~100ms.
+    let err = r.unwrap_err();
     assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "returned at the ~100ms deadline, not the 5s interval"
+        err.elapsed >= Duration::from_millis(100),
+        "waited out the deadline: {err}"
+    );
+    assert!(
+        probes >= 2,
+        "probed again after the clamped sleep: {probes}"
     );
 }
 
@@ -69,7 +104,7 @@ fn final_sleep_clamped_to_remaining() {
 #[test]
 fn returns_ready_after_pending() {
     let n = Cell::new(0u32);
-    let r = poll_until(Duration::from_secs(5), Duration::from_millis(5), || {
+    let r = poll_until(HANG, Duration::from_millis(5), || {
         n.set(n.get() + 1);
         if n.get() >= 3 {
             Observation::Ready(n.get())

@@ -30,9 +30,9 @@ use windows_sys::Win32::System::Threading::{
     TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
-/// Bound on each cleanup step in [`ConPty::close`]. A hang detector, not a
-/// performance claim: every step normally takes milliseconds.
-const CLOSE_STEP: Duration = Duration::from_secs(10);
+/// Bound on each cleanup step in [`ConPty::close`]: the shared hang
+/// detector, since every step normally takes milliseconds.
+const CLOSE_STEP: Duration = super::HANG;
 
 /// Path to the `conmode` helper (src/bin/conmode.rs).
 #[allow(dead_code)]

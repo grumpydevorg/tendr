@@ -509,7 +509,9 @@ mod tests {
         // is installed.
         unsafe { libc::raise(libc::SIGWINCH) };
         let stdin = std::io::stdin();
-        let ready = wait_ready(stdin.as_fd(), handlers.wake(), Duration::from_secs(5));
+        // The handler has already written the wake pipe; the bound only
+        // stops a hang.
+        let ready = wait_ready(stdin.as_fd(), handlers.wake(), Duration::from_secs(120));
         assert!(ready.signal, "SIGWINCH wakes the poll");
         let received = handlers.take();
         assert!(received.winch);

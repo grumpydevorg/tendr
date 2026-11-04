@@ -40,7 +40,7 @@ use super::{
 };
 #[cfg(unix)]
 use super::{
-    AttachPools, ConnectionRegistry, RunEffects, SidecarControlHooks, UnixPtyInput,
+    AttachPools, ConnectionRegistry, RetireWaits, RunEffects, SidecarControlHooks, UnixPtyInput,
     recorder_limits, run_attach_listener, start_pty_recording,
 };
 use crate::model::ids::{EpochTimestamp, ProcessIdentity};
@@ -392,6 +392,7 @@ impl RunCore {
             effects: effects.sender(),
             registry: registry.clone(),
             attach_sink: Arc::clone(&sink),
+            retire_waits: RetireWaits::default(),
         };
         let input = PtyInput {
             writer: crate::pty_input::InputWriter::spawn(
@@ -815,7 +816,7 @@ fn terminate_and_reap(
         }
     };
 
-    let mut gone = wait_gone(child, identity, Duration::from_secs(10));
+    let mut gone = wait_gone(child, identity, stop_grace());
     if !gone {
         if let Err(e) = Current::kill_child(handle, true) {
             notes.push(format!("force-killing the child failed: {e}"));
@@ -834,6 +835,17 @@ fn terminate_and_reap(
         ));
     }
     Stopped { gone, notes }
+}
+
+/// How long [`terminate_and_reap`] waits for the graceful stop before it
+/// force-kills the child itself.
+const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// [`STOP_GRACE`]. Debug builds accept `TENDR_TEST_STOP_GRACE_MS` so tests
+/// can tell a child the graceful stop ended from one the forced fallback
+/// did.
+fn stop_grace() -> Duration {
+    crate::test_timer::or_env("TENDR_TEST_STOP_GRACE_MS", STOP_GRACE)
 }
 
 /// Reap the child, or confirm it is gone, within `timeout`.

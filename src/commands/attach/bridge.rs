@@ -165,7 +165,7 @@ mod unix {
     use tendr::attach_proto::{self, Frame, FrameError};
 
     use super::super::Control;
-    use super::super::client::{DETACH_GRACE, Outbox, spawn_sender};
+    use super::super::client::{Outbox, detach_grace, spawn_sender};
 
     /// How often the bridge checks whether the client has hung up while
     /// both directions are blocked.
@@ -242,7 +242,7 @@ mod unix {
                 Ok(frame @ (Frame::Resize(_) | Frame::Repaint)) => outbox.push_control(frame),
                 Ok(Frame::Detach) => {
                     detached.store(true, Ordering::SeqCst);
-                    outbox.detach(DETACH_GRACE);
+                    outbox.detach(detach_grace());
                     return true;
                 }
                 // Frames a client does not send, and unknown or malformed
@@ -310,7 +310,7 @@ mod unix {
                 Ok(end) => return end,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return End::Left,
                 Err(mpsc::RecvTimeoutError::Timeout) if client_hung_up() => {
-                    return ended.recv_timeout(DETACH_GRACE).unwrap_or(End::Left);
+                    return ended.recv_timeout(detach_grace()).unwrap_or(End::Left);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }

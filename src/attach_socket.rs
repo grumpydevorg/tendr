@@ -369,6 +369,13 @@ impl io::Read for DeadlineReader<'_> {
 /// longer than a bind takes to publish its breadcrumb.
 pub const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// [`ORPHAN_GRACE`]. Debug builds accept `TENDR_TEST_ORPHAN_GRACE_MS` so
+/// tests can keep a fresh socket younger than the grace however slow the
+/// machine.
+fn orphan_grace() -> std::time::Duration {
+    crate::test_timer::or_env("TENDR_TEST_ORPHAN_GRACE_MS", ORPHAN_GRACE)
+}
+
 /// Remove attach sockets that a sidecar killed outright left behind in
 /// `state_root/sockets` (only a sidecar that ends normally removes its own), or
 /// with `dry_run` only report them. Returns the orphans' paths.
@@ -422,7 +429,7 @@ pub fn sweep_orphans(state_root: &Path, dry_run: bool) -> io::Result<Vec<PathBuf
             .modified()
             .ok()
             .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= ORPHAN_GRACE);
+            .is_some_and(|age| age >= orphan_grace());
         if !meta.file_type().is_socket() || meta.uid() != euid || !old_enough {
             continue;
         }
@@ -749,21 +756,21 @@ mod tests {
     #[test]
     fn deadline_reader_stops_a_trickling_peer_at_the_overall_deadline() {
         let (a, mut b) = UnixStream::pair().unwrap();
+        // A byte far more often than the deadline, until the reader is gone:
+        // a per-read deadline would never expire, so the read below would
+        // never end. That it returns is the proof the deadline is overall.
         let trickle = std::thread::spawn(move || {
-            for _ in 0..20 {
-                if b.write_all(&[0]).is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(40));
+            while b.write_all(&[0]).is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
             }
         });
         let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
         let mut reader = DeadlineReader {
             stream: &a,
-            deadline: started + Duration::from_millis(200),
+            deadline,
         };
-        let mut buf = [0u8; 20];
-        let err = reader.read_exact(&mut buf).unwrap_err();
+        let err = reader.read_to_end(&mut Vec::new()).unwrap_err();
         assert!(
             matches!(
                 err.kind(),
@@ -771,11 +778,7 @@ mod tests {
             ),
             "unexpected error {err}"
         );
-        assert!(
-            started.elapsed() < Duration::from_millis(600),
-            "the deadline is overall, not per read: {:?}",
-            started.elapsed()
-        );
+        assert!(Instant::now() >= deadline, "not before the deadline");
         drop(a);
         let _ = trickle.join();
     }

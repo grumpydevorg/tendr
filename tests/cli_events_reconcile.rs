@@ -5,14 +5,13 @@
 
 mod harness;
 
-use harness::{Observation, poll_until, tendr, wait_pid_dead, wait_running};
+use harness::{HANG, Observation, poll_until, tendr, wait_pid_dead, wait_running};
 use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// Sidecar-killing and crash-injection tests are timing-sensitive under
-/// parallel load — serialize within this binary (same pattern as
-/// cli_reconcile.rs).
+/// Sidecar-killing and crash-injection tests are serialised within this
+/// binary (same pattern as cli_reconcile.rs), to keep its own load down.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Read all events for a session, merged by (ts, writer, seq).
@@ -57,13 +56,13 @@ fn sidecar_pid(meta: &serde_json::Value) -> i32 {
     meta["sidecar"]["pid"].as_u64().expect("sidecar.pid") as i32
 }
 
-/// Poll `tendr status` until it reports a terminal state, or panic after
-/// 10 s. Needed after crash injection: the aborting sidecar releases the
+/// Poll `tendr status` until it reports a terminal state, or panic at
+/// `HANG`. Needed after crash injection: the aborting sidecar releases the
 /// session lock only when the process finishes dying (macOS crash reporting
 /// can delay that well past the fsync'd event append), and reconciliation
 /// deliberately no-ops while the lock is held.
 fn poll_status_until_terminal(root: &TempDir, session: &str) -> serde_json::Value {
-    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         let output = tendr(root).args(["status", session]).output().unwrap();
         assert!(output.status.success());
         let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -75,12 +74,12 @@ fn poll_status_until_terminal(root: &TempDir, session: &str) -> serde_json::Valu
     .unwrap_or_else(|e| panic!("waiting for {session} to reconcile to a terminal state: {e}"))
 }
 
-/// Poll until the session's event log contains `kind`, or panic after 10 s.
+/// Poll until the session's event log contains `kind`, or panic at `HANG`.
 fn wait_for_event_kind(root: &TempDir, session: &str, kind: &str) {
     let events_dir = root
         .path()
         .join(format!(".tendr/sessions/default/{session}/events"));
-    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+    poll_until(HANG, Duration::from_millis(50), || {
         if events_dir.exists() && read_events(root, session).iter().any(|e| e["kind"] == kind) {
             Observation::Ready(())
         } else {
@@ -98,9 +97,12 @@ fn killed_sidecar_appends_inferred_sidecar_lost_event() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "s1", "--", "sleep", "60"])
+        .args(["start", "s1", "--", "sleep", "3600"])
         .assert()
         .success();
+    // The child never exits by itself, so it is still there to be reaped as
+    // an orphan however long the test takes.
+    let _session = harness::SessionGuard::new(&root, "s1");
     wait_running(&root, "s1");
 
     let meta = read_meta_json(&root, "s1");
@@ -189,9 +191,10 @@ fn wait_exit_code_reflects_healed_state() {
 
     // ExitedError → 42 (wait's non-zero-child-exit code), not 3 (sidecar
     // lost). wait polls internally, so it tolerates the lock-release lag;
-    // the generous timeout covers slow crash teardown under load.
+    // its timeout is the hang deadline, so slow crash teardown under load
+    // cannot reach it.
     tendr(&root)
-        .args(["wait", "--timeout", "10", "s1"])
+        .args(["wait", "--timeout", &HANG.as_secs().to_string(), "s1"])
         .assert()
         .code(42);
 }
@@ -206,9 +209,10 @@ fn sidecar_lost_stops_a_pty_recording() {
     let root = TempDir::new().unwrap();
 
     tendr(&root)
-        .args(["start", "p1", "--pty", "--", "sleep", "60"])
+        .args(["start", "p1", "--pty", "--", "sleep", "3600"])
         .assert()
         .success();
+    let _session = harness::SessionGuard::new(&root, "p1");
     wait_running(&root, "p1");
     let meta = read_meta_json(&root, "p1");
     assert_eq!(meta["pty"]["recording"]["state"], "Recording");

@@ -7,27 +7,20 @@ use tempfile::TempDir;
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Wait for terminal state, then wait for callback completion.
-/// Callbacks run after the lock is released, so we poll for the callback record file.
+/// Callbacks run after the lock is released, so we poll for the callback record.
 fn wait_for_callbacks(root: &TempDir, session: &str) {
     wait_terminal(root, session);
 
-    // Callbacks run after lock release. Poll for the callback record file.
-    // Read meta to get run_id, then check for callbacks/<run_id>.json
-    let meta_path = root
-        .path()
-        .join(format!(".tendr/sessions/default/{session}/meta.json"));
-    let content = std::fs::read_to_string(&meta_path).expect("meta.json should exist");
-    let meta: serde_json::Value = serde_json::from_str(&content).unwrap();
-    let run_id = meta["run_id"].as_str().unwrap();
-
-    let callbacks_path = root.path().join(format!(".tendr/callbacks/{run_id}.json"));
-    // Callbacks may have no failures and still write the record, so not finding
-    // the file just means we timed out waiting — tests that need it will assert.
-    let _ = harness::poll_path_exists(
-        &callbacks_path,
-        std::time::Duration::from_secs(5),
-        std::time::Duration::from_millis(50),
-    );
+    // Every caller configures on-exit callbacks on a run that exits, and the
+    // sidecar writes callbacks/<run_id>.json after running them, failures
+    // included. It writes it in place, so wait for it to parse, not to exist.
+    harness::poll_until(harness::HANG, std::time::Duration::from_millis(50), || {
+        match read_callback_record(root, session) {
+            Some(_) => harness::Observation::Ready(()),
+            None => harness::Observation::Pending("no complete callback record".into()),
+        }
+    })
+    .unwrap_or_else(|e| panic!("{session} never wrote its callback record: {e}"));
 }
 
 /// Read the callback record for a session (by run_id from meta.json).
@@ -92,7 +85,7 @@ fn on_exit_callback_runs_after_forced_kill() {
             &touch_cmd(&marker),
             "--",
             "sleep",
-            "60",
+            "3600",
         ])
         .output()
         .unwrap();
@@ -101,10 +94,16 @@ fn on_exit_callback_runs_after_forced_kill() {
         "start failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // Never exits by itself: only the forced kill ends it.
+    let _session = harness::SessionGuard::new(&root, "on-exit-kill");
 
     wait_running(&root, "on-exit-kill");
 
     tendr(&root)
+        .env(
+            "TENDR_TEST_KILL_WAIT_MS",
+            harness::HANG.as_millis().to_string(),
+        )
         .args(["kill", "--force", "on-exit-kill"])
         .assert()
         .success();

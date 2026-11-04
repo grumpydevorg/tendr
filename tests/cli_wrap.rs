@@ -9,10 +9,23 @@ use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Start a session that runs `sleep 60`, wait for Running state.
-fn create_running_session(root: &TempDir, name: &str, namespace: &str) {
+/// Start a session that runs a `sleep` that never ends by itself, wait for
+/// Running state. The returned guard force-kills the session on drop.
+fn create_running_session<'a>(
+    root: &'a TempDir,
+    name: &str,
+    namespace: &str,
+) -> harness::SessionGuard<'a> {
     let out = tendr(root)
-        .args(["start", name, "--namespace", namespace, "--", "sleep", "60"])
+        .args([
+            "start",
+            name,
+            "--namespace",
+            namespace,
+            "--",
+            "sleep",
+            "3600",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -20,7 +33,9 @@ fn create_running_session(root: &TempDir, name: &str, namespace: &str) {
         "start failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let guard = harness::SessionGuard::new_ns(root, namespace, name);
     wait_running_ns(root, namespace, name);
+    guard
 }
 
 /// Read the run_id from a session's meta.json.
@@ -96,7 +111,7 @@ fn wrap_preserves_child_exit_code() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-exit", "default");
+    let _session = create_running_session(&root, "wrap-exit", "default");
     let run_id = read_run_id(&root, "default", "wrap-exit");
 
     let out = tendr(&root)
@@ -136,7 +151,7 @@ fn wrap_captures_and_replays_stdout() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-stdout", "default");
+    let _session = create_running_session(&root, "wrap-stdout", "default");
     let run_id = read_run_id(&root, "default", "wrap-stdout");
 
     let out = tendr(&root)
@@ -183,7 +198,7 @@ fn wrap_writes_annotation_line() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-ann", "default");
+    let _session = create_running_session(&root, "wrap-ann", "default");
     let run_id = read_run_id(&root, "default", "wrap-ann");
 
     let out = tendr(&root)
@@ -318,7 +333,7 @@ fn wrap_defaults_session_from_env() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-env-default", "myns");
+    let _session = create_running_session(&root, "wrap-env-default", "myns");
     let run_id = read_run_id(&root, "myns", "wrap-env-default");
 
     // Don't pass --session or --namespace, rely on env vars
@@ -361,7 +376,7 @@ fn wrap_truncates_large_payload() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-trunc", "default");
+    let _session = create_running_session(&root, "wrap-trunc", "default");
     let run_id = read_run_id(&root, "default", "wrap-trunc");
 
     // Generate a large stdin payload (>4096 bytes)
@@ -416,7 +431,7 @@ fn wrap_passes_stdin_to_child() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-stdin", "default");
+    let _session = create_running_session(&root, "wrap-stdin", "default");
     let run_id = read_run_id(&root, "default", "wrap-stdin");
 
     let input = r#"{"tool":"bash","input":"ls"}"#;
@@ -465,7 +480,7 @@ fn wrap_annotation_visible_in_watch() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-watch", "default");
+    let _session = create_running_session(&root, "wrap-watch", "default");
     let run_id = read_run_id(&root, "default", "wrap-watch");
 
     // Wait for the watcher's baseline before mutating, then read until the exact
@@ -495,7 +510,7 @@ fn wrap_annotation_visible_in_watch() {
         .unwrap();
     assert!(out.status.success());
 
-    follower.read_until(std::time::Duration::from_secs(10), |event| {
+    follower.read_until(|event| {
         event["kind"] == "annotation"
             && event["session"] == "wrap-watch"
             && event["source"] == "cmux.claude-hook"
@@ -517,7 +532,7 @@ fn wrap_forwards_sigterm_and_writes_annotation() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-sigterm", "default");
+    let _session = create_running_session(&root, "wrap-sigterm", "default");
     let run_id = read_run_id(&root, "default", "wrap-sigterm");
 
     // The shell installs its TERM trap and *then* publishes an out-of-band
@@ -558,7 +573,7 @@ fn wrap_forwards_sigterm_and_writes_annotation() {
         .expect("failed to spawn tendr wrap");
 
     // No sleep: the trap is proven installed once the ready-file appears.
-    harness::wait_ready_file(&ready, std::time::Duration::from_secs(10));
+    harness::wait_ready_file(&ready);
 
     unsafe {
         libc::kill(wrap_child.id() as i32, libc::SIGTERM);
@@ -566,7 +581,7 @@ fn wrap_forwards_sigterm_and_writes_annotation() {
 
     let status = harness::poll_child_exit(
         &mut wrap_child,
-        std::time::Duration::from_secs(8),
+        harness::HANG,
         std::time::Duration::from_millis(50),
     )
     .unwrap_or_else(|e| {
@@ -600,7 +615,7 @@ fn wrap_dual_writes_event_and_linked_aline() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-dual", "default");
+    let _session = create_running_session(&root, "wrap-dual", "default");
     let run_id = read_run_id(&root, "default", "wrap-dual");
 
     let out = tendr(&root)
@@ -660,7 +675,7 @@ fn wrap_sets_child_env_chain() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-env", "default");
+    let _session = create_running_session(&root, "wrap-env", "default");
     let run_id = read_run_id(&root, "default", "wrap-env");
 
     let out = tendr(&root)
@@ -714,7 +729,7 @@ fn wrap_child_emit_chains_to_hook_event() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-chain", "default");
+    let _session = create_running_session(&root, "wrap-chain", "default");
     let run_id = read_run_id(&root, "default", "wrap-chain");
 
     let tendr_bin = assert_cmd::cargo::cargo_bin("tendr");
@@ -774,7 +789,7 @@ fn wrap_reserved_event_exits_6_without_side_effects() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-res", "default");
+    let _session = create_running_session(&root, "wrap-res", "default");
     let run_id = read_run_id(&root, "default", "wrap-res");
 
     let marker = root.path().join("side-effect-marker");
@@ -820,7 +835,7 @@ fn wrap_legacy_dotless_event_keeps_aline_only() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-legacy", "default");
+    let _session = create_running_session(&root, "wrap-legacy", "default");
     let run_id = read_run_id(&root, "default", "wrap-legacy");
 
     let out = tendr(&root)
@@ -879,7 +894,7 @@ fn wrap_chains_parent_from_ambient_env() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-outer", "default");
+    let _session = create_running_session(&root, "wrap-outer", "default");
     let run_id = read_run_id(&root, "default", "wrap-outer");
 
     let outer = uuid::Uuid::now_v7().to_string();
@@ -922,7 +937,7 @@ fn wrap_event_append_failure_is_best_effort() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
 
-    create_running_session(&root, "wrap-ro", "default");
+    let _session = create_running_session(&root, "wrap-ro", "default");
     let run_id = read_run_id(&root, "default", "wrap-ro");
 
     let events_dir = root.path().join(".tendr/sessions/default/wrap-ro/events");

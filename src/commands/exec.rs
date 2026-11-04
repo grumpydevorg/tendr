@@ -226,7 +226,7 @@ impl PendingExec {
             // As in wait_sentinel_result: the shell's stderr may no longer
             // reach the log. Give stragglers the same grace before the next
             // exec takes its log offset.
-            std::thread::sleep(ERR_MARKER_GRACE);
+            std::thread::sleep(err_marker_grace());
         }
         Ok(sentinel)
     }
@@ -725,6 +725,13 @@ fn run_exec(
 /// sidecar (e.g. an earlier `push 'exec 2>/dev/null'`).
 const ERR_MARKER_GRACE: Duration = Duration::from_secs(1);
 
+/// [`ERR_MARKER_GRACE`]. Debug builds accept `TENDR_TEST_ERR_MARKER_GRACE_MS`
+/// so tests whose marker must be waited for are not cut short by a loaded
+/// machine.
+fn err_marker_grace() -> Duration {
+    tendr::test_timer::or_env("TENDR_TEST_ERR_MARKER_GRACE_MS", ERR_MARKER_GRACE)
+}
+
 /// Scan output.log for the result of one framed exec (PosixShell, DuckDB).
 ///
 /// The sidecar logs stdout and stderr from separate threads, so their lines
@@ -802,7 +809,7 @@ fn wait_sentinel_result(
         let bytes = reader.read_line(&mut buf)?;
         if bytes == 0 {
             if let Some((code, cwd, seen_at)) = &sentinel {
-                if seen_at.elapsed() >= ERR_MARKER_GRACE {
+                if seen_at.elapsed() >= err_marker_grace() {
                     eprintln!(
                         "tendr exec: stderr end marker not seen; the session shell's stderr \
                          may be redirected, so stderr may be incomplete"
