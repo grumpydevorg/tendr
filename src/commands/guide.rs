@@ -18,6 +18,8 @@ const GUIDE: &str = include_str!("../../docs/guide.md");
 const TOPICS: &[(&str, &str)] = &[
     ("install", "Install and build"),
     ("exec", "Drive it with"),
+    ("run", "Run in the foreground"),
+    ("environment", "Choose a launch environment"),
     ("ready", "a server is ready"),
     ("remote", "Reach remote hosts"),
     ("python", "Python /"),
@@ -26,9 +28,9 @@ const TOPICS: &[(&str, &str)] = &[
     ("ndjson", "NDJSON"),
     ("boundary", "--boundary"),
     ("cgroup", "Cap a session's memory"),
-    ("herdr", "inside herdr"),
-    ("replay", "Replay a recording"),
-    ("agent-turns", "Drive an agent turn"),
+    ("herdr", "alongside Herdr Core"),
+    ("export", "Export a recording"),
+    ("events", "Wait for a published event"),
     ("pty", "Partial lines"),
 ];
 
@@ -244,19 +246,6 @@ mod tests {
         assert!(
             !cg.contains("Record where a session runs"),
             "cgroup section must not bleed into the boundary section"
-        );
-    }
-
-    #[test]
-    fn herdr_section_covers_survival_hook_and_limits() {
-        let herdr = slice_section(GUIDE, "inside herdr").unwrap();
-        assert!(herdr.contains("herdr session stop"));
-        assert!(herdr.contains("HERDR_BIN_PATH"));
-        assert!(herdr.contains("--on-exit"));
-        assert!(herdr.contains("herdr pane read"));
-        assert!(
-            !herdr.contains("## See also"),
-            "herdr section must not bleed into See also"
         );
     }
 

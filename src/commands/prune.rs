@@ -337,7 +337,7 @@ fn prune_sessions(
                 bytes_reclaimed += b;
             }
         } else {
-            match fs::remove_dir_all(session_dir.path()) {
+            match session::remove(&session_dir) {
                 Ok(()) => {
                     emit_delete(ns, name, ended_at, &exit_reason, bytes);
                     deleted += 1;

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use tendr::model::event::EventTimestamp;
 use tendr::model::ids::{Namespace, Source};
 
@@ -109,147 +109,111 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Start a supervised run
-    Start {
-        /// Session name
-        name: String,
-        /// Namespace for session grouping
-        #[arg(long)]
-        namespace: Option<String>,
-        /// Enable stdin pipe for exec and push (a --pty session takes push without it)
-        #[arg(long)]
-        stdin: bool,
-        /// Interactive pseudo-terminal mode
-        #[arg(long)]
-        pty: bool,
-        /// What ends a pipe session's log record: newline (default) or
-        /// newline-or-cr, which logs each carriage-return progress update at once
-        #[arg(long = "log-delimiter", value_enum, conflicts_with = "pty")]
-        log_delimiter: Option<CliLogDelimiter>,
-        /// Exec target protocol (inferred from argv[0] if omitted)
-        #[arg(long = "exec-target", value_enum)]
-        exec_target: Option<CliExecTarget>,
-        /// Replace existing session (kill + restart)
-        #[arg(long)]
-        replace: bool,
-        /// Stop the child, as `kill` does, after N seconds
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Working directory for the child process
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        /// Environment variable override (KEY=VALUE)
-        #[arg(long = "env", value_name = "KEY=VALUE")]
-        env_vars: Vec<String>,
-        /// Remove NAME from the inherited environment (repeatable)
-        #[arg(long = "unset-env", value_name = "NAME")]
-        unset_env: Vec<String>,
-        /// Command to run after the child exits (repeatable)
-        #[arg(long = "on-exit", value_name = "COMMAND")]
-        on_exit: Vec<String>,
-        /// Wait for session(s) to exit before starting (repeatable)
-        #[arg(long = "after", value_name = "SESSION")]
-        after: Vec<String>,
-        /// Proceed even if dependency exits non-zero
-        #[arg(long = "any-exit", requires = "after")]
-        any_exit: bool,
-        /// Count the run as ready once a line of its output matches REGEX
-        #[arg(
+#[derive(clap::Args)]
+struct LaunchArgs {
+    /// Session name
+    name: String,
+    /// Namespace for session grouping
+    #[arg(long)]
+    namespace: Option<String>,
+    /// Enable stdin pipe for exec and push (a --pty session takes push without it)
+    #[arg(long)]
+    stdin: bool,
+    /// Interactive pseudo-terminal mode
+    #[arg(long)]
+    pty: bool,
+    /// What ends a pipe session's log record: newline (default) or
+    /// newline-or-cr, which logs each carriage-return progress update at once
+    #[arg(long = "log-delimiter", value_enum, conflicts_with = "pty")]
+    log_delimiter: Option<CliLogDelimiter>,
+    /// Exec target protocol (inferred from argv[0] if omitted)
+    #[arg(long = "exec-target", value_enum)]
+    exec_target: Option<CliExecTarget>,
+    /// Replace existing session (kill + restart)
+    #[arg(long)]
+    replace: bool,
+    /// Stop the child, as `kill` does, after N seconds
+    #[arg(long)]
+    timeout: Option<u64>,
+    /// Working directory for the child process
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Environment variable override (KEY=VALUE)
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env_vars: Vec<String>,
+    /// Remove NAME from the inherited environment (repeatable)
+    #[arg(long = "unset-env", value_name = "NAME")]
+    unset_env: Vec<String>,
+    /// Command to run after the child exits (repeatable)
+    #[arg(long = "on-exit", value_name = "COMMAND")]
+    on_exit: Vec<String>,
+    /// Wait for session(s) to exit before starting (repeatable)
+    #[arg(long = "after", value_name = "SESSION")]
+    after: Vec<String>,
+    /// Proceed even if dependency exits non-zero
+    #[arg(long = "any-exit", requires = "after")]
+    any_exit: bool,
+    /// Count the run as ready once a line of its output matches REGEX
+    #[arg(
             long = "ready-when-output",
             value_name = "REGEX",
             group = "ready_when",
             value_parser = parse_ready_regex
         )]
-        ready_when_output: Option<String>,
-        /// Count the run as ready once a TCP connection to PORT on localhost succeeds
-        #[arg(
+    ready_when_output: Option<String>,
+    /// Count the run as ready once a TCP connection to PORT on localhost succeeds
+    #[arg(
             long = "ready-when-port",
             value_name = "PORT",
             group = "ready_when",
             value_parser = clap::value_parser!(u16).range(1..)
         )]
-        ready_when_port: Option<u16>,
-        /// Record a missed deadline if not ready DURATION after the child starts (30s, 2m)
-        #[arg(
+    ready_when_port: Option<u16>,
+    /// Record a missed deadline if not ready DURATION after the child starts (30s, 2m)
+    #[arg(
             long = "ready-within",
             value_name = "DURATION",
             value_parser = parse_duration,
             requires = "ready_when"
         )]
-        ready_within: Option<Duration>,
-        /// Wait for session(s) to be ready before starting (repeatable)
-        #[arg(long = "after-ready", value_name = "SESSION")]
-        after_ready: Vec<String>,
-        /// Declared execution boundary as KIND:LABEL (host, container, vm, pod)
-        #[arg(long, value_name = "KIND:LABEL")]
-        boundary: Option<tendr::model::boundary::Boundary>,
-        /// Ancestry boundary as KIND:LABEL (repeatable; outermost last)
-        #[arg(
-            long = "boundary-parent",
-            value_name = "KIND:LABEL",
-            requires = "boundary"
-        )]
-        boundary_parent: Vec<tendr::model::boundary::Boundary>,
-        /// Also record the input written to the terminal, in clear: anything
-        /// typed or pushed, passwords and tokens included (needs --pty)
-        #[arg(long, requires = "pty", conflicts_with = "no_record")]
-        record_input: bool,
-        /// Record nothing for this run (needs --pty)
-        #[arg(long, requires = "pty")]
-        no_record: bool,
-        /// Command and arguments
-        #[arg(trailing_var_arg = true, required = true)]
-        cmd: Vec<String>,
-    },
-    /// Run a script as a supervised session
-    Run {
-        /// Script file to run
-        script: PathBuf,
-        /// Interpreter override (default: inferred from extension, +x, or shebang)
-        #[arg(long)]
-        shell: Option<String>,
-        /// Return immediately after start (don't wait for exit)
-        #[arg(long, conflicts_with = "foreground")]
-        detach: bool,
-        /// Force foreground mode (overrides #tendr: detach directive)
-        #[arg(long, conflicts_with = "detach")]
-        foreground: bool,
-        /// Namespace for session grouping
-        #[arg(long)]
-        namespace: Option<String>,
-        /// Enable stdin pipe for push command
-        #[arg(long)]
-        stdin: bool,
-        /// Replace existing session (kill + restart)
-        #[arg(long)]
-        replace: bool,
-        /// Stop the child, as `kill` does, after N seconds
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Working directory for the child process
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        /// Environment variable override (KEY=VALUE)
-        #[arg(long = "env", value_name = "KEY=VALUE")]
-        env_vars: Vec<String>,
-        /// Remove NAME from the inherited environment (repeatable)
-        #[arg(long = "unset-env", value_name = "NAME")]
-        unset_env: Vec<String>,
-        /// Command to run after the child exits (repeatable)
-        #[arg(long = "on-exit", value_name = "COMMAND")]
-        on_exit: Vec<String>,
-        /// Wait for session(s) to exit before starting (repeatable)
-        #[arg(long = "after", value_name = "SESSION")]
-        after: Vec<String>,
-        /// Proceed even if dependency exits non-zero
-        #[arg(long = "any-exit", requires = "after")]
-        any_exit: bool,
-        /// Arguments to pass to the script
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
-    },
+    ready_within: Option<Duration>,
+    /// Wait for session(s) to be ready before starting (repeatable)
+    #[arg(long = "after-ready", value_name = "SESSION")]
+    after_ready: Vec<String>,
+    /// Declared execution boundary as KIND:LABEL (host, container, vm, pod)
+    #[arg(long, value_name = "KIND:LABEL")]
+    boundary: Option<tendr::model::boundary::Boundary>,
+    /// Ancestry boundary as KIND:LABEL (repeatable; outermost last)
+    #[arg(
+        long = "boundary-parent",
+        value_name = "KIND:LABEL",
+        requires = "boundary"
+    )]
+    boundary_parent: Vec<tendr::model::boundary::Boundary>,
+    /// Also record the input written to the terminal, in clear: anything
+    /// typed or pushed, passwords and tokens included (needs --pty)
+    #[arg(long, requires = "pty", conflicts_with = "no_record")]
+    record_input: bool,
+    /// Record nothing for this run (needs --pty)
+    #[arg(long, requires = "pty")]
+    no_record: bool,
+    /// Inherit the caller's environment or use the clean baseline
+    #[arg(long, value_enum, default_value = "inherit")]
+    env_mode: tendr::model::spec::EnvMode,
+    /// Pass a caller variable by name when using a clean environment
+    #[arg(long = "pass-env", value_name = "NAME")]
+    pass_env: Vec<String>,
+    /// Command and arguments
+    #[arg(trailing_var_arg = true, required = true)]
+    cmd: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start a supervised run
+    Start(LaunchArgs),
+    /// Run a supervised command in the foreground
+    Run(LaunchArgs),
     /// Send stdin to a running session's child process
     Push {
         /// Session name
@@ -550,33 +514,13 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Play a PTY recording in this terminal at the recorded pace, or export it
-    ///
-    /// PATH is a segment file, a run's recording directory
-    /// (<session>/recording/<run_id>) or a session directory. Ctrl-C stops.
-    /// Local-only: copy a remote recording here first.
-    Replay {
-        /// The recording to play
+    /// Export a PTY recording to stdout (local-only)
+    Export {
+        /// Segment, recording directory, or session directory
         path: PathBuf,
-        /// Pause at each recorded window size change until this window
-        /// matches it
-        #[arg(long, conflicts_with = "export")]
-        strict_geometry: bool,
-        /// Play FACTOR times as fast as recorded (e.g. 2, or 0.5)
-        #[arg(
-            long,
-            value_name = "FACTOR",
-            value_parser = parse_speed,
-            default_value_t = 1.0,
-            conflicts_with_all = ["no_delay", "export"]
-        )]
-        speed: f64,
-        /// Play without the recorded pauses
-        #[arg(long, conflicts_with = "export")]
-        no_delay: bool,
-        /// Write the recording to stdout in FORMAT instead of playing it
-        #[arg(long, value_enum, value_name = "FORMAT")]
-        export: Option<commands::ExportFormat>,
+        /// Output format
+        #[arg(long, value_enum, default_value = "asciicast")]
+        format: commands::ExportFormat,
     },
     /// Attach to a PTY session's terminal
     Attach {
@@ -659,73 +603,91 @@ impl Commands {
     /// after `--`. Returns `None` for commands that keep the generic rejection.
     fn local_fallback_args(&self) -> Option<Vec<String>> {
         match self {
-            Commands::Run {
-                script,
-                shell,
-                detach,
-                foreground,
-                namespace,
-                stdin,
-                replace,
-                timeout,
-                cwd,
-                env_vars,
-                unset_env,
-                on_exit,
-                after,
-                any_exit,
-                args: script_args,
-            } => {
-                let mut args = vec!["run".to_string()];
-                if let Some(s) = shell {
-                    args.extend(["--shell".to_string(), s.clone()]);
+            Commands::Run(launch) => {
+                let mut args = vec!["run".to_string(), launch.name.clone()];
+                if let Some(ns) = &launch.namespace {
+                    args.extend(["--namespace".into(), ns.clone()]);
                 }
-                if *detach {
-                    args.push("--detach".to_string());
+                for (enabled, flag) in [
+                    (launch.stdin, "--stdin"),
+                    (launch.pty, "--pty"),
+                    (launch.replace, "--replace"),
+                    (launch.any_exit, "--any-exit"),
+                    (launch.record_input, "--record-input"),
+                    (launch.no_record, "--no-record"),
+                ] {
+                    if enabled {
+                        args.push(flag.into());
+                    }
                 }
-                if *foreground {
-                    args.push("--foreground".to_string());
+                if let Some(value) = &launch.log_delimiter {
+                    args.extend([
+                        "--log-delimiter".into(),
+                        value.to_possible_value().unwrap().get_name().into(),
+                    ]);
                 }
-                if let Some(ns) = namespace {
-                    args.extend(["--namespace".to_string(), ns.clone()]);
+                if let Some(value) = &launch.exec_target {
+                    args.extend([
+                        "--exec-target".into(),
+                        value.to_possible_value().unwrap().get_name().into(),
+                    ]);
                 }
-                if *stdin {
-                    args.push("--stdin".to_string());
+                if let Some(value) = launch.timeout {
+                    args.extend(["--timeout".into(), value.to_string()]);
                 }
-                if *replace {
-                    args.push("--replace".to_string());
+                if let Some(value) = &launch.cwd {
+                    args.extend(["--cwd".into(), value.display().to_string()]);
                 }
-                if let Some(t) = timeout {
-                    args.extend(["--timeout".to_string(), t.to_string()]);
+                for (flag, values) in [
+                    ("--env", &launch.env_vars),
+                    ("--unset-env", &launch.unset_env),
+                    ("--pass-env", &launch.pass_env),
+                    ("--on-exit", &launch.on_exit),
+                    ("--after", &launch.after),
+                    ("--after-ready", &launch.after_ready),
+                ] {
+                    for value in values {
+                        args.extend([flag.into(), value.clone()]);
+                    }
                 }
-                if let Some(c) = cwd {
-                    args.extend(["--cwd".to_string(), c.display().to_string()]);
+                args.extend([
+                    "--env-mode".into(),
+                    launch
+                        .env_mode
+                        .to_possible_value()
+                        .unwrap()
+                        .get_name()
+                        .into(),
+                ]);
+                if let Some(value) = &launch.ready_when_output {
+                    args.extend(["--ready-when-output".into(), value.clone()]);
                 }
-                for e in env_vars {
-                    args.extend(["--env".to_string(), e.clone()]);
+                if let Some(value) = launch.ready_when_port {
+                    args.extend(["--ready-when-port".into(), value.to_string()]);
                 }
-                for u in unset_env {
-                    args.extend(["--unset-env".to_string(), u.clone()]);
+                if let Some(value) = launch.ready_within {
+                    args.extend([
+                        "--ready-within".into(),
+                        humantime::format_duration(value).to_string(),
+                    ]);
                 }
-                for o in on_exit {
-                    args.extend(["--on-exit".to_string(), o.clone()]);
+                if let Some(value) = &launch.boundary {
+                    args.extend(["--boundary".into(), value.to_string()]);
                 }
-                for a in after {
-                    args.extend(["--after".to_string(), a.clone()]);
+                for value in &launch.boundary_parent {
+                    args.extend(["--boundary-parent".into(), value.to_string()]);
                 }
-                if *any_exit {
-                    args.push("--any-exit".to_string());
-                }
-                args.push(script.display().to_string());
-                // clap consumed the user's first `--` (later ones stay in
-                // the captured args) — re-insert exactly one so hyphen
-                // script args don't re-parse as tendr flags on paste.
-                if !script_args.is_empty() {
-                    args.push("--".to_string());
-                }
-                args.extend(script_args.iter().cloned());
+                args.push("--".into());
+                args.extend(launch.cmd.iter().cloned());
                 Some(args)
             }
+            Commands::Export { path, format } => Some(vec![
+                "export".into(),
+                "--format".into(),
+                format.to_possible_value().unwrap().get_name().into(),
+                "--".into(),
+                path.display().to_string(),
+            ]),
             Commands::Wrap {
                 session,
                 namespace,
@@ -899,19 +861,8 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{s} is too large"))
 }
 
-/// Parse a playback speed: a finite number above zero.
-fn parse_speed(s: &str) -> Result<f64, String> {
-    match s.parse::<f64>() {
-        Ok(speed) if speed.is_finite() && speed > 0.0 => Ok(speed),
-        _ => Err(format!(
-            "expected a number above 0, such as 2 or 0.5, got {s:?}"
-        )),
-    }
-}
-
 /// Parse an optional namespace string without defaulting.
-/// Returns `None` when no namespace was provided — meaning varies by command:
-/// "all namespaces" (list/watch/prune) or "defer to directive/default" (run).
+/// `None` means all namespaces for list/watch/prune.
 fn parse_optional_namespace(namespace: Option<String>) -> anyhow::Result<Option<Namespace>> {
     namespace
         .map(|s| Namespace::new(&s).map_err(anyhow::Error::from))
@@ -1119,41 +1070,7 @@ fn main() {
     }
 
     let result = match cli.command {
-        Commands::Run {
-            script,
-            shell,
-            detach,
-            foreground,
-            namespace,
-            stdin,
-            replace,
-            timeout,
-            cwd,
-            env_vars,
-            unset_env,
-            on_exit,
-            after,
-            any_exit,
-            args,
-        } => parse_optional_namespace(namespace).and_then(|ns| {
-            commands::cmd_run(
-                &script,
-                args,
-                shell,
-                detach,
-                foreground,
-                ns.as_ref(),
-                timeout,
-                stdin,
-                replace,
-                cwd.as_deref(),
-                &env_vars,
-                &unset_env,
-                &on_exit,
-                &after,
-                any_exit,
-            )
-        }),
+        Commands::Run(args) => commands::cmd_run(remote_op::StartRequest::from(&args)),
         Commands::Exec {
             name,
             namespace,
@@ -1266,19 +1183,9 @@ fn main() {
                     .and_then(|ns| commands::cmd_prune_named(&names, &ns, dry_run))
             }
         }
-        Commands::Replay {
-            path,
-            strict_geometry,
-            speed,
-            no_delay,
-            export,
-        } => commands::cmd_replay(&commands::ReplayOptions {
-            path,
-            strict_geometry,
-            speed,
-            no_delay,
-            export,
-        }),
+        Commands::Export { path, format } => {
+            commands::cmd_export(&commands::ExportOptions { path, format })
+        }
         Commands::Wrap {
             session,
             namespace,
@@ -1308,7 +1215,7 @@ fn main() {
         Commands::Remote => remote_frame::serve(),
         // The remote-capable commands run through the same typed layer as
         // `--host`. Named, not a catch-all, so a new command must be classified.
-        remote @ (Commands::Start { .. }
+        remote @ (Commands::Start(_)
         | Commands::Status { .. }
         | Commands::List { .. }
         | Commands::Log { .. }
@@ -1323,8 +1230,15 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("{e:#}");
-        // 1, or a PTY operation's own code (80–85, `tendr::pty_exit`).
-        std::process::exit(tendr::pty_exit::exit_code(&e));
+        let code = if e
+            .downcast_ref::<tendr::environment::EnvironmentError>()
+            .is_some()
+        {
+            2
+        } else {
+            tendr::pty_exit::exit_code(&e)
+        };
+        std::process::exit(code);
     }
 }
 

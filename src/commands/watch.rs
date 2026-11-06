@@ -1,14 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tendr::events::{POLL_INTERVAL, merge_key, read_segment_records};
 use tendr::log::LogLine;
 use tendr::log_files::{LogCursor, LogReader};
 use tendr::model::event::Event;
 use tendr::model::ids::Namespace;
-use tendr::model::state::{ExitReason, RunStatus};
 use tendr::session::{self, SessionRoot};
 
 /// Per-session polling state.
@@ -16,105 +14,26 @@ struct SessionWatcher {
     namespace: String,
     session: String,
     run_id: String,
-    last_status: String,
     log_cursor: LogCursor,
-    /// When the session has an `events/` dir, the run-event stream is
-    /// derived from the event log (spec §5.3) — true timestamps,
-    /// un-collapsed transitions, real sources. Sessions without one keep
-    /// the legacy meta-diff synthesis. Output shape is frozen either way.
-    event_mode: bool,
-    /// Event-mode: segment file name → offset after last consumed line.
+    /// Segment file name → offset after last consumed line.
     seg_offsets: BTreeMap<String, u64>,
 }
 
-/// Return epoch seconds with microsecond precision as an f64.
-fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
-}
+/// Read new lifecycle events in deterministic merge order, advancing offsets.
+fn read_new_run_events(
+    session_dir: &Path,
+    seg_offsets: &mut BTreeMap<String, u64>,
+) -> anyhow::Result<Vec<Event>> {
+    use anyhow::Context;
 
-/// Map a RunStatus to its event name string.
-fn run_event_name(status: &RunStatus) -> &'static str {
-    match status {
-        RunStatus::Starting => "run.starting",
-        RunStatus::Running { .. } => "run.started",
-        RunStatus::SpawnFailed { .. } => "run.spawn_failed",
-        RunStatus::Exited { how, .. } => match how {
-            ExitReason::ExitedOk => "run.exited",
-            ExitReason::ExitedError { .. } => "run.exited",
-            ExitReason::Killed => "run.killed",
-            ExitReason::KilledForced => "run.killed",
-            ExitReason::TimedOut => "run.timed_out",
-            ExitReason::SidecarFailed { .. } => "run.sidecar_failed",
-        },
-        RunStatus::SidecarLost { .. } => "run.sidecar_lost",
-        RunStatus::DependencyFailed { .. } => "run.dependency_failed",
-    }
-}
-
-/// Build the data object for a run event.
-fn run_event_data(status: &RunStatus) -> serde_json::Value {
-    match status {
-        RunStatus::Starting => serde_json::json!({"status": "Starting"}),
-        RunStatus::Running { .. } => serde_json::json!({"status": "Running"}),
-        RunStatus::SpawnFailed { .. } => serde_json::json!({"status": "SpawnFailed"}),
-        RunStatus::Exited { how, .. } => match how {
-            ExitReason::ExitedOk => {
-                serde_json::json!({"status": "Exited", "reason": "ExitedOk", "exit_code": 0})
-            }
-            ExitReason::ExitedError { code } => {
-                serde_json::json!({"status": "Exited", "reason": "ExitedError", "exit_code": code.get()})
-            }
-            ExitReason::Killed => {
-                serde_json::json!({"status": "Exited", "reason": "Killed"})
-            }
-            ExitReason::KilledForced => {
-                serde_json::json!({"status": "Exited", "reason": "KilledForced"})
-            }
-            ExitReason::TimedOut => {
-                serde_json::json!({"status": "Exited", "reason": "TimedOut"})
-            }
-            ExitReason::SidecarFailed { step } => {
-                serde_json::json!({"status": "Exited", "reason": "SidecarFailed", "step": step.as_str()})
-            }
-        },
-        RunStatus::SidecarLost { .. } => {
-            serde_json::json!({"status": "SidecarLost"})
-        }
-        RunStatus::DependencyFailed { reason, .. } => {
-            use tendr::model::dep_fail::DepFailReason;
-            let reason_str = match reason {
-                DepFailReason::Failed => "Failed",
-                DepFailReason::TimedOut => "TimedOut",
-                DepFailReason::Killed => "Killed",
-                DepFailReason::KilledForced => "KilledForced",
-            };
-            serde_json::json!({"status": "DependencyFailed", "reason": reason_str})
-        }
-    }
-}
-
-/// Serialize a status to a string for dedup comparison.
-fn status_key(status: &RunStatus) -> String {
-    // Serialize the status to JSON for a stable comparison key.
-    serde_json::to_string(status).unwrap_or_default()
-}
-
-/// Read new `run.*` events from a session's segments, advancing per-segment
-/// offsets. New (lexicographically later) segments are picked up from their
-/// start. Returned in deterministic merge order (spec §4).
-fn read_new_run_events(session_dir: &Path, seg_offsets: &mut BTreeMap<String, u64>) -> Vec<Event> {
     let events_dir = session_dir.join("events");
-    let Ok(read_dir) = std::fs::read_dir(&events_dir) else {
-        return Vec::new(); // wiped mid-replace — the next generation recreates it
-    };
+    let read_dir = std::fs::read_dir(&events_dir)
+        .with_context(|| format!("cannot read event history at {}", events_dir.display()))?;
     let mut segments: Vec<PathBuf> = read_dir
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .collect();
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("cannot list event history at {}", events_dir.display()))?;
+    segments.retain(|p| p.extension().is_some_and(|x| x == "jsonl"));
     segments.sort();
 
     let mut events = Vec::new();
@@ -123,9 +42,8 @@ fn read_new_run_events(session_dir: &Path, seg_offsets: &mut BTreeMap<String, u6
             continue;
         };
         let from = seg_offsets.get(file_name).copied().unwrap_or(0);
-        let Ok(outcome) = read_segment_records(&segment, from) else {
-            continue;
-        };
+        let outcome = read_segment_records(&segment, from)
+            .with_context(|| format!("cannot read event history segment {}", segment.display()))?;
         seg_offsets.insert(file_name.to_owned(), outcome.consumed_to);
         events.extend(
             outcome
@@ -136,7 +54,50 @@ fn read_new_run_events(session_dir: &Path, seg_offsets: &mut BTreeMap<String, u6
         );
     }
     events.sort_by_key(merge_key);
-    events
+    Ok(events)
+}
+
+/// A replacement can remove or recreate the directory while history is read.
+/// Callers reset offsets when discovering a new run; stale reads are not emitted.
+fn checked_history(
+    session_dir: &session::SessionDir,
+    run_id: tendr::model::ids::RunId,
+    offsets: &mut BTreeMap<String, u64>,
+    require_history: bool,
+    read: impl FnOnce(&Path, &mut BTreeMap<String, u64>) -> anyhow::Result<Vec<Event>>,
+) -> anyhow::Result<Option<Vec<Event>>> {
+    let history = read(session_dir.path(), offsets);
+    let metadata = session::read_meta(session_dir);
+    checked_history_outcome(session_dir, run_id, require_history, history, metadata)
+}
+
+/// Validate the captured read outcomes, not a later filesystem snapshot.
+fn checked_history_outcome(
+    session_dir: &session::SessionDir,
+    run_id: tendr::model::ids::RunId,
+    require_history: bool,
+    history: anyhow::Result<Vec<Event>>,
+    metadata: Result<tendr::model::meta::Meta, session::SessionError>,
+) -> anyhow::Result<Option<Vec<Event>>> {
+    match metadata {
+        Ok(meta) if meta.run_id() != run_id => return Ok(None),
+        Ok(_) => {}
+        Err(session::SessionError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let history = history.map_err(|e| anyhow::anyhow!(
+        "session {} has unusable event history: {e:#}; use --logs or --annotations to view output without lifecycle events",
+        session_dir.name()
+    ))?;
+    if require_history && history.is_empty() {
+        anyhow::bail!(
+            "session {} has no usable event history; use --logs or --annotations to view output without lifecycle events",
+            session_dir.name()
+        );
+    }
+    Ok(Some(history))
 }
 
 /// Project one stored lifecycle event onto watch's frozen output shape:
@@ -227,10 +188,8 @@ pub fn cmd_watch(
         HashSet::new()
     };
 
-    // Sessions found on the first scan existed at invocation: they get
-    // watch's frozen current-state snapshot. Sessions discovered on later
-    // scans are news — with an event log, their whole history replays
-    // un-collapsed (spec §5.3).
+    // Existing sessions get the last persisted lifecycle event as a snapshot;
+    // sessions discovered later replay their history.
     let mut first_scan = true;
 
     loop {
@@ -251,51 +210,36 @@ pub fn cmd_watch(
             };
 
             let run_id_str = meta.run_id().to_string();
-            let current_status_key = status_key(meta.status());
-            let has_event_log = session_dir.path().join("events").is_dir();
-
             if let Some(watcher) = watchers.get_mut(&key) {
-                // Detect run_id change (session replaced) — reset log offset
-                if watcher.run_id != run_id_str {
-                    watcher.run_id = run_id_str.clone();
+                let replaced = watcher.run_id != run_id_str;
+                let mut fresh_offsets = BTreeMap::new();
+                let offsets = if replaced {
+                    &mut fresh_offsets
+                } else {
+                    &mut watcher.seg_offsets
+                };
+                let history = if emit_events {
+                    let Some(history) = checked_history(
+                        &session_dir,
+                        meta.run_id(),
+                        offsets,
+                        replaced,
+                        read_new_run_events,
+                    )?
+                    else {
+                        continue;
+                    };
+                    history
+                } else {
+                    Vec::new()
+                };
+                if replaced {
+                    watcher.run_id = run_id_str;
                     watcher.log_cursor = LogCursor::default();
-                    watcher.last_status = String::new(); // force status re-emit
+                    watcher.seg_offsets = fresh_offsets;
                 }
-
-                // An events dir appearing mid-watch (a legacy session
-                // replaced under a slice-2 binary): switch to the event
-                // log — it carries the new generation from its start.
-                if !watcher.event_mode && has_event_log {
-                    watcher.event_mode = true;
-                    watcher.seg_offsets = BTreeMap::new();
-                }
-
-                if watcher.event_mode {
-                    if emit_events {
-                        let events =
-                            read_new_run_events(session_dir.path(), &mut watcher.seg_offsets);
-                        watcher.last_status = current_status_key;
-                        for event in &events {
-                            if !emit_projected_run_event(&mut stdout, watcher, event) {
-                                return Ok(());
-                            }
-                        }
-                    }
-                } else if emit_events && watcher.last_status != current_status_key {
-                    // Legacy meta-diff synthesis, unchanged.
-                    watcher.last_status = current_status_key;
-                    let ts = now_epoch_secs();
-                    if !emit_event(
-                        &mut stdout,
-                        ts,
-                        &watcher.namespace,
-                        &watcher.session,
-                        &watcher.run_id,
-                        "tendr.sidecar",
-                        "run",
-                        run_event_name(meta.status()),
-                        run_event_data(meta.status()),
-                    ) {
+                for event in &history {
+                    if !emit_projected_run_event(&mut stdout, watcher, event) {
                         return Ok(());
                     }
                 }
@@ -307,68 +251,39 @@ pub fn cmd_watch(
                     namespace: ns.as_str().to_owned(),
                     session: name.as_str().to_owned(),
                     run_id: run_id_str,
-                    last_status: current_status_key,
                     log_cursor: LogCursor::default(),
-                    event_mode: has_event_log,
                     seg_offsets: BTreeMap::new(),
                 };
 
-                if watcher.event_mode {
-                    // Consume the log up to now either way — offsets must
-                    // sit past history so later polls stream only news.
-                    let history = read_new_run_events(session_dir.path(), &mut watcher.seg_offsets);
-                    if skip_initial || !emit_events {
-                        // --from-now (or logs-only): history skipped.
-                    } else if first_scan {
-                        // Pre-existing session: the frozen snapshot
-                        // contract — current state once, from the last
-                        // transition (its true timestamp and source).
-                        if let Some(event) = history.last() {
-                            if !emit_projected_run_event(&mut stdout, &watcher, event) {
-                                return Ok(());
-                            }
-                        } else {
-                            // Events dir with no lifecycle events yet:
-                            // legacy snapshot from meta.
-                            let ts = now_epoch_secs();
-                            if !emit_event(
+                if emit_events {
+                    // Even --from-now requires usable lifecycle history; consume
+                    // it to establish offsets before suppressing the snapshot.
+                    let Some(history) = checked_history(
+                        &session_dir,
+                        meta.run_id(),
+                        &mut watcher.seg_offsets,
+                        true,
+                        read_new_run_events,
+                    )?
+                    else {
+                        continue;
+                    };
+                    if !skip_initial {
+                        if first_scan {
+                            if !emit_projected_run_event(
                                 &mut stdout,
-                                ts,
-                                &watcher.namespace,
-                                &watcher.session,
-                                &watcher.run_id,
-                                "tendr.sidecar",
-                                "run",
-                                run_event_name(meta.status()),
-                                run_event_data(meta.status()),
+                                &watcher,
+                                history.last().unwrap(),
                             ) {
                                 return Ok(());
                             }
-                        }
-                    } else {
-                        // Discovered mid-watch: its whole history is news —
-                        // every transition, un-collapsed.
-                        for event in &history {
-                            if !emit_projected_run_event(&mut stdout, &watcher, event) {
-                                return Ok(());
+                        } else {
+                            for event in &history {
+                                if !emit_projected_run_event(&mut stdout, &watcher, event) {
+                                    return Ok(());
+                                }
                             }
                         }
-                    }
-                } else if !skip_initial && emit_events {
-                    // Legacy: emit initial snapshot of current state.
-                    let ts = now_epoch_secs();
-                    if !emit_event(
-                        &mut stdout,
-                        ts,
-                        &watcher.namespace,
-                        &watcher.session,
-                        &watcher.run_id,
-                        "tendr.sidecar",
-                        "run",
-                        run_event_name(meta.status()),
-                        run_event_data(meta.status()),
-                    ) {
-                        return Ok(());
                     }
                 }
 
@@ -476,4 +391,115 @@ fn log_data(line: &LogLine) -> serde_json::Value {
             serde_json::to_value(terminator).expect("Terminator is always serializable");
     }
     data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU32;
+    use tendr::events::{EventDraft, EventWriter};
+    use tendr::model::event::Kind;
+    use tendr::model::ids::{
+        EpochTimestamp, Generation, ProcessIdentity, RunId, SessionName, Source,
+    };
+    use tendr::model::meta::Meta;
+    use tendr::model::spec::LaunchSpec;
+
+    fn fixture(root: &SessionRoot, name: &str) -> (session::SessionDir, Meta) {
+        let ns = Namespace::new("default").unwrap();
+        let name = SessionName::new(name).unwrap();
+        let dir = session::create(root, &ns, &name).unwrap();
+        let meta = Meta::new_starting(
+            name,
+            RunId::new(),
+            Generation::first(),
+            LaunchSpec::new(vec!["echo".into()]).unwrap(),
+            ProcessIdentity {
+                pid: NonZeroU32::new(100).unwrap(),
+                start_time_ns: 1000,
+            },
+            EpochTimestamp::now(),
+        );
+        session::write_meta_atomic(&dir, &meta).unwrap();
+        (dir, meta)
+    }
+
+    #[test]
+    fn replacement_during_history_read_does_not_stop_other_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = SessionRoot::new(temp.path().to_owned());
+        let (swap, old) = fixture(&root, "swap");
+        let (other, other_meta) = fixture(&root, "other");
+        EventWriter::new(other.path())
+            .append(
+                EventDraft {
+                    id: None,
+                    kind: Kind::new("run.starting").unwrap(),
+                    namespace: Namespace::new("default").unwrap(),
+                    session: SessionName::new("other").unwrap(),
+                    run_id: other_meta.run_id(),
+                    generation: None,
+                    source: Source::trusted("tendr.sidecar").unwrap(),
+                    block_id: None,
+                    parent_id: None,
+                    data: None,
+                    preview: None,
+                },
+                false,
+            )
+            .unwrap();
+
+        let mut offsets = BTreeMap::new();
+        let result = checked_history(&swap, old.run_id(), &mut offsets, true, |path, offsets| {
+            // Deletion unpublishes metadata before recursively removing files.
+            // Exercise that partial-removal window while the directory remains.
+            std::fs::remove_file(path.join("meta.json")).unwrap();
+            read_new_run_events(path, offsets)
+        })
+        .unwrap();
+        assert!(result.is_none());
+
+        // The missing-file result can be handled after replacement republishes.
+        let history = read_new_run_events(swap.path(), &mut BTreeMap::new());
+        let metadata = session::read_meta(&swap);
+        assert!(metadata.is_err());
+        std::fs::remove_dir_all(swap.path()).unwrap();
+        let (_, replacement) = fixture(&root, "swap");
+        assert_ne!(old.run_id(), replacement.run_id());
+        let result = checked_history_outcome(&swap, old.run_id(), true, history, metadata).unwrap();
+        assert!(result.is_none());
+        let history = checked_history(
+            &other,
+            other_meta.run_id(),
+            &mut offsets,
+            true,
+            read_new_run_events,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].kind.as_str(), "run.starting");
+    }
+
+    #[test]
+    fn changed_run_during_empty_read_is_retried_but_same_run_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = SessionRoot::new(temp.path().to_owned());
+        let (dir, old) = fixture(&root, "swap");
+        let mut offsets = BTreeMap::new();
+        let result = checked_history(&dir, old.run_id(), &mut offsets, true, |path, _| {
+            std::fs::remove_dir_all(path).unwrap();
+            let _ = fixture(&root, "swap");
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert!(result.is_none());
+
+        let current = session::read_meta(&dir).unwrap();
+        let error = checked_history(&dir, current.run_id(), &mut offsets, true, |_, _| {
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("event history"));
+    }
 }

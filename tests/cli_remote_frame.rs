@@ -714,6 +714,13 @@ fn start_frame(changes: serde_json::Value) -> Vec<u8> {
     )
 }
 
+fn environment_start_frame(changes: serde_json::Value) -> Vec<u8> {
+    let old = start_frame(changes);
+    let mut header: serde_json::Value = serde_json::from_slice(&old[4..]).unwrap();
+    header["v"] = 3.into();
+    frame(&serde_json::to_vec(&header).unwrap())
+}
+
 fn run_remote_entry(root: &Home, stdin: Vec<u8>) -> Output {
     tendr(root)
         .arg("_remote")
@@ -772,8 +779,8 @@ fn remote_entry_refuses_bad_requests_without_side_effects() {
         ("not an object", frame(b"[1,2]"), "invalid remote request"),
         (
             "unknown version",
-            frame(br#"{"v":3,"op":"list","params":{"namespace":null}}"#),
-            "unsupported remote request version 3",
+            frame(br#"{"v":4,"op":"list","params":{"namespace":null}}"#),
+            "unsupported remote request version 4",
         ),
         (
             "log delimiter with pty",
@@ -819,6 +826,23 @@ fn remote_entry_refuses_bad_requests_without_side_effects() {
             "malformed unset-env",
             start_frame(serde_json::json!({"unset_env": ["A=B"]})),
             "--unset-env",
+        ),
+        (
+            "clean environment under old frame",
+            start_frame(serde_json::json!({"env_mode": "clean"})),
+            "version 3",
+        ),
+        (
+            "pass-env without clean",
+            environment_start_frame(serde_json::json!({"pass_env": ["SETTING"]})),
+            "--env-mode clean",
+        ),
+        (
+            "invalid pass-env name",
+            environment_start_frame(serde_json::json!({
+                "env_mode": "clean", "pass_env": ["NOT=A_NAME"]
+            })),
+            "--pass-env",
         ),
         (
             "empty argv",
@@ -985,4 +1009,96 @@ fn exit_trailer_leaves_stdin_to_the_command() {
         std::fs::metadata(&out).is_ok_and(|m| m.len() >= body.len() as u64)
     });
     assert!(std::fs::read(&out).unwrap() == body, "bytes differ");
+}
+
+#[test]
+fn remote_clean_environment_resolves_values_on_the_executing_host_without_persisting_them() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    let selected = "remote-selected-value-493";
+    let request = environment_start_frame(serde_json::json!({
+        "session": "remote-env",
+        "replace": false,
+        "env_mode": "clean",
+        "pass_env": ["TENDR_REMOTE_SELECTED"],
+        "argv": [
+            harness::test_callback_bin(), "env-probe",
+            "TENDR_REMOTE_SELECTED", "TENDR_REMOTE_OMITTED"
+        ]
+    }));
+    assert!(!String::from_utf8_lossy(&request).contains(selected));
+    let output = tendr(&root)
+        .env("TENDR_REMOTE_SELECTED", selected)
+        .env("TENDR_REMOTE_OMITTED", "must-not-inherit")
+        .arg("_remote")
+        .write_stdin(request)
+        .timeout(HANG)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", outcome(&output));
+    wait_terminal_ns(&root, "default", "remote-env");
+    let log = tendr(&root)
+        .args(["log", "remote-env", "--raw"])
+        .output()
+        .unwrap();
+    assert!(log.status.success(), "{:?}", outcome(&log));
+    let probe: serde_json::Value = serde_json::from_slice(&log.stdout).unwrap();
+    assert_eq!(probe["selected_present"], true);
+    assert_eq!(probe["omitted_present"], false);
+    assert_eq!(
+        probe["selected_sha256"],
+        format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(selected.as_bytes())
+        )
+    );
+    let status = tendr(&root)
+        .args(["status", "remote-env"])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{:?}", outcome(&status));
+    for bytes in [
+        &output.stdout,
+        &output.stderr,
+        &log.stdout,
+        &log.stderr,
+        &status.stdout,
+    ] {
+        assert!(!String::from_utf8_lossy(bytes).contains(selected));
+    }
+    let session = meta_path(&root, "default", "remote-env")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    for name in ["meta.json", "output.log"] {
+        assert!(
+            !std::fs::read_to_string(session.join(name))
+                .unwrap()
+                .contains(selected)
+        );
+    }
+}
+
+#[test]
+fn remote_missing_pass_value_cannot_replace_an_existing_run() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    start_copier(&root, "victim");
+    let before = read_json(&meta_path(&root, "default", "victim"));
+    let request = environment_start_frame(serde_json::json!({
+        "env_mode": "clean",
+        "pass_env": ["TENDR_REMOTE_MISSING_VALUE"],
+        "argv": [harness::test_callback_bin(), "print-cwd"]
+    }));
+    let output = tendr(&root)
+        .env_remove("TENDR_REMOTE_MISSING_VALUE")
+        .arg("_remote")
+        .write_stdin(request)
+        .timeout(HANG)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{:?}", outcome(&output));
+    let after = read_json(&meta_path(&root, "default", "victim"));
+    assert_eq!(after["run_id"], before["run_id"]);
+    assert_eq!(after["status"], "Running");
 }

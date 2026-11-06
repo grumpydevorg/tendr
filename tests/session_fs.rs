@@ -172,12 +172,12 @@ fn write_then_read_meta() {
 }
 
 #[test]
-fn read_meta_missing_returns_corrupt() {
+fn read_meta_missing_preserves_not_found() {
     let (_dir, root) = tmp_root();
     let name = SessionName::new("empty").unwrap();
     let session = session::create(&root, &default_ns(), &name).unwrap();
     let err = session::read_meta(&session).unwrap_err();
-    assert!(matches!(err, SessionError::Corrupt { .. }));
+    assert!(matches!(err, SessionError::Io(error) if error.kind() == std::io::ErrorKind::NotFound));
 }
 
 #[test]

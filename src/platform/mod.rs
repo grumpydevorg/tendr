@@ -98,6 +98,7 @@ pub trait Platform {
         tendr_bin: &Path,
         session_dir: &Path,
         ready_writer: &Self::ReadyWriter,
+        environment: &crate::environment::SidecarEnvironment,
     ) -> io::Result<u32>;
 
     // --- Readiness channel ---

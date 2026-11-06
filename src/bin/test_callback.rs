@@ -8,6 +8,7 @@
 //! print-cwd         — print the current working directory to stdout
 //! ndjson-echo       — a line-oriented JSON process (see `ndjson_echo`)
 //! hook-agent <tendr> — a scripted agent whose hooks emit events (see `hook_agent`)
+//! env-probe <selected> <omitted> — print presence, byte length and SHA-256, never values
 //! ```
 
 fn main() {
@@ -65,6 +66,23 @@ fn main() {
                 std::process::exit(1);
             });
             println!("{}", cwd.display());
+        }
+        "env-probe" => {
+            if args.len() != 4 {
+                eprintln!("usage: test_callback env-probe <selected> <omitted>");
+                std::process::exit(1);
+            }
+            use sha2::{Digest, Sha256};
+            let selected = std::env::var(&args[2]).ok();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "selected_present": selected.is_some(),
+                    "selected_len": selected.as_ref().map(String::len),
+                    "selected_sha256": selected.as_ref().map(|s| format!("{:x}", Sha256::digest(s.as_bytes()))),
+                    "omitted_present": std::env::var_os(&args[3]).is_some(),
+                })
+            );
         }
         "ndjson-echo" => ndjson_echo(),
         "hook-agent" => match args.get(2) {

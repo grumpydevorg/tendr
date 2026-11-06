@@ -6,6 +6,16 @@ sidecar owns the child process and captures its output. When a sidecar is
 gone, the CLI's reconciliation step records what happened (see
 [03-run-lifecycle.md](03-run-lifecycle.md)).
 
+In an agent workflow, the harness is a caller of this runtime. Herdr Core
+(`hc`) may host its interactive terminal; tendr is the primary supervisor of
+its own work processes and authoritative runtime records. This does not
+remove enclosing lifetime authority: hc can sweep processes carrying its
+inherited cleanup scope even after Unix session detachment. The caller keeps
+backend-specific identities and establishes a separate lifetime boundary for
+independently retained work. Task policy and agent turns stay above tendr; see
+the [separation decision](../design.md#harness-herdr-core-and-tendr-have-separate-owners)
+and [operating contract](../guide.md#tendr-alongside-herdr-core-and-a-harness).
+
 ```mermaid
 flowchart TD
     Agent["Agent / user / script"] --> CLI["tendr CLI"]

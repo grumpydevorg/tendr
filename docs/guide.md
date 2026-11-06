@@ -59,26 +59,28 @@ steps in the [CHANGELOG](../CHANGELOG.md).
 tendr start --stdin dev -- bash
 ```
 
-Everything after `--` is the child's argv. `start` and `tendr run` share most
-flags:
+Everything after `--` is the child's argv. `start` returns a session record;
+`run` uses the same launch options and streams output until the run ends:
 
 |Flag|Effect|
 |---|---|
 |`--stdin`|Make a pipe session, so `exec` and `push` can write to it. Use it for shells and REPLs.|
-|`--pty`|Make a PTY session, for programs you want to `attach` to (`start` only).|
-|`--record-input`, `--no-record`|With `--pty`: also record what is typed, or record nothing ([PTY details](#pty-details); `start` only).|
+|`--pty`|Make a PTY session, for programs you want to `attach` to.|
+|`--record-input`, `--no-record`|With `--pty`: also record what is typed, or record nothing ([PTY details](#pty-details)).|
 |`--namespace <ns>`|Put the session in a namespace.|
-|`--exec-target <target>`|Set the exec target instead of inferring it (`start` only).|
+|`--exec-target <target>`|Set the exec target instead of inferring it.|
 |`--replace`|Kill an existing session of the same name and start a new run. A run still starting is waited for first, as `kill` does.|
 |`--timeout <sec>`|Stop the child after this many seconds, as `kill` does.|
 |`--cwd <dir>`, `--env KEY=VALUE`|Set the child's working directory or an environment variable.|
 |`--unset-env NAME`|Remove an inherited variable from the child's environment. Repeatable; `--env` of the same name still sets it.|
+|`--env-mode inherit\|clean`|Inherit the caller's environment (default), or construct a clean sidecar environment before the worker starts.|
+|`--pass-env NAME`|In clean mode, inherit this variable by name. Repeatable; a missing variable is a usage error.|
 |`--after <session>`|Wait for that session to exit before starting. Repeatable.|
 |`--any-exit`|With `--after`, start even if the dependency exited non-zero.|
 |`--on-exit <command>`|Run a command after the child exits. Repeatable.|
-|`--ready-when-output <regex>`, `--ready-when-port <port>`|Say when the run is ready: a line of its output matches, or a TCP port on its host accepts connections (`start` only). See [Wait until a server is ready](#wait-until-a-server-is-ready).|
-|`--ready-within <duration>`|Record a miss if the run is not ready this long after it starts, such as `30s` or `2m` (`start` only).|
-|`--after-ready <session>`|Wait for that session to be ready before starting. Repeatable (`start` only).|
+|`--ready-when-output <regex>`, `--ready-when-port <port>`|Say when the run is ready: a line of its output matches, or a TCP port on its host accepts connections. See [Wait until a server is ready](#wait-until-a-server-is-ready).|
+|`--ready-within <duration>`|Record a miss if the run is not ready this long after it starts, such as `30s` or `2m`.|
+|`--after-ready <session>`|Wait for that session to be ready before starting. Repeatable.|
 
 The sidecar and the child get no descriptor above stderr from the shell that
 ran `start` or `run`. A descriptor left open there, such as a terminal leaked by a
@@ -93,6 +95,72 @@ inference fails:
 ```bash
 tendr start --stdin py --exec-target python-repl -- ipython --no-banner --no-confirm-exit
 ```
+
+## Run in the foreground
+
+```bash
+tendr run build --cwd ./repo -- make test
+tendr run script -- bash ./job.sh
+```
+
+`run <name> [launch options] -- <command> [args]` uses the same launch path
+as `start`, follows the session's output, and exits with the child's code.
+Choose `start` instead when the caller should return immediately with JSON
+session metadata. The session name and executable are explicit: tendr does
+not read launch directives from scripts or infer their interpreter.
+
+`run` does not attach to a PTY or forward the caller's terminal input. For
+interactive control, use `start --pty` followed by `attach`. Its launch
+timeout stops the child, as `start --timeout` does; it is not a wait-only
+timeout. `run` is local-only.
+
+## Choose a launch environment
+
+```bash
+tendr start py --stdin --env-mode inherit -- python3 -i
+tendr start clean-py --stdin --env-mode clean -- python3 -i
+```
+
+- `inherit` is the default and preserves the caller's environment.
+- `clean` constructs an environment before the sidecar is created. The
+  worker and exit callbacks inherit that environment; cleaning only the
+  worker would leave its supervisor subject to inherited lifetime markers.
+- `--pass-env NAME` deliberately copies a named variable into clean mode.
+  Repeat it for several names. It is an error with inherit mode, an invalid
+  name, or an unset variable; resolution happens before replacing or creating
+  a session. Names are case-insensitive on Windows.
+- On Unix the baseline retains these variables when set: `HOME`, `PATH`,
+  `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`, `TZ`.
+  Windows retains `PATH`, `PATHEXT`, `SystemRoot`, `WINDIR`, `COMSPEC`,
+  `USERPROFILE`, `HOME`, `HOMEDRIVE`, `HOMEPATH`, `TEMP`, `TMP`, `APPDATA`,
+  `LOCALAPPDATA`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`.
+- Worker `--unset-env` removals and explicit `--env KEY=VALUE` overrides still
+  apply; generated `TENDR_*` session identity remains authoritative.
+- The launch spec records the mode and selected names, never the resolved
+  `--pass-env` values. Those values travel only in the sidecar's process
+  environment. Explicit `--env` values are persisted configuration, so do not
+  use that option for secrets. Programs can still expose their own environment
+  in output; tendr does not redact arbitrary program output.
+  A passed `TERM` is also omitted from recording/export metadata unless an
+  explicit persisted override or the normal PTY fallback replaces it.
+- A repeated idempotent start does not refresh a running process's values.
+  Replacing it resolves the current environment again. A changed mode or
+  selected-name set is a different launch specification.
+- With `--host`, names resolve on the remote host; local values are not
+  forwarded. Environment policy requires remote frame version 3. Older
+  remotes reject it before launching work instead of silently inheriting.
+
+For example, when `HTTPS_PROXY` is set on the executing host:
+
+```bash
+tendr start worker --env-mode clean --pass-env HTTPS_PROXY -- ./worker
+```
+
+Clean launch is not a sandbox or a universal survival guarantee. It avoids
+inherited environment-based tracking without knowing a terminal product's
+variable names, while retaining platform detachment. Linux cgroups, Windows
+Job Objects, containers, other cleanup policies and host lifetime still apply.
+See [the hc scope observation](#observed-hc-cleanup-scope-limit).
 
 ## Wait until a server is ready
 
@@ -486,7 +554,7 @@ A PTY session starts at 24×80. Tendr records its output and every window size
 under `recording/<run_id>/` in the session directory. `--record-input` also
 records what is typed: every byte written to the terminal, from an attach or
 a `push`, stored in clear. That includes passwords, tokens and anything else
-typed or pushed, and `replay --export asciicast` writes it out as `i` events;
+typed or pushed, and `export --format asciicast` writes it out as `i` events;
 use it only where that is acceptable. `--no-record` records nothing, and
 `status` then shows no `pty.recording`. Otherwise `tendr status` shows the
 recording there. If
@@ -502,54 +570,35 @@ until you delete them ([Pruning](#lifecycle-batches-and-hooks)).
 The child gets `TERM=xterm-256color` when `TERM` was missing, empty, `dumb`,
 or removed with `--unset-env TERM` for the `tendr start` that launched it, as
 in an agent's tool shell or `ssh -T`. Otherwise `TERM` passes through, and
-`--env TERM=…` always wins. Other variables pass through unchanged, apart from
-`PSModulePath` for Windows PowerShell ([PowerShell](#powershell)). An agent's
-shell exports `CI=true` and `NO_COLOR=1`, and Claude Code turns colour off for
-any `CI` value, even an empty one, so `--env CI=` cannot undo it. Remove them
-with `--unset-env CI --unset-env NO_COLOR`.
+`--env TERM=…` always wins. Other variables follow the selected
+[launch environment](#choose-a-launch-environment), apart from `PSModulePath`
+for Windows PowerShell ([PowerShell](#powershell)). With inherited mode,
+`--unset-env CI --unset-env NO_COLOR` removes those application settings
+without changing the sidecar's environment.
 
-### Replay a recording
+### Export a recording
 
 ```bash
-tendr replay ~/.tendr/sessions/default/dev          # play it in this terminal
-tendr replay --speed 4 <path>                       # four times as fast; --no-delay skips the pauses
-tendr replay --export asciicast <path> > dev.cast   # asciicast v2, for asciinema and other players
+tendr export ~/.tendr/sessions/default/dev --format asciicast > dev.cast
 ```
 
-`<path>` is a session directory, its `recording/<run_id>/` directory, or one
-segment file (`seg-00000000.tndrrec`). Replay writes the recorded output to
-your terminal at the recorded pace, and nothing else: it never connects to a
-session, and typed input in a recording is not played. Watch it in a real
-terminal such as Ghostty; tendr has no screen of its own.
+The path may be a session directory, its `recording/<run_id>/` directory,
+or one segment file (`seg-00000000.tndrrec`). The default format is asciicast
+v2. Use an asciicast-compatible player to view it; tendr exports evidence
+without managing playback, terminal geometry or playback timing.
 
-- Replay cannot resize your window. Before it plays, it shows the size the
-  recording starts at and its largest size, and asks you to size the window
-  and press a key, unless the window already matches. The bytes are always
-  played exactly; if the window did not match the recording, replay says so
-  once, after it ends, since the picture may differ. `--strict-geometry`
-  instead pauses at each recorded size change, with a note on the bottom
-  line, until the window matches. The resizes tendr makes itself so a
-  program redraws on attach never ask anything.
-- The terminal is in raw mode while replay runs. What it sends back, such as
-  answers to the queries in the recording, is read and dropped, and so is
-  every key but Ctrl-C, which stops replay (0). SIGHUP, SIGTERM and SIGINT
-  stop it too (1), and on Windows so do Ctrl-Break and closing the console.
-  However it ends, the modes the recording turned on are turned off and the
-  terminal is restored.
-- A damaged recording plays nothing: replay exits 1 naming the file and byte
-  offset. A recording cut off inside its last record, as a running session's
-  can be, plays to its last complete record, and replay says where it was
-  cut.
-- `--export asciicast` writes asciicast v2 to stdout: output as `o` events,
-  recorded input (passwords and tokens included) as `i` events, and every
-  window size change as an `r` event, with times since the recording
-  started. A character split between records
-  is joined. A recording whose output or input is not valid UTF-8 is refused
-  (1), naming the record; the recording itself stays the exact copy.
-- Replay is local-only. Copy a recording from another host first, such as
-  `scp -r box:.tendr/sessions/default/dev/recording ./dev-rec`, then
-  `tendr replay ./dev-rec`. On Windows it plays in Windows Terminal or a
-  conhost window on Windows 10 1809 or later, as `attach` does.
+- Output is written as `o` events, recorded input (passwords and tokens
+  included) as `i` events, and every applied resize as an `r` event, with
+  times since the recording started. Split UTF-8 characters are joined per
+  stream.
+- Corrupt recordings and invalid UTF-8 are refused with exit 1 before any
+  export is written. Diagnostics name the file and byte offset or record.
+  The exact binary recording remains unchanged.
+- A final segment cut inside its last record, as a running session's can
+  be, exports to its last complete record and reports the cut.
+- Export is local-only and needs no terminal. Copy remote recordings here
+  first, for example `scp -r box:.tendr/sessions/default/dev/recording ./dev-rec`,
+  then `tendr export ./dev-rec > dev.cast`.
 
 ## Observe long-running work
 
@@ -572,6 +621,9 @@ tendr watch --namespace nightly --events --logs
   one namespace with `--namespace`. Choose streams with `--events` (run
   lifecycle), `--logs` (output) and `--annotations`. `--from-now` skips the
   initial snapshot.
+  Lifecycle viewing requires usable persisted event history; sessions without
+  it fail with an actionable error rather than synthesizing transitions from
+  metadata. `--logs` or `--annotations` alone can still read their output.
 - `tendr events` replays the event log as NDJSON. Filter with
   `--session <ns>/<name>` (exact), and `--kind` and `--source` (prefix matches).
   All three are repeatable. Use `--follow` to keep
@@ -580,9 +632,10 @@ tendr watch --namespace nightly --events --logs
   `--include-logs` merges output lines in. `--data <key>=<value>` keeps events
   by a field of their data, and `--max-count <N>` and `--timeout` end a follow
   on a match or at a deadline
-  ([Drive an agent turn through its hooks](#drive-an-agent-turn-through-its-hooks)).
-- `wait` waits for processes to exit. An interactive agent keeps running
-  between turns, so wait for a turn with `tendr events`, not `wait`.
+  ([Wait for a published event](#wait-for-a-published-event)).
+- `wait` waits for processes to exit, not for application requests or agent
+  turns to finish. A caller can wait for a published event, but owns its
+  interpretation; interactive agent coordination belongs to hc and the harness.
 - A session keeps its latest 256 MiB of output or so: `output.log` rotates at
   64 MiB and the newest four files are kept. `log`, `watch --logs` and
   `events --include-logs` read them as one log, and `log -f` keeps following
@@ -643,7 +696,7 @@ tendr kill  dev                  # stop a session
 tendr prune dev                  # delete one finished session
 tendr prune --older-than 7d      # delete finished sessions older than 7 days; --all for all
 tendr prune --recordings-older-than 7d --recordings-max 10GiB   # delete old PTY recordings only
-tendr run --detach ./job.sh      # run a script as a session
+tendr run job -- bash ./job.sh    # explicit foreground execution
 ```
 
 **Stopping.** `kill` sends SIGTERM to the session's process group, then SIGKILL
@@ -721,37 +774,17 @@ script. The command gets the [environment variables](#environment-variables),
 including `TENDR_EXIT_REASON`. Tendr logs the results as a `callback.finished`
 event.
 
-**Scripts.** `tendr run <script> [args]` starts a script as a session. It
-waits for the script to finish and exits with its code, unless you pass
-`--detach`. The session name is the file name without its extension, with dots
-replaced by hyphens. Tendr picks the interpreter in this order: `--shell`, an
-executable file, the extension (`.py`, `.ps1`, …), then the shebang.
-
-A script can set its own options in `#tendr:` comment lines at the top, after
-an optional shebang:
-
-```bash
-#!/bin/bash
-#tendr: session=nightly-build
-#tendr: namespace=builds
-#tendr: timeout=3600
-#tendr: on-exit=notify-done
-make all
-```
-
-The keys are `session=NAME`, `namespace`, `timeout`, `on-exit` (repeatable),
-`stdin=pipe`, `cwd`, `env=KEY=VALUE` (repeatable), `replace` and `detach`.
-Each matches the flag of the same name; `--foreground` overrides `detach`.
-Command-line values win: `--on-exit` replaces every `on-exit` directive,
-`--env` entries apply after `env` directives, and `--unset-env NAME` drops an
-`env` directive for that name. An unknown directive, or a second copy of a
-non-repeatable one, is an error.
+**Foreground work.** `tendr run job -- bash ./job.sh` uses the same explicit
+launch specification as `start`, streams output and exits with the child's
+code. For detached work, use `tendr start job -- bash ./job.sh`. Configure
+namespace, working directory, environment and callbacks on the command line,
+not inside the script. See [Run in the foreground](#run-in-the-foreground).
 
 **Annotations.** Inside a session, `tendr wrap` runs a command and records it
 in the session's event log:
 
 ```bash
-tendr wrap --source claude.hook --event hook.post_tool_use -- ~/.claude/hooks/post.sh
+tendr wrap --source worker.local --event work.step -- ./step.sh
 ```
 
 `wrap` passes its stdin to the command. It records stdin, stdout, stderr and
@@ -780,8 +813,8 @@ Start work under `--host`, disconnect, and come back later to `log`, `status`,
 |---|---|
 |`start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `exec`|Run on the remote host. The request travels as data on the SSH stdin, so no remote shell parses it. Through a POSIX login shell, output and exit codes are byte for byte those of the command run there.|
 |`attach`|The request travels the same way, from macOS, Linux or Windows, and your terminal stays local ([Answer prompts and attach](#answer-prompts-and-attach)).|
-|`run`, `wrap`, `prune`, `query`, `guide`, `skill`|Refused with exit 2 and a ready-to-paste fallback for a POSIX shell, such as `try (POSIX shell):  ssh data-box 'tendr run deploy.sh'`.|
-|`events`, `emit`, `replay`|Refused with exit 1.|
+|`run`, `wrap`, `prune`, `query`, `guide`, `skill`, `export`|Refused with exit 2 and a ready-to-paste fallback for a POSIX shell, such as `try (POSIX shell):  ssh data-box 'tendr run deploy -- sh deploy.sh'`.|
+|`events`, `emit`|Refused with exit 1.|
 
 **Versions.** The remote `tendr` must be 0.5.0 or newer for every command,
 `exec` included. An older one fails at once, and tendr says to upgrade it.
@@ -812,6 +845,9 @@ Some features need more:
   newer on the remote host. An older remote refuses the request with exit 2
   and `unsupported remote request version 2`, before anything runs; a
   request without these flags still goes to it as before.
+- A clean launch environment (`--env-mode clean` or `--pass-env`) requires a
+  remote supporting frame version 3. Values resolve there and never travel
+  in the frame; an older remote rejects version 3 before launching.
 - `start --log-delimiter newline-or-cr` needs 0.8.0 or newer on the remote
   host ([Partial lines](#partial-lines-and-progress-output)). An older remote
   refuses the request with exit 2 (`unsupported remote request version 2`)
@@ -909,7 +945,7 @@ Launch tendr inside the slice. The sidecar and its child inherit the cgroup:
 
 ```bash
 systemd-run --user --slice=tendr.slice --scope --quiet \
-  tendr run --detach --replace ./job.sh
+  tendr start job --replace -- bash ./job.sh
 ```
 
 - The child's own scope reports `memory.max = max`. This is expected: cgroup v2
@@ -966,246 +1002,183 @@ on your `PATH`. See the [analytics recipes](analytics-recipes.md).
 tendr query "SELECT kind, count(*) FROM events GROUP BY kind"
 ```
 
-## Drive an agent turn through its hooks
+## Wait for a published event
 
-Some agent features exist only in an interactive session. A program can still
-drive one under tendr: it pushes a prompt into the agent's terminal, and the
-agent's lifecycle hooks write events that say when the prompt was taken, when
-the turn waits for a permission and when it ended. The caller waits on those
-events instead of reading the screen.
+A process can publish structured events with `tendr emit`, or run a command
+and record its result with `tendr wrap`. A supervised child inherits the
+`TENDR_*` session identity; a caller outside the run supplies `--session`.
+Tendr stores these events and filters their fields. It does not interpret
+application completion, agent turns or permission decisions.
 
-`tendr wait` waits for a process to exit, not for a turn. An interactive agent
-keeps running between turns, so wait for a turn with
-`tendr events --follow --max-count`.
-
-Tendr stores these events and does not interpret them: what `hook.stop` means
-is the caller's decision. Consumers such as UIs, analytics or `tendr query`
-read the `hook.*` events; tendr does not route or render them. For a local
-caller that needs one Claude Code turn, `claude --bg` and `claude --bg --resume`
-are simpler. Use tendr when the record must be queryable, the session must
-survive an SSH loss, or the agent has no background mode.
-
-**The pattern.** A hook runs `tendr emit --kind hook.<name>` to record an
-event, or `tendr wrap --event hook.<name> -- <cmd>` to run a command and
-record it with its output. Hooks are the agent's children, so they inherit the
-session's `TENDR_*` variables and need no `--session`. `hook.` is open
-vocabulary, not reserved.
-
-**Wait for one event.** One `tendr events` call blocks until the event arrives
-or a deadline passes, with no follower in the background:
+For an existing session such as `analysis/py` started below, a worker can
+publish an application-defined result:
 
 ```bash
-tendr events --session agents/cc --kind hook.stop --data prompt_id=$PROMPT_ID \
-  --since "$SUBMIT_TS" --follow --max-count 1 --timeout 10m
+tendr emit --session analysis/py --source worker.local --kind work.finished \
+  --data '{"request_id":"r1","ok":true}'
 ```
 
-- `--max-count <N>` ends the follow with 0 once it has printed N events.
-- `--timeout <duration>` ends it with 124 if the duration passes first,
-  counted from the start of the command. Both need `--follow`.
-- `--data <key>=<value>` keeps an event only when its `data` has the top-level
-  field `<key>` equal to `<value>`, a string by its text or a number as JSON
-  writes it ([event protocol](architecture/07-event-protocol.md) §5.1 has the
-  full rule). Repeat it to require several fields. It combines with
-  `--session`, `--kind` and `--source`, and works without `--follow` too.
-- **A payload over 16 KiB loses its fields** (event protocol §3.4), so
-  `--data` cannot match it. Project payloads with `jq` before emitting them,
-  as the hook script below does.
-- `--from-now` skips what the sessions hold when the command starts, so an
-  event written earlier never matches. To wait for a turn's end after its
-  submit event, use `--since` with the submit event's `ts` instead: the end may
-  already be written, and `--since` replays it.
-- With `--ready-file`, the file is created once the replay is printed, even
-  when the replay already held N events. With `--cursors`, a last bookmark
-  follows the Nth event.
-- `events` runs only where the sessions are (it is refused with `--host`).
-  For a remote agent, run it there, for example
-  `ssh box 'tendr events … --max-count 1 --timeout 10m'`, with tendr 0.8.0 or
-  newer on that host.
-
-**Claude Code.** `tendr-hook.sh` gets the hook name as its argument. It keeps
-the payload under the 16 KiB cap and writes nothing to stdout, which Claude
-Code reads as a hook decision:
-
-```sh
-#!/bin/sh
-jq -c '{hook_event_name, session_id, prompt_id, transcript_path,
-        notification_type, message, tool_name, error,
-        last_assistant_message: ((.last_assistant_message // "") | .[0:4000])}' \
-  | tendr emit --best-effort --source claude.hook --kind "hook.$1" --data-stdin >/dev/null
-```
-
-The settings, given to `claude --settings` so they apply to this run only:
-
-```json
-{"hooks":{
-  "SessionStart":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh session_start"}]}],
-  "UserPromptSubmit":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh user_prompt_submit"}]}],
-  "PermissionRequest":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh permission_request"}]}],
-  "Notification":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh notification"}]}],
-  "Stop":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh stop"}]}],
-  "StopFailure":[{"hooks":[{"type":"command","command":"/abs/tendr-hook.sh stop_failure"}]}]
-}}
-```
-
-Start each wait before the action it waits for:
+The caller waits for the corresponding event, whether already stored or
+published while it waits:
 
 ```bash
-ev() { tendr events --session agents/cc "$@"; }
-
-# 1. Wait for the session start, then launch the resolved binary:
-#    tendr start takes argv, so shell aliases do not apply.
-rm -f ./ready
-ev --kind hook.session_start --follow --from-now --max-count 1 --timeout 60s \
-  --ready-file ./ready > ./start.ndjson &
-until [ -f ./ready ]; do sleep 0.1; done
-CLAUDE=$(readlink -f "$(command -v claude)")
-tendr start cc --namespace agents --pty --cwd "$PWD" \
-  --unset-env CI --unset-env NO_COLOR \
-  -- "$CLAUDE" --settings ./tendr-hooks.json
-wait $!
-sleep 3   # give the input box a moment
-
-# 2. Submit: text, a pause, then a lone carriage return.
-rm -f ./ready
-ev --kind hook.user_prompt_submit --follow --from-now --max-count 1 --timeout 30s \
-  --ready-file ./ready > ./submit.ndjson &
-until [ -f ./ready ]; do sleep 0.1; done
-printf 'Summarise README.md in one line.' | tendr push cc --namespace agents
-sleep 0.5
-printf '\r' | tendr push cc --namespace agents
-wait $! || echo "not submitted"   # 124: the prompt was not taken
-PROMPT_ID=$(jq -r .data.prompt_id ./submit.ndjson)
-SUBMIT_TS=$(jq -r .ts ./submit.ndjson)
-
-# 3. The turn's end: hook.stop, or hook.stop_failure on an API error
-#    (--kind is a prefix match).
-ev --kind hook.stop --data "prompt_id=$PROMPT_ID" --since "$SUBMIT_TS" \
-  --follow --max-count 1 --timeout 10m > ./end.ndjson
-# 124: the outcome is unknown, not "still working".
+tendr events --session analysis/py --kind work.finished --data request_id=r1 \
+  --follow --max-count 1 --timeout 10m
 ```
 
-While the turn runs, `hook.permission_request`, or a `hook.notification`
-with `notification_type` `permission_prompt`, means it waits for a
-permission. Decide by your own policy, and answer with `push`, for example
-`printf 1 | tendr push cc --namespace agents`.
+- `--max-count <N>` ends the follow with 0 once it has printed N matching
+  events. That means an event matched, not that the application succeeded:
+  the caller reads its payload. `--kind` and `--source` match prefixes.
+- `--timeout <duration>` ends it with 124 if the deadline passes first,
+  counted from the start of the command. Both options need `--follow`.
+  A deadline means the outcome is unknown; it does not cancel the producer.
+- `--data <key>=<value>` matches a top-level field, a string by its text or
+  a number as JSON writes it. Repeat it to require several fields; it
+  combines with `--session`, `--kind` and `--source`, with or without
+  `--follow`. See [event protocol §5.1](architecture/07-event-protocol.md).
+- Payloads over 16 KiB are stored as a preview without their fields, so
+  `--data` cannot match them. Project the fields needed for matching into
+  a small payload before emitting.
+- Use a unique request identity or a stored cursor/time to exclude stale
+  results. `--since <ts>` includes stored events from that time;
+  `--from-now` excludes events present when the command starts, even if
+  they are the result you need. Start a `--from-now` follower before the
+  action and use `--ready-file` to know when it is subscribed.
+- `--ready-file` is created after replay, even when replay already held N
+  matches. With `--cursors`, a final bookmark follows the Nth event.
+- `events` is local-only. For a remote producer, run it on that host, for
+  example `ssh box 'tendr events … --follow --max-count 1 --timeout 10m'`.
+  These bounded-follow options need tendr 0.8.0 or newer there.
 
-**Read the result** from the stop event's `last_assistant_message`, or from
-the transcript at its `transcript_path`. Scope a transcript query to the turn
-by `promptId`: it is on the user entries (the prompt and each tool result),
-not on the assistant's. This one finds the URLs of the turn's `Artifact`
-calls:
+Events are not authenticated: `source` is caller-supplied except for reserved
+`tendr.*` names. Never grant permission on an event alone. `--best-effort`
+can lose events silently; a failed producer or a replaced/pruned session can
+also leave the caller waiting. Bound waits and treat missing results as
+unknown, not as evidence that the work is still running or safe to repeat.
+
+## Tendr alongside Herdr Core and a harness
+
+[Herdr Core (`hc`)](https://github.com/herdrdev/herdr-core) runs persistent
+interactive terminals. It is not the older `herdr pane`/`herdr session` CLI.
+The [design decision](design.md#harness-herdr-core-and-tendr-have-separate-owners)
+sets these responsibilities:
+
+|Owner|Responsibility|
+|---|---|
+|Harness (omp, Claude Code, Codex)|Model/tool loop, context, permission policy, task completion, backend selection and work-retention/cancellation policy|
+|hc|Hosting interactive harness/agent terminals, screen/history, attach, program-reported status, terminal messaging and terminal-child lifetimes|
+|tendr|Supervised work processes, stateful command/results, logs/events, and generic pipe or PTY transport/recording/attach|
+
+### Compose through the harness
+
+An hc terminal may host a harness that invokes tendr as a tool. Tendr's
+sidecar is the primary supervisor and owns its child's transport and runtime
+record, not the caller's terminal. That does not remove enclosing lifetime
+authority: hc cleanup metadata, OS jobs, cgroups, containers and host lifetime
+can still end the run. Neither hc nor a harness is a tendr dependency.
+Native harness tools remain the default when adequate.
+
+For example, launch an interactive harness with hc:
 
 ```bash
-jq -rs --arg p "$PROMPT_ID" '
-  ([.[] | select(.type=="user" and .promptId==$p)
-        | .message.content[]? | select(.type=="tool_result") | .tool_use_id]) as $ids
-  | [.[] | select(.type=="assistant") | .message.content[]?
-         | select(.type=="tool_use" and .name=="Artifact" and (.id as $i | $ids | index($i)))
-         | .input.url // empty] | unique[]' "$TRANSCRIPT"
+hc run --bg --name workbench claude
 ```
 
-On 2026-10-08 it returned nothing for a plain-text turn and the URL for a
-`/design` turn of the same session. Claude Code writes the transcript
-asynchronously, so it can lag behind the hook: retry a missing result briefly
-before treating it as absent. A person can watch or take over with
-`tendr attach cc --namespace agents`.
-
-**Measured** on 2026-11-04 on an exe.dev VM (Ubuntu 24.04, x86_64) with Claude
-Code 2.1.316 through exe.dev's LLM gateway and tendr 0.7.2 with this section's
-`events` options, running the recipe above, unless a point says otherwise:
-
-- Hooks inherit the session: `tendr emit` without `--session` wrote to the
-  right session and run. `hook.session_start` reached a `--from-now` waiter
-  started before the session existed, 0.4 s after `tendr start`.
-- Text, a 0.5 s pause, then `\r` was taken first time, in both turns. A long
-  prompt ending in its own `\r` is taken as a paste and the CR is removed
-  (2026-10-08, macOS 26.6.2, tendr 0.3.0, Claude Code 2.1.293). Only
-  `hook.user_prompt_submit` confirms that a prompt was taken.
-- `hook.user_prompt_submit` and `hook.stop` carry the same `prompt_id`;
-  the stop also carries `last_assistant_message` and `transcript_path`. In
-  the transcript, `promptId` was on the turn's user entries (the prompt and
-  its tool result) and on no assistant entry.
-- With the API endpoint unreachable, the turn ended with `hook.stop_failure`,
-  `error` `server_error`, after 180 s of Claude Code's retries. The
-  `--kind hook.stop --data prompt_id=…` wait above caught it.
-- A `hook.notification` with `notification_type` `idle_prompt` came after
-  each turn had ended. A wait on `hook.notification` must check the type.
-- Permission prompts were not re-measured: on that VM Claude Code asked for
-  none, even for a `Write` outside its working directory. On 2026-10-08 a
-  `hook.notification` with `permission_prompt` arrived 9 s after the prompt
-  was taken, and `printf 1 | tendr push` answered it. Claude Code's docs say
-  `PermissionRequest` fires at once; that hook has not been seen live.
-- A PTY child gets `TERM=xterm-256color` when the caller's `TERM` is `dumb`,
-  as in agent shells, which also set `CI=true` and `NO_COLOR=1` (2026-10-08);
-  the launch line removes those two.
-- A raw 40 KB `Stop` payload lost its `prompt_id` to the spill (2026-10-08);
-  the tests check that `--data` does not match such an event.
-
-**Trust and failure.**
-
-- Hook events are not authenticated. Only `tendr.*` sources are reserved, and
-  `source` is whatever the caller passes
-  ([event protocol](architecture/07-event-protocol.md) §1). Any process in the
-  session can emit a `hook.stop` with a guessed `prompt_id`. Never grant a
-  permission on the strength of an event alone.
-- `--best-effort` loses events silently. A missing hook script, a full disk,
-  or a session pruned or replaced mid-turn (its emits go to `lost+found`) all
-  look like a slow turn. A missed deadline means the outcome is unknown.
-- A user interrupt fires neither `Stop` nor `StopFailure`, so give every wait
-  a deadline.
-- The payload shapes are Claude Code's and can change with any release. Name
-  the fields in the projection, so a rename shows as a missing value.
-
-## Tendr inside herdr
-
-[herdr](https://herdr.dev) hosts interactive agents in panes and shows whether
-each is working, blocked or idle. Run the agent in a herdr pane, and run its
-builds, REPLs and remote jobs under `tendr start` and `tendr exec`, which return
-exit codes instead of a screen to scrape.
-
-Observed on macOS on 2026-09-25 with herdr 0.9.1, oh-my-pi 18.3.0 and `tender`
-0.2.1 (the release before the rename to `tendr`):
-
-- A session started from a pane kept running after `herdr pane close` and
-  after `herdr session stop`. A `--stdin` shell kept its cwd and exported
-  variables. The sidecar calls `setsid`, so it does not end with the pane.
-- While an omp agent ran `tendr start` and an 8-second `tendr exec`, herdr
-  showed the pane as `working`, then `idle`. The agent got the exec's exit
-  code.
-- Sessions started from a pane inherit `HERDR_ENV`, `HERDR_PANE_ID`,
-  `HERDR_SOCKET_PATH`, `HERDR_SESSION`, `HERDR_BIN_PATH`, `HERDR_TAB_ID` and
-  `HERDR_WORKSPACE_ID`. An `--on-exit` command uses them to reach the right
-  herdr session. herdr accepts lifecycle reports only from the pane's own
-  agent, so these variables do not confuse its agent state: an omp started
-  with `tendr start --pty` from a pane's shell, and a hand-sent
-  `pane.report_agent`, were both acknowledged and ignored.
-
-To raise a herdr notification when a job ends, put the command in a script,
-for example `~/bin/notify-herdr`, because `--on-exit` does not expand
-variables:
-
-```sh
-#!/bin/sh
-exec "$HERDR_BIN_PATH" notification show "tendr: $TENDR_SESSION $TENDR_EXIT_REASON" --sound done
-```
+In that harness's tool calls, use tendr for a stateful worker while the
+hosting terminal lives; this is not a post-terminal survival guarantee:
 
 ```bash
-tendr start --on-exit ~/bin/notify-herdr build -- make   # from inside a herdr pane
+tendr start py --namespace analysis --stdin -- python3 -i
+tendr exec py --namespace analysis -- 'data = list(range(1000))'
+tendr exec py --namespace analysis -- 'print(sum(data))'
 ```
 
-The notification arrives even if the starting pane has closed. Outside herdr,
-`HERDR_BIN_PATH` is unset, the hook fails, and the `callback.finished` event
-records the failure. Use `tendr watch --namespace <ns> --events` to follow
-every job from one pane.
+The harness reads tendr's structured results. A person can attach to the hc
+agent terminal without taking over that worker. Generic tendr PTY sessions
+remain available for work that needs a terminal; shell `exec` requires the
+pipe lane, not a PTY (the Python REPL target is the PTY exception).
 
-Limits:
+Choose one primary supervisor, authoritative runtime record and transport
+owner per work process; enclosing lifetime authority can still apply. Do not
+wrap an hc-hosted job in tendr as if both supervised it:
+`tendr start … -- hc run --bg …` tracks the hc launcher, whose
+exit says nothing about the hosted program. A deliberate one-shot `hc exec`
+is a separate process, not a command inside an existing terminal; `tendr exec`
+addresses an existing session. Do not silently switch between them.
 
-- Read results from tendr, not from `herdr pane read`. A pane is a screen and
-  has no exit code.
-- Run an agent that a person watches in a herdr pane, not under tendr:
-  `tendr start --pty -- omp` works, but herdr cannot see that agent's state.
-  An agent that a program drives can run under tendr instead
-  ([Drive an agent turn through its hooks](#drive-an-agent-turn-through-its-hooks)).
+### Lifecycle and recovery
+
+- Keep the backend's identity: an hc machine/terminal address, or a tendr
+  host, namespace, session and run ID. Inherited environment may also carry
+  backend-specific lifetime metadata; do not assume detachment removes it
+  or strip it implicitly.
+- An hc agent turn ending, a tendr command returning, a work process exiting
+  and the harness task finishing are distinct facts. hc stores status
+  reported through OSC 7501; it does not infer it from screen text.
+  Reported status is neither permission authority nor proof of task success.
+  Tendr's `events` transports published facts without adopting agent-turn
+  meanings; the harness decides whether the task is complete.
+- hc's child-terminal policy and its process-scope cleanup are different
+  mechanisms. `hc run --outlive-parent` governs an hc child terminal; it is not a
+  proven escape for detached tendr descendants. Work started inside an hc
+  terminal can be swept when that terminal's program ends, despite `setsid`.
+  The harness must explicitly stop task-scoped work and establish a separate,
+  verified lifetime boundary for independently retained work. This composition
+  supplies no such boundary and no guarantee of survival or complete cleanup.
+- Stop waiting, interrupt an operation, and kill a process are different
+  actions. A timed-out `tendr exec` can still be running; do not resend work
+  until its outcome is known. hc one-shot `exec` has its own timeout/kill
+  contract; these are not interchangeable cancellation APIs.
+- Reconnect to known work and inspect its identity/status before relaunching.
+  hc holders preserve programs across core restarts; `hc run --keep` recovery
+  starts a fresh shell, not the original task or its in-memory state.
+  A tendr process lost with its host is not restored from its logs.
+- Namespaces, hc sessions and tendr's `--boundary` declarations are not
+  sandboxes. The harness's permission policy is not isolation from other
+  processes running with the same account's access.
+
+### Observed hc cleanup-scope limit
+
+On 2026-11-06, macOS 27, hc 0.1.18 and tendr's 0.7.2 development build
+(runtime source base `9e69346a6370a4a8de8aed327ae1ffafe5af9510`), an isolated
+hc session used scratch HOME/XDG directories. Its `hc run --no-parent
+--no-notify` program was a shell that started `python3 -i` through
+`tendr start --stdin`, then completed `tendr exec` with
+`data = list(range(1000))`. The shell exited 0; a subsequent `tendr status`
+reported `SidecarLost`, with inferred provenance, after the successful exec.
+The private hc core remained alive.
+
+In the control, the same tendr worker was started outside that private hc
+terminal scope. An hc terminal acted only as its client; after that client
+exited, the worker was still `Running` with the same run ID and returned
+`499500` from `print(sum(data))`. This verifies that scope boundary on macOS,
+not universal survival under every enclosing runtime or operating system.
+
+The mechanism is explicit in hc:
+[`holder::reap`](https://github.com/herdrdev/herdr-core/blob/c6b316f87c33e6f2ab1a1ceea3e3461e2b6bb61a/crates/herdr-core/src/holder.rs#L422-L437)
+sweeps the terminal's scope before reporting its exit, and
+[`sweep`](https://github.com/herdrdev/herdr-core/blob/c6b316f87c33e6f2ab1a1ceea3e3461e2b6bb61a/crates/herdr-core/src/sweep.rs)
+finds inherited `HC_SCOPE` across Unix session detachment and signals matching
+processes. Linux uses that token mechanism too; its runtime behavior was not
+exercised here. Windows uses Job Objects instead; survival under its complete
+job hierarchy was not verified. Do not silently unset hc's lifetime metadata
+or impersonate its protected runtime to manufacture independence.
+An explicit `--env-mode clean` launch instead removes arbitrary inherited
+environment metadata before the sidecar starts. This is generic environment
+selection, not an hc exception; it does not escape OS containment.
+
+With this change on the same macOS/hc versions, a private `hc run` shell
+started a Bash worker using `tendr start work --env-mode clean --stdin`,
+then set `PROBE_MARK=retained` through `tendr exec` and exited 0. After hc
+reported that terminal's exit, tendr still reported `Running`; another
+`tendr exec` returned `retained`. This verifies explicit clean-mode
+independence from that hc cleanup scope, not from enclosing cgroups,
+Windows jobs or containers.
+
+This is a composition contract, not an hc adapter, shared registry or
+cancellation bridge. [hc's API](https://github.com/herdrdev/herdr-core/blob/c6b316f87c33e6f2ab1a1ceea3e3461e2b6bb61a/schema/README.md)
+and [machine model](https://github.com/herdrdev/herdr-core/blob/c6b316f87c33e6f2ab1a1ceea3e3461e2b6bb61a/docs/machines.md)
+own its behavior; tendr does not copy its screen or agent-status state.
 
 ## Exit codes
 
@@ -1216,9 +1189,9 @@ or an I/O error.
 
 |Command|Code|Meaning|
 |---|---|---|
-|any|2|Usage error from argument parsing|
+|any|2|Usage error from argument parsing, or invalid environment policy/names/missing passed values before a launch|
 |any, with `--host`|2|Invalid destination; a local-only command (printed with an `ssh` fallback); a `--cwd` that is not UTF-8; a request the remote `tendr` refused as invalid (`tendr _remote:` on stderr); a remote `tendr` too old for the request (1 when the remote login shell is PowerShell)|
-|`events`, `emit`, `replay` with `--host`|1|Not supported over SSH|
+|`events`, `emit` with `--host`|1|Not supported over SSH|
 |any, with `--host`|the remote's|The remote `tendr`'s exit code; 255 without one from the remote is `ssh` failing to connect (`attach` reconnects instead, once it is attached)|
 |any, with `--host`|82|`ssh` did not authenticate and start the remote `tendr` within the connect deadline (`TENDR_SSH_CONNECT_TIMEOUT`, default 30 s); while `attach --host` reconnects, it tries again instead|
 |`start`|2, 5|The child failed to spawn; the sidecar failed|

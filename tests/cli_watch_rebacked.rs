@@ -1,7 +1,5 @@
-//! `tendr watch` re-backed by the event log (spec §5.3, slice 2 plan
-//! scope item 7). Output shape frozen — these tests assert the *gains*
-//! (un-collapsed transitions, true timestamps, provenance stripped) and
-//! the legacy fallback; cli_watch.rs continues to pin the frozen shape.
+//! `tendr watch` projects persisted lifecycle events while retaining its
+//! current output shape.
 
 mod harness;
 use harness::Home;
@@ -125,34 +123,68 @@ fn rebacked_snapshot_carries_the_true_timestamp() {
 }
 
 #[test]
-fn session_without_events_dir_keeps_legacy_meta_diff_synthesis() {
+fn lifecycle_watch_rejects_missing_empty_or_unusable_history() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for layout in ["missing", "empty", "corrupt"] {
+        let root = Home::new();
+        tendr(&root)
+            .args(["start", "legacy", "--", "echo", "hi"])
+            .assert()
+            .success();
+        wait_terminal(&root, "legacy");
+        let events_dir = root.path().join(".tendr/sessions/default/legacy/events");
+        std::fs::remove_dir_all(&events_dir).unwrap();
+        if layout != "missing" {
+            std::fs::create_dir(&events_dir).unwrap();
+        }
+        if layout == "corrupt" {
+            std::fs::write(events_dir.join("broken.jsonl"), b"not an event\n").unwrap();
+        }
+        for args in [&["watch", "--events"][..], &["watch", "--from-now"][..]] {
+            let output = tendr(&root).args(args).output().unwrap();
+            assert!(!output.status.success(), "{layout}: {args:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("legacy") && stderr.contains("event history"),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("--logs") && stderr.contains("--annotations"),
+                "{stderr}"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "must not synthesize a lifecycle event"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_lifecycle_watch_reads_old_output_without_event_history() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = Home::new();
     tendr(&root)
-        .args(["start", "legacy", "--", "echo", "hi"])
+        .args(["start", "legacy", "--", "echo", "old-output"])
         .assert()
         .success();
     wait_terminal(&root, "legacy");
+    std::fs::remove_dir_all(root.path().join(".tendr/sessions/default/legacy/events")).unwrap();
 
-    // A pre-slice-1 layout: meta.json + output.log, no events dir.
-    let events_dir = root.path().join(".tendr/sessions/default/legacy/events");
-    std::fs::remove_dir_all(&events_dir).unwrap();
-
-    let follower = harness::ReadyFollower::spawn(&root, "watch", &["--events"]);
-    follower.read_until(|r| r["session"] == "legacy" && r["name"] == "run.exited");
-    let records = follower.records();
+    let follower = harness::ReadyFollower::spawn(&root, "watch", &["--logs"]);
+    follower.read_until(|r| {
+        r["kind"] == "log"
+            && r["data"]["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("old-output"))
+    });
+    assert!(follower.records().iter().all(|r| r["kind"] == "log"));
     follower.stop();
 
-    assert_eq!(
-        run_names(&records, "legacy"),
-        ["run.exited"],
-        "meta-diff snapshot for sessions without an event log, got: {records:?}"
-    );
-    let snapshot = &records[0];
-    assert_eq!(snapshot["kind"], "run");
-    assert_eq!(snapshot["source"], "tendr.sidecar");
-    assert!(snapshot["ts"].is_f64() || snapshot["ts"].is_u64());
-    assert_eq!(snapshot["data"]["status"], "Exited");
+    // Annotation-only mode also establishes its baseline without lifecycle history.
+    let follower = harness::ReadyFollower::spawn(&root, "watch", &["--annotations"]);
+    assert!(follower.records().is_empty());
+    follower.stop();
 }
 
 #[test]
@@ -207,6 +239,13 @@ fn replaced_session_streams_the_new_generation_uncollapsed() {
         .assert()
         .success();
     wait_terminal(&root, "swap");
+
+    tendr(&root)
+        .args(["start", "unrelated", "--", "echo", "still watching"])
+        .assert()
+        .success();
+    wait_terminal(&root, "unrelated");
+    follower.read_until(|r| r["session"] == "unrelated" && r["name"] == "run.exited");
 
     // Two run.exited events occur (gen-1 snapshot, gen-2 exit), so wait on the
     // full count rather than a single terminal marker.

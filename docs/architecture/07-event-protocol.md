@@ -15,7 +15,7 @@ The reasons behind the design are in [../design.md](../design.md#decisions).
 | Oversize payloads | Spilled to a blob, never rejected (§3.4). |
 | Retention | The event log lives in the session dir; `prune` deletes it with the session (§3.7). |
 | `kind` | An open vocabulary, not a closed enum. Some prefixes are reserved (§1). |
-| `watch` | Output shape frozen; read from the event log when one exists (§5.3). `tendr events` is the full protocol surface. |
+| `watch` | Output shape frozen; lifecycle facts come from persisted event history (§5.3). `tendr events` is the full protocol surface. |
 | `wrap`, `exec` | Write the event, then an `output.log` `A` line linked to it by `event_id` (§6). |
 
 ## 1. Envelope
@@ -337,9 +337,17 @@ is read from its start.
 ### 5.3 `tendr watch`
 
 `watch` keeps its output shape: f64 `ts`, the kind/name split, and its event
-names. For a session with an `events/` directory, `watch` reads the event
-log, so it reports true timestamps, every transition, and real sources. For
-a session without one, it derives events from changes in `meta.json`.
+names. Persisted event history is its lifecycle authority, with occurrence
+timestamps, transitions and real sources. A session with missing, empty or
+unusable lifecycle history causes an actionable error rather than invented
+metadata-diff transitions. Logs-only and annotations-only views can still
+read output without lifecycle history.
+Session deletion unpublishes metadata before removing history. Watch rechecks
+the run identity after reading history and discards a read overtaken by removal
+or replacement, rather than stopping observation of unrelated sessions.
+Metadata absence is the typed `NotFound` result of that read, not a later
+existence probe: replacement may already have published a new run by the time
+the missing-file result is handled. Malformed metadata remains an error.
 
 ## 6. Write surface
 

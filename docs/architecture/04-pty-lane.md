@@ -859,25 +859,16 @@ out of `meta.json`).
   follow the run's terminal event. The segments on disk hold the complete
   recording.
 
-`tendr replay <path>` plays a recording in the user's terminal, and
-`tendr replay --export asciicast <path>` writes it as asciicast v2
-(`src/commands/replay.rs`; [guide](../guide.md#replay-a-recording)).
-`<path>` is a segment file, a run's recording directory, or a session
-directory. Both decode the whole recording with `recording::decode_recording`
-first, so a damaged one is refused with its file and byte offset before
-anything is shown, and a final segment cut off inside a record ends at its
-last complete record. Playback writes only `OUTPUT` records, paced by their
-`elapsed_ns` (scaled by `--speed`, or not at all with `--no-delay`), in raw
-mode through the attach client's terminal layer (`commands::terminal`), and
-reads and drops whatever the terminal sends: query replies, and keys other
-than Ctrl-C (the byte, or kitty's or `modifyOtherKeys`' encoding of it, which
-a recorded program may have switched the terminal to). After the last record
-it drains the keyboard until it has been quiet for 100 ms (at most 1 s), so
-replies to the last queries do not reach the shell, then writes the
-`TermModes` reset for what it played, and restores the terminal. Geometry
-follows `USER` resizes only; `REPAINT` records play nothing. The export
-decodes output and input as UTF-8 incrementally, each stream on its own, and
-writes every applied resize as an `r` event, repaints included.
+`tendr export <path> --format asciicast` writes a recording as asciicast v2
+(`src/commands/export.rs`; [guide](../guide.md#export-a-recording)).
+The path is a segment file, a run's recording directory, or a session
+directory. The exporter decodes the whole recording before writing, so a
+damaged one is refused with its file and byte offset without a partial
+export. A final segment cut inside a record ends at its last complete record.
+Output and input are decoded as UTF-8 incrementally, each stream on its own;
+invalid UTF-8 is refused. Every applied resize is an `r` event, repaints
+included. External players own playback timing, geometry and terminal state;
+the exporter never opens a terminal or connects to a live session.
 
 `cargo run --example dump-recording -- <path>` prints a recording as text,
 for the same paths. It prints one line per record with output bytes escaped,

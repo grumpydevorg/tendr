@@ -605,6 +605,116 @@ fn pty_child_gets_a_usable_term() {
 }
 
 #[test]
+fn passed_term_reaches_pty_without_entering_recording_metadata() {
+    use sha2::{Digest, Sha256};
+
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Home::new();
+    let secret = "private-term-marker-3127";
+    for (session, extra, child_term, recorded_term) in [
+        ("term-private", &[][..], secret, ""),
+        (
+            "term-private-override",
+            &["--env", "TERM=xterm-public"][..],
+            "xterm-public",
+            "xterm-public",
+        ),
+        (
+            "term-private-unset",
+            &["--unset-env", "TERM"][..],
+            "xterm-256color",
+            "xterm-256color",
+        ),
+    ] {
+        let start = tendr(&root)
+            .env("TERM", secret)
+            .args([
+                "start",
+                session,
+                "--pty",
+                "--env-mode",
+                "clean",
+                "--pass-env",
+                "TERM",
+            ])
+            .args(extra)
+            .args([
+                "--",
+                &harness::test_callback_bin(),
+                "env-probe",
+                "TERM",
+                "TENDR_TEST_ABSENT_TERM_PROBE",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            start.status.success(),
+            "{}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        let meta = harness::wait_terminal(&root, session);
+        assert_eq!(meta["reason"], "ExitedOk", "{meta}");
+
+        let recording = decode_session_recording(&root, session);
+        assert_eq!(recording.header.term.as_str(), recorded_term);
+        let probe: serde_json::Value =
+            serde_json::from_slice(&recorded_output(&recording.records)).unwrap();
+        assert_eq!(probe["selected_present"], true);
+        assert_eq!(probe["selected_len"], child_term.len());
+        assert_eq!(
+            probe["selected_sha256"],
+            format!("{:x}", Sha256::digest(child_term.as_bytes()))
+        );
+        assert_eq!(probe["omitted_present"], false);
+
+        let dir = recording_dir(&root, session);
+        let segments = tendr::recorder::DirectoryStore::segments(&dir).unwrap();
+        assert!(!segments.is_empty());
+        for segment in segments {
+            assert!(!contains(
+                &std::fs::read(segment).unwrap(),
+                secret.as_bytes()
+            ));
+        }
+        let export = tendr(&root).arg("export").arg(&dir).output().unwrap();
+        assert!(
+            export.status.success(),
+            "{}",
+            String::from_utf8_lossy(&export.stderr)
+        );
+        let header: serde_json::Value =
+            serde_json::from_slice(export.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        if recorded_term.is_empty() {
+            assert!(header.get("env").is_none(), "{header}");
+        } else {
+            assert_eq!(header["env"]["TERM"], recorded_term);
+        }
+        let status = tendr(&root).args(["status", session]).output().unwrap();
+        assert!(status.status.success());
+        let session_dir = root
+            .path()
+            .join(format!(".tendr/sessions/default/{session}"));
+        let meta_bytes = std::fs::read(session_dir.join("meta.json")).unwrap();
+        let events = serde_json::to_vec(&harness::read_events(&root, session)).unwrap();
+        for bytes in [
+            &start.stdout,
+            &start.stderr,
+            &export.stdout,
+            &export.stderr,
+            &status.stdout,
+            &status.stderr,
+            &meta_bytes,
+            &events,
+        ] {
+            assert!(
+                !contains(bytes, secret.as_bytes()),
+                "{session}: value leaked"
+            );
+        }
+    }
+}
+
+#[test]
 fn start_pty_session_shows_pty_metadata() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = Home::new();
