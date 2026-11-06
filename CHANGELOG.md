@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.8.0 — explicit standalone launches
+
 ### Added
 
 - **Clean launch environments:** `start` and `run` accept
