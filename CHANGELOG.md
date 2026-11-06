@@ -4,23 +4,17 @@
 
 ### Added
 
-- **`tendr replay` plays a PTY recording in your terminal.** Give it a
-  session directory, a run's `recording/<run_id>/` or a segment file, and it
-  writes the recorded output at the recorded pace (`--speed`, `--no-delay`),
-  so you can see what a past session looked like in a real terminal such as
-  Ghostty. It asks once for the window size the recording starts at;
-  `--strict-geometry` also pauses at each later size change until the
-  window matches, and the repaint resizes tendr makes on attach never ask.
-  Replies the terminal sends to the recording's queries are dropped, Ctrl-C
-  stops it, and the terminal is restored however it ends. A damaged
-  recording plays nothing and names the file and byte offset; a running
-  session's recording plays to its last complete record. Local-only, and it
-  works in a Windows console too.
-- **`tendr replay --export asciicast` writes a recording as asciicast v2**,
-  for asciinema and other players and for agents that cannot watch a
-  terminal: characters split between records are joined, every window size
-  change is an `r` event, and output that is not UTF-8 is refused rather
-  than altered.
+- **Clean launch environments:** `start` and `run` accept
+  `--env-mode inherit|clean` and repeatable `--pass-env NAME`. Clean mode
+  selects a platform baseline before the sidecar starts, and passed values
+  remain ephemeral: metadata and launch identity contain only mode/names.
+  Missing variables are usage errors before replacement; remote values
+  resolve on the remote host, under frame version 3 so older readers reject
+  rather than ignore the policy. Inherited mode remains the default.
+- **`tendr export <path> --format asciicast` writes a PTY recording as
+  asciicast v2**, without opening a terminal. Output, recorded input and
+  applied resizes are preserved; split UTF-8 characters are joined, while
+  corruption and invalid UTF-8 are refused before writing a partial export.
 - **`tendr start --pty --record-input` records typed input too, and
   `--no-record` records nothing.** Input written to the terminal, by an
   attach or a `push`, becomes `INPUT` records ahead of the echo it causes.
@@ -73,21 +67,20 @@
   ended first, and `start --after-ready <session>` starts a client once its
   server is ready, failing as a failed dependency (4) if it will not be.
   Over `--host` these need 0.8.0 on the remote host: such a request goes as
-  remote frame version 2, which an older remote refuses (exit 2) rather
-  than ignore the flags. Every other request still goes as version 1.
+  remote frame version 2 (or 3 with environment policy), which an older
+  remote refuses (exit 2) rather than ignoring the flags. Requests without
+  versioned features still use version 1.
 
 - **`tendr events --follow` can end on a match.** `--max-count N` exits 0
   once N events are printed, `--timeout <duration>` exits 124 if it passes
   first, and `--data key=value` keeps only events whose data has that
-  top-level field. A caller can now push a prompt to an agent and block until
-  its turn ends with one command and a deadline, where a follow piped into
-  `grep -m1` never ended while the agent was silent. `--data` cannot match
-  the fields of a payload over 16 KiB: project payloads with `jq` first.
-- **`tendr guide agent-turns`** shows how to drive an interactive agent such
-  as Claude Code under tendr: hooks that `emit` into the event log, the
-  submit rule, the permission signals, reading the result, and what the
-  events cannot prove. The herdr guide no longer says every agent belongs
-  outside tendr: that holds for agents a person watches.
+  top-level field. A caller can now wait for an application-defined event
+  with one command and a deadline, where a follow piped into `grep -m1`
+  never ended while the producer was silent. `--data` cannot match the
+  fields of a payload over 16 KiB: project payloads with `jq` first.
+- **`tendr guide events`** documents generic published-event waiting,
+  correlation, replay, deadlines and trust limits without prescribing an
+  interactive agent's hooks or permission workflow.
 - **`tendr start --log-delimiter newline-or-cr` logs progress updates as they
   happen.** A pipe session's child that redraws a progress meter with carriage
   returns (`rsync --info=progress2`) showed nothing in `output.log` until it
@@ -108,6 +101,24 @@
 
 ### Changed
 
+- **Foreground execution is explicit:** `tendr run <name> -- <command>
+  [args]` shares all launch options and the launch path with `start`, streams
+  output and returns the child's code. Script directives, interpreter/name
+  inference and the script-specific launch flags are removed.
+- **Lifecycle watch reads persisted event history only.** The metadata-diff
+  fallback is removed; missing or unusable history produces an actionable
+  error. Logs-only and annotations-only views remain available.
+- **Recording playback is external.** The built-in player, geometry prompts,
+  playback timing and playback command are removed; recording, export,
+  retention and generic live attach remain.
+- **Harness, Herdr Core and tendr have explicit ownership boundaries.**
+  The harness owns task policy, hc hosts interactive agent terminals, and
+  tendr is the primary supervisor of its work processes and durable records.
+  `guide herdr` replaces the old pane/session notification recipe with this
+  contract and the measured hc cleanup-scope limit: detached tendr work
+  started inside hc must not be assumed to survive its terminal. No implicit
+  scope-metadata removal is added. Generic PTY, event and arbitrary-executable
+  support remain; the vendor-specific agent-turn tutorial and its topic go.
 - **PowerShell `exec` keeps variables and functions between calls.** Each
   `exec` ran its code in a scope of its own, so `$x = 42` or
   `function f {}` was gone by the next call unless written as `$global:`.

@@ -1,8 +1,8 @@
 //! `tendr events --follow` that ends on a match: `--max-count`, `--data` and
-//! `--timeout`, driven the way the guide's agent-turn recipe drives them. A
-//! scripted agent (`test_callback hook-agent`) fires hooks that run
-//! `tendr emit`; a caller waits for its turn's end with one `tendr events`
-//! call and no background follower.
+//! `--timeout`. A scripted producer uses agent-shaped payloads to exercise
+//! arbitrary application events; only the test caller interprets their
+//! meaning. The generic event transport must correlate requests, ignore
+//! unrelated or stale results, and bound a wait without cancelling the producer.
 
 mod harness;
 use harness::Home;
@@ -35,8 +35,7 @@ fn fire(root: &Home, hooks: &[(&str, serde_json::Value)]) {
         .success();
 }
 
-/// A waiter for one turn's end, started (and proven ready) before the turn's
-/// prompt is sent, as the recipe orders it.
+/// Start a bounded event follower before triggering its producer.
 fn wait_for(root: &Home, args: &[&str]) -> ReadyFollower {
     let mut all = vec!["--follow", "--from-now", "--session", "default/cc"];
     all.extend_from_slice(args);

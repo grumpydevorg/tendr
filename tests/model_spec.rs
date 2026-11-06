@@ -238,3 +238,50 @@ fn launch_spec_log_delimiter_round_trips_and_changes_the_hash() {
     assert_eq!(back, spec);
     assert_ne!(spec.canonical_hash(), plain.canonical_hash());
 }
+
+#[test]
+fn environment_identity_defaults_and_round_trips_without_values() {
+    use tendr::model::spec::{EnvMode, LaunchSpec};
+    let old = r#"{"argv":["echo"],"stdin_mode":"None","io_mode":"Pipe","exec_target":"None"}"#;
+    let mut spec: LaunchSpec = serde_json::from_str(old).unwrap();
+    assert_eq!(spec.env_mode, EnvMode::Inherit);
+    assert_eq!(serde_json::to_string(&spec).unwrap(), old);
+    let inherited_hash = spec.canonical_hash();
+    spec.env_mode = EnvMode::Clean;
+    spec.pass_env.insert("TOKEN".into());
+    let json = serde_json::to_string(&spec).unwrap();
+    assert!(json.contains("\"env_mode\":\"clean\""));
+    assert!(json.contains("\"pass_env\":[\"TOKEN\"]"));
+    assert_ne!(spec.canonical_hash(), inherited_hash);
+    assert_eq!(serde_json::from_str::<LaunchSpec>(&json).unwrap(), spec);
+}
+
+#[test]
+fn sidecar_environment_debug_redacts_values() {
+    use std::collections::BTreeMap;
+    use tendr::environment::SidecarEnvironment;
+    let env = SidecarEnvironment::Clean(BTreeMap::from([("KEY".into(), "secret-value".into())]));
+    assert!(!format!("{env:?}").contains("secret-value"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_pass_names_are_case_insensitive_and_deduplicated() {
+    use tendr::environment::{SidecarEnvironment, canonical_names, resolve};
+    use tendr::model::spec::EnvMode;
+    let names = vec!["Path".to_string(), "PATH".to_string()];
+    assert_eq!(canonical_names(&names).len(), 1);
+    let SidecarEnvironment::Clean(vars) = resolve(EnvMode::Clean, &names).unwrap() else {
+        panic!("clean mode must create an explicit environment");
+    };
+    assert_eq!(
+        vars.keys()
+            .filter(|key| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
+            .count(),
+        1
+    );
+    assert!(
+        vars.values()
+            .any(|value| Some(value.clone()) == std::env::var_os("PATH"))
+    );
+}

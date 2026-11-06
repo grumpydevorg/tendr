@@ -18,12 +18,13 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tendr::attach_escape::EscapeMode;
-use tendr::model::boundary::{Boundary, BoundaryContext};
-use tendr::model::ids::Namespace;
+use tendr::model::boundary::Boundary;
 use tendr::model::ready::{ReadyCheck, ReadyWhen};
-use tendr::model::spec::{ExecTarget, LogDelimiter, RecordingPolicy};
+use tendr::model::spec::{EnvMode, ExecTarget, LogDelimiter};
 
-use crate::{AttachEscape, Commands, commands, parse_optional_namespace, resolve_namespace};
+use crate::{
+    AttachEscape, Commands, LaunchArgs, commands, parse_optional_namespace, resolve_namespace,
+};
 
 /// One remote-capable command, as typed. One request per process, so the
 /// size of its largest variant does not matter.
@@ -55,6 +56,10 @@ pub struct StartRequest {
     pub cwd: Option<PathBuf>,
     pub env: Vec<String>,
     pub unset_env: Vec<String>,
+    #[serde(default, skip_serializing_if = "EnvMode::is_inherit")]
+    pub env_mode: EnvMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pass_env: Vec<String>,
     pub stdin: bool,
     pub timeout: Option<u64>,
     pub exec_target: Option<ExecTarget>,
@@ -116,6 +121,65 @@ impl StartRequest {
     }
 }
 
+impl From<&LaunchArgs> for StartRequest {
+    fn from(args: &LaunchArgs) -> Self {
+        let LaunchArgs {
+            name,
+            namespace,
+            stdin,
+            pty,
+            log_delimiter,
+            exec_target,
+            replace,
+            timeout,
+            cwd,
+            env_vars,
+            unset_env,
+            env_mode,
+            pass_env,
+            on_exit,
+            after,
+            any_exit,
+            ready_when_output,
+            ready_when_port,
+            ready_within,
+            after_ready,
+            boundary,
+            boundary_parent,
+            record_input,
+            no_record,
+            cmd,
+        } = args;
+        Self {
+            session: name.clone(),
+            namespace: namespace.clone(),
+            argv: cmd.clone(),
+            cwd: cwd.clone(),
+            env: env_vars.clone(),
+            unset_env: unset_env.clone(),
+            env_mode: *env_mode,
+            pass_env: pass_env.clone(),
+            stdin: *stdin,
+            timeout: *timeout,
+            exec_target: exec_target.clone().map(ExecTarget::from),
+            pty: *pty,
+            replace: *replace,
+            on_exit: on_exit.clone(),
+            after: after.clone(),
+            any_exit: *any_exit,
+            boundary: boundary.clone(),
+            boundary_parent: boundary_parent.clone(),
+            record_input: *record_input,
+            no_record: *no_record,
+            ready_when_output: ready_when_output.clone(),
+            ready_when_port: *ready_when_port,
+            ready_within_ms: ready_within.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            after_ready: after_ready.clone(),
+            log_delimiter: (*log_delimiter).map(LogDelimiter::from).unwrap_or_default(),
+        }
+    }
+}
+
 /// Debug shows the shape of the payload, never its values: argv, cwd, env and
 /// callbacks can carry secrets.
 impl fmt::Debug for StartRequest {
@@ -127,6 +191,8 @@ impl fmt::Debug for StartRequest {
             .field("cwd", &self.cwd.as_ref().map(|_| Redacted(1)))
             .field("env", &Redacted(self.env.len()))
             .field("unset_env", &Redacted(self.unset_env.len()))
+            .field("env_mode", &self.env_mode)
+            .field("pass_env", &self.pass_env)
             .field("stdin", &self.stdin)
             .field("timeout", &self.timeout)
             .field("exec_target", &self.exec_target)
@@ -313,56 +379,7 @@ impl TryFrom<&Commands> for RemoteOperation {
     fn try_from(command: &Commands) -> Result<Self, LocalOnly> {
         let local = |command| Err(LocalOnly { command });
         Ok(match command {
-            Commands::Start {
-                name,
-                namespace,
-                stdin,
-                pty,
-                log_delimiter,
-                exec_target,
-                replace,
-                timeout,
-                cwd,
-                env_vars,
-                unset_env,
-                on_exit,
-                after,
-                any_exit,
-                ready_when_output,
-                ready_when_port,
-                ready_within,
-                after_ready,
-                boundary,
-                boundary_parent,
-                record_input,
-                no_record,
-                cmd,
-            } => Self::Start(StartRequest {
-                session: name.clone(),
-                namespace: namespace.clone(),
-                argv: cmd.clone(),
-                cwd: cwd.clone(),
-                env: env_vars.clone(),
-                unset_env: unset_env.clone(),
-                stdin: *stdin,
-                timeout: *timeout,
-                exec_target: exec_target.clone().map(ExecTarget::from),
-                pty: *pty,
-                replace: *replace,
-                on_exit: on_exit.clone(),
-                after: after.clone(),
-                any_exit: *any_exit,
-                boundary: boundary.clone(),
-                boundary_parent: boundary_parent.clone(),
-                record_input: *record_input,
-                no_record: *no_record,
-                ready_when_output: ready_when_output.clone(),
-                ready_when_port: *ready_when_port,
-                ready_within_ms: ready_within
-                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
-                after_ready: after_ready.clone(),
-                log_delimiter: (*log_delimiter).map(LogDelimiter::from).unwrap_or_default(),
-            }),
+            Commands::Start(args) => Self::Start(StartRequest::from(args)),
             Commands::Status { name, namespace } => Self::Status(StatusRequest {
                 session: name.clone(),
                 namespace: namespace.clone(),
@@ -446,14 +463,14 @@ impl TryFrom<&Commands> for RemoteOperation {
                 protocol: tendr::attach_proto::Version::LATEST as u8,
                 resume: None,
             }),
-            Commands::Run { .. } => return local("run"),
+            Commands::Run(_) => return local("run"),
             Commands::Exec { .. } => return local("exec"),
             Commands::Wrap { .. } => return local("wrap"),
             Commands::Events { .. } => return local("events"),
             Commands::Query { .. } => return local("query"),
             Commands::Emit { .. } => return local("emit"),
             Commands::Prune { .. } => return local("prune"),
-            Commands::Replay { .. } => return local("replay"),
+            Commands::Export { .. } => return local("export"),
             Commands::Guide { .. } => return local("guide"),
             Commands::Skill { .. } => return local("skill"),
             Commands::Sidecar { .. } => return local("_sidecar"),
@@ -462,119 +479,10 @@ impl TryFrom<&Commands> for RemoteOperation {
     }
 }
 
-/// What `cmd_start` receives: a [`StartRequest`] with its defaults resolved.
-struct StartInputs {
-    name: String,
-    cmd: Vec<String>,
-    stdin: bool,
-    replace: bool,
-    timeout: Option<u64>,
-    cwd: Option<PathBuf>,
-    env_vars: Vec<String>,
-    unset_env: Vec<String>,
-    on_exit: Vec<String>,
-    after: Vec<String>,
-    any_exit: bool,
-    namespace: Namespace,
-    pty: bool,
-    exec_target: Option<ExecTarget>,
-    boundary: Option<BoundaryContext>,
-    recording: RecordingPolicy,
-    ready: Option<ReadyCheck>,
-    after_ready: Vec<String>,
-    log_delimiter: LogDelimiter,
-}
-
-/// Resolve a start request on the host that runs it. Only the namespace and
-/// the ready flags can fail here; the namespace is still the first input
-/// checked.
-fn start_inputs(request: StartRequest) -> anyhow::Result<StartInputs> {
-    let namespace = resolve_namespace(request.namespace.clone())?;
-    let ready = request.ready_check().map_err(anyhow::Error::msg)?;
-    let StartRequest {
-        session,
-        namespace: _,
-        argv,
-        cwd,
-        env,
-        unset_env,
-        stdin,
-        timeout,
-        exec_target,
-        pty,
-        replace,
-        on_exit,
-        after,
-        any_exit,
-        boundary,
-        boundary_parent,
-        record_input,
-        no_record,
-        ready_when_output: _,
-        ready_when_port: _,
-        ready_within_ms: _,
-        after_ready,
-        log_delimiter,
-    } = request;
-    Ok(StartInputs {
-        namespace,
-        name: session,
-        cmd: argv,
-        stdin,
-        replace,
-        timeout,
-        cwd,
-        env_vars: env,
-        unset_env,
-        on_exit,
-        after,
-        any_exit,
-        pty,
-        exec_target,
-        boundary: boundary.map(|current| BoundaryContext {
-            current,
-            parents: boundary_parent,
-        }),
-        recording: if no_record {
-            RecordingPolicy::Off
-        } else if record_input {
-            RecordingPolicy::OutputAndInput
-        } else {
-            RecordingPolicy::Output
-        },
-        ready,
-        after_ready,
-        log_delimiter,
-    })
-}
-
 /// Run an operation on this host.
 pub fn dispatch(operation: RemoteOperation) -> anyhow::Result<()> {
     match operation {
-        RemoteOperation::Start(request) => {
-            let i = start_inputs(request)?;
-            commands::cmd_start(
-                &i.name,
-                i.cmd,
-                i.stdin,
-                i.replace,
-                i.timeout,
-                i.cwd.as_deref(),
-                &i.env_vars,
-                &i.unset_env,
-                &i.on_exit,
-                &i.after,
-                i.any_exit,
-                &i.namespace,
-                i.pty,
-                i.exec_target,
-                i.boundary,
-                i.recording,
-                i.ready,
-                &i.after_ready,
-                i.log_delimiter,
-            )
-        }
+        RemoteOperation::Start(request) => commands::cmd_start(request),
         RemoteOperation::Status(r) => {
             commands::cmd_status(&r.session, &resolve_namespace(r.namespace)?)
         }
@@ -626,10 +534,6 @@ mod tests {
     use super::*;
     use crate::{Cli, Commands};
     use clap::Parser as _;
-    use std::path::PathBuf;
-    use tendr::model::boundary::{Boundary, BoundaryContext, BoundaryKind};
-    use tendr::model::ids::Namespace;
-    use tendr::model::spec::ExecTarget;
 
     fn parse(args: &[&str]) -> Commands {
         let mut argv = vec!["tendr"];
@@ -644,207 +548,6 @@ mod tests {
     fn round_trip(op: &RemoteOperation) -> RemoteOperation {
         let json = serde_json::to_string(op).expect("encodes");
         serde_json::from_str(&json).expect("decodes")
-    }
-
-    fn strings(values: &[&str]) -> Vec<String> {
-        values.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    fn boundary(kind: BoundaryKind, label: &str) -> Boundary {
-        Boundary {
-            kind,
-            label: label.to_owned(),
-        }
-    }
-
-    /// Every `start` flag survives Commands → StartRequest → JSON → decode →
-    /// the inputs dispatch hands to `cmd_start`. Both destructurings are
-    /// exhaustive: a new `start` flag or input fails to compile here until
-    /// it is carried through.
-    #[test]
-    fn every_start_flag_survives_the_round_trip() {
-        let cwd = r"C:\Users\o'neil\a b&c";
-        let command = parse(&[
-            "start",
-            "--namespace",
-            "ns-1",
-            "--stdin",
-            "--pty",
-            "--exec-target",
-            "powershell",
-            "--replace",
-            "--timeout",
-            "42",
-            "--cwd",
-            cwd,
-            "--env",
-            "A=$(id)",
-            "--env",
-            "B=x=y;z",
-            "--unset-env",
-            "DROP",
-            "--on-exit",
-            "notify 'done' | tee",
-            "--after",
-            "dep-1",
-            "--after",
-            "dep-2",
-            "--any-exit",
-            "--ready-when-output",
-            r"^listening on \d+$",
-            "--ready-within",
-            "1m 500ms",
-            "--after-ready",
-            "db",
-            "--boundary",
-            "host:alpha",
-            "--boundary-parent",
-            "vm:beta",
-            "--boundary-parent",
-            "pod:gamma",
-            "--record-input",
-            "x&calc",
-            "--",
-            "prog",
-            "--flag",
-            "a b\r\n`é`",
-        ]);
-        let Commands::Start {
-            name,
-            namespace,
-            stdin,
-            pty,
-            log_delimiter: _, // conflicts with --pty; its trip: remote_frame's version test
-            exec_target,
-            replace,
-            timeout,
-            cwd: parsed_cwd,
-            env_vars,
-            unset_env,
-            on_exit,
-            after,
-            any_exit,
-            ready_when_output,
-            ready_when_port,
-            ready_within,
-            after_ready,
-            boundary: parsed_boundary,
-            boundary_parent,
-            record_input,
-            no_record,
-            cmd,
-        } = &command
-        else {
-            panic!("not a start");
-        };
-
-        let RemoteOperation::Start(request) =
-            round_trip(&RemoteOperation::try_from(&command).expect("remote-capable"))
-        else {
-            panic!("not a start request");
-        };
-        let StartInputs {
-            name: in_name,
-            cmd: in_cmd,
-            stdin: in_stdin,
-            replace: in_replace,
-            timeout: in_timeout,
-            cwd: in_cwd,
-            env_vars: in_env,
-            unset_env: in_unset,
-            on_exit: in_on_exit,
-            after: in_after,
-            any_exit: in_any_exit,
-            namespace: in_namespace,
-            pty: in_pty,
-            exec_target: in_exec_target,
-            boundary: in_boundary,
-            recording: in_recording,
-            ready: in_ready,
-            after_ready: in_after_ready,
-            log_delimiter: _,
-        } = start_inputs(request).expect("resolves");
-
-        assert_eq!(name, "x&calc");
-        assert_eq!(&in_name, name);
-        assert_eq!(namespace.as_deref(), Some("ns-1"));
-        assert_eq!(in_namespace, Namespace::new("ns-1").unwrap());
-        assert!(*stdin && in_stdin);
-        assert!(*pty && in_pty);
-        assert!(exec_target.is_some());
-        assert_eq!(in_exec_target, Some(ExecTarget::PowerShell));
-        assert!(*replace && in_replace);
-        assert_eq!((*timeout, in_timeout), (Some(42), Some(42)));
-        assert_eq!(parsed_cwd.as_deref(), Some(std::path::Path::new(cwd)));
-        assert_eq!(in_cwd, Some(PathBuf::from(cwd)));
-        assert_eq!(env_vars, &strings(&["A=$(id)", "B=x=y;z"]));
-        assert_eq!(&in_env, env_vars);
-        assert_eq!(unset_env, &strings(&["DROP"]));
-        assert_eq!(&in_unset, unset_env);
-        assert_eq!(on_exit, &strings(&["notify 'done' | tee"]));
-        assert_eq!(&in_on_exit, on_exit);
-        assert_eq!(after, &strings(&["dep-1", "dep-2"]));
-        assert_eq!(&in_after, after);
-        assert!(*any_exit && in_any_exit);
-        assert_eq!(ready_when_output.as_deref(), Some(r"^listening on \d+$"));
-        assert_eq!(*ready_when_port, None);
-        assert_eq!(
-            *ready_within,
-            Some(std::time::Duration::from_millis(60_500))
-        );
-        assert_eq!(
-            in_ready,
-            Some(ReadyCheck {
-                when: ReadyWhen::Output(r"^listening on \d+$".to_owned()),
-                within_ms: Some(60_500),
-            })
-        );
-        assert_eq!(after_ready, &strings(&["db"]));
-        assert_eq!(&in_after_ready, after_ready);
-        assert_eq!(
-            parsed_boundary.as_ref(),
-            Some(&boundary(BoundaryKind::Host, "alpha"))
-        );
-        assert_eq!(
-            boundary_parent,
-            &vec![
-                boundary(BoundaryKind::Vm, "beta"),
-                boundary(BoundaryKind::Pod, "gamma")
-            ]
-        );
-        assert_eq!(
-            in_boundary,
-            Some(BoundaryContext {
-                current: boundary(BoundaryKind::Host, "alpha"),
-                parents: boundary_parent.clone(),
-            })
-        );
-        assert_eq!(cmd, &strings(&["prog", "--flag", "a b\r\n`é`"]));
-        assert_eq!(&in_cmd, cmd);
-        assert!(*record_input && !*no_record);
-        assert_eq!(in_recording, RecordingPolicy::OutputAndInput);
-    }
-
-    /// `--no-record` (which conflicts with `--record-input`) arrives, and
-    /// neither flag means the default recording.
-    #[test]
-    fn recording_flags_resolve_on_the_target() {
-        for (flags, expected) in [
-            (&["--pty", "--no-record"][..], RecordingPolicy::Off),
-            (&["--pty"][..], RecordingPolicy::Output),
-        ] {
-            let mut args = vec!["start"];
-            args.extend_from_slice(flags);
-            args.extend(["s", "--", "true"]);
-            let RemoteOperation::Start(request) = round_trip(&op(&args)) else {
-                panic!("not a start request");
-            };
-            assert_eq!(
-                start_inputs(request).unwrap().recording,
-                expected,
-                "{flags:?}"
-            );
-        }
     }
 
     /// The port condition travels too, and the flags that cannot combine are
@@ -862,7 +565,7 @@ mod tests {
             panic!("not a start request");
         };
         assert_eq!(
-            start_inputs(request).expect("resolves").ready,
+            request.ready_check().expect("resolves"),
             Some(ReadyCheck {
                 when: ReadyWhen::Port(8080),
                 within_ms: None,
@@ -887,19 +590,6 @@ mod tests {
             argv.extend_from_slice(args);
             assert!(Cli::try_parse_from(argv).is_err(), "{args:?}");
         }
-    }
-
-    #[test]
-    fn start_defaults_resolve_on_the_target() {
-        let RemoteOperation::Start(request) = round_trip(&op(&["start", "s", "--", "true"])) else {
-            panic!("not a start request");
-        };
-        assert_eq!(request.namespace, None, "the wire carries what was typed");
-        let inputs = start_inputs(request).expect("resolves");
-        assert_eq!(inputs.namespace, Namespace::default_namespace());
-        assert_eq!(inputs.exec_target, None, "inferred by the launch, not here");
-        assert_eq!(inputs.boundary, None);
-        assert_eq!(inputs.cwd, None);
     }
 
     #[test]
@@ -981,38 +671,13 @@ mod tests {
         }
     }
 
-    /// Each start bool lands in its own input: set one at a time.
-    #[test]
-    fn start_bools_do_not_swap() {
-        let flags = ["--stdin", "--pty", "--replace"];
-        for flag in flags {
-            let RemoteOperation::Start(request) = round_trip(&op(&["start", flag, "s", "x"]))
-            else {
-                panic!("not a start request");
-            };
-            let i = start_inputs(request).expect("resolves");
-            assert_eq!(
-                [i.stdin, i.pty, i.replace],
-                flags.map(|f| f == flag),
-                "{flag}"
-            );
-            assert!(!i.any_exit, "{flag}");
-        }
-        let RemoteOperation::Start(request) = round_trip(&op(&["start", "--after", "d", "s", "x"]))
-        else {
-            panic!("not a start request");
-        };
-        let i = start_inputs(request).expect("resolves");
-        assert!(!(i.stdin || i.pty || i.replace || i.any_exit));
-    }
-
     #[test]
     fn local_only_commands_are_unrepresentable() {
         let cases: &[(&[&str], &str)] = &[
-            (&["run", "script.sh"], "run"),
+            (&["run", "job", "--", "true"], "run"),
             (&["wrap", "--source", "s", "--event", "e", "true"], "wrap"),
             (&["prune", "--all"], "prune"),
-            (&["replay", "rec"], "replay"),
+            (&["export", "rec"], "export"),
             (&["query", "select 1"], "query"),
             (&["guide"], "guide"),
             (&["skill", "print"], "skill"),

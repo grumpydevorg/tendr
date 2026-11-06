@@ -18,7 +18,9 @@
 //! version 1, which every remote since 0.5.0 reads. Version 2 (tendr 0.8.0)
 //! carries `start --record-input`, `--no-record` and `--log-delimiter`, and
 //! the ready check: `start --ready-when-*`, `--ready-within`,
-//! `--after-ready`, and `wait --ready`.
+//! `--after-ready`, and `wait --ready`. Version 3 carries clean environment
+//! policy and the names selected by `--pass-env`; their values resolve only
+//! on the host executing the request.
 //!
 //! [`serve`] (`tendr _remote`) reads the frame, checks everything it can
 //! before anything runs, then dispatches the request as if typed on this
@@ -37,10 +39,9 @@ use tendr::model::ids::{Namespace, SessionName};
 use crate::commands::{check_unset_env_name, parse_env_entry};
 use crate::remote_op::{self, RemoteOperation, StartRequest};
 
-/// The newest frame version this binary reads and writes; it reads every
-/// version from 1. Version 2 is version 1 with options a 0.7 remote would
-/// ignore ([`min_frame_version`]).
-pub const FRAME_VERSION: u32 = 2;
+/// The newest frame version this binary reads and writes. Each operation
+/// uses the oldest version that preserves all its requested semantics.
+pub const FRAME_VERSION: u32 = 3;
 
 /// The largest JSON header accepted, in bytes.
 pub const MAX_HEADER_LEN: usize = 1 << 20;
@@ -72,6 +73,8 @@ pub enum EncodeError {
     Json(#[from] serde_json::Error),
     #[error("the request is {0} bytes, over the {MAX_HEADER_LEN}-byte limit")]
     TooLarge(usize),
+    #[error("invalid remote request: {0}")]
+    Invalid(String),
 }
 
 /// Why a received request is refused. Each one is refused before anything
@@ -101,6 +104,7 @@ pub enum FrameError {
 /// uses an option a version 1 remote would ignore.
 fn min_frame_version(operation: &RemoteOperation) -> u32 {
     match operation {
+        RemoteOperation::Start(r) if !r.env_mode.is_inherit() || !r.pass_env.is_empty() => 3,
         RemoteOperation::Start(r)
             if r.record_input
                 || r.no_record
@@ -124,6 +128,10 @@ fn min_frame_version(operation: &RemoteOperation) -> u32 {
 /// # Errors
 /// [`EncodeError`] if the request cannot be carried.
 pub fn encode(operation: &RemoteOperation) -> Result<Vec<u8>, EncodeError> {
+    if let RemoteOperation::Start(request) = operation {
+        tendr::environment::validate(request.env_mode, &request.pass_env)
+            .map_err(|error| EncodeError::Invalid(error.to_string()))?;
+    }
     if let RemoteOperation::Start(StartRequest { cwd: Some(cwd), .. }) = operation {
         if cwd.to_str().is_none() {
             return Err(EncodeError::NonUtf8Cwd(cwd.clone()));
@@ -210,6 +218,17 @@ fn decode_speaking(header: &[u8], newest: u32) -> Result<RemoteOperation, FrameE
         return Err(FrameError::UnknownOperation(op));
     }
     let frame: RemoteFrame<RemoteOperation> = serde_json::from_slice(header)?;
+    if frame.v < 3
+        && matches!(
+            &frame.operation,
+            RemoteOperation::Start(request)
+                if !request.env_mode.is_inherit() || !request.pass_env.is_empty()
+        )
+    {
+        return Err(FrameError::Invalid(
+            "environment policy requires remote request version 3".to_owned(),
+        ));
+    }
     validate(&frame.operation).map_err(FrameError::Invalid)?;
     Ok(frame.operation)
 }
@@ -255,6 +274,7 @@ fn validate_start(r: &StartRequest) -> Result<(), String> {
     if r.argv.is_empty() {
         return Err("no command specified".to_owned());
     }
+    tendr::environment::validate(r.env_mode, &r.pass_env).map_err(|error| error.to_string())?;
     for entry in &r.env {
         parse_env_entry(entry).map_err(|e| e.to_string())?;
     }
@@ -532,6 +552,42 @@ mod tests {
             );
             assert_eq!(read(&frame).unwrap(), original, "{flag}");
         }
+    }
+
+    #[test]
+    fn clean_environment_requires_version_3_and_cannot_be_downgraded() {
+        let request = op(&[
+            "start",
+            "clean",
+            "--env-mode",
+            "clean",
+            "--pass-env",
+            "REMOTE_SETTING",
+            "--",
+            "worker",
+        ]);
+        let encoded = encode(&request).unwrap();
+        let mut header: serde_json::Value = serde_json::from_slice(&encoded[4..]).unwrap();
+        assert_eq!(header["v"], 3);
+        assert!(matches!(
+            decode_speaking(&encoded[4..], 2),
+            Err(FrameError::Version(3))
+        ));
+        assert_eq!(read(&encoded).unwrap(), request);
+
+        for version in [1, 2] {
+            header["v"] = version.into();
+            assert!(matches!(
+                decode(&serde_json::to_vec(&header).unwrap()),
+                Err(FrameError::Invalid(message)) if message.contains("version 3")
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_environment_policy_is_rejected_before_transport() {
+        let request = op(&["start", "invalid", "--pass-env", "SETTING", "--", "worker"]);
+        assert!(matches!(encode(&request), Err(EncodeError::Invalid(_))));
     }
 
     /// The recording flags need `--pty` and exclude each other, as on the

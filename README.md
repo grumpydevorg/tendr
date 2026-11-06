@@ -24,17 +24,40 @@ tendr kill  dev
   same shell, Python, IPython, DuckDB or PowerShell process, or sends one
   request to a line-oriented JSON process, and returns its output and exit
   code as JSON.
-- **Supervises long jobs.** A job keeps running if the caller exits or its
-  terminal closes. `wait`, `status`, `log` and `events` report on it later.
+- **Supervises long jobs.** Runs detach from the caller's terminal;
+  enclosing OS/container lifetime constraints still apply. `wait`, `status`,
+  `log` and `events` report on the work later.
+  Choose `run <name> -- <command>` to stream foreground output and return the
+  child's exit code; `start` instead returns a JSON session record.
 - **Works on other hosts.** `tendr --host user@box …` runs the same commands
   on a remote machine over SSH.
 - **Hosts interactive programs.** A PTY session runs a full-screen program.
   You can attach to it, and a script can type into it with `push`.
 - **Keeps a record.** Each session has an output log and an event log on disk.
   `tendr query` runs SQL over the event logs with DuckDB.
+- **Makes environment inheritance explicit.** `--env-mode clean` selects a
+  platform baseline before starting the sidecar. `--pass-env NAME` opts in
+  application settings without persisting their values. See
+  [launch environments](docs/guide.md#choose-a-launch-environment).
 
-Tendr does not run an agent, render a terminal, or sandbox anything. It starts
-processes, keeps them running, and records what they do.
+Tendr does not implement an agent loop, emulate a terminal screen, or sandbox
+anything. It starts processes, keeps them running, and records what they do.
+
+## With Herdr Core and an agent harness
+
+Use [Herdr Core (`hc`)](https://github.com/herdrdev/herdr-core) to host an
+interactive agent terminal. The harness (omp, Claude Code or Codex) owns its
+model/tool loop and task policy; it can call tendr for stateful shells, REPLs
+and durable jobs. Use native harness tools when they already meet the need.
+
+Each work process has one primary supervisor and authoritative runtime
+record. `hc exec` launches a new process; `tendr exec` addresses an existing
+session. Work started inside hc can still fall within hc's enclosing cleanup
+scope: on macOS with hc 0.1.18, ending the terminal program terminated a
+detached tendr run. Do not assume it survives the terminal. See the
+[ownership and lifecycle contract](docs/guide.md#tendr-alongside-herdr-core-and-a-harness)
+and [design decision](docs/design.md#harness-herdr-core-and-tendr-have-separate-owners).
+Tendr remains usable without hc or a harness, including its generic PTY lane.
 
 ## Install
 

@@ -92,11 +92,16 @@ impl Platform for WindowsPlatform {
     type ReadyReader = File;
     type ReadyWriter = File;
 
-    fn spawn_sidecar(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) -> io::Result<u32> {
+    fn spawn_sidecar(
+        tendr_bin: &Path,
+        session_dir: &Path,
+        ready_writer: &File,
+        environment: &crate::environment::SidecarEnvironment,
+    ) -> io::Result<u32> {
         // Raw CreateProcessW with STARTUPINFOEXW + PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
         // This is the only way to inherit exactly one handle (the ready pipe)
         // without leaking every other inheritable handle from the parent.
-        spawn_sidecar_raw(tendr_bin, session_dir, ready_writer)
+        spawn_sidecar_raw(tendr_bin, session_dir, ready_writer, environment)
     }
 
     fn ready_channel() -> io::Result<(File, File)> {
@@ -624,7 +629,12 @@ fn parent_job_allows_breakaway() -> bool {
 /// readiness read that waits for that process too, never a lost failure.
 ///
 /// Requires Windows 7+ (PROC_THREAD_ATTRIBUTE_HANDLE_LIST support).
-fn spawn_sidecar_raw(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) -> io::Result<u32> {
+fn spawn_sidecar_raw(
+    tendr_bin: &Path,
+    session_dir: &Path,
+    ready_writer: &File,
+    environment: &crate::environment::SidecarEnvironment,
+) -> io::Result<u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
@@ -648,21 +658,35 @@ fn spawn_sidecar_raw(tendr_bin: &Path, session_dir: &Path, ready_writer: &File) 
 
     // --- Build environment block ---
     // Unicode environment block: sorted KEY=VALUE\0 pairs, terminated by \0.
-    let mut env_vars: Vec<(String, String)> = std::env::vars().collect();
-    // Add/override the ready handle env var.
-    let handle_value = ready_handle as usize;
-    let ready_key = "TENDR_READY_HANDLE";
-    if let Some(entry) = env_vars.iter_mut().find(|(k, _)| k == ready_key) {
-        entry.1 = handle_value.to_string();
-    } else {
-        env_vars.push((ready_key.to_string(), handle_value.to_string()));
-    }
-    // Sort case-insensitively (Windows requirement for environment blocks).
-    env_vars.sort_by_cached_key(|(k, _)| k.to_lowercase());
+    use std::borrow::Cow;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    let mut env_vars: Vec<(Cow<'_, OsStr>, Cow<'_, OsStr>)> = match environment {
+        crate::environment::SidecarEnvironment::Inherit => std::env::vars_os()
+            .map(|(k, v)| (Cow::Owned(k), Cow::Owned(v)))
+            .collect(),
+        crate::environment::SidecarEnvironment::Clean(vars) => vars
+            .iter()
+            .map(|(k, v)| (Cow::Borrowed(k.as_os_str()), Cow::Borrowed(v.as_os_str())))
+            .collect(),
+    };
+    // Windows names are case-insensitive; the readiness handle is authoritative.
+    env_vars.retain(|(k, _)| {
+        !k.to_string_lossy()
+            .eq_ignore_ascii_case("TENDR_READY_HANDLE")
+    });
+    env_vars.push((
+        Cow::Borrowed(OsStr::new("TENDR_READY_HANDLE")),
+        Cow::Owned(std::ffi::OsString::from(
+            (ready_handle as usize).to_string(),
+        )),
+    ));
+    env_vars.sort_by_cached_key(|(k, _)| crate::environment::windows_name_key(k));
     let mut env_block: Vec<u16> = Vec::new();
     for (k, v) in &env_vars {
-        let entry = format!("{k}={v}");
-        env_block.extend(entry.encode_utf16());
+        env_block.extend(k.encode_wide());
+        env_block.push(u16::from(b'='));
+        env_block.extend(v.encode_wide());
         env_block.push(0);
     }
     env_block.push(0); // double-null terminator

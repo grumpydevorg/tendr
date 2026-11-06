@@ -1,7 +1,7 @@
-//! The user's terminal as the attach client and `replay` drive it: the
-//! platform layer under the attach client core (`attach::client`) and the
-//! player (`replay`). They touch no file descriptor, signal or console API;
-//! everything they need from the terminal goes through these traits.
+//! The user's terminal as the attach client drives it: the platform layer
+//! under the attach client core (`attach::client`). The client touches no
+//! file descriptor, signal or console API directly; everything it needs
+//! from the terminal goes through these traits.
 //!
 //! - [`Terminal`]: the terminal's state, taken by [`open`] before anything
 //!   that may change it starts (ssh shares the terminal), and turned into

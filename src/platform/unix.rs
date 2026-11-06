@@ -78,8 +78,9 @@ impl Platform for UnixPlatform {
         tendr_bin: &Path,
         session_dir: &Path,
         ready_write_fd: &File,
+        environment: &crate::environment::SidecarEnvironment,
     ) -> io::Result<u32> {
-        spawn_sidecar(tendr_bin, session_dir, ready_write_fd)
+        spawn_sidecar(tendr_bin, session_dir, ready_write_fd, environment)
     }
 
     fn ready_channel() -> io::Result<(File, File)> {
@@ -548,10 +549,18 @@ const SIDECAR_ARG: &str = "_sidecar";
 ///
 /// The sidecar inherits the write end of the readiness pipe and is
 /// responsible for writing a result and closing it.
-fn spawn_sidecar(tendr_bin: &Path, session_dir: &Path, ready_write_fd: &File) -> io::Result<u32> {
+fn spawn_sidecar(
+    tendr_bin: &Path,
+    session_dir: &Path,
+    ready_write_fd: &File,
+    environment: &crate::environment::SidecarEnvironment,
+) -> io::Result<u32> {
     let write_fd_raw = ready_write_fd.as_raw_fd();
 
     let mut cmd = Command::new(tendr_bin);
+    if let crate::environment::SidecarEnvironment::Clean(vars) = environment {
+        cmd.env_clear().envs(vars);
+    }
     cmd.arg(SIDECAR_ARG)
         .arg("--session-dir")
         .arg(session_dir)

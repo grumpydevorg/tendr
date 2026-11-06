@@ -14,6 +14,7 @@ sequenceDiagram
     participant Child
 
     Caller->>CLI: start <session> -- <cmd...>
+    CLI->>CLI: validate and resolve environment policy on executing host
     CLI->>Session: create dir
     CLI->>Session: write launch_spec.json
     CLI->>CLI: create ready pipe
@@ -41,6 +42,11 @@ Notes:
   below the soft `RLIMIT_NOFILE`. So a descriptor the caller leaked
   reaches neither the sidecar nor the child, whose spawn inherits only the
   sidecar's own fds, all opened close-on-exec.
+- Environment selection precedes sidecar creation. In inherited mode the
+  normal process environment is preserved; clean mode applies a finite
+  platform baseline and selected `--pass-env` values at spawn. Only the mode
+  and names enter the launch specification. Resolved values travel in the
+  process environment, not the readiness pipe, metadata or event log.
 - Readiness only informs the CLI; the run never depends on it. If the CLI
   is gone before the sidecar signals (killed, or its terminal closed), the
   write fails. The sidecar records a `readiness not delivered` warning in
@@ -305,13 +311,17 @@ Notes:
 
 ## `run`
 
-`run` wraps `start` for scripts:
+`run <name> [launch options] -- <command> [args]` is the foreground form of
+the same launch path:
 
-- It parses `#tendr:` directives from the script.
-- It resolves the interpreter or shell.
-- It calls the same `launch_session` path as `start`.
-- In foreground mode it follows `output.log` until the run is terminal, then
-  exits with the code from the final `meta.json`.
+- `start` and `run` share one argument structure and one unresolved
+  `StartRequest`; the executing host resolves it once.
+- The executable, argv and session name are explicit. Payload scripts have
+  no tendr configuration language or interpreter/name inference.
+- `run` follows `output.log` until the run is terminal, then exits with the
+  child's original code from `meta.json`. It does not attach to a PTY.
+- `start` instead returns JSON metadata immediately. Neither command makes
+  the work's lifetime independent of enclosing OS containment.
 
 ## `wrap`
 

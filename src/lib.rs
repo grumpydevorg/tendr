@@ -73,7 +73,7 @@ pub mod attach_escape;
 pub mod attach_proto;
 #[cfg(unix)]
 pub mod attach_socket;
-pub mod directive;
+pub mod environment;
 pub mod events;
 pub mod exec_frame;
 pub mod exec_request;

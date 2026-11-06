@@ -147,18 +147,6 @@ fn guide_cgroup_section_is_relevant() {
 }
 
 #[test]
-fn guide_herdr_section_is_relevant() {
-    let root = Home::new();
-
-    tendr(&root)
-        .args(["guide", "herdr"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("herdr pane read"))
-        .stdout(predicate::str::contains("## Exit codes").not());
-}
-
-#[test]
 fn guide_topic_is_case_insensitive() {
     let root = Home::new();
 

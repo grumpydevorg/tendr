@@ -3465,10 +3465,10 @@ impl PtyRecordingRun {
 /// Start recording a PTY run as its launch spec asks: output and applied
 /// geometry, and input too with `RecordingPolicy::OutputAndInput`; `None`
 /// for `RecordingPolicy::Off`. The child starts at the platform's initial
-/// PTY size, under its `TERM` ([`pty_term`]; recorded empty if not
-/// recordable). A stop is queued on the run's effects channel, which appends
-/// it as a `recording.stopped` event and writes it to `meta.json`; the
-/// recorder never touches the session paths itself.
+/// PTY size, under its `TERM` ([`pty_term`]; recorded empty if it comes from
+/// `--pass-env` or is not recordable). A stop is queued on the run's effects
+/// channel, which appends it as a `recording.stopped` event and writes it to
+/// `meta.json`; the recorder never touches the session paths itself.
 #[cfg(unix)]
 fn start_pty_recording(
     session_dir: &Path,
@@ -3486,8 +3486,15 @@ fn start_pty_recording(
         RecordingPolicy::OutputAndInput => true,
     };
     let dir = format!("recording/{run_id}");
-    let term = TermName::new(pty_term(launch_spec))
-        .unwrap_or_else(|_| TermName::new("").expect("an empty TERM is recordable"));
+    let passed_term = launch_spec.pass_env.contains("TERM")
+        && !launch_spec.env.contains_key("TERM")
+        && !launch_spec.unset_env.contains("TERM");
+    let term = if passed_term {
+        TermName::new("").expect("an empty TERM is recordable")
+    } else {
+        TermName::new(pty_term(launch_spec))
+            .unwrap_or_else(|_| TermName::new("").expect("an empty TERM is recordable"))
+    };
     let origin_unix_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));

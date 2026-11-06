@@ -28,6 +28,12 @@ These stay outside tendr:
   [Tendr supervises processes](#tendr-supervises-processes-it-is-not-an-agent-framework));
 - container and Kubernetes lifecycle management.
 
+When used with Herdr Core (`hc`) and an agent harness, tendr owns the work
+processes, not the agent's interactive terminal or task lifecycle. The
+[separation decision](#harness-herdr-core-and-tendr-have-separate-owners)
+defines that boundary; the [guide](guide.md#tendr-alongside-herdr-core-and-a-harness)
+shows how to use it. Neither hc nor a harness is required to use tendr.
+
 ## Rules
 
 A change that breaks more than one of these probably belongs above tendr, or
@@ -111,14 +117,33 @@ alternatives. Where an entry names a file as its source, the full text is in
 Git at commit `95dcf1d`, unless the entry names another commit. `95dcf1d` is
 the last commit before the old plans and specs were removed.
 
+### Harness, Herdr Core and tendr have separate owners
+
+*2026-11-06.* The harness owns the model/tool loop, context, permissions and
+task policy; Herdr Core (`hc`) hosts interactive agent terminals, their
+screens, reported status and terminal messaging; tendr owns supervised work
+processes, persistent command/results and durable logs/events.
+Compose them by letting an hc-hosted harness call tendr, with one primary
+supervisor and authoritative runtime record per work process, not by treating
+a launcher, an agent turn and a job as one lifecycle; this does not imply
+immunity from an enclosing runtime's cleanup scope.
+Keep generic PTY/recording/attach, published events and arbitrary executable
+supervision, but leave terminal emulation and agent coordination above tendr:
+the harness chooses retention/cancellation policy, and independently retained
+work needs a separately established lifetime boundary because hc can sweep
+inherited scope metadata even across session detachment
+([observed limit](guide.md#observed-hc-cleanup-scope-limit)); tendr does not
+silently remove that metadata.
+
 ### Tendr supervises processes; it is not an agent framework
 
-*2026-04-03, amended 2026-10-31.* This is the "process sitter" decision.
+*2026-04-03, amended 2026-11-06.* This is the "process sitter" decision.
 Tendr starts, watches, chains and stops processes. It does not learn LLM
-protocols, count tokens, retry API calls or choose models. An agent runs under
-tendr as its own command-line program, for example
-`tendr start task -- claude -p "…"`. Adding LLM knowledge would turn tendr into
-an AI framework, with a different scope, users and maintenance cost. Source:
+protocols, count tokens, retry API calls or choose models. Agent executables
+remain ordinary programs that tendr can supervise; interactive agent hosting
+uses hc in the composition above, not a vendor-specific turn driver in tendr.
+Adding LLM knowledge would turn tendr into an AI framework, with a different
+scope, users and maintenance cost. Source:
 `docs/plans/specs/decision-process-sitter-not-framework.md`.
 
 The amendment corrects a premise. The 2026-04 decision assumed agent programs
@@ -128,8 +153,9 @@ long-running process, and the rejection of LLM knowledge stands. It also sets
 one more boundary: tendr does not decide when an agent's turn is done. An agent
 can report its turn as events (see the next entry); what those events mean is
 the caller's policy (rule 1). A review on 2026-10-08 (two models,
-independently) rejected a turn contract in core because "done", "blocked" and
-"settled" are vendor terms that change between releases. Source: PR #123.
+independently) rejected a turn contract in core (PR #123). Program-reported
+status need not depend on agent-brand detection: hc accepts OSC 7501, but
+presenting agent status and coordinating turns still belongs above tendr.
 
 ### Processes may publish events; tendr does not interpret them
 
@@ -220,6 +246,28 @@ options: working directory, environment, timeout, dependencies and exit hooks.
 A different spec under the same name is a session conflict error, and
 replacing a run needs `--replace`. Retrying a command is therefore always safe,
 and a conflicting request is never silently merged.
+
+### Foreground execution uses the same explicit launch contract
+
+*2026-11-06.* `run` and `start` share launch arguments and `StartRequest`;
+the caller supplies the session name, executable and argv, and payload scripts
+carry no tendr-specific directives or interpreter inference.
+Keep foreground streaming and the child's original exit status because they
+make tendr usable without a particular harness; only launch presentation
+differs from `start`.
+
+### Clean environments are explicit and passed values are ephemeral
+
+*2026-11-06.* Default inherited mode is unchanged; clean mode constructs a
+documented platform baseline before spawning the sidecar, with explicit
+`--pass-env` names resolving on the executing host.
+Persist only policy and names in launch identity, never their resolved
+values: reusing `LaunchSpec.env` would expose them through metadata, status
+and events, so the values cross only the process-creation boundary.
+This generic opt-in removes arbitrary inherited environment metadata without
+terminal-specific exceptions, an extra supervisor or a promise of escape
+from OS containment; the remote protocol rejects readers that would ignore it.
+
 
 ### `--after` waits for a run, not a name
 
@@ -556,29 +604,24 @@ the `duckdb` exec target drives, so tendr has no DuckDB library dependency.
 
 ### No terminal emulator in core
 
-*2026-07-09, revised 2026-10-31.* Tendr owns the PTY, input ownership and the
-exact recording. It does not parse or render the screen, and it offers no
-screen reads. Core does not link a terminal emulator such as libghostty, so it
-gains no Zig or Ghostty build dependency. A caller that needs the rendered
-screen replays the recording through a terminal of its own. Source:
+*2026-07-09, revised 2026-11-06.* For tendr-created PTY sessions, tendr owns
+the PTY, input control and exact recording. It does not parse or render the
+screen, and it offers no screen reads. Core does not link a terminal emulator
+such as libghostty, so it gains no Zig or Ghostty build dependency. A caller
+that needs the rendered screen replays the recording through a terminal of
+its own. This does not make tendr the owner of an outer hc terminal. Source:
 `docs/plans/specs/ecosystem-landscape.md`, and the cloud PTY plan at
 `95dcf1d`, which designed an optional `tendr-screen` extension that was
 dropped on 2026-10-31.
 
-### Replay plays a recording through the user's terminal
+### Recording export delegates presentation to external players
 
-*2026-11-04.* With no screen engine, the way to see what a past PTY session
-looked like is to play its recorded output through a real terminal, so
-`tendr replay` does that and nothing more: it never connects to a live
-session or writes to a child. Core cannot resize the user's window and does
-not rely on `CSI 8 ; rows ; cols t`, which many terminals ignore, so matching
-the size is the user's: replay asks once, before playback. By default a later
-mismatch is reported once, after playback, because a notice drawn during it
-would damage the picture; `--strict-geometry` pauses at each size change for
-an exact one. Repaint nudges are tendr's own resizes, not the user's, so they
-never prompt. The whole recording is decoded before anything is shown, so a
-damaged one plays nothing: the format leaves salvaging a valid prefix to an
-explicit tool. Source: the pty-replay plan at `7d73421`.
+*2026-11-06.* Tendr records exact PTY evidence and exports it as asciicast;
+external players own playback timing, geometry and terminal restoration.
+The exporter validates the recording before writing, refuses corruption and
+invalid UTF-8, and reports a truncated final record without inventing bytes.
+This retains the machine-facing evidence path without maintaining a second
+human terminal presentation layer.
 
 ### Recordings expire only when asked
 

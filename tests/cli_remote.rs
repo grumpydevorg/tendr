@@ -978,7 +978,16 @@ fn host_run_wrap_prune_exit_2_and_say_local_only() {
     for (verb, cmd_args) in [
         (
             "run",
-            vec!["--host", "user@box", "run", "deploy.sh", "--stdin"],
+            vec![
+                "--host",
+                "user@box",
+                "run",
+                "deploy",
+                "--stdin",
+                "--",
+                "sh",
+                "deploy.sh",
+            ],
         ),
         (
             "wrap",
@@ -1021,25 +1030,31 @@ fn host_run_wrap_prune_exit_2_and_say_local_only() {
     }
 }
 
-/// run's fallback keeps the `--` separator before script args: a script
-/// arg like --stdin must not re-parse as tendr's own flag when the
-/// fallback is pasted (review finding on PR #12). clap consumes the
-/// first `--` but keeps any later one in the captured args, so exactly
-/// one separator is re-inserted.
+/// The fallback preserves child argv after `--`, including flag-shaped
+/// arguments and a second separator inside the child's arguments.
 #[test]
-fn host_run_fallback_keeps_separator_before_script_args() {
+fn host_run_fallback_keeps_separator_before_child_argv() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
     let tmp = poison_ssh();
-    for (cli_args, expected_remote) in [
+    for (cli_args, child_argv) in [
         (
-            vec!["--host", "user@box", "run", "deploy.sh", "--", "--stdin"],
-            vec!["tendr", "run", "deploy.sh", "--", "--stdin"],
+            vec![
+                "--host",
+                "user@box",
+                "run",
+                "job",
+                "--",
+                "sh",
+                "deploy.sh",
+                "--stdin",
+            ],
+            vec!["sh", "deploy.sh", "--stdin"],
         ),
         (
-            // A second `--` inside script args survives in place.
-            vec!["--host", "user@box", "run", "d.sh", "--", "a", "--", "b"],
-            vec!["tendr", "run", "d.sh", "--", "a", "--", "b"],
+            vec![
+                "--host", "user@box", "run", "job", "--", "sh", "d.sh", "a", "--", "b",
+            ],
+            vec!["sh", "d.sh", "a", "--", "b"],
         ),
     ] {
         let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("tendr"))
@@ -1047,14 +1062,12 @@ fn host_run_fallback_keeps_separator_before_script_args() {
             .env("PATH", tmp.path())
             .output()
             .unwrap();
-
         assert_eq!(output.status.code(), Some(2));
         let stderr = String::from_utf8_lossy(&output.stderr);
         let remote = parse_fallback_argv(&stderr, "user@box");
-        assert_eq!(
-            remote, expected_remote,
-            "script args re-parse as script args, not tendr flags"
-        );
+        assert_eq!(&remote[..3], ["tendr", "run", "job"]);
+        let separator = remote.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(&remote[separator + 1..], child_argv);
     }
 }
 
@@ -1497,6 +1510,9 @@ fn host_run_fallback_keeps_unset_env() {
             "run",
             "--unset-env",
             "CI",
+            "deploy",
+            "--",
+            "sh",
             "deploy.sh",
         ])
         .env("PATH", tmp.path())
@@ -1506,11 +1522,14 @@ fn host_run_fallback_keeps_unset_env() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     let remote = parse_fallback_argv(&stderr, "user@box");
-    assert_eq!(
-        remote,
-        ["tendr", "run", "--unset-env", "CI", "deploy.sh"],
-        "fallback passes --unset-env on"
+    assert_eq!(&remote[..3], ["tendr", "run", "deploy"]);
+    let separator = remote.iter().position(|arg| arg == "--").unwrap();
+    assert!(
+        remote[..separator]
+            .windows(2)
+            .any(|args| args == ["--unset-env", "CI"])
     );
+    assert_eq!(&remote[separator + 1..], ["sh", "deploy.sh"]);
 }
 
 // --- host destination hardening (v0.2.1) ---

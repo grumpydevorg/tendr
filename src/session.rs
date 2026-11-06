@@ -262,21 +262,27 @@ pub fn list(
 }
 
 /// Read meta.json from a session directory.
-/// Returns Corrupt if meta.json is missing or contains invalid JSON.
+/// Returns Corrupt for invalid JSON; preserves filesystem errors, including NotFound.
 pub fn read_meta(session: &SessionDir) -> Result<Meta, SessionError> {
     let meta_path = session.meta_path();
-    if !meta_path.exists() {
-        return Err(SessionError::Corrupt {
-            session: session.name().to_string(),
-            reason: "meta.json not found".into(),
-        });
-    }
     let content = fs::read_to_string(&meta_path)?;
     let meta: Meta = serde_json::from_str(&content).map_err(|e| SessionError::Corrupt {
         session: session.name().to_string(),
         reason: format!("invalid meta.json: {e}"),
     })?;
     Ok(meta)
+}
+
+/// Remove a stopped session, unpublishing its identity before its history.
+///
+/// Readers can distinguish deletion from a current run with missing history,
+/// even while recursive removal is still in progress.
+pub fn remove(session: &SessionDir) -> std::io::Result<()> {
+    match fs::remove_file(session.meta_path()) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    fs::remove_dir_all(session.path())
 }
 
 /// Write meta.json atomically via temp file + rename.

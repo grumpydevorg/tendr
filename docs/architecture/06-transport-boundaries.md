@@ -28,6 +28,7 @@ flowchart TD
 | Boundary | Who uses it | What it carries |
 |---|---|---|
 | Ready pipe | Created by `start`; used once at sidecar startup. | `OK:<meta>` or `ERROR:<message>`. |
+| Sidecar environment | Selected by the CLI before spawning the sidecar. | Inherited environment or a clean baseline plus named values. Only mode/names are persisted; resolved passed values are never serialized. |
 | `stdin.pipe` | Created with `--stdin`. Used by `push` to a pipe session, and by `exec` to send framed commands. A PTY `push` uses the attach socket. | Raw input bytes. |
 | `kill_request` | Written by `kill`; read by the sidecar's kill watcher. | `force` and `run_id`; a request for another run is ignored. |
 | `output.log` | Appended by the sidecar, `wrap` and `exec`. Read by `log`, `watch`, `exec` and `events --include-logs`. | JSONL lines tagged `O`, `E` or `A`. |
@@ -43,7 +44,7 @@ model or session store of its own.
 | Over `--host` | Commands |
 |---|---|
 | supported | `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`, `attach`, `exec` |
-| local-only, exit 2 with a ready-to-paste `ssh <host> 'tendr …'` command, quoted for a POSIX shell and labelled so | `run`, `wrap`, `prune`, `query`, `guide`, `skill` |
+| local-only, exit 2 with a ready-to-paste `ssh <host> 'tendr …'` command, quoted for a POSIX shell and labelled so | `run`, `wrap`, `prune`, `query`, `guide`, `skill`, `export` |
 | local-only, exit 1 with the list of supported commands | `emit`, `events` |
 
 `wrap` also needs the supervised-process environment, so it only works
@@ -75,8 +76,8 @@ The JSON is the request under a version:
 
 - `op` is `start`, `status`, `list`, `log`, `push`, `kill`, `wait`, `watch`
   or `attach`; `params` holds what the user typed, unresolved. Namespace
-  defaults and `--after` and `--after-ready` run IDs resolve on the remote
-  host.
+  defaults, dependency run IDs and selected environment values resolve on
+  the remote host. `--pass-env` sends names, not the local values.
 - The client refuses, with exit 2 and before ssh starts, a `--cwd` that is not
   UTF-8 (JSON carries UTF-8 only) and a header over 1 MiB.
 - The client closes ssh stdin after the header, except for `push`, which then
@@ -95,9 +96,14 @@ The JSON is the request under a version:
   (`start --ready-when-output`, `--ready-when-port`, `--ready-within`,
   `--after-ready`, and `wait --ready`). A request that uses one goes as
   version 2, which a 0.7 remote refuses (`unsupported remote request
-  version 2`, exit 2) instead of running it without the option; every other
-  request goes as version 1. A 0.8 remote reads every version from 1 to its
-  own newest.
+  version 2`, exit 2) instead of running it without the option.
+- Environment policy uses version 3: clean mode and passed variable names
+  must never be dropped by a version 1 or 2 reader. The client validates
+  names and mode before SSH; the remote resolves the values before session
+  creation or replacement. A policy carried under a lower frame version
+  is refused, as is version 3 on an older remote. Requests with inherited
+  mode and no passed names still use version 1 or 2 as their other flags
+  require. This binary reads versions 1 through 3.
 - Otherwise the request runs as the same command typed on the remote host:
   stdout, stderr and exit code are the local command's, and `log -f` and
   `watch` stream. `attach` is the exception: the client keeps the terminal,

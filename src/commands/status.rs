@@ -77,6 +77,6 @@ pub(crate) fn cleanup_orphan_dir(
             let _ = tendr::reconcile::kill_verified_orphan(&identity);
         }
     }
-    let _ = std::fs::remove_dir_all(dir.path());
+    let _ = session::remove(&dir);
     Ok(())
 }

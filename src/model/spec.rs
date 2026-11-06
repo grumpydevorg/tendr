@@ -97,6 +97,22 @@ pub struct DependencyBinding {
     pub run_id: RunId,
 }
 
+/// Environment inherited by the sidecar and its descendants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvMode {
+    #[default]
+    Inherit,
+    Clean,
+}
+
+impl EnvMode {
+    #[must_use]
+    pub fn is_inherit(&self) -> bool {
+        *self == Self::Inherit
+    }
+}
+
 /// The full identity of a run. Hashed for idempotent matching.
 /// Argv must be non-empty (validated on construction and deserialization).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -110,6 +126,11 @@ pub struct LaunchSpec {
     /// Omitted when empty so existing specs keep their canonical hash.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub unset_env: BTreeSet<String>,
+    /// Sidecar environment policy and selected inherited names, never values.
+    #[serde(default, skip_serializing_if = "EnvMode::is_inherit")]
+    pub env_mode: EnvMode,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pass_env: BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -161,6 +182,8 @@ impl LaunchSpec {
             cwd: None,
             env: BTreeMap::new(),
             unset_env: BTreeSet::new(),
+            env_mode: EnvMode::Inherit,
+            pass_env: BTreeSet::new(),
             timeout_s: None,
             after: vec![],
             after_any_exit: false,
@@ -202,6 +225,10 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             env: BTreeMap<String, String>,
             #[serde(default)]
             unset_env: BTreeSet<String>,
+            #[serde(default)]
+            env_mode: EnvMode,
+            #[serde(default)]
+            pass_env: BTreeSet<String>,
             timeout_s: Option<u64>,
             #[serde(default)]
             after: Vec<DependencyBinding>,
@@ -234,6 +261,8 @@ impl<'de> Deserialize<'de> for LaunchSpec {
             cwd: raw.cwd,
             env: raw.env,
             unset_env: raw.unset_env,
+            env_mode: raw.env_mode,
+            pass_env: raw.pass_env,
             timeout_s: raw.timeout_s,
             after: raw.after,
             after_any_exit: raw.after_any_exit,

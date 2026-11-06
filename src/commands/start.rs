@@ -1,58 +1,16 @@
-use std::path::Path;
-
+use crate::remote_op::StartRequest;
 use anyhow::Context;
+use tendr::environment::{self, SidecarEnvironment};
 use tendr::model::boundary::BoundaryContext;
 use tendr::model::ids::{Namespace, SessionName};
-use tendr::model::ready::ReadyCheck;
 use tendr::model::spec::{
-    DependencyBinding, ExecTarget, IoMode, LaunchSpec, LogDelimiter, RecordingPolicy, StdinMode,
+    DependencyBinding, ExecTarget, IoMode, LaunchSpec, RecordingPolicy, StdinMode,
 };
 use tendr::platform::{Current, Platform};
 use tendr::session::{self, SessionRoot};
 
-#[allow(clippy::too_many_arguments)] // the launch surface; `remote_op::dispatch` resolves a StartRequest into it
-pub fn cmd_start(
-    name: &str,
-    cmd: Vec<String>,
-    stdin: bool,
-    replace: bool,
-    timeout: Option<u64>,
-    cwd: Option<&std::path::Path>,
-    env_vars: &[String],
-    unset_env: &[String],
-    on_exit: &[String],
-    after: &[String],
-    any_exit: bool,
-    namespace: &Namespace,
-    pty: bool,
-    exec_target: Option<ExecTarget>,
-    boundary: Option<BoundaryContext>,
-    recording: RecordingPolicy,
-    ready: Option<ReadyCheck>,
-    after_ready: &[String],
-    log_delimiter: LogDelimiter,
-) -> anyhow::Result<()> {
-    let (meta, _session) = launch_session(
-        name,
-        cmd,
-        stdin,
-        replace,
-        timeout,
-        cwd,
-        env_vars,
-        unset_env,
-        on_exit,
-        after,
-        any_exit,
-        namespace,
-        pty,
-        exec_target,
-        boundary,
-        recording,
-        ready,
-        after_ready,
-        log_delimiter,
-    )?;
+pub fn cmd_start(request: StartRequest) -> anyhow::Result<()> {
+    let (meta, _session) = launch_session(request)?;
 
     let json = serde_json::to_string_pretty(&meta)?;
     outln!("{json}");
@@ -78,34 +36,53 @@ pub fn cmd_start(
 /// the same spec), it re-reads the existing meta from disk.
 ///
 /// Does not print to stdout or call process::exit — callers decide what to do.
-#[allow(clippy::too_many_arguments)] // the launch surface, shared by start and run
 pub(crate) fn launch_session(
-    name: &str,
-    cmd: Vec<String>,
-    stdin: bool,
-    replace: bool,
-    timeout: Option<u64>,
-    cwd: Option<&std::path::Path>,
-    env_vars: &[String],
-    unset_env: &[String],
-    on_exit: &[String],
-    after: &[String],
-    any_exit: bool,
-    namespace: &Namespace,
-    pty: bool,
-    exec_target: Option<ExecTarget>,
-    boundary: Option<BoundaryContext>,
-    recording: RecordingPolicy,
-    ready: Option<ReadyCheck>,
-    after_ready: &[String],
-    log_delimiter: LogDelimiter,
+    request: StartRequest,
 ) -> anyhow::Result<(tendr::model::meta::Meta, session::SessionDir)> {
-    let session_name = SessionName::new(name)?;
+    let namespace = crate::resolve_namespace(request.namespace.clone())?;
+    let ready = request.ready_check().map_err(anyhow::Error::msg)?;
+    let sidecar_environment = environment::resolve(request.env_mode, &request.pass_env)?;
+    let pass_env = environment::canonical_names(&request.pass_env);
+    let StartRequest {
+        session: name,
+        argv: cmd,
+        stdin,
+        replace,
+        timeout,
+        cwd,
+        env: env_vars,
+        unset_env,
+        on_exit,
+        after,
+        any_exit,
+        pty,
+        exec_target,
+        boundary,
+        boundary_parent,
+        record_input,
+        no_record,
+        after_ready,
+        log_delimiter,
+        env_mode,
+        ..
+    } = request;
+    let boundary = boundary.map(|current| BoundaryContext {
+        current,
+        parents: boundary_parent,
+    });
+    let recording = if no_record {
+        RecordingPolicy::Off
+    } else if record_input {
+        RecordingPolicy::OutputAndInput
+    } else {
+        RecordingPolicy::Output
+    };
+    let session_name = SessionName::new(&name)?;
     let root = SessionRoot::default_path()?;
 
     // Handle --replace before session creation
     let next_generation = if replace {
-        handle_replace(&root, namespace, &session_name)?
+        handle_replace(&root, &namespace, &session_name)?
     } else {
         None
     };
@@ -119,16 +96,18 @@ pub(crate) fn launch_session(
     };
     launch_spec.timeout_s = timeout;
     launch_spec.namespace = Some(namespace.as_str().to_string());
-    launch_spec.cwd = cwd.map(Path::to_path_buf);
-    for entry in env_vars {
+    launch_spec.cwd = cwd;
+    launch_spec.env_mode = env_mode;
+    launch_spec.pass_env = pass_env;
+    for entry in &env_vars {
         let (key, value) = parse_env_entry(entry)?;
         launch_spec.env.insert(key.to_string(), value.to_string());
     }
-    for name in unset_env {
+    for name in &unset_env {
         check_unset_env_name(name)?;
         launch_spec.unset_env.insert(name.clone());
     }
-    launch_spec.on_exit = on_exit.to_vec();
+    launch_spec.on_exit = on_exit;
     launch_spec.boundary = boundary;
     launch_spec.recording = recording;
     launch_spec.ready = ready;
@@ -141,13 +120,13 @@ pub(crate) fn launch_session(
 
     // Resolve --after and --after-ready: capture each dependency's run_id at
     // bind time.
-    for dep_name in after {
-        let (binding, _) = bind_dependency(&root, namespace, dep_name, "--after")?;
+    for dep_name in &after {
+        let (binding, _) = bind_dependency(&root, &namespace, dep_name, "--after")?;
         launch_spec.after.push(binding);
     }
     launch_spec.after_any_exit = !after.is_empty() && any_exit;
-    for dep_name in after_ready {
-        let (binding, dep_meta) = bind_dependency(&root, namespace, dep_name, "--after-ready")?;
+    for dep_name in &after_ready {
+        let (binding, dep_meta) = bind_dependency(&root, &namespace, dep_name, "--after-ready")?;
         if dep_meta.launch_spec().ready.is_none() {
             anyhow::bail!(
                 "--after-ready: session {dep_name} has no ready condition \
@@ -158,15 +137,15 @@ pub(crate) fn launch_session(
     }
 
     // Create session directory (with idempotent handling)
-    let session = match session::create(&root, namespace, &session_name) {
+    let session = match session::create(&root, &namespace, &session_name) {
         Ok(s) => s,
         Err(session::SessionError::AlreadyExists(_)) => {
-            match try_idempotent_start(&root, namespace, &session_name, &launch_spec)? {
+            match try_idempotent_start(&root, &namespace, &session_name, &launch_spec)? {
                 None => {
                     // Idempotent: already running with same spec.
                     // Re-open and return existing meta.
                     let existing =
-                        session::open(&root, namespace, &session_name)?.ok_or_else(|| {
+                        session::open(&root, &namespace, &session_name)?.ok_or_else(|| {
                             anyhow::anyhow!("session vanished during idempotent check")
                         })?;
                     let meta = session::read_meta(&existing)?;
@@ -186,7 +165,7 @@ pub(crate) fn launch_session(
         );
     }
 
-    let meta = spawn_and_wait_ready_inner(&session, &launch_spec)?;
+    let meta = spawn_and_wait_ready_inner(&session, &launch_spec, &sidecar_environment)?;
     Ok((meta, session))
 }
 
@@ -286,7 +265,7 @@ fn handle_replace(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             // Safe to remove -- sidecar has exited or timed out
-            std::fs::remove_dir_all(existing.path())?;
+            session::remove(&existing)?;
             return Ok(Some(prev_generation.next()));
         }
     }
@@ -379,6 +358,7 @@ fn try_idempotent_start(
 fn spawn_and_wait_ready_inner(
     session: &session::SessionDir,
     launch_spec: &LaunchSpec,
+    environment: &SidecarEnvironment,
 ) -> anyhow::Result<tendr::model::meta::Meta> {
     // Write launch spec for sidecar to read
     let spec_json = serde_json::to_string_pretty(launch_spec)?;
@@ -389,14 +369,15 @@ fn spawn_and_wait_ready_inner(
 
     // Spawn detached sidecar
     let tendr_bin = std::env::current_exe()?;
-    let sidecar_result = Current::spawn_sidecar(&tendr_bin, session.path(), &write_end);
+    let sidecar_result =
+        Current::spawn_sidecar(&tendr_bin, session.path(), &write_end, environment);
 
     // Close write end in parent -- we only read
     drop(write_end);
 
     if let Err(e) = sidecar_result {
         // Sidecar failed to spawn -- clean up session dir so start is retryable
-        let _ = std::fs::remove_dir_all(session.path());
+        let _ = session::remove(session);
         anyhow::bail!("failed to spawn sidecar: {e}");
     }
 
@@ -407,7 +388,7 @@ fn spawn_and_wait_ready_inner(
             // Sidecar died before signaling. Only clean up if no child was spawned.
             // If child_pid exists, a child may be alive -- don't delete the evidence.
             if !session.path().join("child_pid").exists() {
-                let _ = std::fs::remove_dir_all(session.path());
+                let _ = session::remove(session);
             }
             anyhow::bail!("sidecar startup failed: {e}");
         }
@@ -416,7 +397,7 @@ fn spawn_and_wait_ready_inner(
     if signal.starts_with("ERROR:") {
         let err_msg = signal.trim_start_matches("ERROR:").trim();
         if !session.path().join("child_pid").exists() {
-            let _ = std::fs::remove_dir_all(session.path());
+            let _ = session::remove(session);
         }
         anyhow::bail!("sidecar failed: {err_msg}");
     }
