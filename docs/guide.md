@@ -459,11 +459,11 @@ for the existing assignment, and agree on a return point when the handoff is tem
 
 ### Secrets and lifetime
 
-Keep `--record-input` off for secret entry, and use masked input. This alone
-does not protect secrets a program prints: PTY output is normally recorded.
-Capture sensitive command output inside the process, or use `--no-record`
-when appropriate, and never put passwords or session keys into the handoff
-message. Follow the environment's credential-handling instructions.
+Keep `--record-input` off for secret entry, and use masked input. Capture
+sensitive command output inside the process: PTY output still goes to
+`output.log`, even with `--no-record` (which disables the separate PTY recording).
+Never put passwords or session keys into the handoff message. Follow the
+environment's credential-handling instructions.
 
 Detach preserves the worker within its existing execution boundary; it does
 not make descendants independent of their owner. Work launched inside Herdr

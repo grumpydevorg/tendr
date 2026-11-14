@@ -35,8 +35,8 @@ continuation by another agent. Read `tendr guide handoff` for the full procedure
 - Wait for `status` to show `AgentControl` before resuming writes. Exit 81 while
   `HumanControl` is a control conflict; coordinate a detach rather than retrying or
   taking the terminal away. Designate one agent writer: `AgentControl` does not identify that agent.
-- For secret entry, keep input recording off and use masked input. Output is still
-  recorded unless disabled; capture tokens and other secret output within the process.
+- For secret entry, keep input recording off and use masked input. PTY output still
+  goes to `output.log`, even with `--no-record`; capture secret output within the process.
   Verify the application result, release the temporary unlock and retire finished helpers.
 
 For current, version-matched usage, run:
