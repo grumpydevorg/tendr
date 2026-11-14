@@ -391,6 +391,85 @@ On tendr's side, the cancel `exec` exits 0 either way, and the stopped
 request's reply, which arrives while it waits, lands in its `unmatched`. A
 `queue_full` reply is an `ok:false` reply, so its `exec` exits 1.
 
+## Hand off interactive control
+
+A named PTY session can carry a task from an agent to a human and back, or
+between agents, without restarting its program or rebuilding its shell state.
+Use this for authorized interactive work such as a local unlock, an approval
+prompt, or a workflow another agent needs to continue. Tendr transfers access
+to the running process; task context, permissions and approval decisions still
+belong to the people and agents involved.
+
+### Agent to human, then back
+
+1. Start the interactive program in a named PTY session. Use `--exec-target none`
+   for a program that does not implement one of the supported exec protocols:
+
+   ```sh
+   tendr start task --pty --exec-target none -- your-interactive-command
+   tendr status task
+   ```
+
+2. Tell the human what is waiting, which input is needed and how to return
+   control. Give the complete attach command, including the host and namespace
+   when they are not local/default:
+
+   ```sh
+   tendr attach task
+   ```
+
+   Attach does not replay scrollback. A one-line prompt printed before the
+   human attaches can leave an apparently blank terminal. Make the program
+   display a fresh prompt after attachment where possible. A harmless
+   press-Enter gate before displaying the real prompt works for a small helper;
+   tell the human to press Enter, rather than leaving that gate unexplained.
+   Establish which prompt is active before asking for sensitive input.
+
+3. The human completes the requested step, then holds **Control**, taps **`\`**,
+   releases both keys and presses **`d`**. This is Tendr's default detach
+   sequence. The normal shell prompt returns and the session keeps running.
+   **Ctrl-C reaches the child program** and may cancel it; it is not the
+   hand-back action. Other attach escape modes are described
+   [below](#answer-prompts-and-attach).
+
+4. Check `tendr status task` before writing again. A live human attach reports
+   `HumanControl`; after detach it reports `AgentControl`. A PTY `push` refused
+   with exit 81 while a human holds control is a coordination signal. Wait for
+   the hand-back instead of retrying writes or using `--takeover` to displace
+   the person. Use read-only observation when only watching is needed.
+
+5. Resume the authorized work and verify its application result. An unlock or
+   detach alone does not prove the task succeeded. When finished, close temporary
+   client sessions and helpers. If Ctrl-C ended the worker, inspect its status
+   and completed effects before deciding whether a restart is safe.
+
+### Agent to agent
+
+Name one responsible writer and agree when that responsibility transfers.
+`AgentControl` is a terminal mode, not an agent identity or a task-level lock:
+two agents must not independently drive the same shell. Keep one in-flight
+`exec` per session and stop issuing commands while another agent owns the work.
+
+Pass the host, namespace, session name, current goal, program/prompt state,
+completed effects and next safe action through the authorized agent/harness
+communication channel. Include pointers to the relevant source or task record.
+The receiving agent checks current status before continuing; the process retains
+its state, not the sending agent's conversation. Transfer only the access needed
+for the existing assignment, and agree on a return point when the handoff is temporary.
+
+### Secrets and lifetime
+
+Keep `--record-input` off for secret entry, and use masked input. Capture
+sensitive command output inside the process: PTY output still goes to
+`output.log`, even with `--no-record` (which disables the separate PTY recording).
+Never put passwords or session keys into the handoff message. Follow the
+environment's credential-handling instructions.
+
+Detach preserves the worker within its existing execution boundary; it does
+not make descendants independent of their owner. Work launched inside Herdr
+Core can still end with its parent terminal. See
+[the Herdr lifetime contract](#tendr-alongside-herdr-core-and-a-harness).
+
 ## Answer prompts and attach
 
 `tendr push <name>` sends its stdin to the child, for example to answer a
