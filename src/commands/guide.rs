@@ -19,6 +19,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("install", "Install and build"),
     ("exec", "Drive it with"),
     ("run", "Run in the foreground"),
+    ("handoff", "Hand off interactive control"),
     ("environment", "Choose a launch environment"),
     ("ready", "a server is ready"),
     ("remote", "Reach remote hosts"),
