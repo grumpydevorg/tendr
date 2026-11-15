@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- A lost startup readiness reply no longer deletes an already-published run
+  after its child exits. Metadata and output history survive even when the
+  sidecar has already retired the child breadcrumb.
+
 ## v0.8.0 — explicit standalone launches
 
 ### Added
