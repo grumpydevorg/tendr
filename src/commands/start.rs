@@ -385,20 +385,14 @@ fn spawn_and_wait_ready_inner(
     let signal = match Current::read_ready_signal(read_end) {
         Ok(s) => s,
         Err(e) => {
-            // Sidecar died before signaling. Only clean up if no child was spawned.
-            // If child_pid exists, a child may be alive -- don't delete the evidence.
-            if !session.path().join("child_pid").exists() {
-                let _ = session::remove(session);
-            }
+            cleanup_failed_start(session);
             anyhow::bail!("sidecar startup failed: {e}");
         }
     };
 
     if signal.starts_with("ERROR:") {
         let err_msg = signal.trim_start_matches("ERROR:").trim();
-        if !session.path().join("child_pid").exists() {
-            let _ = session::remove(session);
-        }
+        cleanup_failed_start(session);
         anyhow::bail!("sidecar failed: {err_msg}");
     }
 
@@ -410,6 +404,16 @@ fn spawn_and_wait_ready_inner(
 
     let meta: tendr::model::meta::Meta = serde_json::from_str(meta_json)?;
     Ok(meta)
+}
+
+/// A lost readiness reply does not undo a published run. Its child may already
+/// have exited and retired child_pid, while meta and history remain recoverable.
+fn cleanup_failed_start(session: &session::SessionDir) {
+    if matches!(session.meta_path().try_exists(), Ok(false))
+        && matches!(session.path().join("child_pid").try_exists(), Ok(false))
+    {
+        let _ = session::remove(session);
+    }
 }
 
 /// Infer exec target from argv[0] when --exec-target is not specified.
@@ -426,5 +430,50 @@ fn infer_exec_target(argv0: &str) -> ExecTarget {
         "python" | "python3" | "ipython" | "py" => ExecTarget::PythonRepl,
         "duckdb" => ExecTarget::DuckDb,
         _ => ExecTarget::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU32;
+    use tendr::model::ids::{EpochTimestamp, Generation, ProcessIdentity, RunId};
+    use tendr::model::meta::Meta;
+    use tendr::model::state::ExitReason;
+
+    #[test]
+    fn failed_readiness_preserves_published_terminal_run() {
+        let home = tempfile::tempdir().unwrap();
+        let root = SessionRoot::new(home.path().to_path_buf());
+        let name = SessionName::new("finished").unwrap();
+        let dir = session::create(&root, &Namespace::default_namespace(), &name).unwrap();
+        let identity = ProcessIdentity {
+            pid: NonZeroU32::new(100).unwrap(),
+            start_time_ns: 1000,
+        };
+        let mut meta = Meta::new_starting(
+            name,
+            RunId::new(),
+            Generation::first(),
+            LaunchSpec::new(vec!["true".into()]).unwrap(),
+            identity,
+            EpochTimestamp::now(),
+        );
+        meta.transition_running(identity).unwrap();
+        meta.transition_exited(ExitReason::ExitedOk, EpochTimestamp::now())
+            .unwrap();
+        session::write_meta_atomic(&dir, &meta).unwrap();
+        std::fs::write(dir.path().join("output.log"), b"finished\n").unwrap();
+
+        // The sidecar retires child_pid before the start client handles EOF.
+        cleanup_failed_start(&dir);
+
+        let saved = session::read_meta(&dir).expect("published run survives lost readiness");
+        assert_eq!(saved.run_id(), meta.run_id());
+        assert_eq!(saved.status(), meta.status());
+        assert_eq!(
+            std::fs::read(dir.path().join("output.log")).unwrap(),
+            b"finished\n"
+        );
     }
 }
