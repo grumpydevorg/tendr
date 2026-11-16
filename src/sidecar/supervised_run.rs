@@ -258,6 +258,9 @@ impl RunCore {
         SidecarFailure { step }
     }
 
+    // Off Unix `start_pty` takes an uninhabited endpoint and never returns, so
+    // the code after the call is unreachable by construction.
+    #[cfg_attr(not(unix), allow(unreachable_code))]
     fn publish_running(&mut self) -> Result<(), SidecarFailure> {
         let dir = self.session_dir().to_path_buf();
 

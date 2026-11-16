@@ -2352,12 +2352,16 @@ impl Pool {
 
     /// A slot, held until the returned guard drops; `None` if all are taken.
     fn take(self: &Arc<Self>) -> Option<Slot> {
-        self.in_use
+        // `try_update` is the new name, but it is not in the advertised MSRV;
+        // keep `fetch_update` until the MSRV reaches it.
+        #[allow(deprecated)]
+        let taken = self
+            .in_use
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < self.cap).then_some(n + 1)
             })
-            .ok()
-            .map(|_| Slot(Arc::clone(self)))
+            .ok();
+        taken.map(|_| Slot(Arc::clone(self)))
     }
 }
 
