@@ -473,10 +473,7 @@ fn emit_batch(
             return Ok(false);
         }
     }
-    if out.flush().is_err() {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(out.flush().is_ok())
 }
 
 /// `--strict`: unparseable segment lines are a defect wherever observed —

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "enabledManagers": ["rust-toolchain"],
+  "packageRules": [
+    {
+      "matchManagers": ["rust-toolchain"],
+      "rangeStrategy": "pin",
+      "automerge": true
+    }
+  ]
+}
